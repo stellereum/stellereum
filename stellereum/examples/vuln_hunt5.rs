@@ -671,9 +671,9 @@ fn sync_poisoning(r: &mut Report) {
 fn bridge_release(r: &mut Report) {
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
-    use stellereum::bridge::MultisigRelayer;
-    use stellereum::consensus::register_validator_pq_key;
+    use stellereum::bridge::{MultisigRelayer, ReleaseBinding};
     use stellereum::post_quantum::{FalconKeypair, PqScheme};
+    use stellereum::pq_registry::PqRegistry;
 
     println!("\n[9] Bridge multisig release");
 
@@ -688,41 +688,85 @@ fn bridge_release(r: &mut Report) {
         ),
     );
 
-    // #38: a lone validator still has to actually sign.
+    // Explicit committed PQ registry: the relayer resolves signer keys AT
+    // `attestation_height` through `PqKeyLookup`. Nothing here touches the
+    // process-local `PQ_VALIDATOR_KEYS` map.
+    let mut registry = PqRegistry::new();
+    let register = |registry: &mut PqRegistry, id: [u8; 32], fk: &FalconKeypair| {
+        registry
+            .register(id, PqScheme::Falcon512, fk.public_key.clone(), 0, 0, true)
+            .expect("fresh deterministic registry entry")
+    };
+
+    // #38: a lone validator still has to actually sign the V2 release
+    // preimage, with a Falcon-512 key committed at the attestation height.
     let k = SigningKey::generate(&mut OsRng);
     let k_id = k.verifying_key().to_bytes();
     let k_falcon = FalconKeypair::generate();
-    register_validator_pq_key(k_id, PqScheme::Falcon512, k_falcon.public_key.clone());
+    register(&mut registry, k_id, &k_falcon);
     let mut one = MultisigRelayer::new(vec![k_id]);
     let op = [2u8; 32];
     let msg = b"release 100 STELL";
-    let preimage = MultisigRelayer::release_signing_message(op, msg);
+    let binding = ReleaseBinding {
+        req_id: 38,
+        stellereum_chain_id: 7,
+    };
+    let preimage = MultisigRelayer::release_signing_message_v2(binding, op, msg);
     let sig = (k_id, k_falcon.sign(&preimage));
+    // Two under-specified signatures that MUST NOT count:
+    // (a) a classical Ed25519 signature over the right preimage (wrong scheme);
+    // (b) a Falcon-512 signature over the RAW `msg` (missing domain + binding).
+    let classical = (
+        k_id,
+        ed25519_dalek::Signer::sign(&k, &preimage)
+            .to_bytes()
+            .to_vec(),
+    );
+    let raw_msg = (k_id, k_falcon.sign(msg));
+    let count = one.count_signers_at_height(&preimage, std::slice::from_ref(&sig), 0, &registry);
     r.check(
-        "#38 lone validator must sign",
-        one.try_release(op, msg, &[]).is_err() && one.try_release(op, msg, &[sig]).is_ok(),
-        "unsigned refused, signed accepted",
+        "#38 lone validator must sign the V2 release preimage",
+        count == 1
+            && one
+                .try_release_at_height(binding, op, msg, &[], 0, &registry)
+                .is_err()
+            && one
+                .try_release_at_height(binding, op, msg, &[classical], 0, &registry)
+                .is_err()
+            && one
+                .try_release_at_height(binding, op, msg, &[raw_msg], 0, &registry)
+                .is_err()
+            && one
+                .try_release_at_height(binding, op, msg, &[sig], 0, &registry)
+                .is_ok(),
+        "unsigned, raw Ed25519, and raw-msg signatures refused; Falcon-512 over release_signing_message_v2 accepted",
     );
 
-    // #39: a signature from outside the relayer set is worthless.
+    // #39: a signature from outside the relayer set is worthless — even when
+    // its Falcon key IS committed in the registry (whitelist, not key lookup).
     let outsider = SigningKey::generate(&mut OsRng);
     let outsider_id = outsider.verifying_key().to_bytes();
     let outsider_falcon = FalconKeypair::generate();
-    register_validator_pq_key(
-        outsider_id,
-        PqScheme::Falcon512,
-        outsider_falcon.public_key.clone(),
-    );
+    register(&mut registry, outsider_id, &outsider_falcon);
     let mut one2 = MultisigRelayer::new(vec![k_id]);
     let op3 = [3u8; 32];
+    let outsider_binding = ReleaseBinding {
+        req_id: 39,
+        stellereum_chain_id: 7,
+    };
     let osig = (
         outsider_id,
-        outsider_falcon.sign(&MultisigRelayer::release_signing_message(op3, msg)),
+        outsider_falcon.sign(&MultisigRelayer::release_signing_message_v2(
+            outsider_binding,
+            op3,
+            msg,
+        )),
     );
     r.check(
         "#39 outsider signature rejected",
-        one2.try_release(op3, msg, &[osig]).is_err(),
-        "non-whitelisted signer does not count",
+        one2.try_release_at_height(outsider_binding, op3, msg, &[osig], 0, &registry)
+            .is_err(),
+        "registered-but-non-whitelisted signer does not count",
     );
 }
 

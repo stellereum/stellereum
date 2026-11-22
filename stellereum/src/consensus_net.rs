@@ -820,6 +820,13 @@ fn peer_in_cooldown(
 /// while a dead peer's ~1.5s "no session key" stall can never hold the queue.
 pub const BROADCAST_JOIN_TIMEOUT_MS_DEFAULT: u64 = 500;
 
+/// Grace window in ms after `fast_target` peers have finished in
+/// [`join_with_quorum_or_timeout`]: once enough fast peers have responded to
+/// satisfy quorum, remaining stragglers get at most this grace before being
+/// detached so the FIFO broadcast queue moves on without waiting the full
+/// `hard_budget`.
+pub const BROADCAST_STRAGGLER_GRACE_MS_DEFAULT: u64 = 35;
+
 /// Parse helper for [`broadcast_join_timeout_ms`]: garbage/zero disables
 /// nothing, it falls back to the default (same clamp-instead-of-disable shape
 /// as the replication pacing parsers). Time-injected so tests need no env.
@@ -829,10 +836,13 @@ pub fn parse_broadcast_join_timeout_ms(raw: Option<String>) -> u64 {
         .unwrap_or(BROADCAST_JOIN_TIMEOUT_MS_DEFAULT)
 }
 
-/// Effective flush join budget (`STELL_BROADCAST_JOIN_MS`, default 500). Read
-/// per flush (cheap, no I/O) so the budget is live-tunable without restart.
+/// Effective flush join budget (`STELL_BROADCAST_JOIN_MS`, default 500), cached
+/// once on first read so consensus flushes do not pay `std::env::var` per packet.
 pub fn broadcast_join_timeout_ms() -> u64 {
-    parse_broadcast_join_timeout_ms(std::env::var("STELL_BROADCAST_JOIN_MS").ok())
+    static CACHED: OnceLock<u64> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_broadcast_join_timeout_ms(std::env::var("STELL_BROADCAST_JOIN_MS").ok())
+    })
 }
 
 /// Consecutive probe timeouts before the shared connection is evicted
@@ -1147,6 +1157,73 @@ pub async fn join_with_timeout<T: Send + 'static>(
                     Some(Ok(Some(v))) => done.push(v),
                     // Inner task panicked/cancelled, or the wrapper failed:
                     // nothing to collect, keep draining the rest.
+                    Some(Ok(None)) | Some(Err(_)) => {}
+                    None => {
+                        drained = true;
+                        break;
+                    }
+                }
+            }
+            _ = &mut budget_sleep => break,
+        }
+    }
+    if drained {
+        (done, 0)
+    } else {
+        let pending = set.len();
+        set.detach_all();
+        (done, pending)
+    }
+}
+
+/// Await `handles` up to `hard_budget`, short-circuiting via `straggler_grace`
+/// once `fast_target` tasks have completed.
+///
+/// While fewer than `fast_target` tasks have completed, this waits up to
+/// `hard_budget`. As soon as `done.len() >= fast_target` with tasks still
+/// pending, the remaining deadline is tightened to `min(remaining, straggler_grace)`,
+/// collecting any peers that finish within the grace window and detaching the
+/// rest via `JoinSet::detach_all`. Detached tasks keep running to completion in
+/// the background (so sends and `peer_health` updates still land) while the
+/// FIFO broadcast queue advances immediately.
+pub async fn join_with_quorum_or_timeout<T: Send + 'static>(
+    handles: Vec<tokio::task::JoinHandle<T>>,
+    fast_target: usize,
+    straggler_grace: Duration,
+    hard_budget: Duration,
+) -> (Vec<T>, usize) {
+    if handles.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let mut set = tokio::task::JoinSet::new();
+    for h in handles {
+        set.spawn(async move { h.await.ok() });
+    }
+    let mut done = Vec::new();
+    let mut drained = false;
+    let mut deadline = tokio::time::Instant::now() + hard_budget;
+    let mut grace_armed = false;
+    let mut budget_sleep = Box::pin(tokio::time::sleep_until(deadline));
+    loop {
+        if set.is_empty() {
+            drained = true;
+            break;
+        }
+        if !grace_armed && done.len() >= fast_target {
+            grace_armed = true;
+            let grace_deadline = tokio::time::Instant::now() + straggler_grace;
+            if grace_deadline < deadline {
+                deadline = grace_deadline;
+                budget_sleep.as_mut().reset(deadline);
+            }
+        }
+        tokio::select! {
+            // `biased`: drain every already-ready completion before noticing
+            // the expired budget/grace, so fast peers join even in a tight window.
+            biased;
+            r = set.join_next() => {
+                match r {
+                    Some(Ok(Some(v))) => done.push(v),
                     Some(Ok(None)) | Some(Err(_)) => {}
                     None => {
                         drained = true;
@@ -2335,15 +2412,39 @@ impl ConsensusNetwork {
         // (join budget), the cooldown durations in `peer_health`, and which
         // payload classes count as exempt — all without touching this path's
         // fail-open send semantics. Detachment here must never become a drop.
-        let (joined_n, detached_late) =
-            join_with_timeout(joined, Duration::from_millis(broadcast_join_timeout_ms())).await;
+        let join_budget_ms = broadcast_join_timeout_ms();
+        let budget = Duration::from_millis(join_budget_ms);
+        let joined_total = joined.len();
+        let use_quorum_grace = !exempt_skip && joined_total >= 3;
+        let fast_target = joined_total.saturating_sub(1).max(1);
+        let (joined_n, detached_late) = if use_quorum_grace {
+            join_with_quorum_or_timeout(
+                joined,
+                fast_target,
+                Duration::from_millis(BROADCAST_STRAGGLER_GRACE_MS_DEFAULT),
+                budget,
+            )
+            .await
+        } else {
+            join_with_timeout(joined, budget).await
+        };
         if detached_late > 0 {
-            tracing::warn!(
-                "[consensus] broadcast join budget ({}ms) exceeded: joined {} peer(s), detached {} slow peer(s) (still recording on completion)",
-                broadcast_join_timeout_ms(),
-                joined_n.len(),
-                detached_late,
-            );
+            if use_quorum_grace && joined_n.len() >= fast_target {
+                tracing::debug!(
+                    "[consensus] broadcast fast-quorum ({}/{}, grace {}ms) detached {} slow peer(s) (still recording on completion)",
+                    joined_n.len(),
+                    joined_total,
+                    BROADCAST_STRAGGLER_GRACE_MS_DEFAULT,
+                    detached_late,
+                );
+            } else {
+                tracing::warn!(
+                    "[consensus] broadcast join budget ({}ms) exceeded: joined {} peer(s), detached {} slow peer(s) (still recording on completion)",
+                    join_budget_ms,
+                    joined_n.len(),
+                    detached_late,
+                );
+            }
         }
         if skipped > 0 {
             tracing::debug!("[consensus] broadcast skipped {skipped} peer(s) in failure cooldown");

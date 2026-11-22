@@ -18,6 +18,10 @@ use crate::consensus_net::COMPACT_GOSSIP_ACTIVATION_HEIGHT;
 use crate::governance::UPGRADE_EXEC_ACTIVATION_HEIGHT;
 use crate::mev_epoch::PQ_TRANSPORT_H_ACTIVATION_HEIGHT;
 use crate::pq_registry::PQ_ROTATION_DELAY_HEIGHTS;
+pub use crate::pq_registry::{
+    effective_pq_lifecycle_activation_height, pq_lifecycle_active_at,
+    PQ_LIFECYCLE_ACTIVATION_HEIGHT,
+};
 use crate::sharding::HEADER_COMMIT_ACTIVATION_HEIGHT;
 use crate::state_engine::EVM_BINDINGS_STATE_ACTIVATION_HEIGHT;
 use crate::tokenomics::EMISSIONCapEXACT_ACTIVATION_HEIGHT;
@@ -410,6 +414,30 @@ pub fn current_activation_schedule() -> ChainActivationSchedule {
                 EVM_BINDINGS_STATE_ACTIVATION_HEIGHT,
                 "Ruleset v7 canonical Domain::EvmBindings state commitment and deterministic first-writer-wins apply",
             ),
+            ActivationGate::new(
+                "PQ_LIFECYCLE_ACTIVATION_HEIGHT",
+                "stellereum::pq_registry",
+                PQ_LIFECYCLE_ACTIVATION_HEIGHT,
+                "Ruleset v7 PQ validator lifecycle: 3-key separation (withdrawal_address), Falcon-512 PoP rotation, and 720k-height evidence retention",
+            ),
+            ActivationGate::new(
+                "BRIDGE_V2_ACTIVATION_HEIGHT",
+                "stellereum::bridge",
+                crate::bridge::BRIDGE_V2_ACTIVATION_HEIGHT,
+                "Ruleset v7 bridge release authorization: verified payout receipts (ReleaseProof), refund tombstones, challengeable quorum-anchored deposits, retraction precedence",
+            ),
+            ActivationGate::new(
+                "FEE_MARKET_V2_ACTIVATION_HEIGHT",
+                "stellereum::tokenomics",
+                crate::tokenomics::FEE_MARKET_V2_ACTIVATION_HEIGHT,
+                "Ruleset v7 fee market: priority_fee_per_gas charge in apply plus burn/proposer/staking split",
+            ),
+            ActivationGate::new(
+                "SUB_NANO_STRICT_ACTIVATION_HEIGHT",
+                "stellereum::tokenomics",
+                crate::tokenomics::SUB_NANO_STRICT_ACTIVATION_HEIGHT,
+                "Ruleset v7 sub-nano exactness: EVM wei carrier boundary, reward-accumulator rescale carry, Q0.64 emission carry",
+            ),
         ],
     }
 }
@@ -558,6 +586,22 @@ mod tests {
                 "EVM_BINDINGS_STATE_ACTIVATION_HEIGHT",
                 EVM_BINDINGS_STATE_ACTIVATION_HEIGHT,
             ),
+            (
+                "PQ_LIFECYCLE_ACTIVATION_HEIGHT",
+                PQ_LIFECYCLE_ACTIVATION_HEIGHT,
+            ),
+            (
+                "BRIDGE_V2_ACTIVATION_HEIGHT",
+                crate::bridge::BRIDGE_V2_ACTIVATION_HEIGHT,
+            ),
+            (
+                "FEE_MARKET_V2_ACTIVATION_HEIGHT",
+                crate::tokenomics::FEE_MARKET_V2_ACTIVATION_HEIGHT,
+            ),
+            (
+                "SUB_NANO_STRICT_ACTIVATION_HEIGHT",
+                crate::tokenomics::SUB_NANO_STRICT_ACTIVATION_HEIGHT,
+            ),
         ];
 
         assert_eq!(schedule.gates.len(), expected.len());
@@ -574,15 +618,19 @@ mod tests {
             );
         }
 
-        for r2_gate in [
+        for r2_r3_gate in [
             "HEADER_COMMIT_ACTIVATION_HEIGHT",
             "EVM_BINDINGS_STATE_ACTIVATION_HEIGHT",
+            "PQ_LIFECYCLE_ACTIVATION_HEIGHT",
+            "BRIDGE_V2_ACTIVATION_HEIGHT",
+            "FEE_MARKET_V2_ACTIVATION_HEIGHT",
+            "SUB_NANO_STRICT_ACTIVATION_HEIGHT",
         ] {
             let gate = schedule
                 .gates
                 .iter()
-                .find(|g| g.name == r2_gate)
-                .expect("R2 gate must be registered");
+                .find(|g| g.name == r2_r3_gate)
+                .expect("R2/R3 gate must be registered");
             assert_eq!(gate.activation_height, u64::MAX);
             assert_eq!(gate.status, ActivationStatus::GatedOff);
         }

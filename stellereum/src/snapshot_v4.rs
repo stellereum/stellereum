@@ -10,8 +10,8 @@
 //! - `Base` mode: 256 deterministic prefix buckets (`addr[0] ∈ 0x00..=0xFF`,
 //!   sorted by `address: [u8; 32]`, sub-chunked at `MAX_ACCOUNTS_PER_CHUNK` /
 //!   `MAX_SNAP_CHUNK_BYTES`, empty buckets encoded as `UnchangedRef` with
-//!   `BLAKE3("STELL_SNAP_BUCKET_EMPTY_V1")` and 0 wire bytes) plus 16 canonical
-//!   `DomainUnitId` units (`Scalars` .. `EvmBindings`).
+//!   `BLAKE3("STELL_SNAP_BUCKET_EMPTY_V1")` and 0 wire bytes) plus 17 canonical
+//!   `DomainUnitId` units (`Scalars` .. `PqRegistry`).
 //! - `Delta` mode: `AccountBucketDelta` / `MapDiff` / `ScalarsDelta` /
 //!   `CrossShardDelta` / `UnchangedRef`, with strict `base_state_root` and
 //!   monotonic `base_height < target_height` chain verification, uniqueness and
@@ -41,6 +41,7 @@ use crate::oracle::OracleState;
 use crate::orderbook::{OrderbookActor, OrderbookManager};
 use crate::pmm::PrimaryMarketMaker;
 use crate::post_quantum::{verify_pq_signature, FalconKeypair, PqScheme, FALCON512_SIG_LEN};
+use crate::pq_registry::PqRegistry;
 use crate::sharding::{CrossShardKey, CrossShardReplaySnapshot, Transaction};
 use crate::staking::{
     CommissionSchedule, JailRecord, StakingLedger, UnbondingEntry, ValidatorRewardState,
@@ -110,8 +111,8 @@ pub const UNIT_ENC_DELTA: u8 = 1;
 pub const UNIT_ENC_UNCHANGED: u8 = 2;
 
 /// Number of non-account domain units.
-pub const N_DOMAIN_UNITS: usize = 16;
-/// Total canonical unit tags (`256` account buckets + `16` domains).
+pub const N_DOMAIN_UNITS: usize = 17;
+/// Total canonical unit tags (`256` account buckets + `17` domains).
 pub const TOTAL_UNIT_TAGS: usize = N_ACCOUNT_BUCKETS + N_DOMAIN_UNITS;
 
 // ============================================================================
@@ -472,7 +473,7 @@ impl std::error::Error for SnapV4Error {}
 // Unit Tags & Domain Identifiers
 // ============================================================================
 
-/// Non-account domain unit identifiers (`unit_tag` 256..=271).
+/// Non-account domain unit identifiers (`unit_tag` 256..=272).
 ///
 /// NOTE: `safety_record_v1`, `ConsensusCheckpoint`, and `VoteWatermark` are
 /// explicitly absent and never represented here.
@@ -495,6 +496,7 @@ pub enum DomainUnitId {
     CnVrfV3 = 269,
     PqKeys = 270,
     EvmBindings = 271,
+    PqRegistry = 272,
 }
 
 impl DomainUnitId {
@@ -515,6 +517,7 @@ impl DomainUnitId {
         Self::CnVrfV3,
         Self::PqKeys,
         Self::EvmBindings,
+        Self::PqRegistry,
     ];
 
     pub const fn tag(self) -> u16 {
@@ -539,6 +542,7 @@ impl DomainUnitId {
             269 => Some(Self::CnVrfV3),
             270 => Some(Self::PqKeys),
             271 => Some(Self::EvmBindings),
+            272 => Some(Self::PqRegistry),
             _ => None,
         }
     }
@@ -561,6 +565,7 @@ impl DomainUnitId {
             Self::CnVrfV3 => "CnVrfV3",
             Self::PqKeys => "PqKeys",
             Self::EvmBindings => "EvmBindings",
+            Self::PqRegistry => "PqRegistry",
         }
     }
 }
@@ -1828,6 +1833,7 @@ pub struct SnapStateV4 {
     pub cnvrf_v3: CnVrfV3EngineSnapshot,
     pub pq_keys: CanonicalPqKeys,
     pub evm_bindings: CanonicalEvmBindings,
+    pub pq_registry: PqRegistry,
 }
 
 impl Default for SnapStateV4 {
@@ -1850,6 +1856,7 @@ impl Default for SnapStateV4 {
             cnvrf_v3: CnVrfV3EngineSnapshot::default(),
             pq_keys: CanonicalPqKeys::default(),
             evm_bindings: CanonicalEvmBindings::default(),
+            pq_registry: PqRegistry::default(),
         }
     }
 }
@@ -1895,6 +1902,29 @@ impl SnapStateV4 {
         governance_override: Option<&Governance>,
         pq_keys_override: Option<&[(Vec<u8>, Vec<u8>)]>,
     ) -> Result<Self, SnapV4Error> {
+        let pq_registry = engine.pq_registry_read().await;
+        Self::capture_from_engine_with_pq_registry(
+            engine,
+            staking_override,
+            governance_override,
+            pq_keys_override,
+            Some(&*pq_registry),
+        )
+        .await
+    }
+
+    /// Capture a canonical `SnapStateV4` from an `InMemoryStateEngine` with an
+    /// optional `PqRegistry` override (defaults to `PqRegistry::default()` until
+    /// `R3-D` wires `InMemoryStateEngine::pq_registry`).
+    ///
+    /// Never reads `safety_record_v1`, `ConsensusCheckpoint`, or `VoteWatermark`.
+    pub async fn capture_from_engine_with_pq_registry(
+        engine: &InMemoryStateEngine,
+        staking_override: Option<&StakingLedger>,
+        governance_override: Option<&Governance>,
+        pq_keys_override: Option<&[(Vec<u8>, Vec<u8>)]>,
+        pq_registry_override: Option<&PqRegistry>,
+    ) -> Result<Self, SnapV4Error> {
         let state_snap = engine.capture_state_snapshot().await;
         let staking_guard;
         let staking = match staking_override {
@@ -1919,6 +1949,8 @@ impl SnapStateV4 {
         let zkml_models = engine.zkml_models_read().await.clone();
         let cnvrf_v3 = engine.cnvrf_v3_snapshot().await;
         let evm_bindings = CanonicalEvmBindings::from_state(&*engine.evm_bindings_read().await);
+        // R3-D wires engine.pq_registry_read().await.clone() when pq_registry_override is None
+        let pq_registry = pq_registry_override.cloned().unwrap_or_default();
 
         let engine_consumed = engine.cross_shard_consumed_snapshot().await;
         let produced_pairs = engine.cross_shard_produced_snapshot().await;
@@ -2029,6 +2061,7 @@ impl SnapStateV4 {
                 entries: pq_entries,
             },
             evm_bindings,
+            pq_registry,
         })
     }
 
@@ -2110,6 +2143,8 @@ impl SnapStateV4 {
             .await
             .map_err(SnapV4Error::EngineRestore)?;
 
+        // R3-D wires engine.restore_pq_registry(&self.pq_registry) here.
+
         Ok((staking, governance))
     }
 
@@ -2118,6 +2153,26 @@ impl SnapStateV4 {
     pub async fn compute_state_root(&self) -> Result<[u8; 32], SnapV4Error> {
         let throwaway = InMemoryStateEngine::new();
         self.apply_to_engine(&throwaway).await?;
+        if !self.pq_registry.is_empty() {
+            let snapshot = throwaway.commitment_snapshot().await;
+            let zkml_models = throwaway.zkml_models_read().await.clone();
+            let cnvrf_snap = throwaway.cnvrf_v3_snapshot().await;
+            let evm_bindings = throwaway.evm_bindings_read().await.clone();
+            let digest = crate::commitment::commitment_digest_with_all_domains(
+                &snapshot,
+                &zkml_models,
+                &cnvrf_snap,
+                throwaway.total_minted_nano(),
+                &evm_bindings,
+                &self.pq_registry,
+            );
+            throwaway
+                .state_trie
+                .write()
+                .await
+                .insert(&crate::commitment::commitment_key(), &digest);
+            return Ok(throwaway.state_trie.read().await.root_hash());
+        }
         Ok(throwaway.get_state_root().await)
     }
 
@@ -2364,6 +2419,7 @@ impl SnapStateV4 {
             DomainUnitId::CnVrfV3 => encode_canonical(&self.cnvrf_v3)?,
             DomainUnitId::PqKeys => encode_canonical(&self.pq_keys)?,
             DomainUnitId::EvmBindings => encode_canonical(&self.evm_bindings)?,
+            DomainUnitId::PqRegistry => encode_canonical(&self.pq_registry)?,
         };
         if single.len() > MAX_SNAP_CHUNK_BYTES {
             return Err(SnapV4Error::ChunkTooLarge {
@@ -2568,7 +2624,7 @@ fn finalize_manifest(
     Ok(manifest)
 }
 
-/// Build a `Base` `SnapV4` checkpoint (256 prefix buckets + 16 canonical domain units).
+/// Build a `Base` `SnapV4` checkpoint (256 prefix buckets + 17 canonical domain units).
 pub fn build_base_snapshot(
     state: &SnapStateV4,
     params: &SnapshotBuildParams<'_>,
@@ -2720,7 +2776,7 @@ pub fn build_delta_snapshot(
         )?;
     }
 
-    // 16 domain units
+    // 17 domain units
     for domain in DomainUnitId::ALL {
         let base_hash = base.domain_state_hash(domain)?;
         let target_hash = target.domain_state_hash(domain)?;
@@ -2938,7 +2994,8 @@ pub fn build_delta_snapshot(
             | DomainUnitId::SessionKeys
             | DomainUnitId::Bridge
             | DomainUnitId::ZkMl
-            | DomainUnitId::CnVrfV3 => {
+            | DomainUnitId::CnVrfV3
+            | DomainUnitId::PqRegistry => {
                 push_full_chunks(
                     domain.tag(),
                     full_chunks,
@@ -3371,6 +3428,9 @@ async fn assemble_base_state_inner(
                     DomainUnitId::EvmBindings => {
                         state.evm_bindings = decode_canonical_exact(raw, limit)?
                     }
+                    DomainUnitId::PqRegistry => {
+                        state.pq_registry = decode_canonical_exact(raw, limit)?
+                    }
                     DomainUnitId::Tokens | DomainUnitId::Contracts => unreachable!(),
                 }
             }
@@ -3623,7 +3683,7 @@ async fn apply_delta_state_inner(
         next_state.buckets[b] = decode_bucket_full_chunks(bucket, descs, chunks)?;
     }
 
-    // 16 domain units
+    // 17 domain units
     for domain in DomainUnitId::ALL {
         let descs = &grouped[domain.tag() as usize];
         let base_dom_hash = base_state.domain_state_hash(domain)?;
@@ -3919,7 +3979,8 @@ async fn apply_delta_state_inner(
                 | DomainUnitId::SessionKeys
                 | DomainUnitId::Bridge
                 | DomainUnitId::ZkMl
-                | DomainUnitId::CnVrfV3 => {
+                | DomainUnitId::CnVrfV3
+                | DomainUnitId::PqRegistry => {
                     return Err(SnapV4Error::InvalidEncodingForKind {
                         kind: "Delta(CompactDomain)",
                         unit_tag: domain.tag(),
@@ -4007,6 +4068,9 @@ async fn apply_delta_state_inner(
                     }
                     DomainUnitId::EvmBindings => {
                         next_state.evm_bindings = decode_canonical_exact(raw, limit)?
+                    }
+                    DomainUnitId::PqRegistry => {
+                        next_state.pq_registry = decode_canonical_exact(raw, limit)?
                     }
                     DomainUnitId::Tokens | DomainUnitId::Contracts => unreachable!(),
                 }

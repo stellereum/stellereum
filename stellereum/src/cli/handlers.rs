@@ -2008,6 +2008,288 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 payload.highest_precommit_round
             );
         }
+        Commands::Validator { sub } => match sub {
+            ValidatorCommands::RegisterValidator {
+                withdrawal_seed,
+                withdrawal_key_file,
+                voting_seed,
+                voting_key_file,
+                amount,
+                commission_bps,
+                rpc,
+                nonce,
+                chain_id,
+                dry_run,
+                token,
+            } => {
+                let withdrawal_kp =
+                    resolve_falcon_keypair(withdrawal_key_file, withdrawal_seed, "withdrawal")?;
+                let voting_kp = resolve_falcon_keypair(voting_key_file, voting_seed, "voting")?;
+                let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
+                let withdrawal_addr = falcon_pq_address(&withdrawal_kp);
+                let account_nonce = resolve_nonce(&rpc, &withdrawal_addr, nonce)?;
+                let (tx, validator_id) = build_register_validator_tx_with_chain(
+                    &withdrawal_kp,
+                    &voting_kp,
+                    amount,
+                    commission_bps,
+                    account_nonce,
+                    chain_id,
+                );
+                if !tx.verify_signature_for_chain(chain_id, true) {
+                    anyhow::bail!(
+                        "refusing to submit: built register-validator tx failed chain-bound verify"
+                    );
+                }
+                println!(
+                    "✅ RegisterValidator signed (OpCode 59, Falcon-512 PoP, chain_id={chain_id}):"
+                );
+                println!("  Validator ID:       {}", hex::encode(validator_id));
+                println!("  Withdrawal Address: {}", hex::encode(withdrawal_addr));
+                println!("  Amount:             {amount} nano-STELL");
+                println!("  Commission:         {commission_bps} bps");
+                println!("  Nonce:              {account_nonce}");
+                println!(
+                    "  Hash:               {}",
+                    hex::encode(tx.compute_tx_hash())
+                );
+                if dry_run {
+                    println!("  raw: {}", hex::encode(bincode::serialize(&tx)?));
+                    return Ok(());
+                }
+                let hash = rpc_submit_tx(&rpc, "stell_sendRawTransaction", &tx, token.as_deref())?;
+                println!("  Submitted, mempool tx hash: {hash}");
+            }
+            ValidatorCommands::RotateVotingKey {
+                withdrawal_seed,
+                withdrawal_key_file,
+                validator_id,
+                rotation_seq,
+                new_voting_seed,
+                new_voting_key_file,
+                cancel,
+                rpc,
+                nonce,
+                chain_id,
+                dry_run,
+                token,
+            } => {
+                let withdrawal_kp =
+                    resolve_falcon_keypair(withdrawal_key_file, withdrawal_seed, "withdrawal")?;
+                let validator_id = parse_wallet_address(&validator_id)?;
+                let new_voting_kp = if cancel {
+                    None
+                } else {
+                    Some(resolve_falcon_keypair(
+                        new_voting_key_file,
+                        new_voting_seed,
+                        "new-voting",
+                    )?)
+                };
+                let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
+                let withdrawal_addr = falcon_pq_address(&withdrawal_kp);
+                let account_nonce = resolve_nonce(&rpc, &withdrawal_addr, nonce)?;
+                let tx = build_rotate_voting_key_tx_with_chain(
+                    &withdrawal_kp,
+                    validator_id,
+                    rotation_seq,
+                    new_voting_kp.as_ref(),
+                    account_nonce,
+                    chain_id,
+                );
+                if !tx.verify_signature_for_chain(chain_id, true) {
+                    anyhow::bail!(
+                        "refusing to submit: built rotate-voting-key tx failed chain-bound verify"
+                    );
+                }
+                println!("✅ RotateVotingKey signed (OpCode 60, cancel={cancel}, seq={rotation_seq}, chain_id={chain_id}):");
+                println!("  Validator ID: {}", hex::encode(validator_id));
+                println!("  Nonce:        {account_nonce}");
+                println!("  Hash:         {}", hex::encode(tx.compute_tx_hash()));
+                if dry_run {
+                    println!("  raw: {}", hex::encode(bincode::serialize(&tx)?));
+                    return Ok(());
+                }
+                let hash = rpc_submit_tx(&rpc, "stell_sendRawTransaction", &tx, token.as_deref())?;
+                println!("  Submitted, mempool tx hash: {hash}");
+            }
+            ValidatorCommands::ChangeWithdrawal {
+                withdrawal_seed,
+                withdrawal_key_file,
+                validator_id,
+                new_withdrawal_seed,
+                new_withdrawal_key_file,
+                rpc,
+                nonce,
+                chain_id,
+                dry_run,
+                token,
+            } => {
+                let current_kp =
+                    resolve_falcon_keypair(withdrawal_key_file, withdrawal_seed, "withdrawal")?;
+                let new_kp = resolve_falcon_keypair(
+                    new_withdrawal_key_file,
+                    new_withdrawal_seed,
+                    "new-withdrawal",
+                )?;
+                let validator_id = parse_wallet_address(&validator_id)?;
+                let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
+                let current_addr = falcon_pq_address(&current_kp);
+                let account_nonce = resolve_nonce(&rpc, &current_addr, nonce)?;
+                let tx = build_change_withdrawal_tx_with_chain(
+                    &current_kp,
+                    validator_id,
+                    &new_kp,
+                    account_nonce,
+                    chain_id,
+                );
+                if !tx.verify_signature_for_chain(chain_id, true) {
+                    anyhow::bail!(
+                        "refusing to submit: built change-withdrawal tx failed chain-bound verify"
+                    );
+                }
+                println!(
+                    "✅ ChangeWithdrawal signed (OpCode 61, Falcon-512 PoP, chain_id={chain_id}):"
+                );
+                println!("  Validator ID:   {}", hex::encode(validator_id));
+                println!(
+                    "  New Withdrawal: {}",
+                    hex::encode(falcon_pq_address(&new_kp))
+                );
+                println!("  Nonce:          {account_nonce}");
+                println!("  Hash:           {}", hex::encode(tx.compute_tx_hash()));
+                if dry_run {
+                    println!("  raw: {}", hex::encode(bincode::serialize(&tx)?));
+                    return Ok(());
+                }
+                let hash = rpc_submit_tx(&rpc, "stell_sendRawTransaction", &tx, token.as_deref())?;
+                println!("  Submitted, mempool tx hash: {hash}");
+            }
+            ValidatorCommands::ClaimWithdrawal {
+                withdrawal_seed,
+                withdrawal_key_file,
+                validator_id,
+                voting_seed,
+                voting_key_file,
+                rpc,
+                nonce,
+                chain_id,
+                dry_run,
+                token,
+            } => {
+                let withdrawal_kp =
+                    resolve_falcon_keypair(withdrawal_key_file, withdrawal_seed, "withdrawal")?;
+                let voting_kp = resolve_falcon_keypair(voting_key_file, voting_seed, "voting")?;
+                let validator_id = parse_wallet_address(&validator_id)?;
+                let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
+                let withdrawal_addr = falcon_pq_address(&withdrawal_kp);
+                let account_nonce = resolve_nonce(&rpc, &withdrawal_addr, nonce)?;
+                let tx = build_claim_withdrawal_tx_with_chain(
+                    &withdrawal_kp,
+                    validator_id,
+                    &voting_kp,
+                    account_nonce,
+                    chain_id,
+                );
+                if !tx.verify_signature_for_chain(chain_id, true) {
+                    anyhow::bail!(
+                        "refusing to submit: built claim-withdrawal tx failed chain-bound verify"
+                    );
+                }
+                println!("✅ ClaimWithdrawal signed (OpCode 62, chain_id={chain_id}):");
+                println!("  Validator ID:       {}", hex::encode(validator_id));
+                println!("  Withdrawal Address: {}", hex::encode(withdrawal_addr));
+                println!("  Nonce:              {account_nonce}");
+                println!(
+                    "  Hash:               {}",
+                    hex::encode(tx.compute_tx_hash())
+                );
+                if dry_run {
+                    println!("  raw: {}", hex::encode(bincode::serialize(&tx)?));
+                    return Ok(());
+                }
+                let hash = rpc_submit_tx(&rpc, "stell_sendRawTransaction", &tx, token.as_deref())?;
+                println!("  Submitted, mempool tx hash: {hash}");
+            }
+            ValidatorCommands::AnnounceCommission {
+                withdrawal_seed,
+                withdrawal_key_file,
+                validator_id,
+                new_bps,
+                rpc,
+                nonce,
+                chain_id,
+                dry_run,
+                token,
+            } => {
+                let withdrawal_kp =
+                    resolve_falcon_keypair(withdrawal_key_file, withdrawal_seed, "withdrawal")?;
+                let validator_id = parse_wallet_address(&validator_id)?;
+                let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
+                let withdrawal_addr = falcon_pq_address(&withdrawal_kp);
+                let account_nonce = resolve_nonce(&rpc, &withdrawal_addr, nonce)?;
+                let tx = build_announce_commission_tx_with_chain(
+                    &withdrawal_kp,
+                    validator_id,
+                    new_bps,
+                    account_nonce,
+                    chain_id,
+                );
+                if !tx.verify_signature_for_chain(chain_id, true) {
+                    anyhow::bail!(
+                        "refusing to submit: built announce-commission tx failed chain-bound verify"
+                    );
+                }
+                println!("✅ AnnounceCommission signed (OpCode 63, new_bps={new_bps}, chain_id={chain_id}):");
+                println!("  Validator ID: {}", hex::encode(validator_id));
+                println!("  Nonce:        {account_nonce}");
+                println!("  Hash:         {}", hex::encode(tx.compute_tx_hash()));
+                if dry_run {
+                    println!("  raw: {}", hex::encode(bincode::serialize(&tx)?));
+                    return Ok(());
+                }
+                let hash = rpc_submit_tx(&rpc, "stell_sendRawTransaction", &tx, token.as_deref())?;
+                println!("  Submitted, mempool tx hash: {hash}");
+            }
+            ValidatorCommands::ApplyCommission {
+                withdrawal_seed,
+                withdrawal_key_file,
+                validator_id,
+                rpc,
+                nonce,
+                chain_id,
+                dry_run,
+                token,
+            } => {
+                let withdrawal_kp =
+                    resolve_falcon_keypair(withdrawal_key_file, withdrawal_seed, "withdrawal")?;
+                let validator_id = parse_wallet_address(&validator_id)?;
+                let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
+                let withdrawal_addr = falcon_pq_address(&withdrawal_kp);
+                let account_nonce = resolve_nonce(&rpc, &withdrawal_addr, nonce)?;
+                let tx = build_apply_commission_tx_with_chain(
+                    &withdrawal_kp,
+                    validator_id,
+                    account_nonce,
+                    chain_id,
+                );
+                if !tx.verify_signature_for_chain(chain_id, true) {
+                    anyhow::bail!(
+                        "refusing to submit: built apply-commission tx failed chain-bound verify"
+                    );
+                }
+                println!("✅ ApplyCommission signed (OpCode 64, chain_id={chain_id}):");
+                println!("  Validator ID: {}", hex::encode(validator_id));
+                println!("  Nonce:        {account_nonce}");
+                println!("  Hash:         {}", hex::encode(tx.compute_tx_hash()));
+                if dry_run {
+                    println!("  raw: {}", hex::encode(bincode::serialize(&tx)?));
+                    return Ok(());
+                }
+                let hash = rpc_submit_tx(&rpc, "stell_sendRawTransaction", &tx, token.as_deref())?;
+                println!("  Submitted, mempool tx hash: {hash}");
+            }
+        },
     }
     Ok(())
 }

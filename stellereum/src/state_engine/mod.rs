@@ -571,6 +571,13 @@ pub struct InMemoryStateEngine {
     /// `commitment_generation`). CONDITIONAL in the commitment (0 bytes while
     /// empty, preserving `COMMITMENT_VERSION = 5` and genesis KATs).
     evm_bindings: Arc<RwLock<EvmBindingsState>>,
+    /// Canonical on-chain PQ validator key registry (`Domain::PqRegistry`).
+    ///
+    /// PRIVATE on purpose: reads go through `pq_registry_read`, mutations
+    /// through `pq_registry_write` (which bumps `Domain::PqRegistry` and
+    /// `commitment_generation`). CONDITIONAL in the commitment (0 bytes while
+    /// empty, preserving `COMMITMENT_VERSION = 5` and genesis KATs).
+    pq_registry: Arc<RwLock<crate::pq_registry::PqRegistry>>,
     /// Test/debug per-engine activation height override for CN-VRF v3
     /// (initialized to `u64::MAX`, keeping frozen `CNVRF_V3_ACTIVATION_HEIGHT` untouched).
     #[cfg(any(test, debug_assertions))]

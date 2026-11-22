@@ -16,7 +16,7 @@
 //! * a [`VerificationEvidence`] / [`DepositEvidence`] enum with three kinds:
 //!   (a) [`DepositEvidence::QuorumAttested`] - the already-live
 //!   relayer-quorum rule, adapted (same canonical message, same 2/3 DISTINCT
-//!   threshold, same [`super::verify_quorum_signatures`] helper - no
+//!   threshold, same [`super::verify_quorum_signatures_at_height`] helper - no
 //!   duplicated counting logic);
 //!   (b) SPV-style header + inclusion-proof evidence, one variant per chain
 //!   ([`DepositEvidence::TonCell`], [`DepositEvidence::EvmReceipt`],
@@ -66,6 +66,7 @@
 //!   rejected at BOTH layers (`validate_shape` and `verify`), loudly.
 
 use crate::bridge::{
+    bridge_v2_active_at, verify_quorum_signatures_at_height, PqKeyLookup, PreV2ConsensusLookup,
     SupportedChain, ARBITRUM_FINALITY_BLOCKS, ETHEREUM_FINALITY_BLOCKS, MIN_TON_CONFIRMATIONS,
 };
 use serde::{Deserialize, Serialize};
@@ -166,10 +167,15 @@ pub fn evm_receipt_encoding(
     recipient: &[u8; 32],
     amount: u64,
 ) -> Vec<u8> {
+    // Strict EVM pinning (`docs/specs/06 §1.2.2`): a non-EVM chain is NO
+    // LONGER collapsed onto the `0x00` tag (which made every non-EVM claim
+    // share one receipt domain). It gets a sentinel that matches no EVM
+    // receipt; `EvmAdapter` refuses non-EVM chains before it can build or
+    // compare an expected receipt, so this encoding is never authoritative.
     let tag = match chain {
         SupportedChain::Ethereum => 0x01u8,
         SupportedChain::Arbitrum => 0x02u8,
-        _ => 0x00u8,
+        SupportedChain::Ton | SupportedChain::Solana => 0xFFu8,
     };
     let mut b = Vec::with_capacity(21 + 1 + 32 + 4 + 32 + 8);
     b.extend_from_slice(b"STELL_EVM_RECEIPT_V1");
@@ -189,6 +195,56 @@ pub fn solana_leaf_encoding(claim: &DepositClaim) -> Vec<u8> {
     b.extend_from_slice(&claim.recipient);
     b.extend_from_slice(&claim.amount.to_be_bytes());
     b
+}
+
+// ---------------------------------------------------------------------------
+// V2 attestation binding: adapter discriminant + finalized head.
+// ---------------------------------------------------------------------------
+
+/// Domain tag for the V2 header attestation preimage.
+///
+/// Separates V2 header signatures from the V1 preimage
+/// (`STELL_BRIDGE_HEADER_V1`), payout receipts
+/// (`STELL_BRIDGE_RELEASE_RECEIPT_V2`), deposit claims and consensus votes, so
+/// a signature over one statement can never be replayed as another.
+pub const BRIDGE_HEADER_SIGN_DOMAIN_V2: &[u8] = b"STELL_BRIDGE_HEADER_V2";
+
+/// Which adapter variant a V2 header attestation belongs to.
+///
+/// `Evm` covers both EVM chains (Ethereum and Arbitrum); the foreign
+/// `chain_tag` in the same preimage keeps the two apart. The task-level
+/// discriminants are `Ton = 0`, `Evm = 1`, `Solana = 2` (fixed forever: they
+/// are part of a signed preimage).
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AdapterKindTag {
+    Ton = 0x00,
+    Evm = 0x01,
+    Solana = 0x02,
+}
+
+impl AdapterKindTag {
+    /// The adapter variant that owns `chain` (the committed mapping, not a
+    /// caller-supplied label).
+    pub fn of_chain(chain: SupportedChain) -> Self {
+        match chain {
+            SupportedChain::Ton => Self::Ton,
+            SupportedChain::Ethereum | SupportedChain::Arbitrum => Self::Evm,
+            SupportedChain::Solana => Self::Solana,
+        }
+    }
+}
+
+impl From<SupportedChain> for AdapterKindTag {
+    fn from(chain: SupportedChain) -> Self {
+        Self::of_chain(chain)
+    }
+}
+
+/// Free-function form of [`StoredHeader::chain_tag`] (`0x54` TON, `0x41`
+/// Arbitrum, `0x45` Ethereum, `0x53` Solana).
+pub fn chain_tag(chain: SupportedChain) -> u8 {
+    StoredHeader::chain_tag(chain)
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +302,46 @@ impl StoredHeader {
         let mut b = Vec::with_capacity(22 + 73);
         b.extend_from_slice(b"STELL_BRIDGE_HEADER_V1");
         b.extend_from_slice(&self.canonical_bytes());
+        b
+    }
+
+    /// V2 quorum preimage with the finalized head fixed at zero
+    /// (`docs/specs/06 §1.1`).
+    ///
+    /// The zero slot is the header-only form: callers that attest a concrete
+    /// foreign finalized head use [`Self::signing_message_v2_binding`] (the
+    /// adapters always do, so an unsigned `finalized_*` can never be
+    /// inflated after the quorum signed).
+    pub fn signing_message_v2(&self, chain_id: u64) -> Vec<u8> {
+        self.signing_message_v2_binding(chain_id, AdapterKindTag::from(self.chain), 0)
+    }
+
+    /// Canonical V2 preimage (fixed-width, big-endian, zero ambiguity):
+    ///
+    /// ```text
+    /// STELL_BRIDGE_HEADER_V2 (22B)
+    ///   || chain_id (8B)               // Stellereum network: no cross-network replay
+    ///   || adapter_kind (1B)           // Ton / Evm / Solana variant
+    ///   || chain_tag (1B)              // 0x54 / 0x41 / 0x45 / 0x53: no cross-chain transplant
+    ///   || height (8B) || prev_hash (32B) || tx_root (32B)
+    ///   || finalized_head (8B)         // the attested foreign finalized head
+    /// ```
+    pub fn signing_message_v2_binding(
+        &self,
+        chain_id: u64,
+        adapter_kind: AdapterKindTag,
+        finalized_head: u64,
+    ) -> Vec<u8> {
+        let mut b =
+            Vec::with_capacity(BRIDGE_HEADER_SIGN_DOMAIN_V2.len() + 8 + 1 + 1 + 8 + 32 + 32 + 8);
+        b.extend_from_slice(BRIDGE_HEADER_SIGN_DOMAIN_V2);
+        b.extend_from_slice(&chain_id.to_be_bytes());
+        b.push(adapter_kind as u8);
+        b.push(Self::chain_tag(self.chain));
+        b.extend_from_slice(&self.height.to_be_bytes());
+        b.extend_from_slice(&self.prev_hash);
+        b.extend_from_slice(&self.tx_root);
+        b.extend_from_slice(&finalized_head.to_be_bytes());
         b
     }
 }
@@ -481,10 +577,11 @@ pub fn verify_binary_merkle_proof(
 /// only checks the DEPTH arithmetic, never a clock, never the network.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DepositEvidence {
-    /// (a) The already-live relay rule as evidence: ed25519 signatures over
-    /// `TeleportBridgeEngine::deposit_signing_message` of the claim.
-    /// Verified by the SAME [`super::verify_quorum_signatures`] helper the
-    /// engine uses - no duplicated threshold logic.
+    /// (a) The already-live relay rule as evidence: Falcon-512 signatures
+    /// over `TeleportBridgeEngine::deposit_signing_message` of the claim.
+    /// Verified by the SAME [`super::verify_quorum_signatures_at_height`]
+    /// helper the engine uses - no duplicated threshold logic, no Ed25519
+    /// fallback.
     QuorumAttested {
         signatures: Vec<([u8; 32], Vec<u8>)>,
     },
@@ -493,7 +590,8 @@ pub enum DepositEvidence {
     /// `header.tx_root`, and whose bytes equal the claim's TON leaf.
     TonCell {
         header: StoredHeader,
-        /// Quorum over `header.signing_message()`.
+        /// Quorum over the V1 `header.signing_message()` below activation, or
+        /// the V2 preimage (with `finalized_*`) at/after it.
         header_signatures: Vec<([u8; 32], Vec<u8>)>,
         /// Finalized masterchain seqno the watcher observed (depth =
         /// `finalized_seqno - header.height`).
@@ -505,7 +603,8 @@ pub enum DepositEvidence {
     /// compressed Patricia-Trie proof.
     EvmReceipt {
         header: StoredHeader,
-        /// Quorum over `header.signing_message()`.
+        /// Quorum over the V1 `header.signing_message()` below activation, or
+        /// the V2 preimage (with `finalized_*`) at/after it.
         header_signatures: Vec<([u8; 32], Vec<u8>)>,
         /// Finalized head the watcher observed (depth =
         /// `finalized_number - header.height`).
@@ -518,7 +617,8 @@ pub enum DepositEvidence {
     /// open under `header.tx_root` via the binary proof.
     SolanaTx {
         header: StoredHeader,
-        /// Quorum over `header.signing_message()`.
+        /// Quorum over the V1 `header.signing_message()` below activation, or
+        /// the V2 preimage (with `finalized_*`) at/after it.
         header_signatures: Vec<([u8; 32], Vec<u8>)>,
         /// Finalized slot the watcher observed (depth =
         /// `finalized_slot - header.height`).
@@ -636,32 +736,58 @@ pub trait ChainAdapter {
     ) -> Result<VerifiedDeposit, String>;
 }
 
-/// Shared header gate every SPV adapter runs FIRST: the evidence variant
-/// must be the adapter's own, the header must name the adapter's chain, and
-/// the header must carry a 2/3 DISTINCT-validator quorum over its signing
-/// message (the same rule as relay attestations - an unsigned or
-/// outsider-signed header is "unknown" and fails closed).
-fn check_header(
-    adapter_chain: SupportedChain,
+/// Shared header gate every SPV adapter runs FIRST: the header must name the
+/// adapter's chain, and the header must carry a 2/3 DISTINCT-validator quorum
+/// over its signing preimage (the same rule as relay attestations - an
+/// unsigned or outsider-signed header is "unknown" and fails closed).
+///
+/// Height-indexed (`docs/specs/06 §1.1-1.3`):
+///
+/// * `attestation_height >= BRIDGE_V2_ACTIVATION_HEIGHT`: the quorum MUST be
+///   over [`StoredHeader::signing_message_v2_binding`], which binds the
+///   Stellereum `chain_id`, the committed adapter discriminant (derived from
+///   the header's chain via [`AdapterKindTag::from`]), the foreign chain tag,
+///   the header fields AND `finalized_head`. A V1 signature is refused: no
+///   dual-accept fallback exists.
+/// * below activation: the historical V1 preimage
+///   [`StoredHeader::signing_message`] is replayed (existing evidence stays
+///   byte-identical), still resolved through the committed `pq_keys` lookup.
+///
+/// Returns the number of DISTINCT Falcon-512 signers that verified.
+pub fn check_header_at_height(
     header: &StoredHeader,
     header_signatures: &[([u8; 32], Vec<u8>)],
-    evidence_name: &str,
     validators: &[[u8; 32]],
-) -> Result<(), String> {
-    if header.chain != adapter_chain {
-        return Err(format!(
-            "{evidence_name}: header chain mismatch (header names {:?})",
-            header.chain
-        ));
+    finalized_head: u64,
+    attestation_height: u64,
+    chain_id: u64,
+    pq_keys: &dyn PqKeyLookup,
+) -> Result<usize, String> {
+    if bridge_v2_active_at(attestation_height) {
+        let adapter_kind = AdapterKindTag::from(header.chain);
+        let message = header.signing_message_v2_binding(chain_id, adapter_kind, finalized_head);
+        verify_quorum_signatures_at_height(
+            &message,
+            header_signatures,
+            validators,
+            attestation_height,
+            pq_keys,
+        )
+        .map_err(|e| {
+            format!(
+                "header is not quorum-attested under V2 (chain_id {chain_id}, adapter {adapter_kind:?}, finalized {finalized_head}): {e}"
+            )
+        })
+    } else {
+        verify_quorum_signatures_at_height(
+            &header.signing_message(),
+            header_signatures,
+            validators,
+            attestation_height,
+            pq_keys,
+        )
+        .map_err(|e| format!("header is not quorum-attested (V1): {e}"))
     }
-    crate::bridge::verify_quorum_signatures(
-        &header.signing_message(),
-        header_signatures,
-        validators,
-    )
-    .map(|_| ())
-    .map_err(|e| format!("{evidence_name}: header is not quorum-attested: {e}"))?;
-    Ok(())
 }
 
 /// Shared depth gate: `finalized - header.height` must reach the adapter's
@@ -719,22 +845,18 @@ impl TonAdapter {
         }
         self.headers.insert(header)
     }
-}
 
-impl ChainAdapter for TonAdapter {
-    fn chain(&self) -> SupportedChain {
-        SupportedChain::Ton
-    }
-
-    fn min_confirmations(&self) -> u64 {
-        self.min_confirmations
-    }
-
-    fn verify_deposit(
+    /// Height-indexed deposit verification (V2 at/after activation, V1 replay
+    /// below it). Same checks as [`ChainAdapter::verify_deposit`], with the
+    /// attested `finalized_seqno` bound inside the quorum signature at V2.
+    pub fn verify_deposit_at_height(
         &self,
         claim: &DepositClaim,
         evidence: &DepositEvidence,
         validators: &[[u8; 32]],
+        attestation_height: u64,
+        chain_id: u64,
+        pq_keys: &dyn PqKeyLookup,
     ) -> Result<VerifiedDeposit, String> {
         if claim.chain != SupportedChain::Ton {
             return Err("TON adapter: claim is not a TON deposit".to_string());
@@ -748,16 +870,25 @@ impl ChainAdapter for TonAdapter {
         else {
             return Err("TON adapter: evidence is not TON cell inclusion".to_string());
         };
+        if header.chain != SupportedChain::Ton {
+            return Err(format!(
+                "TON evidence: header chain mismatch (header names {:?})",
+                header.chain
+            ));
+        }
         if boc_bytes.len() > MAX_DEPOSIT_BOC_BYTES {
             return Err("TON adapter: BoC blob exceeds the size cap".to_string());
         }
-        check_header(
-            SupportedChain::Ton,
+        check_header_at_height(
             header,
             header_signatures,
-            "TON evidence",
             validators,
-        )?;
+            *finalized_seqno,
+            attestation_height,
+            chain_id,
+            pq_keys,
+        )
+        .map_err(|e| format!("TON evidence: {e}"))?;
         check_depth(
             "TON evidence",
             header.height,
@@ -801,6 +932,34 @@ impl ChainAdapter for TonAdapter {
     }
 }
 
+impl ChainAdapter for TonAdapter {
+    fn chain(&self) -> SupportedChain {
+        SupportedChain::Ton
+    }
+
+    fn min_confirmations(&self) -> u64 {
+        self.min_confirmations
+    }
+
+    /// PRE-V2 compatibility wrapper: height 0 and [`PreV2ConsensusLookup`],
+    /// i.e. the historical V1 preimage and legacy key resolution.
+    fn verify_deposit(
+        &self,
+        claim: &DepositClaim,
+        evidence: &DepositEvidence,
+        validators: &[[u8; 32]],
+    ) -> Result<VerifiedDeposit, String> {
+        self.verify_deposit_at_height(
+            claim,
+            evidence,
+            validators,
+            0,
+            crate::zkml::effective_chain_id(),
+            &PreV2ConsensusLookup,
+        )
+    }
+}
+
 // --- EVM: receipts-trie (Merkle-Patricia) inclusion --------------------------
 
 /// LIVE EVM adapter (Ethereum and Arbitrum share the receipts-trie design;
@@ -816,6 +975,25 @@ pub struct EvmAdapter {
 }
 
 impl EvmAdapter {
+    /// Fallible constructor: refuses any chain that is not Ethereum or
+    /// Arbitrum (`docs/specs/06 §1.2.2`, strict EVM pinning). Prefer this over
+    /// [`Self::new`] on any path that handles untrusted chain labels.
+    pub fn try_new(chain: SupportedChain, min_confirmations: u64) -> Result<Self, String> {
+        if !matches!(chain, SupportedChain::Ethereum | SupportedChain::Arbitrum) {
+            return Err(format!(
+                "EVM adapter: chain {chain:?} is not an EVM chain (Ethereum/Arbitrum only), refusing fail-closed"
+            ));
+        }
+        Ok(Self {
+            chain,
+            min_confirmations,
+            headers: HeaderStore::new(),
+        })
+    }
+
+    /// Infallible constructor kept for historical call sites/tests; the chain
+    /// pin is re-asserted at verify time at/after `BRIDGE_V2_ACTIVATION_HEIGHT`
+    /// (see [`Self::verify_deposit_at_height`]).
     pub fn new(chain: SupportedChain, min_confirmations: u64) -> Self {
         debug_assert!(
             matches!(chain, SupportedChain::Ethereum | SupportedChain::Arbitrum),
@@ -835,22 +1013,21 @@ impl EvmAdapter {
         }
         self.headers.insert(header)
     }
-}
 
-impl ChainAdapter for EvmAdapter {
-    fn chain(&self) -> SupportedChain {
-        self.chain
-    }
-
-    fn min_confirmations(&self) -> u64 {
-        self.min_confirmations
-    }
-
-    fn verify_deposit(
+    /// Height-indexed deposit verification with strict EVM pinning.
+    ///
+    /// At `attestation_height >= BRIDGE_V2_ACTIVATION_HEIGHT` a non-EVM
+    /// adapter/claim is refused BEFORE any encoding or proof work, so a
+    /// non-EVM label can never be mapped onto the EVM receipt domain. Below
+    /// activation the historical behavior is preserved byte-for-byte.
+    pub fn verify_deposit_at_height(
         &self,
         claim: &DepositClaim,
         evidence: &DepositEvidence,
         validators: &[[u8; 32]],
+        attestation_height: u64,
+        chain_id: u64,
+        pq_keys: &dyn PqKeyLookup,
     ) -> Result<VerifiedDeposit, String> {
         if claim.chain != self.chain {
             return Err("EVM adapter: claim is not for this chain".to_string());
@@ -866,19 +1043,39 @@ impl ChainAdapter for EvmAdapter {
         else {
             return Err("EVM adapter: evidence is not EVM receipt inclusion".to_string());
         };
+        if bridge_v2_active_at(attestation_height)
+            && !matches!(
+                self.chain,
+                SupportedChain::Ethereum | SupportedChain::Arbitrum
+            )
+        {
+            return Err(format!(
+                "EVM evidence: non-EVM chain {:?} refused fail-closed at V2 (strict pinning)",
+                self.chain
+            ));
+        }
+        if header.chain != self.chain {
+            return Err(format!(
+                "EVM evidence: header chain mismatch (header names {:?})",
+                header.chain
+            ));
+        }
         if receipt_value.len() > MAX_RECEIPT_BYTES {
             return Err("EVM adapter: receipt exceeds the size cap".to_string());
         }
         if mpt_proof.path.len() > MAX_MPT_PROOF_STEPS {
             return Err("EVM adapter: proof path exceeds the step cap".to_string());
         }
-        check_header(
-            self.chain,
+        check_header_at_height(
             header,
             header_signatures,
-            "EVM evidence",
             validators,
-        )?;
+            *finalized_number,
+            attestation_height,
+            chain_id,
+            pq_keys,
+        )
+        .map_err(|e| format!("EVM evidence: {e}"))?;
         check_depth(
             "EVM evidence",
             header.height,
@@ -921,6 +1118,33 @@ impl ChainAdapter for EvmAdapter {
     }
 }
 
+impl ChainAdapter for EvmAdapter {
+    fn chain(&self) -> SupportedChain {
+        self.chain
+    }
+
+    fn min_confirmations(&self) -> u64 {
+        self.min_confirmations
+    }
+
+    /// PRE-V2 compatibility wrapper: height 0 and [`PreV2ConsensusLookup`].
+    fn verify_deposit(
+        &self,
+        claim: &DepositClaim,
+        evidence: &DepositEvidence,
+        validators: &[[u8; 32]],
+    ) -> Result<VerifiedDeposit, String> {
+        self.verify_deposit_at_height(
+            claim,
+            evidence,
+            validators,
+            0,
+            crate::zkml::effective_chain_id(),
+            &PreV2ConsensusLookup,
+        )
+    }
+}
+
 // --- Solana: transaction-Merkle inclusion ------------------------------------
 
 /// LIVE Solana adapter. Verifies: evidence kind, header quorum, slot depth,
@@ -948,22 +1172,18 @@ impl SolanaAdapter {
         }
         self.headers.insert(header)
     }
-}
 
-impl ChainAdapter for SolanaAdapter {
-    fn chain(&self) -> SupportedChain {
-        SupportedChain::Solana
-    }
-
-    fn min_confirmations(&self) -> u64 {
-        self.min_confirmations
-    }
-
-    fn verify_deposit(
+    /// Height-indexed deposit verification (V2 at/after activation, V1 replay
+    /// below it). Same checks as [`ChainAdapter::verify_deposit`], with the
+    /// attested `finalized_slot` bound inside the quorum signature at V2.
+    pub fn verify_deposit_at_height(
         &self,
         claim: &DepositClaim,
         evidence: &DepositEvidence,
         validators: &[[u8; 32]],
+        attestation_height: u64,
+        chain_id: u64,
+        pq_keys: &dyn PqKeyLookup,
     ) -> Result<VerifiedDeposit, String> {
         if claim.chain != SupportedChain::Solana {
             return Err("Solana adapter: claim is not a Solana deposit".to_string());
@@ -978,13 +1198,22 @@ impl ChainAdapter for SolanaAdapter {
         else {
             return Err("Solana adapter: evidence is not Solana transaction inclusion".to_string());
         };
-        check_header(
-            SupportedChain::Solana,
+        if header.chain != SupportedChain::Solana {
+            return Err(format!(
+                "Solana evidence: header chain mismatch (header names {:?})",
+                header.chain
+            ));
+        }
+        check_header_at_height(
             header,
             header_signatures,
-            "Solana evidence",
             validators,
-        )?;
+            *finalized_slot,
+            attestation_height,
+            chain_id,
+            pq_keys,
+        )
+        .map_err(|e| format!("Solana evidence: {e}"))?;
         check_depth(
             "Solana evidence",
             header.height,
@@ -1006,6 +1235,33 @@ impl ChainAdapter for SolanaAdapter {
             amount: claim.amount,
             via: EvidenceKind::SolanaTx,
         })
+    }
+}
+
+impl ChainAdapter for SolanaAdapter {
+    fn chain(&self) -> SupportedChain {
+        SupportedChain::Solana
+    }
+
+    fn min_confirmations(&self) -> u64 {
+        self.min_confirmations
+    }
+
+    /// PRE-V2 compatibility wrapper: height 0 and [`PreV2ConsensusLookup`].
+    fn verify_deposit(
+        &self,
+        claim: &DepositClaim,
+        evidence: &DepositEvidence,
+        validators: &[[u8; 32]],
+    ) -> Result<VerifiedDeposit, String> {
+        self.verify_deposit_at_height(
+            claim,
+            evidence,
+            validators,
+            0,
+            crate::zkml::effective_chain_id(),
+            &PreV2ConsensusLookup,
+        )
     }
 }
 
@@ -1031,10 +1287,12 @@ impl ChainAdapter for SolanaAdapter {
 /// The retraction preimage lives next to the deposit preimage in
 /// [`super::TeleportBridgeEngine::deposit_failure_signing_message`] - the two
 /// are domain-separated, so a signature over one never verifies as the other.
-pub fn verify_quorum_retraction(
+pub fn verify_quorum_retraction_at_height(
     claim: &DepositClaim,
     signatures: &[([u8; 32], Vec<u8>)],
     validators: &[[u8; 32]],
+    attestation_height: u64,
+    pq_keys: &dyn PqKeyLookup,
 ) -> Result<(), String> {
     let msg = super::TeleportBridgeEngine::deposit_failure_signing_message(
         claim.chain,
@@ -1042,20 +1300,32 @@ pub fn verify_quorum_retraction(
         claim.recipient,
         claim.amount,
     );
-    crate::bridge::verify_quorum_signatures(&msg, signatures, validators)
+    verify_quorum_signatures_at_height(&msg, signatures, validators, attestation_height, pq_keys)
         .map(|_| ())
         .map_err(|e| format!("quorum retraction: {e}"))
 }
 
-/// Verify [`DepositEvidence::QuorumAttested`] for `claim`: rebuild the exact
-/// [`super::TeleportBridgeEngine::deposit_signing_message`] the live path
-/// signs and count DISTINCT committed validators with the SHARED helper.
-/// Replay and the empty-set guard stay where they belong (the engine/plan) -
-/// this answers only "did the relayers attest THIS claim".
-pub fn verify_quorum_evidence(
+/// PRE-V2 compatibility wrapper: [`verify_quorum_retraction_at_height`] at
+/// `attestation_height = 0` with [`PreV2ConsensusLookup`].
+pub fn verify_quorum_retraction(
     claim: &DepositClaim,
     signatures: &[([u8; 32], Vec<u8>)],
     validators: &[[u8; 32]],
+) -> Result<(), String> {
+    verify_quorum_retraction_at_height(claim, signatures, validators, 0, &PreV2ConsensusLookup)
+}
+
+/// Height-indexed [`DepositEvidence::QuorumAttested`] verification.
+///
+/// The relay quorum is resolved through the committed `pq_keys` AT
+/// `attestation_height` ([`verify_quorum_signatures_at_height`]), never the
+/// process-local `PQ_VALIDATOR_KEYS` map.
+pub fn verify_quorum_evidence_at_height(
+    claim: &DepositClaim,
+    signatures: &[([u8; 32], Vec<u8>)],
+    validators: &[[u8; 32]],
+    attestation_height: u64,
+    pq_keys: &dyn PqKeyLookup,
 ) -> Result<VerifiedDeposit, String> {
     let event = super::TeleportDepositEvent {
         source_chain: claim.chain,
@@ -1067,7 +1337,7 @@ pub fn verify_quorum_evidence(
         zk_proof: None,
     };
     let msg = super::TeleportBridgeEngine::deposit_signing_message(&event);
-    crate::bridge::verify_quorum_signatures(&msg, signatures, validators)
+    verify_quorum_signatures_at_height(&msg, signatures, validators, attestation_height, pq_keys)
         .map_err(|e| format!("quorum evidence: {e}"))?;
     Ok(VerifiedDeposit {
         chain: claim.chain,
@@ -1078,23 +1348,44 @@ pub fn verify_quorum_evidence(
     })
 }
 
+/// PRE-V2 compatibility wrapper: [`verify_quorum_evidence_at_height`] at
+/// `attestation_height = 0` with [`PreV2ConsensusLookup`].
+pub fn verify_quorum_evidence(
+    claim: &DepositClaim,
+    signatures: &[([u8; 32], Vec<u8>)],
+    validators: &[[u8; 32]],
+) -> Result<VerifiedDeposit, String> {
+    verify_quorum_evidence_at_height(claim, signatures, validators, 0, &PreV2ConsensusLookup)
+}
+
 // ---------------------------------------------------------------------------
 // verify_evidence: the single consensus entry point (called by plan).
 // ---------------------------------------------------------------------------
 
-/// Verify ANY evidence kind for `claim` against the committed validator set.
-/// Dispatches on the CLAIM's chain (so a TON adapter can never be tricked
-/// into verifying an EVM receipt and vice versa); the adapter then checks
-/// the evidence variant matches. Deterministic: no I/O, no clock.
+/// Height-indexed [`verify_evidence`] (`docs/specs/06 §1.2`).
+///
+/// Verify ANY evidence kind for `claim` against the committed validator set
+/// AT `attestation_height`, resolving every quorum key through the committed
+/// `pq_keys` lookup. Dispatches on the CLAIM's chain (so a TON adapter can
+/// never be tricked into verifying an EVM receipt and vice versa); each
+/// adapter re-checks `header.chain == claim.chain` before any cryptography.
+/// Deterministic: no I/O, no clock, no global key map.
+///
+/// At/after `BRIDGE_V2_ACTIVATION_HEIGHT` every header quorum must be over the
+/// V2 preimage binding `chain_id`, the adapter discriminant and the evidence's
+/// finalized head; V1 signatures are refused.
 ///
 /// Depth policy per chain: TON `MIN_TON_CONFIRMATIONS`, Ethereum
 /// `ETHEREUM_FINALITY_BLOCKS`, Arbitrum `ARBITRUM_FINALITY_BLOCKS`, Solana
 /// `SOLANA_FINALITY_SLOTS` - the same constants the offline watchers use,
 /// so the live verdict cannot drift from the modeled finality depths.
-pub fn verify_evidence(
+pub fn verify_evidence_at_height(
     claim: &DepositClaim,
     evidence: &DepositEvidence,
     validators: &[[u8; 32]],
+    attestation_height: u64,
+    chain_id: u64,
+    pq_keys: &dyn PqKeyLookup,
 ) -> Result<VerifiedDeposit, String> {
     // Shape caps first: plan (and tests) may call this without the VM's
     // pre-check, so verification is self-sufficient. The placeholder is
@@ -1103,12 +1394,22 @@ pub fn verify_evidence(
         .validate_shape()
         .map_err(|e| format!("deposit evidence refused: {e}"))?;
     match evidence {
-        DepositEvidence::QuorumAttested { signatures } => {
-            verify_quorum_evidence(claim, signatures, validators)
-        }
-        DepositEvidence::TonCell { .. } => {
-            TonAdapter::new(MIN_TON_CONFIRMATIONS).verify_deposit(claim, evidence, validators)
-        }
+        DepositEvidence::QuorumAttested { signatures } => verify_quorum_evidence_at_height(
+            claim,
+            signatures,
+            validators,
+            attestation_height,
+            pq_keys,
+        ),
+        DepositEvidence::TonCell { .. } => TonAdapter::new(MIN_TON_CONFIRMATIONS)
+            .verify_deposit_at_height(
+                claim,
+                evidence,
+                validators,
+                attestation_height,
+                chain_id,
+                pq_keys,
+            ),
         DepositEvidence::EvmReceipt { .. } => {
             let min = match claim.chain {
                 SupportedChain::Ethereum => ETHEREUM_FINALITY_BLOCKS,
@@ -1119,14 +1420,45 @@ pub fn verify_evidence(
                     );
                 }
             };
-            EvmAdapter::new(claim.chain, min).verify_deposit(claim, evidence, validators)
+            EvmAdapter::try_new(claim.chain, min)?.verify_deposit_at_height(
+                claim,
+                evidence,
+                validators,
+                attestation_height,
+                chain_id,
+                pq_keys,
+            )
         }
-        DepositEvidence::SolanaTx { .. } => {
-            SolanaAdapter::new(SOLANA_FINALITY_SLOTS).verify_deposit(claim, evidence, validators)
-        }
+        DepositEvidence::SolanaTx { .. } => SolanaAdapter::new(SOLANA_FINALITY_SLOTS)
+            .verify_deposit_at_height(
+                claim,
+                evidence,
+                validators,
+                attestation_height,
+                chain_id,
+                pq_keys,
+            ),
         DepositEvidence::ZkProofPlaceholder { .. } => Err(
             "zk deposit proofs are not yet supported: failing closed (no verifier exists)"
                 .to_string(),
         ),
     }
+}
+
+/// PRE-V2 compatibility wrapper: [`verify_evidence_at_height`] at
+/// `attestation_height = 0`, the effective local chain id and
+/// [`PreV2ConsensusLookup`], i.e. the historical V1 rule set.
+pub fn verify_evidence(
+    claim: &DepositClaim,
+    evidence: &DepositEvidence,
+    validators: &[[u8; 32]],
+) -> Result<VerifiedDeposit, String> {
+    verify_evidence_at_height(
+        claim,
+        evidence,
+        validators,
+        0,
+        crate::zkml::effective_chain_id(),
+        &PreV2ConsensusLookup,
+    )
 }

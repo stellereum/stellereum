@@ -1424,6 +1424,7 @@ pub const SYNC_DOMAIN_KINDS: &[&str] = &[
     "cnvrf_v3",
     "pq_keys",
     "evm_bindings",
+    "pq_registry",
 ];
 
 pub async fn fast_sync_state<F, Fut, G, GFut>(
@@ -1870,6 +1871,12 @@ async fn install_bundle(
                     .restore_evm_bindings(dbytes)
                     .await
                     .map_err(|e| format!("fast sync: restore evm_bindings error: {e}"))?;
+            }
+            "pq_registry" => {
+                engine
+                    .restore_pq_registry(dbytes)
+                    .await
+                    .map_err(|e| format!("fast sync: restore pq_registry error: {e}"))?;
             }
             // Forward-compat: kinds the restore path does not install yet.
             // A non-empty blob here is logged loudly so a silently-dropped

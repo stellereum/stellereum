@@ -92,6 +92,7 @@ impl InMemoryStateEngine {
             epoch_vdf_beacons: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             cnvrf_freeze_inputs: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             evm_bindings: Arc::new(RwLock::new(super::EvmBindingsState::default())),
+            pq_registry: Arc::new(RwLock::new(crate::pq_registry::PqRegistry::default())),
             #[cfg(any(test, debug_assertions))]
             cnvrf_v3_activation_override: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
         }
@@ -125,6 +126,7 @@ impl InMemoryStateEngine {
         let epoch_vdf_beacons = self.epoch_vdf_beacons.read().await.clone();
         let cnvrf_freeze_inputs = self.cnvrf_freeze_inputs.read().await.clone();
         let evm_bindings = self.evm_bindings.read().await.clone();
+        let pq_registry = self.pq_registry.read().await.clone();
 
         let pq_tree = self
             .pq_tree
@@ -231,6 +233,7 @@ impl InMemoryStateEngine {
             epoch_vdf_beacons: Arc::new(RwLock::new(epoch_vdf_beacons)),
             cnvrf_freeze_inputs: Arc::new(RwLock::new(cnvrf_freeze_inputs)),
             evm_bindings: Arc::new(RwLock::new(evm_bindings)),
+            pq_registry: Arc::new(RwLock::new(pq_registry)),
             #[cfg(any(test, debug_assertions))]
             cnvrf_v3_activation_override: Arc::new(std::sync::atomic::AtomicU64::new(
                 self.cnvrf_v3_activation_override
@@ -931,7 +934,29 @@ impl InMemoryStateEngine {
             }
         };
 
-        crate::commitment::assemble_cached_digest_with_cnvrf_minted_and_evm_bindings(
+        // Canonical PQ validator key registry (Domain::PqRegistry).
+        let gen = self.domain_gens.load(Domain::PqRegistry);
+        let pq_registry_hit = self
+            .domain_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_pq_registry_silent(gen);
+        let pq_registry = match pq_registry_hit {
+            Some(b) => b,
+            None => {
+                let state = self.pq_registry.read().await.clone();
+                let b = crate::commitment::pq_registry_preimage(&state);
+                if self.domain_gens.load(Domain::PqRegistry) == gen {
+                    self.domain_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .put_pq_registry_silent(gen, b.clone());
+                }
+                b
+            }
+        };
+
+        crate::commitment::assemble_cached_digest_with_all_domains(
             [
                 &tokens,
                 &staking,
@@ -950,6 +975,7 @@ impl InMemoryStateEngine {
             &cnvrf,
             self.total_minted_nano(),
             &evm_bindings,
+            &pq_registry,
         )
     }
 
@@ -1363,6 +1389,51 @@ impl InMemoryStateEngine {
         self.restore_evm_bindings_state(snap).await
     }
 
+    /// Read the canonical on-chain PQ validator key registry (`Domain::PqRegistry`).
+    pub async fn pq_registry_read(
+        &self,
+    ) -> tokio::sync::RwLockReadGuard<'_, crate::pq_registry::PqRegistry> {
+        self.pq_registry.read().await
+    }
+
+    /// Write access to the canonical on-chain PQ validator key registry (bumps
+    /// `Domain::PqRegistry` and `commitment_generation`).
+    pub async fn pq_registry_write(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, crate::pq_registry::PqRegistry> {
+        self.dom_guard(crate::commitment::Domain::PqRegistry, &self.pq_registry)
+            .await
+    }
+
+    /// Serialize the canonical PQ registry domain for persistence / SnapV4.
+    /// Returns an empty `Vec` when the domain is empty (0 bytes invariant).
+    pub async fn pq_registry_snapshot(&self) -> Vec<u8> {
+        let guard = self.pq_registry.read().await;
+        if guard.is_empty() {
+            return Vec::new();
+        }
+        bincode::serialize(&*guard).unwrap_or_default()
+    }
+
+    /// Install a [`crate::pq_registry::PqRegistry`] directly and bump
+    /// `Domain::PqRegistry` + `commitment_generation`.
+    pub async fn restore_pq_registry_state(&self, reg: crate::pq_registry::PqRegistry) {
+        *self.pq_registry_write().await = reg;
+    }
+
+    /// Install serialized PQ registry bytes (empty bytes install an empty registry).
+    pub async fn restore_pq_registry(&self, bytes: &[u8]) -> Result<(), String> {
+        if bytes.is_empty() {
+            *self.pq_registry_write().await = crate::pq_registry::PqRegistry::default();
+            return Ok(());
+        }
+        let reg: crate::pq_registry::PqRegistry =
+            bincode_deserialize_exact(bytes, MAX_SNAPSHOT_DECODE_BYTES)
+                .map_err(|e| format!("restore pq_registry failed: {e:?}"))?;
+        self.restore_pq_registry_state(reg).await;
+        Ok(())
+    }
+
     /// Set the test/debug per-engine CN-VRF v3 activation height override.
     ///
     /// Keeps frozen `CNVRF_V3_ACTIVATION_HEIGHT` (`u64::MAX`) untouched.
@@ -1676,12 +1747,14 @@ impl InMemoryStateEngine {
         let zkml_models = self.zkml_models.read().await.clone();
         let cnvrf_snap = self.cnvrf_v3_snapshot().await;
         let evm_bindings = self.evm_bindings.read().await.clone();
-        let digest = crate::commitment::commitment_digest_with_zkml_cnvrf_minted_and_evm_bindings(
+        let pq_registry = self.pq_registry.read().await.clone();
+        let digest = crate::commitment::commitment_digest_with_all_domains(
             &snapshot,
             &zkml_models,
             &cnvrf_snap,
             self.total_minted_nano(),
             &evm_bindings,
+            &pq_registry,
         );
         self.state_trie
             .write()
@@ -2302,6 +2375,21 @@ impl InMemoryStateEngine {
                 // Fall through to the older formats below.
             }
         }
+        if let Ok(v3) = bincode_deserialize_limited::<crate::bridge::BridgeStateV3>(
+            bytes,
+            MAX_SNAPSHOT_DECODE_BYTES,
+        ) {
+            // V3 = pre-Bridge-V2 layout (no release receipts / payout replay
+            // set / refund tombstones). Upgrade LOUD: a pre-V2 `executed = true`
+            // flag is NOT retroactively promoted to a verified receipt, so
+            // those withdrawals stay unprovable exactly like deposits older
+            // than `CHALLENGE_MAX_AGE_SECS`.
+            tracing::warn!(
+                "[bridge] restored pre-Bridge-V2 V3 state: no payout receipts exist for already-released withdrawals"
+            );
+            *self.bridge_write().await = v3.upgrade();
+            return Ok(());
+        }
         if let Ok(v2) = bincode_deserialize_limited::<crate::bridge::BridgeStateV2>(
             bytes,
             MAX_SNAPSHOT_DECODE_BYTES,
@@ -2440,6 +2528,7 @@ impl InMemoryStateEngine {
         self.bump_domain_generation(crate::commitment::Domain::CrossShard);
         self.bump_domain_generation(crate::commitment::Domain::Xpc);
         self.bump_domain_generation(crate::commitment::Domain::EvmBindings);
+        self.bump_domain_generation(crate::commitment::Domain::PqRegistry);
 
         // The cross-shard replay sets are derived from applied blocks and are
         // not part of the accounts snapshot: clear them so a reorg that
@@ -2459,6 +2548,7 @@ impl InMemoryStateEngine {
         self.cross_shard_completed.write().await.clear();
         self.cross_shard_xpc.write().await.clear();
         *self.evm_bindings.write().await = super::EvmBindingsState::default();
+        *self.pq_registry.write().await = crate::pq_registry::PqRegistry::default();
 
         // Consistent lock order: accounts -> tokens -> trie
         let mut map = self.accounts.write().await;

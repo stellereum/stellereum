@@ -8,8 +8,8 @@ use stellereum::consensus::ValidatorId;
 use stellereum::governance::Governance;
 use stellereum::mempool::Mempool;
 use stellereum::post_quantum::{PqScheme, FALCON512_PUBKEY_LEN};
-use stellereum::pq_registry::{PqRegistry, PQ_KEY_HISTORY_LIMIT, PQ_ROTATION_DELAY_HEIGHTS};
-use stellereum::rpc::{pq_registry_handle, ReceiptIndex, RpcState};
+use stellereum::pq_registry::{PQ_KEY_HISTORY_LIMIT, PQ_ROTATION_DELAY_HEIGHTS};
+use stellereum::rpc::{ReceiptIndex, RpcState};
 use stellereum::sharding::ShardRegistry;
 use stellereum::staking::{StakingLedger, MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
 
@@ -20,13 +20,6 @@ fn vid(n: u8) -> ValidatorId {
 fn falcon_key(fill: u8) -> Vec<u8> {
     vec![fill; FALCON512_PUBKEY_LEN]
 }
-
-/// The registry view ([`pq_registry_handle`]) is process-wide: these tests
-/// must not interleave reset/register/read sequences, so each holds this
-/// file-local guard for its whole body (distinct validator ids alone would
-/// not survive a concurrent reset wiping the map mid-read).
-static TEST_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
-    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 fn test_state_with_tip(tip: u64) -> Arc<RpcState> {
     Arc::new(RpcState {
@@ -49,10 +42,6 @@ fn test_state_with_tip(tip: u64) -> Arc<RpcState> {
     })
 }
 
-async fn reset_registry() {
-    *pq_registry_handle().write().await = PqRegistry::new();
-}
-
 async fn bond_and_register(st: &Arc<RpcState>, id: ValidatorId, key: &[u8], at: u64) {
     st.engine
         .staking_write()
@@ -60,7 +49,7 @@ async fn bond_and_register(st: &Arc<RpcState>, id: ValidatorId, key: &[u8], at: 
         .bond(id, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
         .expect("bond must succeed");
     let mut ledger = st.engine.staking_write().await;
-    let mut reg = pq_registry_handle().write().await;
+    let mut reg = st.engine.pq_registry_write().await;
     ledger
         .pq_register_key(&mut reg, id, PqScheme::Falcon512, key.to_vec(), at, at)
         .expect("register must succeed");
@@ -68,15 +57,13 @@ async fn bond_and_register(st: &Arc<RpcState>, id: ValidatorId, key: &[u8], at: 
 
 #[tokio::test]
 async fn pq_rpc_happy_path_matches_direct_registry_reads() {
-    let _serial = TEST_SERIAL.lock().await;
-    reset_registry().await;
     let st = test_state_with_tip(50_000);
     let id = vid(0x41);
     let key = falcon_key(0xA5);
     bond_and_register(&st, id, &key, 10).await;
 
     let direct = {
-        let reg = pq_registry_handle().read().await;
+        let reg = st.engine.pq_registry_read().await;
         reg.get_active_key(&id, 10).expect("direct read must hit")
     };
     let out = st
@@ -106,8 +93,6 @@ async fn pq_rpc_happy_path_matches_direct_registry_reads() {
 
 #[tokio::test]
 async fn pq_rpc_unknown_validator_errors_fail_closed() {
-    let _serial = TEST_SERIAL.lock().await;
-    reset_registry().await;
     let st = test_state_with_tip(50_000);
     let known = vid(0x42);
     bond_and_register(&st, known, &falcon_key(0xB0), 0).await;
@@ -137,8 +122,6 @@ async fn pq_rpc_unknown_validator_errors_fail_closed() {
 
 #[tokio::test]
 async fn pq_rpc_height_indexed_reads_pre_post_effective() {
-    let _serial = TEST_SERIAL.lock().await;
-    reset_registry().await;
     let st = test_state_with_tip(50_000);
     let id = vid(0x43);
     let old = falcon_key(0xA5);
@@ -146,7 +129,7 @@ async fn pq_rpc_height_indexed_reads_pre_post_effective() {
     bond_and_register(&st, id, &old, 10).await;
     {
         let mut ledger = st.engine.staking_write().await;
-        let mut reg = pq_registry_handle().write().await;
+        let mut reg = st.engine.pq_registry_write().await;
         ledger
             .pq_announce_rotation(&mut reg, id, PqScheme::Falcon512, new.clone(), 100)
             .expect("announce must succeed");
@@ -171,12 +154,12 @@ async fn pq_rpc_height_indexed_reads_pre_post_effective() {
     assert_eq!(post["pubkey_hex"], json!(hex::encode(&new)));
 
     let direct_pre = {
-        let reg = pq_registry_handle().read().await;
+        let reg = st.engine.pq_registry_read().await;
         reg.get_active_key(&id, eff - 1)
             .expect("direct pre must hit")
     };
     let direct_post = {
-        let reg = pq_registry_handle().read().await;
+        let reg = st.engine.pq_registry_read().await;
         reg.get_active_key(&id, eff).expect("direct post must hit")
     };
     assert_eq!(direct_pre.1, old);
@@ -185,8 +168,6 @@ async fn pq_rpc_height_indexed_reads_pre_post_effective() {
 
 #[tokio::test]
 async fn pq_rpc_pending_rotation_visible_then_clears_on_apply() {
-    let _serial = TEST_SERIAL.lock().await;
-    reset_registry().await;
     let st = test_state_with_tip(50_000);
     let id = vid(0x44);
     let old = falcon_key(0xA5);
@@ -194,7 +175,7 @@ async fn pq_rpc_pending_rotation_visible_then_clears_on_apply() {
     bond_and_register(&st, id, &old, 0).await;
     {
         let mut ledger = st.engine.staking_write().await;
-        let mut reg = pq_registry_handle().write().await;
+        let mut reg = st.engine.pq_registry_write().await;
         ledger
             .pq_announce_rotation(&mut reg, id, PqScheme::Falcon512, new.clone(), 0)
             .expect("announce must succeed");
@@ -214,7 +195,7 @@ async fn pq_rpc_pending_rotation_visible_then_clears_on_apply() {
 
     {
         let mut ledger = st.engine.staking_write().await;
-        let mut reg = pq_registry_handle().write().await;
+        let mut reg = st.engine.pq_registry_write().await;
         ledger
             .pq_apply_rotation(&mut reg, id, PQ_ROTATION_DELAY_HEIGHTS)
             .expect("apply must succeed");

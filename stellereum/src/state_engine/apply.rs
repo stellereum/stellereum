@@ -239,6 +239,12 @@ impl InMemoryStateEngine {
                 // apply performs the height-gated unjail, but the ledger is
                 // still read inside the VM, so snapshot it for rollback.
                 | SysCallUnjail { .. }
+                | SysCallRegisterValidator(_)
+                | SysCallRotateVotingKey(_)
+                | SysCallChangeWithdrawal(_)
+                | SysCallClaimWithdrawal(_)
+                | SysCallAnnounceCommission { .. }
+                | SysCallApplyCommission { .. }
                 // The PQ equivocation report SLASHES the ledger inside the VM
                 // (it must: the verdict depends on the accused validator's
                 // registered post-quantum key), so the ledger must be
@@ -467,6 +473,7 @@ impl InMemoryStateEngine {
         let exec_hardening = crate::chain_spec::exec_hardening_v1_active_at(chain_height);
         let wasm_pmm_hardening =
             crate::chain_spec::wasm_xshard_pmm_hardening_active_at(chain_height);
+        let pq_lifecycle = crate::pq_registry::pq_lifecycle_active_at(chain_height);
         // Session-key gate at the BLOCK timestamp, checked BEFORE the
         // empty-payload early return below. A plain session transfer has no
         // payload, so without this it would never reach the session hook at
@@ -597,6 +604,32 @@ impl InMemoryStateEngine {
                 None
             };
             (sbal, budgets)
+        };
+
+        let pq_registry_snap = if pq_lifecycle {
+            let mut needs_pq_reg = false;
+            for op in &tx.payload {
+                if exec_hardening && matches!(op, crate::svm::OpCode::Halt) {
+                    break;
+                }
+                if matches!(
+                    op,
+                    crate::svm::OpCode::SysCallRegisterValidator(_)
+                        | crate::svm::OpCode::SysCallRotateVotingKey(_)
+                        | crate::svm::OpCode::SysCallClaimWithdrawal(_)
+                        | crate::svm::OpCode::SysCallReportPqEquivocation { .. }
+                ) {
+                    needs_pq_reg = true;
+                    break;
+                }
+            }
+            if needs_pq_reg {
+                Some(self.pq_registry.read().await.clone())
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
         let mut tokens = self.tokens_write().await;
@@ -845,6 +878,10 @@ impl InMemoryStateEngine {
             wasm_pmm_hardening,
             tx_nonce: tx.nonce,
             outbound_budget_from_accounts,
+            pq_lifecycle,
+            chain_id: Some(self.chain_id),
+            chain_height,
+            pq_registry: pq_registry_snap,
         };
         let res = crate::svm::Svm::execute_with_confidential_and_sends_at(
             &tx.payload,
@@ -991,6 +1028,13 @@ impl InMemoryStateEngine {
                 // validators from, so all of them reach the same verdict on
                 // the same block.
                 let bridge_validators: Vec<[u8; 32]> = staking.validators.keys().copied().collect();
+                // R4: the release-receipt quorum resolves each signer's PQ key
+                // AT the receipt's attested height out of COMMITTED state, not
+                // the process-local `PQ_VALIDATOR_KEYS` map. The guard is
+                // scoped to this leg so the later `pq_registry` writers in this
+                // payload cannot deadlock against it.
+                let bridge_pq_keys = self.pq_registry.read().await;
+                let bridge_pq_lookup = (&*staking, &*bridge_pq_keys);
                 // C7 shard gate: the bridge domain (replay set, escrow,
                 // mint counters, disputes) lives on the masterchain ONLY.
                 // Settling the same intents on a workchain would credit
@@ -1009,6 +1053,9 @@ impl InMemoryStateEngine {
                         floor,
                         timestamp,
                         &bridge_validators,
+                        chain_height,
+                        self.chain_id,
+                        &bridge_pq_lookup,
                     )
                     .await
                 {
@@ -1697,6 +1744,7 @@ impl InMemoryStateEngine {
         // H1: a committed single transaction feeds the same routing/settlement
         // indexes as a block apply.
         self.observe_committed_evm_tx(tx);
+        self.apply_pq_lifecycle_tx_ops(tx, chain_height).await;
 
         Ok(())
     }
@@ -1901,6 +1949,51 @@ impl InMemoryStateEngine {
         Self::billed_gas_at(tx, gas_used, exec_hardening)
             .max(floor_base)
             .saturating_add(surcharge)
+    }
+
+    /// W4 `FEE_MARKET_V2` twin of [`Self::fee_for_gas_at`].
+    ///
+    /// When the gate is active the declared `priority_fee_per_gas` is actually
+    /// CHARGED as part of the core — capped by the signed `gas_limit`, floored
+    /// by consensus, surcharge additive — instead of being handed back as
+    /// unused gas. With `fee_market_v2 == false` (or a zero bid) the result is
+    /// byte-identical to [`Self::fee_for_gas_at`], so every pre-activation
+    /// block re-applies to the same root.
+    pub(super) fn fee_for_gas_at_v2(
+        tx: &crate::sharding::Transaction,
+        gas_used: u64,
+        floor_base: u64,
+        surcharge: u64,
+        exec_hardening: bool,
+        fee_market_v2: bool,
+    ) -> u64 {
+        if !fee_market_v2 || tx.priority_fee_per_gas == 0 {
+            return Self::fee_for_gas_at(tx, gas_used, floor_base, surcharge, exec_hardening);
+        }
+        let core = Self::billed_gas_at(tx, gas_used, exec_hardening)
+            .saturating_add(tx.priority_fee_per_gas)
+            .min(tx.gas_limit.max(floor_base))
+            .max(floor_base);
+        core.saturating_add(surcharge)
+    }
+
+    /// W4 `FEE_MARKET_V2` twin of [`Self::failure_fee_for`]: the priority bid
+    /// is charged on an attributable failure too (a reverted payload still
+    /// bought block space), under the same cap/floor/surcharge rules.
+    pub fn failure_fee_for_v2(
+        tx: &crate::sharding::Transaction,
+        floor_base: u64,
+        surcharge: u64,
+        fee_market_v2: bool,
+    ) -> u64 {
+        if !fee_market_v2 || tx.priority_fee_per_gas == 0 {
+            return Self::failure_fee_for(tx, floor_base, surcharge);
+        }
+        let core = Self::TX_INTRINSIC_GAS
+            .saturating_add(tx.priority_fee_per_gas)
+            .min(tx.gas_limit.max(floor_base))
+            .max(floor_base);
+        core.saturating_add(surcharge)
     }
 
     /// FEE-01: the fee an ATTRIBUTABLE FAILURE pays.
@@ -2912,6 +3005,11 @@ impl InMemoryStateEngine {
         // at-height set and may therefore admit evidence this step skips;
         // that direction is fail-closed (forgiven downtime, never a
         // conflicting one).
+        // 0-pre (W3 PQ lifecycle): one-time adoption of pre-W3 validators into
+        // `PqRegistry` + deterministic promotion of any due `PendingPqRotation`
+        // at `block.height >= effective_height` before block transactions execute.
+        self.apply_pq_lifecycle_step0(block.height).await;
+
         let pre_transition_set = self.staking.read().await.to_validator_set();
         // 0. Cross-shard INBOUND credits, committed by this block's
         //    `cross_shard_out` consumption records. This is a no-op unless the
@@ -3049,13 +3147,52 @@ impl InMemoryStateEngine {
         //     bounces and nested sends.
         let _actor_delivered = self.apply_actor_messages_at(block).await;
 
-        // 2. Pay the collected fees to the proposer. The fees were already
-        //    debited from senders in step 1, so this is a transfer, not a mint
-        //    — and it deliberately uses the UNCAPPED credit: a block whose
-        //    rewards filled the global supply cap must still be able to pay
-        //    its proposer fees collected from existing balances.
+        // 2. Pay the collected fees. Pre-activation (default) this is the
+        //    historical 100% proposer transfer. Once `FEE_MARKET_V2` is active
+        //    the same pot is split exactly, in u128, over the WHOLE block:
+        //    burn (never credited — the fees were already debited), proposer,
+        //    and the staking rewards pool. The proposer share is the remainder,
+        //    so `burn + proposer + staking == fees` to the last nano; the
+        //    staking leg is a TRANSFER of collected fees (`distribute_fee_reward`
+        //    never touches `rewards_minted`), so neither the 350M emission cap
+        //    nor the 1B supply cap is bypassed or unblocked.
         if fees > 0 {
-            let _ = self.credit_native_transfer(&block.proposer, fees).await;
+            if crate::tokenomics::fee_market_v2_active_at(block.height) {
+                let burn_bps = crate::tokenomics::DEFAULT_FEE_BURN_BPS as u128;
+                let staking_bps = crate::tokenomics::DEFAULT_FEE_STAKING_BPS as u128;
+                let denom = crate::staking::BPS_DENOMINATOR as u128;
+                let burn = ((fees as u128) * burn_bps / denom) as u64;
+                let staking = ((fees as u128) * staking_bps / denom) as u64;
+                let mut proposer = fees.saturating_sub(burn).saturating_sub(staking);
+                if staking > 0 {
+                    let credited = self
+                        .staking_write()
+                        .await
+                        .distribute_fee_reward(block.proposer, staking)
+                        .is_ok();
+                    if credited {
+                        if self
+                            .credit_native_transfer(&crate::staking::REWARDS_POOL, staking)
+                            .await
+                            .is_err()
+                        {
+                            // Defensive: keep the ledger's pool backing 1:1 if
+                            // the native leg ever refuses.
+                            let mut l = self.staking_write().await;
+                            l.rewards_pool = l.rewards_pool.saturating_sub(staking);
+                        }
+                    } else {
+                        // Jailed/unknown proposer: the staking share falls back
+                        // to the proposer, keeping the split exact.
+                        proposer = proposer.saturating_add(staking);
+                    }
+                }
+                if proposer > 0 {
+                    let _ = self.credit_native_transfer(&block.proposer, proposer).await;
+                }
+            } else {
+                let _ = self.credit_native_transfer(&block.proposer, fees).await;
+            }
         }
 
         // 3. Block reward to the proposer out of the staking emission (paid as
@@ -3230,6 +3367,12 @@ impl InMemoryStateEngine {
         //     byte-identical.
         let _gov_exec = self.apply_governance_transition(block).await;
 
+        // 5f. W3 PQ validator lifecycle ops (`SysCallRegisterValidator`,
+        //     `SysCallRotateVotingKey`, `SysCallClaimWithdrawal`,
+        //     `SysCallAnnounceCommission`, `SysCallApplyCommission`), scanned in
+        //     block order over applied pre-`Halt` payloads at `block.height`.
+        let _pq_reg_ops = self.apply_pq_registry_ops(block, &status).await;
+
         BlockTransitionOutcome {
             applied,
             failed,
@@ -3296,6 +3439,11 @@ impl InMemoryStateEngine {
                         .then_with(|| a.epoch_n.cmp(&b.epoch_n))
                 });
                 let ledger = self.staking.read().await;
+                let pq_reg_guard = if crate::pq_registry::pq_lifecycle_active_at(block.height) {
+                    Some(self.pq_registry.read().await)
+                } else {
+                    None
+                };
                 for c in commits {
                     if !ledger.validators.contains_key(&c.validator_id) {
                         tracing::warn!(
@@ -3305,14 +3453,24 @@ impl InMemoryStateEngine {
                         );
                         continue;
                     }
-                    let key_opt = ledger
-                        .validator_pq_keys
-                        .get(&c.validator_id)
-                        .cloned()
-                        .or_else(|| {
+                    let key_opt = if let Some(ref pq_reg) = pq_reg_guard {
+                        if pq_reg.record_of(&c.validator_id).is_some() {
+                            pq_reg.get_active_key(&c.validator_id, block.height)
+                        } else {
                             crate::consensus::pq_key_at_height(&c.validator_id, block.height)
-                        })
-                        .or_else(|| self.get_pinned_pubkey(&c.validator_id));
+                                .or_else(|| ledger.validator_pq_keys.get(&c.validator_id).cloned())
+                                .or_else(|| self.get_pinned_pubkey(&c.validator_id))
+                        }
+                    } else {
+                        ledger
+                            .validator_pq_keys
+                            .get(&c.validator_id)
+                            .cloned()
+                            .or_else(|| {
+                                crate::consensus::pq_key_at_height(&c.validator_id, block.height)
+                            })
+                            .or_else(|| self.get_pinned_pubkey(&c.validator_id))
+                    };
                     let Some((scheme, pk)) = key_opt else {
                         tracing::warn!(
                             validator = %hex::encode(c.validator_id),
@@ -4160,14 +4318,15 @@ impl InMemoryStateEngine {
         if requests.is_empty() {
             return 0;
         }
+        let post_w3 = crate::pq_registry::pq_lifecycle_active_at(block.height);
         let mut ledger = self.staking_write().await;
         let mut unjailed = 0usize;
         for (sender, validator) in requests {
             // Defense in depth: the VM already refused a mismatch, but a
             // replayed/foreign envelope must never clear someone else's jail.
-            if sender != validator {
+            if let Err(e) = ledger.authorize_validator_owner(&validator, &sender, post_w3) {
                 tracing::warn!(
-                    "SysCallUnjail refused at height {}: sender {} is not validator {}",
+                    "SysCallUnjail refused at height {}: sender {} unauthorized for validator {} ({e})",
                     block.height,
                     hex::encode(sender),
                     hex::encode(validator),
@@ -4963,6 +5122,296 @@ impl InMemoryStateEngine {
         block: &crate::sharding::Block,
     ) -> crate::governance::UpgradeExecOutcome {
         self.apply_governance_transition(block).await
+    }
+
+    /// W3 PQ lifecycle Step 0 (pre-tx): adopt any pre-W3 validators that have
+    /// committed `validator_pq_keys` without a `PqRegistry` record, and promote
+    /// every pending PQ key rotation due at `height` (`height >= effective_height`).
+    async fn apply_pq_lifecycle_step0(&self, height: u64) {
+        if !crate::pq_registry::pq_lifecycle_active_at(height) {
+            return;
+        }
+        let (needs_adopt, has_due) = {
+            let ledger = self.staking.read().await;
+            let pq_reg = self.pq_registry.read().await;
+            let needs_adopt = ledger
+                .validator_pq_keys
+                .keys()
+                .any(|id| ledger.validators.contains_key(id) && pq_reg.record_of(id).is_none());
+            let has_due = pq_reg.records().values().any(|rec| {
+                rec.pending
+                    .as_ref()
+                    .is_some_and(|p| height >= p.effective_height)
+            });
+            (needs_adopt, has_due)
+        };
+        if !needs_adopt && !has_due {
+            return;
+        }
+        let mut ledger = self.staking_write().await;
+        let mut pq_reg = self.pq_registry_write().await;
+        if needs_adopt {
+            let _ = ledger.pq_adopt_legacy_keys_at(&mut pq_reg, 0);
+        }
+        if has_due {
+            let _ = ledger.pq_apply_due_rotations(&mut pq_reg, height);
+        }
+        // R3-F/runtime calls consensus::sync_committed_pq_registry
+    }
+
+    fn is_pq_lifecycle_op(op: &crate::svm::OpCode) -> bool {
+        matches!(
+            op,
+            crate::svm::OpCode::SysCallRegisterValidator(_)
+                | crate::svm::OpCode::SysCallRotateVotingKey(_)
+                | crate::svm::OpCode::SysCallChangeWithdrawal(_)
+                | crate::svm::OpCode::SysCallClaimWithdrawal(_)
+                | crate::svm::OpCode::SysCallAnnounceCommission { .. }
+                | crate::svm::OpCode::SysCallApplyCommission { .. }
+        )
+    }
+
+    fn apply_single_pq_lifecycle_op(
+        &self,
+        ledger: &mut crate::staking::StakingLedger,
+        pq_reg: &mut crate::pq_registry::PqRegistry,
+        sender: [u8; 32],
+        op: &crate::svm::OpCode,
+        height: u64,
+    ) -> bool {
+        use crate::svm::OpCode::*;
+        match op {
+            SysCallRegisterValidator(p) => {
+                if p.withdrawal_address == [0u8; 32] || sender != p.withdrawal_address {
+                    tracing::warn!(
+                        height,
+                        "SysCallRegisterValidator refused in Step 5f: sender != withdrawal_address"
+                    );
+                    return false;
+                }
+                let validator_id = crate::pq_registry::derive_validator_id(
+                    self.chain_id,
+                    &p.withdrawal_address,
+                    &p.voting_pubkey,
+                );
+                if !ledger.validators.contains_key(&validator_id) {
+                    tracing::warn!(
+                        height,
+                        validator = %hex::encode(validator_id),
+                        "SysCallRegisterValidator refused in Step 5f: validator bond missing"
+                    );
+                    return false;
+                }
+                if let Err(e) = crate::pq_registry::verify_voting_key_pop(
+                    self.chain_id,
+                    &validator_id,
+                    &p.withdrawal_address,
+                    0,
+                    p.voting_scheme,
+                    &p.voting_pubkey,
+                    &p.voting_pop,
+                ) {
+                    tracing::warn!(
+                        height,
+                        validator = %hex::encode(validator_id),
+                        "SysCallRegisterValidator PoP refused in Step 5f: {e}"
+                    );
+                    return false;
+                }
+                match pq_reg.register_with_seq(
+                    validator_id,
+                    crate::post_quantum::PqScheme::Falcon512,
+                    p.voting_pubkey.clone(),
+                    height,
+                    height,
+                    0,
+                    true,
+                ) {
+                    Ok(()) => {
+                        ledger.validator_pq_keys.insert(
+                            validator_id,
+                            (
+                                crate::post_quantum::PqScheme::Falcon512,
+                                p.voting_pubkey.clone(),
+                            ),
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            height,
+                            validator = %hex::encode(validator_id),
+                            "SysCallRegisterValidator registry commit refused in Step 5f: {e}"
+                        );
+                        false
+                    }
+                }
+            }
+            SysCallRotateVotingKey(p) => {
+                let res = if p.cancel {
+                    if !p.new_pubkey.is_empty() || !p.pop_signature.is_empty() {
+                        tracing::warn!(
+                            height,
+                            validator = %hex::encode(p.validator_id),
+                            "SysCallRotateVotingKey cancel refused in Step 5f: non-empty key/sig"
+                        );
+                        return false;
+                    }
+                    ledger.pq_cancel_rotation(
+                        pq_reg,
+                        p.validator_id,
+                        sender,
+                        p.rotation_seq,
+                        height,
+                    )
+                } else {
+                    ledger.pq_announce_rotation_with_seq(
+                        pq_reg,
+                        self.chain_id,
+                        p.validator_id,
+                        sender,
+                        p.rotation_seq,
+                        p.new_scheme,
+                        &p.new_pubkey,
+                        &p.pop_signature,
+                        height,
+                    )
+                };
+                match res {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            height,
+                            validator = %hex::encode(p.validator_id),
+                            cancel = p.cancel,
+                            "SysCallRotateVotingKey refused in Step 5f: {e}"
+                        );
+                        false
+                    }
+                }
+            }
+            SysCallChangeWithdrawal(_) => {
+                // `SysCallChangeWithdrawal` mutates `working_staking` directly in Step 1 via
+                // SVM clone-commit so subsequent operations in the same payload/block see the
+                // rotated `withdrawal_address` immediately.
+                true
+            }
+            SysCallClaimWithdrawal(_) => {
+                // `SysCallClaimWithdrawal` mutates `working_staking` directly in Step 1 via
+                // SVM clone-commit so subsequent operations in the same payload/block see the
+                // claimed `withdrawal_address` immediately and cannot double-claim in-block.
+                true
+            }
+            SysCallAnnounceCommission { validator, new_bps } => {
+                if let Err(e) = ledger.authorize_validator_owner(validator, &sender, true) {
+                    tracing::warn!(
+                        height,
+                        validator = %hex::encode(validator),
+                        "SysCallAnnounceCommission unauthorized in Step 5f: {e}"
+                    );
+                    return false;
+                }
+                match ledger.announce_commission(*validator, *new_bps, height) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            height,
+                            validator = %hex::encode(validator),
+                            "SysCallAnnounceCommission refused in Step 5f: {e}"
+                        );
+                        false
+                    }
+                }
+            }
+            SysCallApplyCommission { validator } => {
+                if let Err(e) = ledger.authorize_validator_owner(validator, &sender, true) {
+                    tracing::warn!(
+                        height,
+                        validator = %hex::encode(validator),
+                        "SysCallApplyCommission unauthorized in Step 5f: {e}"
+                    );
+                    return false;
+                }
+                match ledger.apply_commission(*validator, height) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            height,
+                            validator = %hex::encode(validator),
+                            "SysCallApplyCommission refused in Step 5f: {e}"
+                        );
+                        false
+                    }
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// W3 PQ lifecycle Step 5f: scan applied pre-`Halt` payload ops in block
+    /// order and commit `PqRegistry` / height-gated staking transitions.
+    pub async fn apply_pq_registry_ops(
+        &self,
+        block: &crate::sharding::Block,
+        status: &[bool],
+    ) -> usize {
+        if !crate::pq_registry::pq_lifecycle_active_at(block.height) {
+            return 0;
+        }
+        let mut ops: Vec<([u8; 32], &crate::svm::OpCode)> = Vec::new();
+        for (i, tx) in block.transactions.iter().enumerate() {
+            if !status.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            for op in &tx.payload {
+                if matches!(op, crate::svm::OpCode::Halt) {
+                    break;
+                }
+                if Self::is_pq_lifecycle_op(op) {
+                    ops.push((tx.from, op));
+                }
+            }
+        }
+        if ops.is_empty() {
+            return 0;
+        }
+        let mut ledger = self.staking_write().await;
+        let mut pq_reg = self.pq_registry_write().await;
+        let mut applied = 0usize;
+        for (sender, op) in ops {
+            if self.apply_single_pq_lifecycle_op(&mut ledger, &mut pq_reg, sender, op, block.height)
+            {
+                applied += 1;
+            }
+        }
+        // R3-F/runtime calls consensus::sync_committed_pq_registry
+        applied
+    }
+
+    /// Single-transaction twin of [`Self::apply_pq_registry_ops`] for direct
+    /// `apply_transaction_at_height` parity with `apply_block_transition`.
+    async fn apply_pq_lifecycle_tx_ops(&self, tx: &crate::sharding::Transaction, height: u64) {
+        if !crate::pq_registry::pq_lifecycle_active_at(height) || tx.payload.is_empty() {
+            return;
+        }
+        let mut ops: Vec<&crate::svm::OpCode> = Vec::new();
+        for op in &tx.payload {
+            if matches!(op, crate::svm::OpCode::Halt) {
+                break;
+            }
+            if Self::is_pq_lifecycle_op(op) {
+                ops.push(op);
+            }
+        }
+        if ops.is_empty() {
+            return;
+        }
+        let mut ledger = self.staking_write().await;
+        let mut pq_reg = self.pq_registry_write().await;
+        for op in ops {
+            let _ =
+                self.apply_single_pq_lifecycle_op(&mut ledger, &mut pq_reg, tx.from, op, height);
+        }
     }
 
     /// The full session gate: the stateless GRANT policy

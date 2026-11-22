@@ -2125,7 +2125,7 @@ fn truncate_text(s: &str, max_chars: usize) -> String {
 /// numbers as numbers, free text truncated, and byte blobs (code, proofs,
 /// calldata, evidence envelopes) render as lengths — never echoed raw, so the
 /// view stays bounded no matter what the payload carries.
-fn describe_intent_op(op: &crate::svm::OpCode) -> String {
+pub fn describe_intent_op(op: &crate::svm::OpCode) -> String {
     use crate::svm::OpCode as Op;
     match op {
         Op::Nop => "nop".to_string(),
@@ -2366,6 +2366,37 @@ fn describe_intent_op(op: &crate::svm::OpCode) -> String {
             hex::encode(claim.evm_address),
             claim.pq_pubkey.len(),
         ),
+        // W3 PQ validator lifecycle opcodes (59..=64, appended at enum end):
+        // bounded indexed labels only, never raw pubkey/PoP byte blobs.
+        Op::SysCallRegisterValidator(p) => format!(
+            "register-validator withdrawal={} amount={} commission_bps={}",
+            hex::encode(p.withdrawal_address),
+            p.amount,
+            p.commission_bps,
+        ),
+        Op::SysCallRotateVotingKey(p) => format!(
+            "rotate-voting-key validator={} seq={} cancel={}",
+            hex::encode(p.validator_id),
+            p.rotation_seq,
+            p.cancel,
+        ),
+        Op::SysCallChangeWithdrawal(p) => format!(
+            "change-withdrawal validator={} new_withdrawal={}",
+            hex::encode(p.validator_id),
+            hex::encode(p.new_withdrawal_address),
+        ),
+        Op::SysCallClaimWithdrawal(p) => format!(
+            "claim-withdrawal validator={} withdrawal={}",
+            hex::encode(p.validator_id),
+            hex::encode(p.withdrawal_address),
+        ),
+        Op::SysCallAnnounceCommission { validator, new_bps } => format!(
+            "announce-commission validator={} new_bps={new_bps}",
+            hex::encode(validator),
+        ),
+        Op::SysCallApplyCommission { validator } => {
+            format!("apply-commission validator={}", hex::encode(validator),)
+        }
         Op::Reserved33ConfidentialTransfer(_)
         | Op::Reserved40ConfidentialTransfer2(_)
         | Op::Reserved41ConfidentialShield(_)

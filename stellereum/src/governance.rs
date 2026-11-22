@@ -192,6 +192,17 @@ pub const UPGRADE_EXECUTOR: [u8; 32] = [0u8; 32];
 const BPS: u128 = 10_000;
 /// Basis points as u64 for parameter bounds checks.
 const BPS_U64: u64 = 10_000;
+
+/// A fee split is valid iff the three basis-point shares sum to EXACTLY
+/// `10_000` (100%). `checked_add` makes an oversized pair a clean `false`
+/// instead of a debug-build overflow panic.
+fn fee_split_bps_valid(burn_bps: u64, proposer_bps: u64, staking_bps: u64) -> bool {
+    burn_bps
+        .checked_add(proposer_bps)
+        .and_then(|s| s.checked_add(staking_bps))
+        == Some(BPS_U64)
+}
+
 /// Upper bound for `SetMinValidatorBond`: 1000x the protocol floor (1M STELL).
 /// Lets governance tighten Sybil resistance hard without ever pricing out the
 /// whole validator set at once (which would halt the chain for lack of quorum).
@@ -342,6 +353,30 @@ pub enum GovAction {
     },
     /// Cancel an upcoming scheduled software upgrade.
     CancelUpgrade,
+    // APPENDED, never inserted above (same discriminant rule as the oracle
+    // actions and `SoftwareUpgrade`: `GovAction` is bincode-serialized inside
+    // every committed `Proposal`, so renumbering an existing variant would
+    // change the tag of proposals already committed to the root).
+    /// Set the block-fee split (Burn / Proposer / Staking Pool) in basis
+    /// points for Fee Market v2 (`tokenomics::fee_market_v2_active_at`).
+    ///
+    /// Validation: `burn_bps + proposer_bps + staking_bps == 10_000` exactly,
+    /// checked with `checked_add` so an absurd pair fails closed instead of
+    /// overflowing. Defaults are `tokenomics::DEFAULT_FEE_{BURN,PROPOSER,
+    /// STAKING}_BPS = 5000 / 3000 / 2000`.
+    ///
+    /// EXECUTION IS DELIBERATELY FAIL-CLOSED for now: the fee-split consumer
+    /// in `state_engine::apply` and the committed `AppliedParams`/storage
+    /// shape are owned by the Fee Market v2 rollout. Until that holder exists,
+    /// a passed proposal is refused deterministically at execute time (every
+    /// node identical, `Passed -> Executed` never happens) — the same
+    /// fail-closed shape as `SetEquivocationSlashBps`, rather than committing
+    /// a decorative parameter no code reads.
+    SetFeeSplitBps {
+        burn_bps: u64,
+        proposer_bps: u64,
+        staking_bps: u64,
+    },
 }
 
 impl GovAction {
@@ -371,6 +406,7 @@ impl GovAction {
             GovAction::SetMinGasLimit(_) => "set_min_gas_limit",
             GovAction::SoftwareUpgrade { .. } => "software_upgrade",
             GovAction::CancelUpgrade => "cancel_upgrade",
+            GovAction::SetFeeSplitBps { .. } => "set_fee_split_bps",
         }
     }
 
@@ -392,6 +428,7 @@ impl GovAction {
         "set_min_gas_limit",
         "software_upgrade",
         "cancel_upgrade",
+        "set_fee_split_bps",
     ];
 
     /// Deprecated aliases of the canonical action strings.
@@ -476,6 +513,18 @@ impl GovAction {
                 }
             }
             GovAction::CancelUpgrade => {}
+            GovAction::SetFeeSplitBps {
+                burn_bps,
+                proposer_bps,
+                staking_bps,
+            } => {
+                // The split must cover the whole fee exactly: a sum below
+                // 10_000 would burn the difference silently, a sum above
+                // would need minting value that was already debited.
+                if !fee_split_bps_valid(*burn_bps, *proposer_bps, *staking_bps) {
+                    return Err(GovError::InvalidAction);
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -612,6 +661,11 @@ pub fn gov_action_from_params(
             })
         }
         "cancel_upgrade" => Ok(GovAction::CancelUpgrade),
+        "set_fee_split_bps" => Ok(GovAction::SetFeeSplitBps {
+            burn_bps: gov_u64(p, "burn_bps")?,
+            proposer_bps: gov_u64(p, "proposer_bps")?,
+            staking_bps: gov_u64(p, "staking_bps")?,
+        }),
         other => Err(format!(
             "unknown governance action type '{other}' (known: {})",
             GovAction::ACTION_TYPES.join(", ")
@@ -2460,6 +2514,29 @@ impl Governance {
                 // still inert). It remains a single-shot, committed action.
                 self.applied.upgrade_plan = None;
             }
+            GovAction::SetFeeSplitBps {
+                burn_bps,
+                proposer_bps,
+                staking_bps,
+            } => {
+                // EXECUTE-TIME BACKSTOP (mirrors propose-time `validate`):
+                // a sum that is not exactly 100% can never be applied.
+                if !fee_split_bps_valid(burn_bps, proposer_bps, staking_bps) {
+                    return Err(GovError::InvalidAction);
+                }
+                // FAIL CLOSED, like `SetEquivocationSlashBps`: the fee-split
+                // consumer and its committed storage slot are part of the
+                // Fee Market v2 rollout. Committing the parameter before that
+                // slot exists would make `applied` claim a rule the chain does
+                // not enforce (a silent no-op). Deterministic on every node;
+                // the proposal stays `Passed` for the rollout migration.
+                tracing::error!(
+                    "governance SetFeeSplitBps({burn_bps}/{proposer_bps}/{staking_bps}) \
+                     REFUSED: the Fee Market v2 fee-split consumer is not wired yet; refusing \
+                     instead of committing a parameter that does nothing"
+                );
+                return Err(GovError::InvalidAction);
+            }
         }
         // Only reached once every domain (governance AND, for an oracle action,
         // the oracle) has been written, so `Executed` never over-promises.
@@ -2642,6 +2719,11 @@ mod tests {
                 sha256: [7u8; 32],
             },
             GovAction::CancelUpgrade,
+            GovAction::SetFeeSplitBps {
+                burn_bps: 5_000,
+                proposer_bps: 3_000,
+                staking_bps: 2_000,
+            },
         ]
     }
 
@@ -2711,6 +2793,15 @@ mod tests {
                     "height": height,
                     "sha256": hex::encode(sha256),
                 }),
+                GovAction::SetFeeSplitBps {
+                    burn_bps,
+                    proposer_bps,
+                    staking_bps,
+                } => serde_json::json!({
+                    "burn_bps": burn_bps,
+                    "proposer_bps": proposer_bps,
+                    "staking_bps": staking_bps,
+                }),
             };
             let back = gov_action_from_params(t, &p)
                 .unwrap_or_else(|e| panic!("action '{t}' must parse: {e}"));
@@ -2745,6 +2836,54 @@ mod tests {
         }
         // The documented alias is known too (and maps to its canonical name).
         assert!(GovAction::is_known_action_type("upgrade"));
+    }
+
+    /// `SetFeeSplitBps` is strictly append-only and must cover the whole fee:
+    /// the three shares sum to exactly 10_000 bps, checked without overflow.
+    #[test]
+    fn set_fee_split_bps_requires_exact_hundred_percent() {
+        let ok = GovAction::SetFeeSplitBps {
+            burn_bps: 5_000,
+            proposer_bps: 3_000,
+            staking_bps: 2_000,
+        };
+        assert!(ok.validate().is_ok(), "5000/3000/2000 is valid");
+        assert_eq!(ok.action_type(), "set_fee_split_bps");
+
+        // Below and above 100% both fail closed.
+        assert!(GovAction::SetFeeSplitBps {
+            burn_bps: 5_000,
+            proposer_bps: 3_000,
+            staking_bps: 1_999,
+        }
+        .validate()
+        .is_err());
+        assert!(GovAction::SetFeeSplitBps {
+            burn_bps: 5_001,
+            proposer_bps: 3_000,
+            staking_bps: 2_000,
+        }
+        .validate()
+        .is_err());
+        // `checked_add`: an oversized pair is a clean refusal, never a panic.
+        assert!(GovAction::SetFeeSplitBps {
+            burn_bps: u64::MAX,
+            proposer_bps: 1,
+            staking_bps: 0,
+        }
+        .validate()
+        .is_err());
+
+        // The canonical action string parses back to the same variant.
+        let params = serde_json::json!({
+            "burn_bps": 5_000,
+            "proposer_bps": 3_000,
+            "staking_bps": 2_000,
+        });
+        assert_eq!(
+            gov_action_from_params("set_fee_split_bps", &params).unwrap(),
+            ok
+        );
     }
 
     /// The action string of a variant is what the RPC answers report.

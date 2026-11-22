@@ -84,3 +84,56 @@ consumers — external-facing, publish candidate), `scripts/tools/stelops`,
 - [x] Audit package refreshed 2026-10-30: brief provenance → `4d0d539` (src 164081 lines/58 files/55 modules), workspace renames (infnode, contract-sdk), VEL build `573d86f5`; KI-36/build/harness moved to KNOWN_ISSUES §N (verified in code + green run)
 - [ ] audit-repro red: `audit_rpc_evm_closeout` F4 2 tests (KI-37, estimate floor-vs-pure contract mismatch, other agents) — gate NOT green, no check weakened to green it
 - [ ] Open items recorded KNOWN_ISSUES §M 2026-10-30: KI-37 F4, KI-38 CT-P0 rewrite (acceptance: failing `poc_p0_*`), KI-39 wallet UX note, KI-40 r0-decide rate (meter pending), KI-41 workchain PARK/fund (unprobed, refusal logged)
+
+---
+
+## Active Roadmap — Ruleset v7, Jitter Optimization & Rollout (2026-11-21)
+
+Canonical blueprint: `docs/specs/RULESET_V7_ACTIVATION_BLUEPRINT.md`.
+Defect registry: `docs/OPEN_DEFECTS.md` (zero-backlog rule: every item ends `FIXED`, `BY DESIGN`, or `SEPARATE SYSTEM`).
+
+### Completed Baselines (`origin/main` & `origin/full-pq-testnet-2026-11-16`)
+- [x] **W0 + P0 + Isolated W1/W2/W4 crates (`e31968725..74d641dba`)**: `SafetyAuthority` + `SafetyRecordStore` + `O(1)` cross-kind guard + `RESTART-SPLIT` + `PROPOSER VALUE PREFERENCE` + security/faucet/explorer/mempool/light_client fixes + `OPT-HNTT`/`OPT-TXHASH-BATCH`/`OPT-RECEIPT-INDEX`/`OPT-FINALIZED-CACHE`/`OPT-ESTIMATE-FEE`/`OPT-CLIENT-IP-CONFIG`/`OPT-SUBSCRIPTION-HUB` + Falcon FIPS-206 compression retry + `data_plane_rs` + `snapshot_v4` + `indexer` + `ledger-tool` + `infnode` EC.
+- [x] **R1 (`a8d8ca6cb`)**: Execution atomicity (`OpCode::Halt` barriers, `SysCallCallContractArgs`/`SysCallSubmitPqPriceFeed` rollback, `TX_INTRINSIC_GAS`, CLOB `MAX_MATCH_FILLS_PER_ORDER`), WASM (`SubCallSnapshot`, `caller` vs `origin`, `validate_code_hardened`, per-byte `send_message` fuel, `deploy_with_nonce`, `outbound_messages` after `commit_native`, `Eager` consensus cache), PMM (`wUSDT` CEI + `ZeroMint`/`ZeroPayout`), canonical `PQ1` `decode_canonical` (`381/382`, gated off `u64::MAX`).
+- [x] **R2 (`abad158cf`)**: Two-level `BlockHeader` v4 + `body_commitment`, fail-closed light-client/CLI/sync verification, `Domain::EvmBindings` (`0B` empty, first-writer-wins), `O(1)` RAM `hydrate_rpc_from_store`, `SnapV4` storage/sync integration (`386/387`, gated off `u64::MAX`).
+- [x] **Live Cluster Recovery (`a8d8ca6cb`)**: Deployed across `A/B/C/D` (`3/4` non-fragile quorum at genesis; note: `nodeC` `9865d3...` was later jailed at `#242` due to pre-fix `dht.store` 4s stalls on `a8d8ca6cb`).
+
+### Upcoming & In-Flight Waves
+
+#### Wave 1 (DONE 2026-11-21): Jitter Optimization (`OPT-JITTER-*`) + Эшелон **R3** (PQ Validator Lifecycle & Remote Signer v2)
+- [x] `OPT-JITTER-INFNODE`: `Arc<StoredValue>` zero-copy snapshots in `infnode/dht.rs` + 10s throttled `sweep` in `infnode/node.rs` (eliminates 4s `Arc::make_mut` stalls on `dht.store`; `infnode` lib `62/62`, `clippy 0/0`).
+- [x] `OPT-JITTER-NET`: `join_with_quorum_or_timeout` (`35ms` straggler grace) in `consensus_net.rs`, `<=120ms` minor-gap `try_catch_up` cap & 4x reduction in redundant `dht.store` publishes in `consensus_driver.rs`.
+- [x] `R3-A..E`: `PQ_LIFECYCLE_ACTIVATION_HEIGHT = u64::MAX`, `PqRegistry` PoP/retention `720_000`/explicit `cancel_rotation`, `RemotePqSigner` v2 (`897B`/`666B`), `ValidatorStake::withdrawal_address`, `Domain::PqRegistry`, `ValidatorStakeV1`/`DomainSnapshotV9`, `SnapV4::PqRegistry = 272`, `OpCode 59..=64`, `InMemoryStateEngine::pq_registry`, `sync_committed_pq_registry`, `light_client` height-key.
+- [x] `R3-F` + `R3` тесты: `r3_pq_registry_signer_tests` 11/11, `r3_staking_commit_tests` 6/6, `r3_vm_engine_apply_tests` 6/6, `r3_storage_pq_registry_tests` 3/3, `r3_consensus_readers_tests` 3/3, `r3_runtime_node_rpc_cli_tests` 6/6; `pq_rpc_tests` 4/4, `pentest_rpc_surface` 5/5.
+- [x] **Полный гейт `stellereum`: `397/397` бинарей зелёные, `clippy --all-targets -D warnings` 0/0** (`docs/OPEN_DEFECTS.md` обновлён; `FORK_ID`/`COMMITMENT_VERSION` не двигались).
+- [ ] **Optional W0 non-fork optimizations** (can run alongside R4.1 or right before R5): `OPT-PARALLEL-WAVE` (`PlainTxPlan` inline `[;3]` + selective penalty/vesting read), `clone_for_simulation_for_payload` in `accounts.rs`/`rpc/reads.rs`, `ReceiptIndex::by_contract_events` in `rpc/state.rs`.
+
+#### Wave 2 (DONE 2026-11-21, активация в R5): Эшелон **R4** — Bridge V2 Release Authorization + W4 Economics, History & Geyser-Lite
+- [x] **Phase R4.1** (4 parallel no-cargo workers on disjoint files; все правки вошли в дерево):
+  - `R4.1-Bridge`: `bridge.rs`, `bridge_adapters.rs`, `native_api.rs`, `examples/vuln_hunt5.rs` (`BRIDGE_V2_ACTIVATION_HEIGHT = u64::MAX`, `PqKeyLookup`, `BridgeIntent::ReleaseProof` (`8`), `StoredHeader::signing_message_v2`, `AdapterKindTag`, `Challenge` on `DepositProof`, `RETRACTION` precedence, strict EVM pinning, Falcon-512 `MultisigRelayer` in `vuln_hunt5`).
+  - `R4.1-W4-E2`: `evm_adapter/*`, `tokenomics.rs`, `staking.rs`, `governance.rs` (`wei_to_nano_exact`, integer `eth_feeHistory`, `mul_div_floor_256` in `GenesisVault`, `pow_half_fixed_exact_q64`, `ValidatorRewardState::accrue` rescale carry, `distribute_fee_reward`, `emission_carry_q64`, optional `GovAction::SetFeeSplitBps`).
+  - `R4.1-W4-History`: `storage.rs`, `token.rs`, `contract.rs`, `rpc/{reads,cache}.rs`, `stellereum-indexer` (`"tx_by_addr"`, `"events_by_contract"`, `"receipt_meta_v2"`, cursor pagination for `stell_getAddressHistory`, `stell_getProgramAccounts`, `stell_getTokenAccountsByOwner`, `stell_getEvents`).
+  - `R4.1-W4-Geyser`: `rpc/{streams,state}.rs`, `node/consensus_driver.rs` (`self.engine.shard_id()` in `record_block`, `seq` + `GEYSER_REPLAY_WINDOW = 512` + `after_seq` + explicit `Lagged` + `AccountUpdates` / `TokenTransfers` topics).
+- [x] **Phase R4.2** (после R4.1; `accrue` rescale-carry и committed `emission_carry_q64` вынесены отдельным пунктом ниже):
+  - `R4.2-Commit`: `commitment.rs` (`BRIDGE_V2_RELEASE_V1`, `STAKING_EMISSION_CARRY_V1`, optional `SetFeeSplitBps`, `0B` when empty/zero), `chain_spec.rs` (`BRIDGE_V2_ACTIVATION_HEIGHT`, `FEE_MARKET_V2_ACTIVATION_HEIGHT`, `SUB_NANO_STRICT_ACTIVATION_HEIGHT` all `u64::MAX`).
+  - `R4.2-Engine`: `state_engine/{apply,parallel,settlement,accounts,types}.rs`, `svm.rs`, `mempool.rs`, `runtime/{mev_sync,consensus_step}.rs`, `cli/{args,tx_builders}.rs` (Bridge V2 settlement wiring, `FEE_MARKET_V2` priority fee debit + burn/proposer/staking split + `MP04` fee-density ordering, `SUB_NANO_STRICT` EVM/reward wiring).
+- [x] **R4 Gate**: `bridge_authorization_p0_regression.rs` **4/4 GREEN**, `H-1/H/H+1` & `parallel == sequential` parity (`propose_select_differential_tests` 3/3, `state_commit_batch_tests` 5/5), full `test_parallel.sh -p stellereum` **397/397 GREEN**.
+- [ ] **Остаток W4 E2** (`FEE-SUBNANO-EXACT`, `OPEN`): rescale-carry в `ValidatorRewardState::accrue` (`new_rem = floor(old_rem * new_den / old_den)`) и committed `emission_carry_q64` (`pow_half_fixed_exact_q64`/`emit_with_q64_carry` уже готовы, нужен `StakingLedger`-слот + `DomainSnapshotV10`) — за тем же `SUB_NANO_STRICT_ACTIVATION_HEIGHT`.
+
+#### Wave 3: Эшелон **R5** — Ruleset v7 Unified Hard-Fork Activation & Frozen-Core Gate
+- [ ] Switch all 8 Ruleset v7 gates in `chain_spec.rs` / `sharding/block.rs` / `bridge.rs` / `pq_registry.rs` from `u64::MAX` to `0` (new v7 genesis) or coordinated height `H`.
+- [ ] Decision check with user: whether to also tighten `MAX_BLOCK_TIMESTAMP_DRIFT_MS` (currently 1h -> ~30s) in Ruleset v7.
+- [ ] Update `stellereum/src/protocol.rs`: `CONSENSUS_RULESET_VERSION = 7`, `DOMAIN_SET_VERSION = 4`, append all 8 activation heights + `PQ_EVIDENCE_RETENTION_HEIGHTS` to `FORK_ID_RULES`, mix new domain strings into `derive_fork_id`, update `docs/RULESET_V7.md`, `protocol_negotiation_tests.rs`, `stellereum-sdk`.
+- [ ] Update legacy height-0 tests to use `H - 1 / H / H + 1` RAII overrides where pre-v7 behavior is tested (`bonding_moves_real_funds_and_grants_validator_power`, `bridge_dispute_tests`, etc.) without weakening security assertions.
+- [ ] Full workspace gate: `cargo clippy --all-targets -- -D warnings` (0/0), `./scripts/verify_testnet_ideal.sh`, `consensus_liveness_harness`, `pentest-3` sweep, and zero `OPEN` items in `docs/OPEN_DEFECTS.md`.
+
+#### Wave 4: Live Cluster Rollout (`A/B/C/D`), Loadtest, Soak & Site Deploy
+- [ ] Build & deploy release binaries (`OPT-JITTER-*` + Ruleset v7) to all 4 validators (`A, B, C, D`) with `env.C` aligned (`STELL_MIN_BLOCK_MS=250`, `STELL_CATCHUP_BUDGET_MS=500`), `safety-init` / clean v7 genesis with validator self-bond >= `MIN + buffer` (`1100 STELL` so a single slash never ejects a validator), and restore `4/4` active validators (`quorum 3/4`, `fragile: false`).
+- [ ] Verify live block time stability (no 2s–4s `dht.store` spikes), run `scripts/cluster_liveness_watch.sh`, 256-sender `loadtest --print-all-senders`, and 24h soak.
+- [ ] Deploy updated `stellereum/site/assets/js/metrics.js` (`57750d40f`) to `/var/www/stellereum` on `nodeA` (with Cloudflare cache verify).
+- [ ] Optional ops follow-up: `UP-5` (`cosmovisor`-style auto-upgrader daemon in `stellereum-upgrader`).
+
+#### Deferred Post-Mainnet (`SEPARATE SYSTEM`, out of W0–W5 / R1–R5 scope)
+- [ ] `stell-wallet/` full UX + own connect protocol (then WalletConnect v2; MetaMask bridge stays maintenance-only).
+- [ ] `explorer-site/` UI & `events-race` completion.
+- [ ] L2 / Data Availability, dynamic TON-like shard split/merge (`>2` shards), true ZK prover/verifier for zkML, EVM smart-contract interpreter, second independent consensus client.

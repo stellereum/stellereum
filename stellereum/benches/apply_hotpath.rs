@@ -600,6 +600,7 @@ fn make_staking(n: usize) -> stellereum::staking::StakingLedger {
                 total_slashed: 0,
                 missed: 0,
                 last_downtime_penalty: 0,
+                withdrawal_address: None,
             },
         );
     }

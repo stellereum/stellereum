@@ -604,6 +604,8 @@ fn evm_release_order_refuses_non_evm_chain() {
         1_000,
         7,
         50_000,
+        0,
+        5_757,
     );
     let msg = bad.signing_message();
     bad.signatures.push(sign_msg(&keys[0], &msg));
@@ -622,6 +624,8 @@ fn evm_release_order_refuses_non_evm_chain() {
         1_000,
         7,
         50_000,
+        0,
+        5_757,
     );
     let msg2 = good.signing_message();
     good.signatures.push(sign_msg(&keys[0], &msg2));

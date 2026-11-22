@@ -626,6 +626,268 @@ pub struct TokenRegistry {
     pub next_nonce: u64,
 }
 
+/// Hard cap on the token-id snapshot materialised for LEGACY `offset`
+/// pagination of `stell_listTokens`.
+///
+/// `tokens` is a `BTreeMap`, so a keyset page never needs a snapshot. The
+/// legacy `offset` path is kept for old clients, but it is bounded: at most
+/// this many ids are materialised, so an attacker-grown registry cannot turn
+/// one RPC call into an unbounded allocation. Cursor clients are unaffected.
+pub const MAX_TOKENS_SORT_CAP: usize = 50_000;
+
+/// One `(token, holder) -> balance` cell returned by the deterministic
+/// pagination helpers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenHolding {
+    pub token_id: [u8; 32],
+    pub holder: [u8; 32],
+    pub balance: u64,
+}
+
+/// Deterministic keyset page over a `BTreeMap`-backed token view.
+///
+/// `items` are in ascending key order (token id, or holder address); the next
+/// page continues STRICTLY after `next_cursor`, so concurrent inserts cannot
+/// shift, duplicate or skip an entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenPage<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<[u8; 32]>,
+    pub has_more: bool,
+    /// The scan/offset budget was hit before the registry was exhausted.
+    pub truncated: bool,
+    /// Number of candidate keys inspected by this call.
+    pub scanned: usize,
+}
+
+impl<T> TokenPage<T> {
+    /// An empty page (the starting point of the registry helpers).
+    pub fn empty() -> Self {
+        Self {
+            items: Vec::new(),
+            next_cursor: None,
+            has_more: false,
+            truncated: false,
+            scanned: 0,
+        }
+    }
+}
+
+impl TokenRegistry {
+    /// Deterministic page of token ids.
+    ///
+    /// With `cursor` this is a pure keyset scan (`token_id > cursor`). Without
+    /// a cursor the legacy `offset` semantics are preserved, but the walk is
+    /// capped at [`MAX_TOKENS_SORT_CAP`] ids (`truncated` is set when the
+    /// registry is larger) so an offset read stays bounded.
+    pub fn token_ids_page(
+        &self,
+        cursor: Option<[u8; 32]>,
+        offset: usize,
+        limit: usize,
+    ) -> TokenPage<[u8; 32]> {
+        let limit = limit.max(1);
+        let mut page: TokenPage<[u8; 32]> = TokenPage::empty();
+        if let Some(cursor) = cursor {
+            for id in self
+                .tokens
+                .range((
+                    std::ops::Bound::Excluded(cursor),
+                    std::ops::Bound::Unbounded,
+                ))
+                .map(|(id, _)| id)
+            {
+                page.scanned += 1;
+                if page.items.len() >= limit {
+                    page.has_more = true;
+                    break;
+                }
+                page.items.push(*id);
+            }
+            page.next_cursor = page.items.last().copied().filter(|_| page.has_more);
+            return page;
+        }
+        let total = self.tokens.len();
+        let cap = total.min(MAX_TOKENS_SORT_CAP);
+        page.truncated = total > MAX_TOKENS_SORT_CAP;
+        for (index, id) in self.tokens.keys().take(cap).enumerate() {
+            if index < offset {
+                continue;
+            }
+            page.scanned += 1;
+            if page.items.len() >= limit {
+                page.has_more = true;
+                break;
+            }
+            page.items.push(*id);
+        }
+        page.next_cursor = page.items.last().copied().filter(|_| page.has_more);
+        page
+    }
+
+    /// Deterministic holders page of ONE token, sorted by holder address.
+    ///
+    /// `min_balance` / `include_zero` filter BEFORE the page is filled, so the
+    /// returned cursor is still positioned on a real inspected holder. At most
+    /// `scan_cap` holders are inspected (`truncated` when the cap is hit).
+    #[allow(clippy::too_many_arguments)]
+    // GATE: token id + the documented filters + cursor/limit/scan cap; the
+    // grouping would only rename the same RPC parameters.
+    pub fn token_holders_page(
+        &self,
+        token_id: &[u8; 32],
+        min_balance: u64,
+        include_zero: bool,
+        cursor: Option<[u8; 32]>,
+        limit: usize,
+        scan_cap: usize,
+    ) -> TokenPage<TokenHolding> {
+        let limit = limit.max(1);
+        let mut page: TokenPage<TokenHolding> = TokenPage::empty();
+        let Some(actor) = self.tokens.get(token_id) else {
+            return page;
+        };
+        let mut holders: Vec<[u8; 32]> = actor.balances.keys().copied().collect();
+        holders.sort_unstable();
+        let mut last_scanned: Option<[u8; 32]> = None;
+        for holder in holders {
+            if page.scanned >= scan_cap {
+                page.truncated = true;
+                break;
+            }
+            page.scanned += 1;
+            last_scanned = Some(holder);
+            if cursor.map(|c| holder <= c).unwrap_or(false) {
+                continue;
+            }
+            let balance = actor.balance_of(&holder);
+            if balance == 0 && !include_zero {
+                continue;
+            }
+            if balance < min_balance {
+                continue;
+            }
+            if page.items.len() >= limit {
+                page.has_more = true;
+                break;
+            }
+            page.items.push(TokenHolding {
+                token_id: *token_id,
+                holder,
+                balance,
+            });
+        }
+        page.has_more |= page.truncated;
+        page.next_cursor = if page.has_more {
+            page.items.last().map(|h| h.holder).or(last_scanned)
+        } else {
+            None
+        };
+        page
+    }
+
+    /// Deterministic page of one owner's token holdings, sorted by token id.
+    ///
+    /// With `token` the page is that single cell (empty when the owner holds
+    /// nothing); otherwise every token id `> cursor` is inspected. Same
+    /// filters and scan cap as [`Self::token_holders_page`].
+    #[allow(clippy::too_many_arguments)]
+    // GATE: owner + token filter + filters + cursor/limit/scan cap are the
+    // documented RPC parameters.
+    pub fn owner_token_page(
+        &self,
+        owner: &[u8; 32],
+        token: Option<[u8; 32]>,
+        include_zero: bool,
+        cursor: Option<[u8; 32]>,
+        limit: usize,
+        scan_cap: usize,
+    ) -> TokenPage<TokenHolding> {
+        let limit = limit.max(1);
+        let mut page: TokenPage<TokenHolding> = TokenPage::empty();
+        let mut last_scanned: Option<[u8; 32]> = None;
+        if let Some(id) = token {
+            if let Some((token_id, actor)) = self.tokens.get_key_value(&id) {
+                if page.scanned >= scan_cap {
+                    page.truncated = true;
+                } else {
+                    page.scanned += 1;
+                    last_scanned = Some(*token_id);
+                    Self::push_owner_holding(
+                        &mut page,
+                        owner,
+                        token_id,
+                        actor,
+                        include_zero,
+                        cursor,
+                        limit,
+                    );
+                }
+            }
+        } else {
+            for (token_id, actor) in self.tokens.iter() {
+                if page.scanned >= scan_cap {
+                    page.truncated = true;
+                    break;
+                }
+                page.scanned += 1;
+                last_scanned = Some(*token_id);
+                if Self::push_owner_holding(
+                    &mut page,
+                    owner,
+                    token_id,
+                    actor,
+                    include_zero,
+                    cursor,
+                    limit,
+                ) {
+                    break;
+                }
+            }
+        }
+        page.has_more |= page.truncated;
+        page.next_cursor = if page.has_more {
+            page.items.last().map(|h| h.token_id).or(last_scanned)
+        } else {
+            None
+        };
+        page
+    }
+
+    /// One candidate of the owner page: returns `true` when the page is full
+    /// and the caller must stop scanning.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: one candidate + the page state it mutates; grouping would just
+    // rename the same parameters.
+    fn push_owner_holding(
+        page: &mut TokenPage<TokenHolding>,
+        owner: &[u8; 32],
+        token_id: &[u8; 32],
+        actor: &TokenActor,
+        include_zero: bool,
+        cursor: Option<[u8; 32]>,
+        limit: usize,
+    ) -> bool {
+        if cursor.map(|c| *token_id <= c).unwrap_or(false) {
+            return false;
+        }
+        let balance = actor.balance_of(owner);
+        if balance == 0 && !include_zero {
+            return false;
+        }
+        if page.items.len() >= limit {
+            page.has_more = true;
+            return true;
+        }
+        page.items.push(TokenHolding {
+            token_id: *token_id,
+            holder: *owner,
+            balance,
+        });
+        false
+    }
+}
+
 impl TokenRegistry {
     pub fn new() -> Self {
         Self {

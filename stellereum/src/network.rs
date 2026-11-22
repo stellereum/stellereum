@@ -1178,6 +1178,7 @@ pub const SNAPSHOT_PUBLISH_DOMAIN_KINDS: &[&str] = &[
     "cnvrf_v3",
     "pq_keys",
     "evm_bindings",
+    "pq_registry",
 ];
 
 /// Process-wide bound on concurrent DHT fetches (storm guard 2026-10-13).

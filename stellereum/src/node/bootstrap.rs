@@ -165,6 +165,41 @@ fn install_genesis_chain_spec_from_env() {
     }
 }
 
+pub(crate) fn resolve_startup_pq_signer(
+    remote_url: Option<&str>,
+    remote_token: Option<&str>,
+    validator_pub: [u8; 32],
+    local_falcon: Option<&stellereum::post_quantum::FalconKeypair>,
+    expected_committed_pk: Option<&[u8]>,
+    pq_lifecycle_active: bool,
+) -> anyhow::Result<Option<Arc<dyn stellereum::remote_signer::PqSigner>>> {
+    if let Some(url) = remote_url.map(str::trim).filter(|s| !s.is_empty()) {
+        let mut transport = stellereum::remote_signer::HttpPqSignerTransport::new(url);
+        if let Some(tok) = remote_token.map(str::trim).filter(|s| !s.is_empty()) {
+            transport = transport.with_bearer_token(tok);
+        }
+        let remote = stellereum::remote_signer::RemotePqSigner::new(
+            Arc::new(transport),
+            validator_pub,
+            expected_committed_pk,
+        )
+        .map_err(|e| anyhow::anyhow!("remote PQ signer v2 rejected at startup: {e}"))?;
+        return Ok(Some(Arc::new(remote)));
+    }
+    if pq_lifecycle_active {
+        let kp = local_falcon.ok_or_else(|| {
+            anyhow::anyhow!(
+                "W3 PQ lifecycle is active and STELL_REMOTE_SIGNER_URL is unset, \
+                 but no local falcon.key was loaded"
+            )
+        })?;
+        let local = stellereum::remote_signer::LocalPqSigner::new(kp.clone(), validator_pub)
+            .map_err(|e| anyhow::anyhow!("local PQ signer v2 rejected at startup: {e}"))?;
+        return Ok(Some(Arc::new(local)));
+    }
+    Ok(None)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_workchain_shard(
     adapter: Arc<P2pNetworkAdapter>,
@@ -175,6 +210,7 @@ pub(crate) async fn start_workchain_shard(
     shard: u32,
     registry: ShardRegistry,
     remote_signer: Option<Arc<dyn stellereum::remote_signer::Signer>>,
+    pq_signer: Option<Arc<dyn stellereum::remote_signer::PqSigner>>,
     header_registry: Arc<std::sync::RwLock<stellereum::sharding::FinalizedHeaderRegistry>>,
     master_staking: stellereum::sharding::MasterStakingLedger,
 ) -> anyhow::Result<()> {
@@ -414,6 +450,7 @@ pub(crate) async fn start_workchain_shard(
             shared_gov,
             rpc_state,
             remote_signer,
+            pq_signer,
             is_validator,
             registry,
             header_registry,
@@ -763,33 +800,52 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
     // infnode transport/auth.
     let data_dir = PathBuf::from("./data");
     let keys_dir = PathBuf::from("./keys");
-    let falcon_path = std::env::var("STELL_FALCON_KEY_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| keys_dir.join("falcon.key"));
-    let key_bundle =
-        stellereum::node_keys::NodeKeyBundle::load_or_generate(&keys_dir, &falcon_path)?;
-    let keys = key_bundle.node_keys;
-    let pq_keys = key_bundle.pq_identity;
+    let remote_signer_url = std::env::var(stellereum::remote_signer::REMOTE_SIGNER_URL_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let remote_signer_token = std::env::var(stellereum::remote_signer::REMOTE_SIGNER_TOKEN_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let validator_key = stellereum::node_keys::load_or_generate_consensus_key(&keys_dir)?;
     let validator_pub = validator_key.verifying_key().to_bytes();
+
+    // Remote / HSM signing v2. When `STELL_REMOTE_SIGNER_URL` is configured,
+    // we MUST NOT open or generate `./keys/falcon.key` and MUST NOT fall back
+    // to any local key material on failure.
+    let (keys, pq_keys, local_falcon, pq_signer_early, remote_signer) =
+        if let Some(url) = remote_signer_url.as_deref() {
+            let keys = stellereum::node_keys::load_or_generate_node_keys(&keys_dir)?;
+            let pq_keys = infnode::keyring::PqKeys::load_or_generate(&keys_dir)?;
+            let pq_signer = resolve_startup_pq_signer(
+                Some(url),
+                remote_signer_token.as_deref(),
+                validator_pub,
+                None,
+                None,
+                true,
+            )?;
+            (keys, pq_keys, None, pq_signer, None)
+        } else {
+            let falcon_path = std::env::var("STELL_FALCON_KEY_FILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| keys_dir.join("falcon.key"));
+            let key_bundle =
+                stellereum::node_keys::NodeKeyBundle::load_or_generate(&keys_dir, &falcon_path)?;
+            let validator_signer =
+                stellereum::remote_signer::validator_signer_from_env(validator_key.to_bytes())
+                    .map_err(|e| anyhow::anyhow!("remote signer rejected at startup: {e}"))?;
+            (
+                key_bundle.node_keys,
+                key_bundle.pq_identity,
+                Some(key_bundle.falcon),
+                None,
+                validator_signer.into_remote(),
+            )
+        };
     // NOTE: genesis accounts are funded AFTER the validator set is known
     // (see below), so every node credits exactly the same accounts.
-
-    // Remote / HSM signing. `STELL_REMOTE_SIGNER_URL` (and the optional
-    // `STELL_REMOTE_SIGNER_TOKEN`) move the validator key out of this
-    // process. Construction resolves and pins the remote public key, so
-    // an unreachable signer, a wrong-width key or a value that is not a
-    // curve point aborts startup HERE. There is deliberately no path
-    // back to the plaintext `validator_key` below: rule 1 of the
-    // remote_signer module is that a configured remote signer must never
-    // fall back to a local key.
-    let validator_signer =
-        stellereum::remote_signer::validator_signer_from_env(validator_key.to_bytes())
-            .map_err(|e| anyhow::anyhow!("remote signer rejected at startup: {e}"))?;
-    // Threaded all the way through now: `ValidatorRuntime` signs votes and
-    // the proposal through this handle instead of the in-process key, and a
-    // signer failure produces NO vote rather than a locally signed one.
-    let remote_signer = validator_signer.into_remote();
 
     if config.exists() {
         info!("Bootstrapping infnode P2P transport from {:?}", config);
@@ -1338,6 +1394,31 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             .flatten()
             .map(|(h, _)| h)
             .unwrap_or(0);
+        let pq_signer = if let Some(ps) = pq_signer_early {
+            if let Ok(Some(bytes)) = persistence.storage().pq_registry_at(init_height) {
+                if let Ok(reg) = stellereum::storage::decode_pq_registry(&bytes) {
+                    if let Some((_scheme, committed_pk)) =
+                        reg.get_active_key(&validator_pub, init_height)
+                    {
+                        if ps.public_key().as_slice() != committed_pk.as_slice() {
+                            anyhow::bail!(
+                                "remote PQ signer v2 public key does not match committed PqRegistry key at height {init_height}"
+                            );
+                        }
+                    }
+                }
+            }
+            Some(ps)
+        } else {
+            resolve_startup_pq_signer(
+                None,
+                None,
+                validator_pub,
+                local_falcon.as_ref(),
+                None,
+                stellereum::pq_registry::pq_lifecycle_active_at(init_height),
+            )?
+        };
         // JSON-RPC + explorer/gateway state. Shared with the consensus
         // loop so the finalized height and recent-block feed stay live.
         let rpc_state = Arc::new(stellereum::rpc::RpcState {
@@ -1627,6 +1708,7 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
 
         let c_rpc = rpc_state.clone();
         let c_remote_signer = remote_signer.clone();
+        let c_pq_signer = pq_signer.clone();
         // Persist the mempool on shutdown too (not just every 15s): a
         // restart between submit and the next periodic save otherwise
         // silently drops fresh transactions. Best-effort and tiny.
@@ -1693,6 +1775,7 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 extra,
                 registry.clone(),
                 remote_signer.clone(),
+                pq_signer.clone(),
                 header_registry.clone(),
                 // The masterchain's registry: the workchain's
                 // consensus set follows it, so a masterchain
@@ -1718,6 +1801,7 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 c_gov,
                 c_rpc,
                 c_remote_signer,
+                c_pq_signer,
                 is_validator,
                 c_registry,
                 c_headers,
@@ -1850,5 +1934,46 @@ mod genesis_fingerprint_gate_tests {
             read_genesis_fingerprint(Ok(Some(root.clone())), "shard 0").expect("record passes"),
             Some(root)
         );
+    }
+}
+
+#[cfg(test)]
+mod r3_bootstrap_pq_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_startup_pq_signer_refuses_unreachable_remote_without_local_fallback() {
+        let local_kp = stellereum::post_quantum::FalconKeypair::generate_from_seed(0x91);
+        let vid = [0x33u8; 32];
+        // Even if local_falcon is passed, a configured remote URL must fail closed
+        // on unreachable remote signer and NEVER fall back to local_falcon.
+        let err = match resolve_startup_pq_signer(
+            Some("http://127.0.0.1:1"),
+            None,
+            vid,
+            Some(&local_kp),
+            None,
+            true,
+        ) {
+            Ok(_) => panic!("unreachable STELL_REMOTE_SIGNER_URL must fail closed"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("remote PQ signer v2 rejected at startup"),
+            "unexpected error message: {msg}"
+        );
+
+        // When no remote URL and W3 is inactive -> Ok(None).
+        let none_res = resolve_startup_pq_signer(None, None, vid, Some(&local_kp), None, false)
+            .expect("pre-W3 without remote URL returns None");
+        assert!(none_res.is_none());
+
+        // When no remote URL and W3 is active -> Some(LocalPqSigner) bound to vid.
+        let local_res = resolve_startup_pq_signer(None, None, vid, Some(&local_kp), None, true)
+            .expect("W3 active builds LocalPqSigner")
+            .expect("must return Some");
+        assert_eq!(local_res.validator_id(), vid);
+        assert_eq!(local_res.public_key(), local_kp.public_key());
     }
 }

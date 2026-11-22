@@ -1650,8 +1650,12 @@ impl InMemoryStateEngine {
     /// attestations), so there is nothing to restore later. `Ok(Some(_))`
     /// carries the pre-change accounts AND pre-change domain for rollback by a
     /// failure after this point.
-    #[allow(clippy::type_complexity)]
-    // GATE: bridge snapshot mirrors account tuple layout shared with commit path.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    // GATE: the seven inputs ARE the consensus contract of the bridge leg
+    // (`payer`, `floor`, block `now`, the committed validator set, the block
+    // height, the chain id and the committed PQ-key lookup); grouping them in a
+    // struct would add a projection layer between the state engine and
+    // `BridgeState::plan_at_height` without removing any parameter.
     pub(super) async fn settle_bridge_native(
         &self,
         intents: &[crate::bridge::BridgeIntent],
@@ -1659,11 +1663,22 @@ impl InMemoryStateEngine {
         floor: u64,
         now: u64,
         validators: &[[u8; 32]],
+        block_height: u64,
+        chain_id: u64,
+        pq_keys: &dyn crate::bridge::PqKeyLookup,
     ) -> Result<Option<BridgeSnapshot>, String> {
         // Policy pass: clone the committed domain, plan against it, write
         // nothing. Refusals here leave the accounts AND the domain untouched.
         let before = self.bridge.read().await.clone();
-        let plan = before.plan(intents, validators, payer, now)?;
+        let plan = before.plan_at_height(
+            intents,
+            validators,
+            payer,
+            now,
+            block_height,
+            chain_id,
+            pq_keys,
+        )?;
         if plan.effects.is_empty() && plan.state == before {
             // Nothing a block could commit (a payload with only attestations
             // is not state): no write guard, no generation bump, no movement.

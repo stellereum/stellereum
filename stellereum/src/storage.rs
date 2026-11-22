@@ -22,10 +22,15 @@
 //!   "xshard_headers": b"latest" -> bincode(FinalizedHeaderRegistry snapshot) [durable C1 anchors]
 //!   "receipts_v1" : tx_hash (32B) -> bincode(StoredReceipt)   [NEW, additive only]
 //!   "receipts_by_height": height(8B BE)+index(4B BE)+tx_hash(32B) -> b"" [NEW, additive only]
+//!   "tx_by_addr"  : addr(32B)+!height(8B)+!tx_index(4B) -> tx_hash(32B) [W4 E3, additive]
+//!   "events_by_contract": contract(32B)+!height(8B)+!tx_index(4B)+!log_index(4B)
+//!                   -> bincode(StoredContractEvent)          [W4 E3, additive]
+//!   "receipt_meta_v2": tx_hash(32B) -> bincode(StoredReceiptMetaV2) [W4 E3, additive]
 //!   "pq_keys"     : b"a:"+address (32B) -> bincode(scheme, pubkey, salt) / b"h:"+pk_hash (32B) -> pubkey
 //!   "headers_v2"  : height(8B BE) -> bincode(BlockHeaderRecordV2) [additive v4 BlockHeader]
 //!   "evm_bindings_state": height(8B BE) -> bincode(EvmBindingsSnapshot) [additive root-committed domain]
 //!   "evm_bindings": b"e:"||evm(20)->pq(32), b"p:"||pq(32)->evm(20), b"meta:cursor"->u64 BE [never pruned]
+//!   "pq_registry" : height(8B BE) -> bincode(PqRegistry) [additive root-committed domain]
 //!   "snap_units"  : unit_hash(32B) -> raw SnapV4 unit/chunk bytes
 //!   "snap_manifests": height(8B BE) -> canonical SnapshotManifestV1 bytes
 //!   "snap_committed": height(8B BE) -> bincode(SnapCommitMarker)
@@ -554,6 +559,15 @@ pub struct Storage {
     /// tip-window (`iter().rev()` is `(height, index)`-descending) with no
     /// change to `StoredReceipt` or `receipts_v1` bytes.
     receipts_by_height: sled::Tree,
+    /// W4 E3 address history index: `addr || !height || !tx_index -> tx_hash`.
+    /// Additive tree, tip-first by construction.
+    tx_by_addr: sled::Tree,
+    /// W4 E3 contract event history index:
+    /// `contract || !height || !tx_index || !log_index -> bincode(StoredContractEvent)`.
+    events_by_contract: sled::Tree,
+    /// W4 E3 per-transaction metadata (from/to/amount/shard/timestamp) keyed by
+    /// tx hash. Separate from the frozen `StoredReceipt` shape.
+    receipt_meta_v2: sled::Tree,
     /// Post-quantum public keys tree.
     pub pq_keys: sled::Tree,
     /// Two-level v4 block header records (`BlockHeaderRecordV2`), keyed by height.
@@ -562,6 +576,8 @@ pub struct Storage {
     evm_bindings_state: sled::Tree,
     /// Non-consensus crash-safe EVM ↔ PQ bijection index (never pruned).
     evm_bindings: sled::Tree,
+    /// Canonical `Domain::PqRegistry` snapshot tree, keyed by height.
+    pq_registry: sled::Tree,
     /// W1 SnapV4 content-addressed unit/chunk store (`unit_hash -> bytes`).
     snap_units: sled::Tree,
     /// W1 SnapV4 manifests keyed by height (`height_be -> canonical bytes`).
@@ -903,6 +919,276 @@ fn receipt_index_key(r: &StoredReceipt) -> [u8; RECEIPT_INDEX_KEY_LEN] {
     key
 }
 
+// ===========================================================================
+// W4 E3 — SECONDARY HISTORY INDEXES (additive, read-only consumers)
+//
+// Three NEW trees, keyed so a plain ascending iteration is TIP-FIRST
+// (`!height` in the key inverts the numeric order). Existing `data/`
+// directories open unchanged: `Storage::open` creates the trees empty and a
+// missing row simply means "not indexed yet". `prune_receipts_below` drops
+// rows below the same retention window as the receipts, so a pruning node
+// does not grow a second forever-tree.
+// ===========================================================================
+
+/// Hard per-request cap for the history reads (`stell_getAddressHistory`,
+/// `stell_getEvents` pagination).
+pub const STORAGE_HISTORY_MAX_LIMIT: usize = 200;
+
+/// Maximum number of index keys INSPECTED by one history read, including rows
+/// filtered out by `role` / height window / topic. Bounds CPU on an
+/// unauthenticated read; when it is hit the page says so and returns a
+/// continuation cursor.
+pub const STORAGE_SCAN_HARD_CAP: usize = 10_000;
+
+/// Fixed width of one `tx_by_addr` key: `addr(32) || !height(8) || !tx_index(4)`.
+pub const TX_BY_ADDR_KEY_LEN: usize = 44;
+/// Fixed width of one `events_by_contract` key:
+/// `contract(32) || !height(8) || !tx_index(4) || !log_index(4)`.
+pub const EVENTS_BY_CONTRACT_KEY_LEN: usize = 48;
+/// Fixed width of one `receipt_meta_v2` key (`tx_hash(32)`).
+pub const RECEIPT_META_V2_KEY_LEN: usize = 32;
+
+/// Which side of a transaction an address-history query is interested in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryRole {
+    /// Sender, recipient or sponsor of the transaction.
+    All,
+    /// `tx.from == address` only.
+    Sender,
+    /// `tx.to == address` only.
+    Recipient,
+}
+
+impl HistoryRole {
+    /// Parse the RPC spelling (`"all" | "sender" | "recipient"`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "all" => Some(Self::All),
+            "sender" => Some(Self::Sender),
+            "recipient" => Some(Self::Recipient),
+            _ => None,
+        }
+    }
+}
+
+/// Keyset cursor for `tx_by_addr` / `stell_getAddressHistory`:
+/// `(height, tx_index)` of the last row already served. The next page resumes
+/// STRICTLY older than this position, so no row is duplicated or skipped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct HistoryCursor {
+    pub height: u64,
+    pub tx_index: u32,
+}
+
+impl HistoryCursor {
+    /// Wire form: 12 bytes `height(8 BE) || tx_index(4 BE)`.
+    pub fn encode(self) -> [u8; 12] {
+        let mut out = [0u8; 12];
+        out[0..8].copy_from_slice(&self.height.to_be_bytes());
+        out[8..12].copy_from_slice(&self.tx_index.to_be_bytes());
+        out
+    }
+
+    /// Decode the 12-byte wire form; `None` on a wrong length.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 12 {
+            return None;
+        }
+        Some(Self {
+            height: u64::from_be_bytes(bytes[0..8].try_into().ok()?),
+            tx_index: u32::from_be_bytes(bytes[8..12].try_into().ok()?),
+        })
+    }
+
+    pub fn to_hex(self) -> String {
+        hex::encode(self.encode())
+    }
+
+    /// Accepts the 24-hex-character wire form with or without `0x`.
+    pub fn from_hex(s: &str) -> Option<Self> {
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        Self::decode(&hex::decode(s).ok()?)
+    }
+}
+
+/// Keyset cursor for `events_by_contract` / paginated `stell_getEvents`:
+/// `(height, tx_index, log_index)` of the last row already served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct EventCursor {
+    pub height: u64,
+    pub tx_index: u32,
+    pub log_index: u32,
+}
+
+impl EventCursor {
+    /// Wire form: 16 bytes
+    /// `height(8 BE) || tx_index(4 BE) || log_index(4 BE)`.
+    pub fn encode(self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[0..8].copy_from_slice(&self.height.to_be_bytes());
+        out[8..12].copy_from_slice(&self.tx_index.to_be_bytes());
+        out[12..16].copy_from_slice(&self.log_index.to_be_bytes());
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 16 {
+            return None;
+        }
+        Some(Self {
+            height: u64::from_be_bytes(bytes[0..8].try_into().ok()?),
+            tx_index: u32::from_be_bytes(bytes[8..12].try_into().ok()?),
+            log_index: u32::from_be_bytes(bytes[12..16].try_into().ok()?),
+        })
+    }
+
+    pub fn to_hex(self) -> String {
+        hex::encode(self.encode())
+    }
+
+    /// Accepts the 32-hex-character wire form with or without `0x`.
+    pub fn from_hex(s: &str) -> Option<Self> {
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        Self::decode(&hex::decode(s).ok()?)
+    }
+}
+
+/// Self-contained value of one `events_by_contract` row.
+///
+/// The contract, height, tx index and log index live in the KEY, so the value
+/// only has to carry the transaction identity and the event payload. Decoding
+/// is bounded by [`crate::state_engine::MAX_SMALL_RECORD_DECODE_BYTES`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredContractEvent {
+    pub tx_hash: [u8; 32],
+    pub topic: i64,
+    pub value: i64,
+}
+
+/// Per-transaction metadata the address history needs but `StoredReceipt`
+/// (frozen) does not carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredReceiptMetaV2 {
+    pub from: [u8; 32],
+    pub to: [u8; 32],
+    pub amount: u64,
+    pub shard_id: u32,
+    pub timestamp: u64,
+}
+
+/// One address-history row. `meta` is `None` only for an index row whose
+/// metadata row is missing (crash window / pre-index data): the transaction
+/// hash and inclusion position are still real, the participant fields are
+/// honestly absent instead of fabricated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddressHistoryItem {
+    pub tx_hash: [u8; 32],
+    pub height: u64,
+    pub tx_index: u32,
+    pub meta: Option<StoredReceiptMetaV2>,
+}
+
+/// Bounded page of [`Storage::address_history`], tip-first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AddressHistoryPage {
+    pub items: Vec<AddressHistoryItem>,
+    pub next_cursor: Option<HistoryCursor>,
+    pub has_more: bool,
+    pub scanned: usize,
+    pub scan_truncated: bool,
+}
+
+/// One contract event as read from `events_by_contract`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContractEventRecord {
+    pub contract: [u8; 32],
+    pub tx_hash: [u8; 32],
+    pub height: u64,
+    pub tx_index: u32,
+    pub log_index: u32,
+    pub topic: i64,
+    pub value: i64,
+}
+
+/// Bounded page of [`Storage::events_by_contract_range`], tip-first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContractEventsPage {
+    pub items: Vec<ContractEventRecord>,
+    pub next_cursor: Option<EventCursor>,
+    pub has_more: bool,
+    pub scanned: usize,
+    pub scan_truncated: bool,
+}
+
+/// `tx_by_addr` key: `addr || !height || !tx_index` (44 bytes).
+///
+/// The bitwise-not height/index make lexicographic order equal to
+/// `(height DESC, tx_index DESC)`, so `iter()` is a tip-first range scan.
+pub fn tx_by_addr_key(addr: &[u8; 32], height: u64, tx_index: u32) -> [u8; TX_BY_ADDR_KEY_LEN] {
+    let mut key = [0u8; TX_BY_ADDR_KEY_LEN];
+    key[0..32].copy_from_slice(addr);
+    key[32..40].copy_from_slice(&(!height).to_be_bytes());
+    key[40..44].copy_from_slice(&(!tx_index).to_be_bytes());
+    key
+}
+
+/// Inverse of [`tx_by_addr_key`]; `None` on a malformed key.
+pub fn tx_by_addr_key_parts(key: &[u8]) -> Option<([u8; 32], u64, u32)> {
+    if key.len() != TX_BY_ADDR_KEY_LEN {
+        return None;
+    }
+    let mut addr = [0u8; 32];
+    addr.copy_from_slice(&key[0..32]);
+    let height = u64::from_be_bytes(key[32..40].try_into().ok()?);
+    let tx_index = u32::from_be_bytes(key[40..44].try_into().ok()?);
+    Some((addr, !height, !tx_index))
+}
+
+/// `events_by_contract` key:
+/// `contract || !height || !tx_index || !log_index` (48 bytes).
+pub fn events_by_contract_key(
+    contract: &[u8; 32],
+    height: u64,
+    tx_index: u32,
+    log_index: u32,
+) -> [u8; EVENTS_BY_CONTRACT_KEY_LEN] {
+    let mut key = [0u8; EVENTS_BY_CONTRACT_KEY_LEN];
+    key[0..32].copy_from_slice(contract);
+    key[32..40].copy_from_slice(&(!height).to_be_bytes());
+    key[40..44].copy_from_slice(&(!tx_index).to_be_bytes());
+    key[44..48].copy_from_slice(&(!log_index).to_be_bytes());
+    key
+}
+
+/// Inverse of [`events_by_contract_key`]; `None` on a malformed key.
+pub fn events_by_contract_key_parts(key: &[u8]) -> Option<([u8; 32], u64, u32, u32)> {
+    if key.len() != EVENTS_BY_CONTRACT_KEY_LEN {
+        return None;
+    }
+    let mut contract = [0u8; 32];
+    contract.copy_from_slice(&key[0..32]);
+    let height = u64::from_be_bytes(key[32..40].try_into().ok()?);
+    let tx_index = u32::from_be_bytes(key[40..44].try_into().ok()?);
+    let log_index = u32::from_be_bytes(key[44..48].try_into().ok()?);
+    Some((contract, !height, !tx_index, !log_index))
+}
+
+/// `receipt_meta_v2` key: the transaction hash (32 bytes).
+pub fn receipt_meta_v2_key(tx_hash: &[u8; 32]) -> [u8; RECEIPT_META_V2_KEY_LEN] {
+    *tx_hash
+}
+
+/// Decode a small self-describing record with the shared per-record byte
+/// ceiling, so a corrupt length prefix cannot drive an OOM.
+fn decode_small_record<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(crate::state_engine::MAX_SMALL_RECORD_DECODE_BYTES)
+        .deserialize(bytes)
+        .map_err(|e| anyhow!("{what}: record does not decode within the size limit: {e}"))
+}
+
 /// Default sled page-cache ceiling in bytes: 1 GiB, exactly the sled 0.34
 /// default — made explicit and tunable rather than inherited silently. The
 /// 1 GiB default is itself an OOM contributor on small (2–4 GB) nodes; lower
@@ -981,10 +1267,14 @@ impl Storage {
         let xshard_headers = db.open_tree("xshard_headers")?;
         let receipts = db.open_tree("receipts_v1")?;
         let receipts_by_height = db.open_tree("receipts_by_height")?;
+        let tx_by_addr = db.open_tree("tx_by_addr")?;
+        let events_by_contract = db.open_tree("events_by_contract")?;
+        let receipt_meta_v2 = db.open_tree("receipt_meta_v2")?;
         let pq_keys = db.open_tree("pq_keys")?;
         let headers_v2 = db.open_tree("headers_v2")?;
         let evm_bindings_state = db.open_tree("evm_bindings_state")?;
         let evm_bindings = db.open_tree("evm_bindings")?;
+        let pq_registry = db.open_tree("pq_registry")?;
         let snap_units = db.open_tree("snap_units")?;
         let snap_manifests = db.open_tree("snap_manifests")?;
         let snap_committed = db.open_tree("snap_committed")?;
@@ -1005,10 +1295,14 @@ impl Storage {
             xshard_headers,
             receipts,
             receipts_by_height,
+            tx_by_addr,
+            events_by_contract,
+            receipt_meta_v2,
             pq_keys,
             headers_v2,
             evm_bindings_state,
             evm_bindings,
+            pq_registry,
             snap_units,
             snap_manifests,
             snap_committed,
@@ -1692,6 +1986,11 @@ impl Storage {
         // writes the tip-ordered row, atomically with the body (one two-tree
         // sled transaction per receipt — still a per-tx cost, no block batch).
         let mut n = 0;
+        // Block-level dimensions for `receipt_meta_v2` (from/to/amount/shard/
+        // timestamp). The header is written by `put_block` BEFORE the receipt
+        // job in the single-writer queue; a missing header (crash, hand-built
+        // store) leaves honest zero defaults instead of failing the receipts.
+        let (timestamp, shard_id) = self.block_stamp(height);
         for (i, tx) in txs.iter().enumerate() {
             let success = statuses.get(i).copied().unwrap_or(false);
             let fee_charged =
@@ -1699,19 +1998,107 @@ impl Storage {
                     .copied()
                     .unwrap_or(if success { tx.gas_limit } else { 0 });
             let evts = events.get(i).cloned().unwrap_or_default();
+            let tx_hash = tx.compute_tx_hash();
             self.put_receipt(&StoredReceipt {
-                tx_hash: tx.compute_tx_hash(),
+                tx_hash,
                 height,
                 block_hash: *block_hash,
                 index: i as u32,
                 success,
                 gas_limit: tx.gas_limit,
                 fee_charged,
-                events: evts,
+                events: evts.clone(),
             })?;
+            // DATA BEFORE INDEX (same discipline as `put_block`): the receipt
+            // body is durable before any history row points at it, so a crash
+            // can only leave history rows missing, never a row naming a
+            // transaction this store never filed.
+            self.index_tx_history(height, i as u32, timestamp, shard_id, tx, &tx_hash, &evts)?;
             n += 1;
         }
         Ok(n)
+    }
+
+    /// Header-derived `(timestamp, shard_id)` for the history metadata.
+    ///
+    /// `timestamp` comes from the prune-surviving `headers` record; `shard_id`
+    /// only exists in the additive v2 header, so it defaults to `0`
+    /// (masterchain) when that record is absent — the same value every
+    /// pre-v4 store observed.
+    fn block_stamp(&self, height: u64) -> (u64, u32) {
+        let timestamp = self
+            .headers
+            .get(height.to_be_bytes())
+            .ok()
+            .flatten()
+            .and_then(|v| bincode::deserialize::<BlockHeaderRecord>(&v).ok())
+            .map(|h| h.timestamp)
+            .unwrap_or(0);
+        let shard_id = self
+            .headers_v2
+            .get(height.to_be_bytes())
+            .ok()
+            .flatten()
+            .and_then(|v| bincode::deserialize::<BlockHeaderRecordV2>(&v).ok())
+            .map(|h| h.header.shard_id)
+            .unwrap_or(0);
+        (timestamp, shard_id)
+    }
+
+    /// Write the three additive history rows for one transaction.
+    ///
+    /// `tx_by_addr` gets one row for the sender, one for a distinct recipient
+    /// and one for a third-party sponsor (a self-sponsored transaction already
+    /// collapses to the sender via `effective_sponsor`). A row collision (same
+    /// address twice in one transaction) is idempotent: the key is identical
+    /// and the value is the same transaction hash.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: the row needs the block position, the transaction and its event
+    // list together; grouping them would just move the same fields.
+    fn index_tx_history(
+        &self,
+        height: u64,
+        tx_index: u32,
+        timestamp: u64,
+        shard_id: u32,
+        tx: &crate::sharding::Transaction,
+        tx_hash: &[u8; 32],
+        events: &[crate::contract::ContractEvent],
+    ) -> Result<()> {
+        let meta = StoredReceiptMetaV2 {
+            from: tx.from,
+            to: tx.to,
+            amount: tx.amount,
+            shard_id,
+            timestamp,
+        };
+        self.receipt_meta_v2
+            .insert(receipt_meta_v2_key(tx_hash), bincode::serialize(&meta)?)?;
+
+        let mut addresses = vec![tx.from];
+        if tx.to != tx.from {
+            addresses.push(tx.to);
+        }
+        if let Some(sponsor) = tx.effective_sponsor() {
+            addresses.push(sponsor);
+        }
+        for addr in addresses {
+            self.tx_by_addr
+                .insert(tx_by_addr_key(&addr, height, tx_index), tx_hash.as_slice())?;
+        }
+
+        for (log_index, event) in events.iter().enumerate() {
+            let record = StoredContractEvent {
+                tx_hash: *tx_hash,
+                topic: event.topic,
+                value: event.value,
+            };
+            self.events_by_contract.insert(
+                events_by_contract_key(&event.contract, height, tx_index, log_index as u32),
+                bincode::serialize(&record)?,
+            )?;
+        }
+        Ok(())
     }
 
     /// Receipt for one transaction hash, if durably stored.
@@ -1751,15 +2138,70 @@ impl Storage {
             }
             let mut bodies = sled::Batch::default();
             let mut index_rows = sled::Batch::default();
+            let mut meta_rows = sled::Batch::default();
             for (k, r) in &stale {
                 bodies.remove(k);
                 index_rows.remove(&receipt_index_key(r)[..]);
+                // `receipt_meta_v2` is keyed by the SAME tx hash, so the meta
+                // row is removed in this pass instead of growing a separate
+                // forever-tree.
+                meta_rows.remove(&receipt_meta_v2_key(&r.tx_hash)[..]);
             }
             self.receipts.apply_batch(bodies)?;
             self.receipts_by_height.apply_batch(index_rows)?;
+            self.receipt_meta_v2.apply_batch(meta_rows)?;
             removed += stale.len();
             if removed >= PRUNE_BATCH * 4 {
                 break; // one pass drains 80k; the rest next cadence
+            }
+        }
+        // The address/event indexes encode the height IN THE KEY, so they are
+        // pruned by a bounded height scan (filter-then-take, never a prefix:
+        // the key starts with the address/contract, not the height).
+        self.prune_history_below(keep_from)?;
+        Ok(removed)
+    }
+
+    /// Drop `tx_by_addr` / `events_by_contract` rows below `keep_from`.
+    ///
+    /// Bounded by [`PRUNE_BATCH`] per tree per call, matching the receipt and
+    /// body prunes: the flusher is the only writer, so one giant inline scan
+    /// would stall every other write. Rows whose key cannot be decoded are
+    /// left untouched (never deleted blind).
+    fn prune_history_below(&self, keep_from: u64) -> Result<usize> {
+        let mut removed = 0;
+        let stale_addr: Vec<sled::IVec> = self
+            .tx_by_addr
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .filter(|k| {
+                tx_by_addr_key_parts(k)
+                    .map(|(_, height, _)| height < keep_from)
+                    .unwrap_or(false)
+            })
+            .take(PRUNE_BATCH)
+            .collect();
+        for k in stale_addr {
+            if self.tx_by_addr.remove(k)?.is_some() {
+                removed += 1;
+            }
+        }
+        let stale_events: Vec<sled::IVec> = self
+            .events_by_contract
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .filter(|k| {
+                events_by_contract_key_parts(k)
+                    .map(|(_, height, _, _)| height < keep_from)
+                    .unwrap_or(false)
+            })
+            .take(PRUNE_BATCH)
+            .collect();
+        for k in stale_events {
+            if self.events_by_contract.remove(k)?.is_some() {
+                removed += 1;
             }
         }
         Ok(removed)
@@ -1850,6 +2292,217 @@ impl Storage {
             }
         }
         Ok(out)
+    }
+
+    // ---------- W4 E3: secondary history reads (tip-first, bounded) ----------
+
+    /// Per-transaction metadata written alongside the receipt (from / to /
+    /// amount / shard / timestamp), if this store has indexed it.
+    pub fn receipt_meta(&self, tx_hash: &BlockHash) -> Result<Option<StoredReceiptMetaV2>> {
+        match self.receipt_meta_v2.get(receipt_meta_v2_key(tx_hash))? {
+            Some(v) => Ok(Some(decode_small_record(&v, "receipt_meta_v2")?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Address history from `tx_by_addr`, tip-first.
+    ///
+    /// `from_height..=to_height` is INCLUSIVE; `role` filters by the participant
+    /// side recorded in `receipt_meta_v2` (`All` includes the sponsor, because
+    /// the sponsor address is indexed too). `cursor` resumes STRICTLY older than
+    /// its `(height, tx_index)` position, so a page walk cannot duplicate or
+    /// skip a row even when new blocks arrive between requests.
+    ///
+    /// Bounded twice: at most `limit` (capped at
+    /// [`STORAGE_HISTORY_MAX_LIMIT`]) rows are returned, and at most
+    /// [`STORAGE_SCAN_HARD_CAP`] index keys are inspected. Hitting the scan cap
+    /// sets `scan_truncated` and still returns a `next_cursor` positioned past
+    /// the inspected keys, so a caller can continue honestly.
+    pub fn address_history(
+        &self,
+        addr: &[u8; 32],
+        from_height: u64,
+        to_height: u64,
+        role: HistoryRole,
+        cursor: Option<HistoryCursor>,
+        limit: usize,
+    ) -> Result<AddressHistoryPage> {
+        let limit = limit.clamp(1, STORAGE_HISTORY_MAX_LIMIT);
+        let mut page = AddressHistoryPage::default();
+        if from_height > to_height {
+            return Ok(page);
+        }
+        // `!height`/`!tx_index` invert the order: the FIRST key of a height is
+        // its HIGHEST tx index, the LAST key its lowest.
+        let window_start = tx_by_addr_key(addr, to_height, u32::MAX);
+        let window_end = tx_by_addr_key(addr, from_height, 0);
+        let start = match cursor {
+            Some(c) => {
+                let ck = tx_by_addr_key(addr, c.height, c.tx_index);
+                if ck >= window_start {
+                    std::ops::Bound::Excluded(ck)
+                } else {
+                    std::ops::Bound::Included(window_start)
+                }
+            }
+            None => std::ops::Bound::Included(window_start),
+        };
+        let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        let mut last_scanned: Option<HistoryCursor> = None;
+        let mut more = false;
+        for kv in self
+            .tx_by_addr
+            .range((start, std::ops::Bound::Included(window_end)))
+        {
+            if page.scanned >= STORAGE_SCAN_HARD_CAP {
+                page.scan_truncated = true;
+                break;
+            }
+            let (key, value) = kv?;
+            page.scanned += 1;
+            let Some((key_addr, height, tx_index)) = tx_by_addr_key_parts(&key) else {
+                continue;
+            };
+            if key_addr != *addr {
+                break;
+            }
+            last_scanned = Some(HistoryCursor { height, tx_index });
+            if height < from_height || height > to_height || value.len() != 32 {
+                continue;
+            }
+            let mut tx_hash = [0u8; 32];
+            tx_hash.copy_from_slice(&value);
+            let meta = self.receipt_meta(&tx_hash)?;
+            let role_matches = match role {
+                HistoryRole::All => true,
+                HistoryRole::Sender => meta.map(|m| m.from == *addr).unwrap_or(false),
+                HistoryRole::Recipient => meta.map(|m| m.to == *addr).unwrap_or(false),
+            };
+            if !role_matches {
+                continue;
+            }
+            if !seen.insert(tx_hash) {
+                continue;
+            }
+            if page.items.len() >= limit {
+                more = true;
+                break;
+            }
+            page.items.push(AddressHistoryItem {
+                tx_hash,
+                height,
+                tx_index,
+                meta,
+            });
+        }
+        page.has_more = more || page.scan_truncated;
+        page.next_cursor = if more {
+            page.items.last().map(|item| HistoryCursor {
+                height: item.height,
+                tx_index: item.tx_index,
+            })
+        } else if page.scan_truncated {
+            last_scanned
+        } else {
+            None
+        };
+        Ok(page)
+    }
+
+    /// Contract events from `events_by_contract`, tip-first.
+    ///
+    /// `from_height..=to_height` is inclusive and `topic` is an optional exact
+    /// match (`None` = any topic). Cursor/limit/scan caps are the same contract
+    /// as [`Self::address_history`].
+    #[allow(clippy::too_many_arguments)]
+    // GATE: contract + range + topic + cursor + limit are the documented RPC
+    // parameter set; grouping them would only rename the same fields.
+    pub fn events_by_contract_range(
+        &self,
+        contract: &[u8; 32],
+        from_height: u64,
+        to_height: u64,
+        topic: Option<i64>,
+        cursor: Option<EventCursor>,
+        limit: usize,
+    ) -> Result<ContractEventsPage> {
+        let limit = limit.clamp(1, STORAGE_HISTORY_MAX_LIMIT);
+        let mut page = ContractEventsPage::default();
+        if from_height > to_height {
+            return Ok(page);
+        }
+        let window_start = events_by_contract_key(contract, to_height, u32::MAX, u32::MAX);
+        let window_end = events_by_contract_key(contract, from_height, 0, 0);
+        let start = match cursor {
+            Some(c) => {
+                let ck = events_by_contract_key(contract, c.height, c.tx_index, c.log_index);
+                if ck >= window_start {
+                    std::ops::Bound::Excluded(ck)
+                } else {
+                    std::ops::Bound::Included(window_start)
+                }
+            }
+            None => std::ops::Bound::Included(window_start),
+        };
+        let mut last_scanned: Option<EventCursor> = None;
+        let mut more = false;
+        for kv in self
+            .events_by_contract
+            .range((start, std::ops::Bound::Included(window_end)))
+        {
+            if page.scanned >= STORAGE_SCAN_HARD_CAP {
+                page.scan_truncated = true;
+                break;
+            }
+            let (key, value) = kv?;
+            page.scanned += 1;
+            let Some((key_contract, height, tx_index, log_index)) =
+                events_by_contract_key_parts(&key)
+            else {
+                continue;
+            };
+            if key_contract != *contract {
+                break;
+            }
+            last_scanned = Some(EventCursor {
+                height,
+                tx_index,
+                log_index,
+            });
+            if height < from_height || height > to_height {
+                continue;
+            }
+            let record: StoredContractEvent = decode_small_record(&value, "events_by_contract")?;
+            if topic.map(|t| t != record.topic).unwrap_or(false) {
+                continue;
+            }
+            if page.items.len() >= limit {
+                more = true;
+                break;
+            }
+            page.items.push(ContractEventRecord {
+                contract: key_contract,
+                tx_hash: record.tx_hash,
+                height,
+                tx_index,
+                log_index,
+                topic: record.topic,
+                value: record.value,
+            });
+        }
+        page.has_more = more || page.scan_truncated;
+        page.next_cursor = if more {
+            page.items.last().map(|item| EventCursor {
+                height: item.height,
+                tx_index: item.tx_index,
+                log_index: item.log_index,
+            })
+        } else if page.scan_truncated {
+            last_scanned
+        } else {
+            None
+        };
+        Ok(page)
     }
 
     // ---------- Retention ----------
@@ -2134,6 +2787,7 @@ impl Storage {
         self.prune_cross_shard_below(keep_from)?;
         self.prune_cnvrf_v3_below(keep_from)?;
         self.prune_evm_bindings_state_below(keep_from)?;
+        self.prune_pq_registry_below(keep_from)?;
         Ok(removed)
     }
 
@@ -2447,6 +3101,49 @@ impl Storage {
             .collect();
         for k in keys {
             self.evm_bindings_state.remove(k)?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    // ---------- Canonical PQ key registry domain snapshots (`Domain::PqRegistry`) ----------
+
+    pub fn put_pq_registry(&self, height: u64, bytes: &[u8]) -> Result<()> {
+        self.pq_registry.insert(height.to_be_bytes(), bytes)?;
+        Ok(())
+    }
+
+    /// The canonical `Domain::PqRegistry` snapshot at `height`, when stored.
+    /// `None` (or empty bytes) on older directories means empty `PqRegistry`
+    /// (contributes 0 bytes to the commitment digest).
+    pub fn pq_registry_at(&self, height: u64) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .pq_registry
+            .get(height.to_be_bytes())?
+            .map(|v| v.to_vec()))
+    }
+
+    /// Drop `pq_registry` snapshots older than `keep_from`. Called from
+    /// `prune_domains_below`. Never drops a row at a retained snapshot height:
+    /// see [`Self::aux_retained_heights`].
+    pub fn prune_pq_registry_below(&self, keep_from: u64) -> Result<usize> {
+        let keep = self.aux_retained_heights();
+        let mut removed = 0;
+        let keys: Vec<sled::IVec> = self
+            .pq_registry
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .filter(|k| {
+                if k.len() != 8 {
+                    return false;
+                }
+                let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
+                h < keep_from && !keep.contains(&h)
+            })
+            .collect();
+        for k in keys {
+            self.pq_registry.remove(k)?;
             removed += 1;
         }
         Ok(removed)
@@ -3310,6 +4007,13 @@ impl Storage {
                 .await
                 .map_err(|e| anyhow!("restore evm_bindings_state at height {height}: {e}"))?;
         }
+        if let Some(bytes) = self.pq_registry_at(height)? {
+            let _pq_reg = decode_pq_registry(&bytes)
+                .map_err(|e| anyhow!("restore pq_registry at height {height}: {e}"))?;
+            tmp.restore_pq_registry(&bytes)
+                .await
+                .map_err(|e| anyhow!("restore pq_registry at height {height}: {e}"))?;
+        }
 
         // Anchor the recomputed root: the header at height+1 commits to the
         // post-`height` state. At the tip (no successor yet) check
@@ -3997,10 +4701,39 @@ impl DomainSnapshotV3 {
     }
 }
 
+/// Pre-W3 [`crate::staking::ValidatorStake`] shape (7 fields, before
+/// `withdrawal_address: Option<[u8; 32]>` was appended).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidatorStakeV1 {
+    pub self_bond: u64,
+    pub delegated: u64,
+    pub commission_bps: u64,
+    pub pending_rewards: u64,
+    pub total_slashed: u64,
+    pub missed: u32,
+    pub last_downtime_penalty: u64,
+}
+
+impl ValidatorStakeV1 {
+    pub fn upgrade(self) -> crate::staking::ValidatorStake {
+        crate::staking::ValidatorStake {
+            self_bond: self.self_bond,
+            delegated: self.delegated,
+            commission_bps: self.commission_bps,
+            pending_rewards: self.pending_rewards,
+            total_slashed: self.total_slashed,
+            missed: self.missed,
+            last_downtime_penalty: self.last_downtime_penalty,
+            withdrawal_address: None,
+        }
+    }
+}
+
 /// Pre-jail/commission/lock ledger shape: identical to
-/// [`crate::staking::StakingLedger`] except WITHOUT the three trailing maps
-/// (`jail`, `commission_schedule`, `redelegation_lock`) appended after the
-/// lazy delegator-reward accumulator.
+/// [`crate::staking::StakingLedger`] except WITHOUT `withdrawal_address` on
+/// validator rows and WITHOUT the trailing maps (`jail`, `commission_schedule`,
+/// `redelegation_lock`, `recent_full_exits`) appended after the lazy
+/// delegator-reward accumulator.
 ///
 /// This is what the live network persisted between the F1 lazy-accumulator
 /// upgrade and the downtime-jail/commission/lock upgrade: bincode has no
@@ -4008,12 +4741,10 @@ impl DomainSnapshotV3 {
 /// (`UnexpectedEof` on the missing trailing maps) and must not be decoded as
 /// [`DomainSnapshotV3`] either (a shorter ledger shape would read the two
 /// accumulator maps as governance — refused loudly instead). NEVER written;
-/// `upgrade` fills the three new maps EMPTY, which is EXACT: none of the
-/// paths that create a jail record, a commission schedule or a redelegation
-/// lock existed when those bytes were written.
+/// `upgrade` fills the new maps EMPTY and sets `withdrawal_address: None`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StakingLedgerV4 {
-    pub validators: HashMap<crate::consensus::ValidatorId, crate::staking::ValidatorStake>,
+    pub validators: HashMap<crate::consensus::ValidatorId, ValidatorStakeV1>,
     pub delegations: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
     pub delegator_rewards: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
     pub unbonding: Vec<crate::staking::UnbondingEntry>,
@@ -4047,7 +4778,11 @@ pub struct StakingLedgerV4 {
 impl StakingLedgerV4 {
     pub fn upgrade(self) -> crate::staking::StakingLedger {
         crate::staking::StakingLedger {
-            validators: self.validators,
+            validators: self
+                .validators
+                .into_iter()
+                .map(|(k, v)| (k, v.upgrade()))
+                .collect(),
             delegations: self.delegations,
             delegator_rewards: self.delegator_rewards,
             reward_accumulators: self.reward_accumulators,
@@ -4078,17 +4813,15 @@ impl StakingLedgerV4 {
 }
 
 /// Ledger shape written after the downtime-jail/commission/lock upgrade but
-/// BEFORE the forensic `recent_full_exits` map was appended (the pentest-F6
-/// attribution record: `validator -> (pre_exit_power, exit_height)`).
+/// BEFORE the forensic `recent_full_exits` map and `ValidatorStake::withdrawal_address`
+/// were appended.
 ///
 /// bincode has no field names and no "missing trailing field" rule, so those
 /// bytes do not decode as the current struct. NEVER written; `upgrade` fills
-/// the map EMPTY, which is EXACT: it only ever holds the current + previous
-/// block's exits, and a snapshot is taken at a block boundary (the next
-/// applied block repopulates it before any evidence is judged).
+/// `recent_full_exits` EMPTY and `withdrawal_address: None`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StakingLedgerV5 {
-    pub validators: HashMap<crate::consensus::ValidatorId, crate::staking::ValidatorStake>,
+    pub validators: HashMap<crate::consensus::ValidatorId, ValidatorStakeV1>,
     pub delegations: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
     pub delegator_rewards: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
     pub unbonding: Vec<crate::staking::UnbondingEntry>,
@@ -4116,7 +4849,11 @@ pub struct StakingLedgerV5 {
 impl StakingLedgerV5 {
     pub fn upgrade(self) -> crate::staking::StakingLedger {
         crate::staking::StakingLedger {
-            validators: self.validators,
+            validators: self
+                .validators
+                .into_iter()
+                .map(|(k, v)| (k, v.upgrade()))
+                .collect(),
             delegations: self.delegations,
             delegator_rewards: self.delegator_rewards,
             reward_accumulators: self.reward_accumulators,
@@ -4136,6 +4873,68 @@ impl StakingLedgerV5 {
             vesting_schedules: self.vesting_schedules,
             min_validator_bond: self.min_validator_bond,
             recent_full_exits: HashMap::new(),
+        }
+    }
+}
+
+/// Pre-W3 ledger shape: identical to [`crate::staking::StakingLedger`]
+/// (including `recent_full_exits`) except validator entries use the 7-field
+/// [`ValidatorStakeV1`] without `withdrawal_address`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StakingLedgerV6 {
+    pub validators: HashMap<crate::consensus::ValidatorId, ValidatorStakeV1>,
+    pub delegations: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub delegator_rewards: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub unbonding: Vec<crate::staking::UnbondingEntry>,
+    pub withdrawable: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub total_burned: u64,
+    pub rewards_pool: u64,
+    pub rewards_minted: u64,
+    pub locked_governance: HashMap<[u8; 32], u64>,
+    pub pq_equivocation_dedup: std::collections::HashSet<[u8; 32]>,
+    pub equivocation_dedup: std::collections::HashSet<[u8; 32]>,
+    pub validator_pq_keys:
+        HashMap<crate::consensus::ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>,
+    pub min_validator_bond: Option<u64>,
+    pub vesting_schedules:
+        std::collections::BTreeMap<[u8; 32], crate::tokenomics::TeamVestingSchedule>,
+    pub reward_accumulators:
+        HashMap<crate::consensus::ValidatorId, crate::staking::ValidatorRewardState>,
+    pub delegator_reward_checkpoints: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u128>,
+    pub jail: HashMap<crate::consensus::ValidatorId, crate::staking::JailRecord>,
+    pub commission_schedule:
+        HashMap<crate::consensus::ValidatorId, crate::staking::CommissionSchedule>,
+    pub redelegation_lock: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub recent_full_exits: HashMap<crate::consensus::ValidatorId, (u64, u64)>,
+}
+
+impl StakingLedgerV6 {
+    pub fn upgrade(self) -> crate::staking::StakingLedger {
+        crate::staking::StakingLedger {
+            validators: self
+                .validators
+                .into_iter()
+                .map(|(k, v)| (k, v.upgrade()))
+                .collect(),
+            delegations: self.delegations,
+            delegator_rewards: self.delegator_rewards,
+            reward_accumulators: self.reward_accumulators,
+            delegator_reward_checkpoints: self.delegator_reward_checkpoints,
+            jail: self.jail,
+            commission_schedule: self.commission_schedule,
+            redelegation_lock: self.redelegation_lock,
+            unbonding: self.unbonding,
+            withdrawable: self.withdrawable,
+            total_burned: self.total_burned,
+            rewards_pool: self.rewards_pool,
+            rewards_minted: self.rewards_minted,
+            locked_governance: self.locked_governance,
+            pq_equivocation_dedup: self.pq_equivocation_dedup,
+            equivocation_dedup: self.equivocation_dedup,
+            validator_pq_keys: self.validator_pq_keys,
+            vesting_schedules: self.vesting_schedules,
+            min_validator_bond: self.min_validator_bond,
+            recent_full_exits: self.recent_full_exits,
         }
     }
 }
@@ -4200,6 +4999,40 @@ pub struct DomainSnapshotV8 {
 }
 
 impl DomainSnapshotV8 {
+    pub fn upgrade(self) -> DomainSnapshot {
+        DomainSnapshot {
+            tokens: self.tokens,
+            contracts: self.contracts,
+            orderbooks: self.orderbooks,
+            pmm: self.pmm,
+            pmm_usdt_token: self.pmm_usdt_token,
+            pmm_treasury: self.pmm_treasury,
+            order_escrow: self.order_escrow,
+            staking: self.staking.upgrade(),
+            governance: self.governance,
+            oracle: self.oracle,
+        }
+    }
+}
+
+/// Pre-W3 domain shape: identical to [`DomainSnapshot`] except the staking
+/// ledger is [`StakingLedgerV6`] (which uses 7-field [`ValidatorStakeV1`]
+/// without `withdrawal_address`). Upgrade fills `withdrawal_address: None`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DomainSnapshotV9 {
+    pub tokens: crate::token::TokenRegistry,
+    pub contracts: crate::contract::ContractRegistry,
+    pub orderbooks: crate::orderbook::OrderbookManager,
+    pub pmm: crate::pmm::PrimaryMarketMaker,
+    pub pmm_usdt_token: Option<[u8; 32]>,
+    pub pmm_treasury: [u8; 32],
+    pub order_escrow: HashMap<(u32, u64), crate::state_engine::EscrowRecord>,
+    pub staking: StakingLedgerV6,
+    pub governance: crate::governance::Governance,
+    pub oracle: crate::oracle::OracleState,
+}
+
+impl DomainSnapshotV9 {
     pub fn upgrade(self) -> DomainSnapshot {
         DomainSnapshot {
             tokens: self.tokens,
@@ -4365,9 +5198,9 @@ impl GovernanceLegacy {
 /// A domain snapshot whose CONTRACT REGISTRY and GOVERNANCE are in the legacy
 /// layout, parameterised over the staking-ledger shape.
 macro_rules! legacy_contract_domain_snapshot {
-    ($name:ident, $staking:ty) => {
+    ($vis:vis $name:ident, $staking:ty) => {
         #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-        pub struct $name {
+        $vis struct $name {
             pub tokens: crate::token::TokenRegistry,
             pub contracts: ContractRegistryLegacy,
             pub orderbooks: crate::orderbook::OrderbookManager,
@@ -4380,7 +5213,7 @@ macro_rules! legacy_contract_domain_snapshot {
             pub oracle: crate::oracle::OracleState,
         }
         impl $name {
-            pub fn upgrade(self) -> DomainSnapshot {
+            $vis fn upgrade(self) -> DomainSnapshot {
                 DomainSnapshot {
                     tokens: self.tokens,
                     contracts: self.contracts.upgrade(),
@@ -4398,9 +5231,196 @@ macro_rules! legacy_contract_domain_snapshot {
     };
 }
 
-legacy_contract_domain_snapshot!(DomainSnapshotV4, crate::staking::StakingLedgerV3);
-legacy_contract_domain_snapshot!(DomainSnapshotV5, crate::staking::StakingLedgerV2);
-legacy_contract_domain_snapshot!(DomainSnapshotV6, crate::staking::StakingLedgerV1);
+legacy_contract_domain_snapshot!(pub DomainSnapshotV4, crate::staking::StakingLedgerV3);
+legacy_contract_domain_snapshot!(pub DomainSnapshotV5, crate::staking::StakingLedgerV2);
+legacy_contract_domain_snapshot!(pub DomainSnapshotV6, crate::staking::StakingLedgerV1);
+
+// Private 7-field `ValidatorStakeV1` shadow shapes for V1..V3 ledgers (which live
+// in `staking.rs` with 8-field `ValidatorStake`) so real pre-W3 V1..V6 domain
+// snapshots on disk also decode cleanly with `withdrawal_address: None`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct StakingLedgerV1WithV1Stake {
+    pub validators: HashMap<crate::consensus::ValidatorId, ValidatorStakeV1>,
+    pub delegations: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub delegator_rewards: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub unbonding: Vec<crate::staking::UnbondingEntry>,
+    pub withdrawable: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub total_burned: u64,
+}
+
+impl StakingLedgerV1WithV1Stake {
+    fn upgrade(self) -> crate::staking::StakingLedger {
+        crate::staking::StakingLedgerV1 {
+            validators: self
+                .validators
+                .into_iter()
+                .map(|(k, v)| (k, v.upgrade()))
+                .collect(),
+            delegations: self.delegations,
+            delegator_rewards: self.delegator_rewards,
+            unbonding: self.unbonding,
+            withdrawable: self.withdrawable,
+            total_burned: self.total_burned,
+        }
+        .upgrade()
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct StakingLedgerV2WithV1Stake {
+    pub validators: HashMap<crate::consensus::ValidatorId, ValidatorStakeV1>,
+    pub delegations: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub delegator_rewards: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub unbonding: Vec<crate::staking::UnbondingEntry>,
+    pub withdrawable: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub total_burned: u64,
+    #[serde(default)]
+    pub rewards_pool: u64,
+    #[serde(default)]
+    pub rewards_minted: u64,
+    #[serde(default)]
+    pub locked_governance: HashMap<[u8; 32], u64>,
+    #[serde(default)]
+    pub pq_equivocation_dedup: std::collections::HashSet<[u8; 32]>,
+    #[serde(default)]
+    pub validator_pq_keys:
+        HashMap<crate::consensus::ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>,
+}
+
+impl StakingLedgerV2WithV1Stake {
+    fn upgrade(self) -> crate::staking::StakingLedger {
+        crate::staking::StakingLedgerV2 {
+            validators: self
+                .validators
+                .into_iter()
+                .map(|(k, v)| (k, v.upgrade()))
+                .collect(),
+            delegations: self.delegations,
+            delegator_rewards: self.delegator_rewards,
+            unbonding: self.unbonding,
+            withdrawable: self.withdrawable,
+            total_burned: self.total_burned,
+            rewards_pool: self.rewards_pool,
+            rewards_minted: self.rewards_minted,
+            locked_governance: self.locked_governance,
+            pq_equivocation_dedup: self.pq_equivocation_dedup,
+            validator_pq_keys: self.validator_pq_keys,
+        }
+        .upgrade()
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct StakingLedgerV3WithV1Stake {
+    pub validators: HashMap<crate::consensus::ValidatorId, ValidatorStakeV1>,
+    pub delegations: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub delegator_rewards: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub unbonding: Vec<crate::staking::UnbondingEntry>,
+    pub withdrawable: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub total_burned: u64,
+    #[serde(default)]
+    pub rewards_pool: u64,
+    #[serde(default)]
+    pub rewards_minted: u64,
+    #[serde(default)]
+    pub locked_governance: HashMap<[u8; 32], u64>,
+    #[serde(default)]
+    pub pq_equivocation_dedup: std::collections::HashSet<[u8; 32]>,
+    #[serde(default)]
+    pub equivocation_dedup: std::collections::HashSet<[u8; 32]>,
+    #[serde(default)]
+    pub validator_pq_keys:
+        HashMap<crate::consensus::ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>,
+    #[serde(default)]
+    pub min_validator_bond: Option<u64>,
+    #[serde(default)]
+    pub vesting_schedules:
+        std::collections::BTreeMap<[u8; 32], crate::tokenomics::TeamVestingSchedule>,
+}
+
+impl StakingLedgerV3WithV1Stake {
+    fn upgrade(self) -> crate::staking::StakingLedger {
+        crate::staking::StakingLedgerV3 {
+            validators: self
+                .validators
+                .into_iter()
+                .map(|(k, v)| (k, v.upgrade()))
+                .collect(),
+            delegations: self.delegations,
+            delegator_rewards: self.delegator_rewards,
+            unbonding: self.unbonding,
+            withdrawable: self.withdrawable,
+            total_burned: self.total_burned,
+            rewards_pool: self.rewards_pool,
+            rewards_minted: self.rewards_minted,
+            locked_governance: self.locked_governance,
+            pq_equivocation_dedup: self.pq_equivocation_dedup,
+            equivocation_dedup: self.equivocation_dedup,
+            validator_pq_keys: self.validator_pq_keys,
+            min_validator_bond: self.min_validator_bond,
+            vesting_schedules: self.vesting_schedules,
+        }
+        .upgrade()
+    }
+}
+
+macro_rules! current_contract_v1_stake_domain_snapshot {
+    ($name:ident, $staking:ty) => {
+        #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+        struct $name {
+            pub tokens: crate::token::TokenRegistry,
+            pub contracts: crate::contract::ContractRegistry,
+            pub orderbooks: crate::orderbook::OrderbookManager,
+            pub pmm: crate::pmm::PrimaryMarketMaker,
+            pub pmm_usdt_token: Option<[u8; 32]>,
+            pub pmm_treasury: [u8; 32],
+            pub order_escrow: HashMap<(u32, u64), crate::state_engine::EscrowRecord>,
+            pub staking: $staking,
+            pub governance: crate::governance::Governance,
+            pub oracle: crate::oracle::OracleState,
+        }
+        impl $name {
+            fn upgrade(self) -> DomainSnapshot {
+                DomainSnapshot {
+                    tokens: self.tokens,
+                    contracts: self.contracts,
+                    orderbooks: self.orderbooks,
+                    pmm: self.pmm,
+                    pmm_usdt_token: self.pmm_usdt_token,
+                    pmm_treasury: self.pmm_treasury,
+                    order_escrow: self.order_escrow,
+                    staking: self.staking.upgrade(),
+                    governance: self.governance,
+                    oracle: self.oracle,
+                }
+            }
+        }
+    };
+}
+
+legacy_contract_domain_snapshot!(DomainSnapshotV4WithV1Stake, StakingLedgerV3WithV1Stake);
+legacy_contract_domain_snapshot!(DomainSnapshotV5WithV1Stake, StakingLedgerV2WithV1Stake);
+legacy_contract_domain_snapshot!(DomainSnapshotV6WithV1Stake, StakingLedgerV1WithV1Stake);
+current_contract_v1_stake_domain_snapshot!(DomainSnapshotV3WithV1Stake, StakingLedgerV3WithV1Stake);
+current_contract_v1_stake_domain_snapshot!(DomainSnapshotV2WithV1Stake, StakingLedgerV2WithV1Stake);
+current_contract_v1_stake_domain_snapshot!(DomainSnapshotV1WithV1Stake, StakingLedgerV1WithV1Stake);
+
+/// Decode a persisted [`crate::pq_registry::PqRegistry`] snapshot blob.
+///
+/// Empty bytes decode to an empty registry; non-empty bytes require exact
+/// fixint bincode decoding with trailing bytes rejected.
+pub fn decode_pq_registry(bytes: &[u8]) -> Result<crate::pq_registry::PqRegistry> {
+    use bincode::Options;
+    if bytes.is_empty() {
+        return Ok(crate::pq_registry::PqRegistry::default());
+    }
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(DOMAIN_SNAPSHOT_STRICT_MAX_BYTES)
+        .reject_trailing_bytes()
+        .deserialize(bytes)
+        .map_err(|e| anyhow!("decode pq_registry: {e}"))
+}
 
 /// Decode a persisted domain snapshot, accepting the pre-E2/E7 V1 shape.
 ///
@@ -4422,8 +5442,17 @@ pub fn decode_domain_snapshot(bytes: &[u8]) -> Result<DomainSnapshot> {
     if let Ok(snap) = bincode::deserialize::<DomainSnapshot>(bytes) {
         return Ok(snap);
     }
+    // V9: pre-W3 current-shape domains (`StakingLedgerV6`, including
+    // `recent_full_exits`), with 7-field `ValidatorStakeV1` (no
+    // `withdrawal_address`). Upgrade sets `withdrawal_address: None`.
+    if let Ok(v9) = bincode::deserialize::<DomainSnapshotV9>(bytes) {
+        tracing::warn!(
+            "[domains] restored pre-W3 V9 staking state: validator withdrawal_address starts as None until claimed via SysCallClaimWithdrawal"
+        );
+        return Ok(v9.upgrade());
+    }
     // V8: current domains written before the forensic `recent_full_exits`
-    // ledger map was appended. Closest to the current shape, so tried first.
+    // ledger map was appended. Closest to the current shape, so tried next.
     // The map is empty on upgrade, which is exact at a snapshot boundary (it
     // only ever holds the current + previous block's exits).
     if let Ok(v8) = bincode::deserialize::<DomainSnapshotV8>(bytes) {
@@ -4441,15 +5470,33 @@ pub fn decode_domain_snapshot(bytes: &[u8]) -> Result<DomainSnapshot> {
         );
         return Ok(v4.upgrade());
     }
+    if let Ok(v4) = bincode::deserialize::<DomainSnapshotV4WithV1Stake>(bytes) {
+        tracing::warn!(
+            "[domains] restored pre-ABI/upgrade-plan domain state (pre-W3 ValidatorStakeV1): contract balances, contract ABI manifests, the registry's last-return-data and the coordinated upgrade plan start EMPTY"
+        );
+        return Ok(v4.upgrade());
+    }
     if let Ok(v5) = bincode::deserialize::<DomainSnapshotV5>(bytes) {
         tracing::warn!(
             "[domains] restored pre-ABI/upgrade-plan domain state (older staking ledger): contract balances, contract ABI manifests, the registry's last-return-data and the coordinated upgrade plan start EMPTY (exact — none of them existed when written)"
         );
         return Ok(v5.upgrade());
     }
+    if let Ok(v5) = bincode::deserialize::<DomainSnapshotV5WithV1Stake>(bytes) {
+        tracing::warn!(
+            "[domains] restored pre-ABI/upgrade-plan domain state (older staking ledger, pre-W3 ValidatorStakeV1): contract balances, contract ABI manifests, the registry's last-return-data and the coordinated upgrade plan start EMPTY"
+        );
+        return Ok(v5.upgrade());
+    }
     if let Ok(v6) = bincode::deserialize::<DomainSnapshotV6>(bytes) {
         tracing::warn!(
             "[domains] restored pre-ABI/upgrade-plan domain state (oldest staking ledger): contract balances, contract ABI manifests, the registry's last-return-data and the coordinated upgrade plan start EMPTY (exact — none of them existed when written)"
+        );
+        return Ok(v6.upgrade());
+    }
+    if let Ok(v6) = bincode::deserialize::<DomainSnapshotV6WithV1Stake>(bytes) {
+        tracing::warn!(
+            "[domains] restored pre-ABI/upgrade-plan domain state (oldest staking ledger, pre-W3 ValidatorStakeV1): contract balances, contract ABI manifests, the registry's last-return-data and the coordinated upgrade plan start EMPTY"
         );
         return Ok(v6.upgrade());
     }
@@ -4478,6 +5525,12 @@ pub fn decode_domain_snapshot(bytes: &[u8]) -> Result<DomainSnapshot> {
         );
         return Ok(v3.upgrade());
     }
+    if let Ok(v3) = bincode::deserialize::<DomainSnapshotV3WithV1Stake>(bytes) {
+        tracing::warn!(
+            "[domains] restored pre-lazy-accumulator V3 staking state (pre-W3 ValidatorStakeV1): the reward accumulator and the delegator checkpoints start EMPTY"
+        );
+        return Ok(v3.upgrade());
+    }
     // V2: pre-equivocation-dedup/vesting ledger shape (what the live network
     // persisted before the coordinated upgrade appending those two trailing
     // fields). Upgrades with both new sets empty — exact, neither registry
@@ -4488,11 +5541,23 @@ pub fn decode_domain_snapshot(bytes: &[u8]) -> Result<DomainSnapshot> {
         );
         return Ok(v2.upgrade());
     }
-    // Fall through to the older format below.
-    let v1: DomainSnapshotV1 =
+    if let Ok(v2) = bincode::deserialize::<DomainSnapshotV2WithV1Stake>(bytes) {
+        tracing::warn!(
+            "[domains] restored pre-dedup/vesting V2 staking state (pre-W3 ValidatorStakeV1): equivocation_dedup and vesting_schedules start EMPTY"
+        );
+        return Ok(v2.upgrade());
+    }
+    // Fall through to the oldest format below.
+    if let Ok(v1) = bincode::deserialize::<DomainSnapshotV1>(bytes) {
+        tracing::warn!(
+            "[domains] restored pre-E2 V1 staking state: rewards counters start at ZERO — verify real minted supply out-of-band before trusting emission-cap headroom (exact on fresh/test chains)"
+        );
+        return Ok(v1.upgrade());
+    }
+    let v1: DomainSnapshotV1WithV1Stake =
         bincode::deserialize(bytes).map_err(|e| anyhow!("restore domains: {e}"))?;
     tracing::warn!(
-        "[domains] restored pre-E2 V1 staking state: rewards counters start at ZERO — verify real minted supply out-of-band before trusting emission-cap headroom (exact on fresh/test chains)"
+        "[domains] restored pre-E2 V1 staking state (pre-W3 ValidatorStakeV1): rewards counters start at ZERO — verify real minted supply out-of-band before trusting emission-cap headroom (exact on fresh/test chains)"
     );
     Ok(v1.upgrade())
 }
@@ -4507,7 +5572,7 @@ pub const DOMAIN_SNAPSHOT_STRICT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 ///
 /// Accepts ONLY the current [`DomainSnapshot`] shape, with trailing bytes
 /// rejected (same wire contract as `ConsensusMsg::decode`: fixint bincode,
-/// exact-length). Any legacy shape (`DomainSnapshotV1`..`V8`, pre-ABI
+/// exact-length). Any legacy shape (`DomainSnapshotV1`..`V9`, pre-ABI
 /// governance, pre-lazy ledgers) or unknown/future version is a hard `Err`
 /// naming the refusal — NO warn-and-upgrade fallback, NO silent skip.
 ///
@@ -4719,6 +5784,7 @@ pub async fn load_full_state_into(
     let cross_shard_snap: Option<crate::sharding::CrossShardReplaySnapshot>;
     let cnvrf_snap: Option<crate::state_engine::CnVrfV3EngineSnapshot>;
     let evm_bindings_opt: Option<Vec<u8>>;
+    let pq_registry_opt: Option<Vec<u8>>;
 
     // Phase 1 (throwaway): restore + verify without touching live state. The
     // verification is MANDATORY whenever an anchor exists: a snapshot labeled H whose
@@ -4802,6 +5868,14 @@ pub async fn load_full_state_into(
                 .await
                 .map_err(|e| anyhow!("restore evm_bindings_state: {e}"))?;
         }
+        pq_registry_opt = storage.pq_registry_at(height)?;
+        if let Some(bytes) = &pq_registry_opt {
+            let _pq_reg =
+                decode_pq_registry(bytes).map_err(|e| anyhow!("restore pq_registry: {e}"))?;
+            tmp.restore_pq_registry(bytes)
+                .await
+                .map_err(|e| anyhow!("restore pq_registry: {e}"))?;
+        }
         storage.verify_restored_root(&tmp, height).await?;
     }
 
@@ -4844,6 +5918,13 @@ pub async fn load_full_state_into(
             .restore_evm_bindings(bytes)
             .await
             .map_err(|e| anyhow!("restore evm_bindings_state: {e}"))?;
+    }
+    if let Some(bytes) = &pq_registry_opt {
+        let _pq_reg = decode_pq_registry(bytes).map_err(|e| anyhow!("restore pq_registry: {e}"))?;
+        engine
+            .restore_pq_registry(bytes)
+            .await
+            .map_err(|e| anyhow!("restore pq_registry: {e}"))?;
     }
     match domains_opt {
         Some(bytes) => {
@@ -4906,6 +5987,10 @@ pub enum PersistJob {
         bytes: Vec<u8>,
     },
     EvmBindingsState {
+        height: u64,
+        bytes: Vec<u8>,
+    },
+    PqRegistry {
         height: u64,
         bytes: Vec<u8>,
     },
@@ -4986,6 +6071,7 @@ pub fn persist_job_label(job: &PersistJob) -> &'static str {
         PersistJob::Domains { .. } => "Domains snapshot",
         PersistJob::CnVrfV3 { .. } => "CN-VRF v3 snapshot",
         PersistJob::EvmBindingsState { .. } => "EVM bindings state snapshot",
+        PersistJob::PqRegistry { .. } => "PQ registry snapshot",
         PersistJob::XshardHeaders { .. } => "cross-shard header registry",
         PersistJob::Consensus(_) => "Consensus safety checkpoint",
         PersistJob::Finalized { .. } => "Finalized tip pointer",
@@ -5020,6 +6106,7 @@ pub fn persist_drop_consequence(job: &PersistJob) -> &'static str {
         }
         PersistJob::CnVrfV3 { .. }
         | PersistJob::EvmBindingsState { .. }
+        | PersistJob::PqRegistry { .. }
         | PersistJob::XshardHeaders { .. }
         | PersistJob::Flush => {
             "recoverable auxiliary state; the next cadence/finalize refreshes it"
@@ -5140,6 +6227,7 @@ impl AsyncPersistence {
                     PersistJob::EvmBindingsState { height, bytes } => {
                         st.put_evm_bindings_state(height, &bytes)
                     }
+                    PersistJob::PqRegistry { height, bytes } => st.put_pq_registry(height, &bytes),
                     PersistJob::XshardHeaders { bytes } => st.put_xshard_headers(&bytes),
                     PersistJob::Consensus(cp) => st.set_consensus(&cp),
                     PersistJob::Finalized { height, hash } => st.set_finalized(height, &hash),
@@ -5403,6 +6491,11 @@ impl AsyncPersistence {
     /// Non-blocking: enqueue a canonical `Domain::EvmBindings` snapshot for `height`.
     pub fn enqueue_evm_bindings_state(&self, height: u64, bytes: Vec<u8>) {
         self.push(PersistJob::EvmBindingsState { height, bytes });
+    }
+
+    /// Non-blocking: enqueue a canonical `Domain::PqRegistry` snapshot for `height`.
+    pub fn enqueue_pq_registry(&self, height: u64, bytes: Vec<u8>) {
+        self.push(PersistJob::PqRegistry { height, bytes });
     }
 
     /// Non-blocking: enqueue a complete cross-shard finalized-header registry

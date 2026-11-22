@@ -387,6 +387,46 @@ pub const COMMISSION_EFFECT_DELAY_HEIGHTS: u64 = 30_000;
 /// Change requires spec update + audit note (AGENTS.md §7).
 pub const COMMISSION_CHANGE_COOLDOWN_HEIGHTS: u64 = 30_000;
 
+/// Domain separator for one-time pre-W3 `ClaimWithdrawal` signatures.
+pub const PQ_CLAIM_WITHDRAWAL_DST: &[u8] = b"STELL_CLAIM_WITHDRAWAL_V1";
+
+/// Domain separator for `ChangeWithdrawal` Proof-of-Possession signatures.
+pub const PQ_WITHDRAWAL_POP_DST: &[u8] = b"STELL_WITHDRAWAL_POP_V1";
+
+/// Canonical preimage signed by a validator's active `voting_pq_key` to claim
+/// a cold `withdrawal_address` for an unclaimed pre-W3 validator record:
+/// `b"STELL_CLAIM_WITHDRAWAL_V1" || chain_id.to_be_bytes() || validator_id || withdrawal_address`.
+pub fn pq_claim_withdrawal_preimage(
+    chain_id: u64,
+    validator_id: &[u8; 32],
+    withdrawal_address: &[u8; 32],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(PQ_CLAIM_WITHDRAWAL_DST.len() + 8 + 32 + 32);
+    out.extend_from_slice(PQ_CLAIM_WITHDRAWAL_DST);
+    out.extend_from_slice(&chain_id.to_be_bytes());
+    out.extend_from_slice(validator_id);
+    out.extend_from_slice(withdrawal_address);
+    out
+}
+
+/// Canonical preimage signed by a new cold `withdrawal_address` Falcon-512 key
+/// in `SysCallChangeWithdrawal`:
+/// `b"STELL_WITHDRAWAL_POP_V1" || chain_id.to_be_bytes() || validator_id || current_withdrawal_address || new_withdrawal_address`.
+pub fn pq_withdrawal_pop_preimage(
+    chain_id: u64,
+    validator_id: &[u8; 32],
+    current_withdrawal_address: &[u8; 32],
+    new_withdrawal_address: &[u8; 32],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(PQ_WITHDRAWAL_POP_DST.len() + 8 + 32 + 32 + 32);
+    out.extend_from_slice(PQ_WITHDRAWAL_POP_DST);
+    out.extend_from_slice(&chain_id.to_be_bytes());
+    out.extend_from_slice(validator_id);
+    out.extend_from_slice(current_withdrawal_address);
+    out.extend_from_slice(new_withdrawal_address);
+    out
+}
+
 /// CN-VRF v3 reveal-abort slash fraction in basis points (1% = 100 bps).
 ///
 /// Triggered when a committed proposer's leaky-bucket abort counter reaches
@@ -495,6 +535,14 @@ pub enum StakingError {
     /// topping up an existing position is always allowed. Appended last so
     /// existing serialized error indices are untouched.
     DelegationCapReached,
+    /// Caller is not authorized for this validator lifecycle operation
+    /// (`sender != validator` pre-W3 or `withdrawal_address != Some(sender)` post-W3).
+    Unauthorized,
+    /// One-time `ClaimWithdrawal` or `set_withdrawal_address` conflict: the
+    /// validator already has a `withdrawal_address` set (or `new == current`).
+    WithdrawalAlreadySet,
+    /// Operation rejected by [`crate::pq_registry::PqRegistry`].
+    PqRegistryRejected(String),
 }
 
 impl std::fmt::Display for StakingError {
@@ -547,6 +595,15 @@ impl std::fmt::Display for StakingError {
             }
             StakingError::DelegationCapReached => {
                 "validator delegation count cap reached: top up an existing position or pick another validator"
+            }
+            StakingError::Unauthorized => {
+                "sender is not authorized for this validator lifecycle operation"
+            }
+            StakingError::WithdrawalAlreadySet => {
+                "validator withdrawal address is already set"
+            }
+            StakingError::PqRegistryRejected(msg) => {
+                return write!(f, "PQ registry rejected operation: {msg}");
             }
         };
         write!(f, "{s}")
@@ -897,6 +954,10 @@ pub struct ValidatorStake {
     /// Height of the last downtime slash, so one outage is punished once and
     /// repeated replays of the same evidence cannot slash repeatedly.
     pub last_downtime_penalty: u64,
+    /// Cold staking control credential (`PQ1` Falcon-512 address) under Ruleset v7.
+    /// `None` only on pre-W3 / legacy records until claimed via `pq_claim_withdrawal`.
+    #[serde(default)]
+    pub withdrawal_address: Option<[u8; 32]>,
 }
 
 impl ValidatorStake {
@@ -1439,11 +1500,53 @@ impl StakingLedger {
                 total_slashed: 0,
                 missed: 0,
                 last_downtime_penalty: 0,
+                withdrawal_address: None,
             },
         );
         // Fail-open cushion policy on top of the fail-closed floor above: when
         // the operator raised the env buffer beyond STELL_MIN_BOND_BUFFER, a
         // bond inside [floor, MIN+env_buffer) still WARNs (log-only).
+        if let Some(msg) = buffer_warn_message_for(amount, min_bond_buffer_nano()) {
+            tracing::warn!("SysCallStake/bond {}: {msg}", hex::encode(validator));
+        }
+        self.warn_if_quorum_fragile("SysCallStake/bond");
+        Ok(())
+    }
+
+    /// Register a post-W3 validator with an initial self-bond and a cold
+    /// `withdrawal_address` (`PQ1` Falcon-512 address, non-zero).
+    pub fn bond_with_withdrawal(
+        &mut self,
+        validator: ValidatorId,
+        amount: u64,
+        commission_bps: u64,
+        withdrawal_address: [u8; 32],
+    ) -> Result<(), StakingError> {
+        if withdrawal_address == [0u8; 32] {
+            return Err(StakingError::ZeroAddress);
+        }
+        if amount < required_bond_floor_nano() {
+            return Err(StakingError::BondBelowMinimum);
+        }
+        if commission_bps > BPS_DENOMINATOR {
+            return Err(StakingError::BadCommission);
+        }
+        if self.validators.contains_key(&validator) {
+            return Err(StakingError::AlreadyValidator);
+        }
+        self.validators.insert(
+            validator,
+            ValidatorStake {
+                self_bond: amount,
+                delegated: 0,
+                commission_bps,
+                pending_rewards: 0,
+                total_slashed: 0,
+                missed: 0,
+                last_downtime_penalty: 0,
+                withdrawal_address: Some(withdrawal_address),
+            },
+        );
         if let Some(msg) = buffer_warn_message_for(amount, min_bond_buffer_nano()) {
             tracing::warn!("SysCallStake/bond {}: {msg}", hex::encode(validator));
         }
@@ -1480,6 +1583,7 @@ impl StakingLedger {
                 total_slashed: 0,
                 missed: 0,
                 last_downtime_penalty: 0,
+                withdrawal_address: None,
             },
         );
         if let Some(msg) = buffer_warn_message_for(amount, min_bond_buffer_nano()) {
@@ -1487,6 +1591,130 @@ impl StakingLedger {
         }
         self.warn_if_quorum_fragile("genesis-bond");
         Ok(())
+    }
+
+    /// Genesis-only bond with an explicit cold `withdrawal_address` (Ruleset v7
+    /// fresh genesis). Same floor exemptions as [`Self::bond_genesis`], refusing
+    /// the zero `withdrawal_address`.
+    pub fn bond_genesis_with_withdrawal(
+        &mut self,
+        validator: ValidatorId,
+        amount: u64,
+        commission_bps: u64,
+        withdrawal_address: [u8; 32],
+    ) -> Result<(), StakingError> {
+        if withdrawal_address == [0u8; 32] {
+            return Err(StakingError::ZeroAddress);
+        }
+        if commission_bps > BPS_DENOMINATOR {
+            return Err(StakingError::BadCommission);
+        }
+        if self.validators.contains_key(&validator) {
+            return Err(StakingError::AlreadyValidator);
+        }
+        self.validators.insert(
+            validator,
+            ValidatorStake {
+                self_bond: amount,
+                delegated: 0,
+                commission_bps,
+                pending_rewards: 0,
+                total_slashed: 0,
+                missed: 0,
+                last_downtime_penalty: 0,
+                withdrawal_address: Some(withdrawal_address),
+            },
+        );
+        if let Some(msg) = buffer_warn_message_for(amount, min_bond_buffer_nano()) {
+            tracing::warn!("genesis-bond {}: {msg}", hex::encode(validator));
+        }
+        self.warn_if_quorum_fragile("genesis-bond");
+        Ok(())
+    }
+
+    /// Cold withdrawal credential (`PQ1` Falcon-512 address) bound to `validator`,
+    /// or `None` for pre-W3 / unclaimed validators.
+    pub fn withdrawal_address_of(&self, validator: &ValidatorId) -> Option<[u8; 32]> {
+        self.validators
+            .get(validator)
+            .and_then(|v| v.withdrawal_address)
+    }
+
+    /// Rotate a validator's cold `withdrawal_address` (`SysCallChangeWithdrawal`).
+    ///
+    /// Fail-closed: requires an existing validator with a set `withdrawal_address`
+    /// matching `sender`, a non-zero `new_withdrawal_address`, and
+    /// `new_withdrawal_address != sender`. (Callers must have already verified
+    /// the new address's PoP signature.)
+    pub fn set_withdrawal_address(
+        &mut self,
+        validator: ValidatorId,
+        sender: [u8; 32],
+        new_withdrawal_address: [u8; 32],
+    ) -> Result<(), StakingError> {
+        if sender == [0u8; 32] || new_withdrawal_address == [0u8; 32] {
+            return Err(StakingError::ZeroAddress);
+        }
+        let v = self
+            .validators
+            .get_mut(&validator)
+            .ok_or(StakingError::NotValidator)?;
+        let current = v.withdrawal_address.ok_or(StakingError::Unauthorized)?;
+        if sender != current {
+            return Err(StakingError::Unauthorized);
+        }
+        if new_withdrawal_address == current {
+            return Err(StakingError::WithdrawalAlreadySet);
+        }
+        v.withdrawal_address = Some(new_withdrawal_address);
+        Ok(())
+    }
+
+    /// Authorize `sender` for validator lifecycle operations (`unbond`, `unjail`,
+    /// `claim_rewards`, `withdraw`, `rotate_voting_key`, `announce/apply_commission`).
+    ///
+    /// - `post_w3 == false`: legacy rule `sender == validator`.
+    /// - `post_w3 == true`: strictly requires `v.withdrawal_address == Some(*sender)`
+    ///   (rejects `None`, unknown validators, `[0u8; 32]`, and even `sender == validator`
+    ///   when `withdrawal_address` differs, fail-closed with [`StakingError::Unauthorized`]).
+    pub fn authorize_validator_owner(
+        &self,
+        validator: &ValidatorId,
+        sender: &[u8; 32],
+        post_w3: bool,
+    ) -> Result<(), StakingError> {
+        if !post_w3 {
+            return if sender == validator {
+                Ok(())
+            } else {
+                Err(StakingError::Unauthorized)
+            };
+        }
+        if *sender == [0u8; 32] {
+            return Err(StakingError::Unauthorized);
+        }
+        let Some(v) = self.validators.get(validator) else {
+            return Err(StakingError::Unauthorized);
+        };
+        match v.withdrawal_address {
+            Some(addr) if addr == *sender => Ok(()),
+            _ => Err(StakingError::Unauthorized),
+        }
+    }
+
+    /// Height-gated convenience wrapper around [`Self::authorize_validator_owner`],
+    /// using [`crate::pq_registry::pq_lifecycle_active_at`].
+    pub fn authorize_validator_owner_at_height(
+        &self,
+        validator: &ValidatorId,
+        sender: &[u8; 32],
+        height: u64,
+    ) -> Result<(), StakingError> {
+        self.authorize_validator_owner(
+            validator,
+            sender,
+            crate::pq_registry::pq_lifecycle_active_at(height),
+        )
     }
 
     /// Add more self-bond to an existing validator.
@@ -3444,8 +3672,9 @@ impl StakingLedger {
         registry: &mut crate::pq_registry::PqRegistry,
         now_height: u64,
     ) -> Vec<ValidatorId> {
+        let supply_before = self.ledger_stake_supply();
         let applied = registry.apply_due_rotations(now_height);
-        applied
+        let members: Vec<ValidatorId> = applied
             .into_iter()
             .filter(|v| {
                 let member = self.validators.contains_key(v);
@@ -3456,7 +3685,323 @@ impl StakingLedger {
                 }
                 member
             })
-            .collect()
+            .collect();
+        debug_assert_eq!(
+            supply_before,
+            self.ledger_stake_supply(),
+            "pq apply due rotations must move no stake"
+        );
+        members
+    }
+
+    /// Deterministic one-time adoption pass for pre-W3 validators: copies
+    /// committed `validator_pq_keys` entries (for existing `self.validators`
+    /// members without a `PqRegistry` record) into `registry` in sorted
+    /// `ValidatorId` order at `at_height` (`next_seq = 1`).
+    ///
+    /// Returns the number of records adopted. Invalid/disabled legacy keys are
+    /// skipped rather than failing the block transition.
+    pub fn pq_adopt_legacy_keys_at(
+        &mut self,
+        registry: &mut crate::pq_registry::PqRegistry,
+        at_height: u64,
+    ) -> usize {
+        let mut ids: Vec<ValidatorId> = self.validator_pq_keys.keys().copied().collect();
+        ids.sort_unstable();
+        let mut adopted = 0usize;
+        for id in ids {
+            if !self.validators.contains_key(&id) || registry.record_of(&id).is_some() {
+                continue;
+            }
+            if let Some((scheme, pubkey)) = self.validator_pq_keys.get(&id).cloned() {
+                if registry
+                    .adopt_legacy_key_at(id, scheme, pubkey, at_height, true)
+                    .is_ok()
+                {
+                    adopted += 1;
+                }
+            }
+        }
+        adopted
+    }
+
+    /// Post-W3 atomic validator registration (`SysCallRegisterValidator`):
+    /// derives `validator_id = BLAKE3("STELL_VAL_ID_V1" || chain_id || withdrawal_address || voting_pubkey)`,
+    /// verifies the Falcon-512 PoP at `rotation_seq = 0`, registers the key in
+    /// `registry` at `now_height`, mirrors into `validator_pq_keys`, and bonds
+    /// the validator with `withdrawal_address`.
+    ///
+    /// Fail-closed & atomic: if any check fails, neither `self` nor `registry`
+    /// is modified.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: W3 registration takes explicit (registry, chain_id, amount, commission, withdrawal, scheme, pubkey, pop, now_height).
+    pub fn pq_register_validator_with_withdrawal(
+        &mut self,
+        registry: &mut crate::pq_registry::PqRegistry,
+        chain_id: u64,
+        amount: u64,
+        commission_bps: u64,
+        withdrawal_address: [u8; 32],
+        voting_scheme: u8,
+        voting_pubkey: &[u8],
+        voting_pop: &[u8],
+        now_height: u64,
+    ) -> Result<ValidatorId, StakingError> {
+        let supply_before = self.ledger_stake_supply();
+        if withdrawal_address == [0u8; 32] {
+            return Err(StakingError::ZeroAddress);
+        }
+        if amount < required_bond_floor_nano() {
+            return Err(StakingError::BondBelowMinimum);
+        }
+        if commission_bps > BPS_DENOMINATOR {
+            return Err(StakingError::BadCommission);
+        }
+        let validator_id =
+            crate::pq_registry::derive_validator_id(chain_id, &withdrawal_address, voting_pubkey);
+        if validator_id == [0u8; 32] {
+            return Err(StakingError::ZeroAddress);
+        }
+        if self.validators.contains_key(&validator_id) {
+            return Err(StakingError::AlreadyValidator);
+        }
+        crate::pq_registry::verify_voting_key_pop(
+            chain_id,
+            &validator_id,
+            &withdrawal_address,
+            0,
+            voting_scheme,
+            voting_pubkey,
+            voting_pop,
+        )
+        .map_err(|e| StakingError::PqRegistryRejected(e.to_string()))?;
+
+        // Mutate `registry` first (fails cleanly on DuplicateKey without
+        // touching `self`), then commit `bond_with_withdrawal` (all
+        // preconditions already validated above, so it cannot fail).
+        registry
+            .register_with_seq(
+                validator_id,
+                crate::post_quantum::PqScheme::Falcon512,
+                voting_pubkey.to_vec(),
+                now_height,
+                now_height,
+                0,
+                true,
+            )
+            .map_err(|e| StakingError::PqRegistryRejected(e.to_string()))?;
+        self.bond_with_withdrawal(validator_id, amount, commission_bps, withdrawal_address)?;
+        self.validator_pq_keys.insert(
+            validator_id,
+            (
+                crate::post_quantum::PqScheme::Falcon512,
+                voting_pubkey.to_vec(),
+            ),
+        );
+        debug_assert_eq!(
+            supply_before.saturating_add(amount),
+            self.ledger_stake_supply(),
+            "pq_register_validator_with_withdrawal must add exactly `amount` to stake supply"
+        );
+        Ok(validator_id)
+    }
+
+    /// Post-W3 sequence-protected voting-key rotation announcement
+    /// (`SysCallRotateVotingKey` with `cancel == false`).
+    ///
+    /// Enforces:
+    /// - `sender == v.withdrawal_address` (strict W3 cold-key authorization;
+    ///   `withdrawal_address == None` fails closed with [`StakingError::Unauthorized`]);
+    /// - `rotation_seq == rec.next_seq` (or `1` if adopting a legacy key);
+    /// - Falcon-512 PoP signature over `PQ_KEY_POP_DST || chain_id || validator_id || withdrawal_address || rotation_seq || scheme || len || pubkey`;
+    /// - `PqRegistry::announce_rotation_seq` (delay, no duplicate key, no same key, checked_add).
+    ///
+    /// Committed `validator_pq_keys` keeps the OLD key until `pq_apply_due_rotations`.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: W3 rotation announcement takes explicit (registry, chain_id, validator_id, sender, rotation_seq, scheme, pubkey, pop, now_height).
+    pub fn pq_announce_rotation_with_seq(
+        &self,
+        registry: &mut crate::pq_registry::PqRegistry,
+        chain_id: u64,
+        validator_id: ValidatorId,
+        sender: [u8; 32],
+        rotation_seq: u64,
+        new_scheme: u8,
+        new_pubkey: &[u8],
+        pop_signature: &[u8],
+        now_height: u64,
+    ) -> Result<(), StakingError> {
+        self.authorize_validator_owner(&validator_id, &sender, true)?;
+        let withdrawal_address = self
+            .withdrawal_address_of(&validator_id)
+            .ok_or(StakingError::Unauthorized)?;
+
+        let expected_seq = if let Some(rec) = registry.record_of(&validator_id) {
+            rec.next_seq
+        } else if self.get_pq_key(&validator_id).is_some() {
+            1
+        } else {
+            return Err(StakingError::PqRegistryRejected(
+                crate::pq_registry::PqRegistryError::UnknownValidator.to_string(),
+            ));
+        };
+        if rotation_seq != expected_seq {
+            return Err(StakingError::PqRegistryRejected(
+                crate::pq_registry::PqRegistryError::InvalidRotationSeq {
+                    expected: expected_seq,
+                    got: rotation_seq,
+                }
+                .to_string(),
+            ));
+        }
+
+        crate::pq_registry::verify_voting_key_pop(
+            chain_id,
+            &validator_id,
+            &withdrawal_address,
+            rotation_seq,
+            new_scheme,
+            new_pubkey,
+            pop_signature,
+        )
+        .map_err(|e| StakingError::PqRegistryRejected(e.to_string()))?;
+
+        if registry.record_of(&validator_id).is_none() {
+            let Some((cur_scheme, cur_pubkey)) = self.get_pq_key(&validator_id) else {
+                return Err(StakingError::PqRegistryRejected(
+                    crate::pq_registry::PqRegistryError::UnknownValidator.to_string(),
+                ));
+            };
+            // Pre-check announce preconditions before adopting so a refused
+            // call leaves `registry` untouched.
+            if cur_scheme == crate::post_quantum::PqScheme::Falcon512
+                && cur_pubkey.as_slice() == new_pubkey
+            {
+                return Err(StakingError::PqRegistryRejected(
+                    crate::pq_registry::PqRegistryError::SameKey.to_string(),
+                ));
+            }
+            if now_height
+                .checked_add(crate::pq_registry::PQ_ROTATION_DELAY_HEIGHTS)
+                .is_none()
+            {
+                return Err(StakingError::ArithmeticOverflow);
+            }
+            let duplicate = registry.records().iter().any(|(id, rec)| {
+                id != &validator_id
+                    && ((rec.scheme == crate::post_quantum::PqScheme::Falcon512
+                        && rec.pubkey.as_slice() == new_pubkey)
+                        || rec.pending.as_ref().is_some_and(|p| {
+                            p.scheme == crate::post_quantum::PqScheme::Falcon512
+                                && p.pubkey.as_slice() == new_pubkey
+                        }))
+            });
+            if duplicate {
+                return Err(StakingError::PqRegistryRejected(
+                    crate::pq_registry::PqRegistryError::DuplicateKey.to_string(),
+                ));
+            }
+            registry
+                .adopt_legacy_key_at(validator_id, cur_scheme, cur_pubkey, 0, true)
+                .map_err(|e| StakingError::PqRegistryRejected(e.to_string()))?;
+        }
+
+        registry
+            .announce_rotation_seq(
+                validator_id,
+                crate::post_quantum::PqScheme::Falcon512,
+                new_pubkey.to_vec(),
+                now_height,
+                rotation_seq,
+                true,
+            )
+            .map_err(|e| match e {
+                crate::pq_registry::PqRegistryError::ArithmeticOverflow => {
+                    StakingError::ArithmeticOverflow
+                }
+                other => StakingError::PqRegistryRejected(other.to_string()),
+            })
+    }
+
+    /// Post-W3 explicit cancellation of a pending voting-key rotation
+    /// (`SysCallRotateVotingKey` with `cancel == true`).
+    ///
+    /// Enforces `sender == v.withdrawal_address`, `rotation_seq == rec.next_seq`,
+    /// and `now_height < pending.effective_height`.
+    pub fn pq_cancel_rotation(
+        &self,
+        registry: &mut crate::pq_registry::PqRegistry,
+        validator_id: ValidatorId,
+        sender: [u8; 32],
+        rotation_seq: u64,
+        now_height: u64,
+    ) -> Result<(), StakingError> {
+        self.authorize_validator_owner(&validator_id, &sender, true)?;
+        registry
+            .cancel_rotation(validator_id, now_height, rotation_seq, true)
+            .map_err(|e| match e {
+                crate::pq_registry::PqRegistryError::ArithmeticOverflow => {
+                    StakingError::ArithmeticOverflow
+                }
+                other => StakingError::PqRegistryRejected(other.to_string()),
+            })
+    }
+
+    /// One-time W3 migration for a pre-W3 validator with `withdrawal_address == None`
+    /// (`SysCallClaimWithdrawal`).
+    ///
+    /// Enforces:
+    /// - `withdrawal_address != [0u8; 32]` and `sender == withdrawal_address`;
+    /// - validator exists and currently has `withdrawal_address == None`
+    ///   (returns [`StakingError::WithdrawalAlreadySet`] once set);
+    /// - `voting_sig` verifies under the validator's active `voting_pq_key` at
+    ///   `now_height` over `pq_claim_withdrawal_preimage(chain_id, validator_id, withdrawal_address)`.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: one-time W3 claim-withdrawal entry requiring (registry, chain_id, validator_id, sender, withdrawal_address, voting_sig, now_height).
+    pub fn pq_claim_withdrawal(
+        &mut self,
+        registry: &crate::pq_registry::PqRegistry,
+        chain_id: u64,
+        validator_id: ValidatorId,
+        sender: [u8; 32],
+        withdrawal_address: [u8; 32],
+        voting_sig: &[u8],
+        now_height: u64,
+    ) -> Result<(), StakingError> {
+        if withdrawal_address == [0u8; 32] || sender == [0u8; 32] {
+            return Err(StakingError::ZeroAddress);
+        }
+        {
+            let v = self
+                .validators
+                .get(&validator_id)
+                .ok_or(StakingError::NotValidator)?;
+            if v.withdrawal_address.is_some() {
+                return Err(StakingError::WithdrawalAlreadySet);
+            }
+        }
+        if sender != withdrawal_address {
+            return Err(StakingError::Unauthorized);
+        }
+        let (scheme, pubkey) = if registry.record_of(&validator_id).is_some() {
+            registry
+                .pq_key_at_height(&validator_id, now_height)
+                .ok_or(StakingError::InvalidSignature)?
+        } else {
+            self.get_pq_key(&validator_id)
+                .ok_or(StakingError::InvalidSignature)?
+        };
+        if scheme.is_disabled() {
+            return Err(StakingError::InvalidSignature);
+        }
+        let preimage = pq_claim_withdrawal_preimage(chain_id, &validator_id, &withdrawal_address);
+        if !crate::post_quantum::verify_pq_signature(scheme, &pubkey, &preimage, voting_sig) {
+            return Err(StakingError::InvalidSignature);
+        }
+        if let Some(v) = self.validators.get_mut(&validator_id) {
+            v.withdrawal_address = Some(withdrawal_address);
+        }
+        Ok(())
     }
 
     /// Resolve the authoritative PQ key for `validator` AT `height` (see
@@ -3538,6 +4083,68 @@ impl StakingLedger {
             return Err(StakingError::InvalidSignature);
         };
         let (scheme, pubkey) = (*scheme, pubkey.clone());
+        self.slash_pq_equivocation_with_key(evidence, is_micro_committee, scheme, pubkey)
+    }
+
+    /// Height- and retention-aware post-quantum equivocation slash (Ruleset v7 / W3).
+    ///
+    /// - When [`crate::pq_registry::pq_lifecycle_active_at`]`(now_height)` is `true`,
+    ///   resolves the voting key STRICTLY via
+    ///   [`crate::pq_registry::PqRegistry::pq_key_at_height_within_retention`]
+    ///   at `(evidence.voter, evidence.height, now_height)` — never falling back
+    ///   to head `validator_pq_keys` if the key is pruned or outside retention.
+    /// - Before W3 activation (`!pq_lifecycle_active_at(now_height)`), uses
+    ///   `pq_key_at_height_within_retention` if the validator already has a
+    ///   record in `pq_registry`, or falls back to `self.validator_pq_keys` if
+    ///   not yet migrated into `pq_registry`.
+    /// - Verifies both signatures and executes the exact same deduplication and
+    ///   slashing rules as [`Self::slash_pq_equivocation`].
+    pub fn slash_pq_equivocation_at_height(
+        &mut self,
+        pq_registry: &crate::pq_registry::PqRegistry,
+        evidence: &CompactPqEquivocationEvidence,
+        is_micro_committee: bool,
+        now_height: u64,
+    ) -> Result<u64, StakingError> {
+        if evidence.block_hash_a == evidence.block_hash_b {
+            return Ok(0);
+        }
+        if !self.validators.contains_key(&evidence.voter) {
+            return Err(StakingError::NotValidator);
+        }
+
+        let w3_active = crate::pq_registry::pq_lifecycle_active_at(now_height);
+        let key = if w3_active || pq_registry.record_of(&evidence.voter).is_some() {
+            pq_registry.pq_key_at_height_within_retention(
+                &evidence.voter,
+                evidence.height,
+                now_height,
+            )
+        } else {
+            self.validator_pq_keys
+                .get(&evidence.voter)
+                .map(|(s, pk)| (*s, pk.clone()))
+        };
+
+        let Some((scheme, pubkey)) = key else {
+            tracing::warn!(
+                "PQ equivocation REFUSED for {} at evidence height {} (now {}): no authoritative PQ key within retention",
+                hex::encode(evidence.voter),
+                evidence.height,
+                now_height,
+            );
+            return Err(StakingError::InvalidSignature);
+        };
+        self.slash_pq_equivocation_with_key(evidence, is_micro_committee, scheme, pubkey)
+    }
+
+    fn slash_pq_equivocation_with_key(
+        &mut self,
+        evidence: &CompactPqEquivocationEvidence,
+        is_micro_committee: bool,
+        scheme: crate::post_quantum::PqScheme,
+        pubkey: Vec<u8>,
+    ) -> Result<u64, StakingError> {
         if scheme.is_disabled() {
             tracing::warn!(
                 "PQ equivocation REFUSED for {}: scheme {} has no verifier",
@@ -4108,6 +4715,63 @@ impl StakingLedger {
         Ok(())
     }
 
+    /// W4 `FEE_MARKET_V2`: distribute a share of COLLECTED FEES to the
+    /// proposer's validator without minting anything.
+    ///
+    /// Same accrual math as [`Self::distribute_reward`] (commission to the
+    /// validator, the rest through the lazy delegator accumulator) but with two
+    /// deliberate differences, both load-bearing:
+    /// * it never touches `rewards_minted` and never checks
+    ///   [`REWARDS_EMISSION_CAP`] — these are existing coins moved from
+    ///   transaction fees, not new issuance;
+    /// * it still refuses a jailed or zero-stake validator fail-closed, so the
+    ///   caller can route the share to the proposer instead of burning backing
+    ///   it never credited.
+    ///
+    /// The caller credits `REWARDS_POOL` natively with the SAME amount, keeping
+    /// the 1:1 pool backing the claim path depends on.
+    pub fn distribute_fee_reward(
+        &mut self,
+        validator: ValidatorId,
+        reward: u64,
+    ) -> Result<(), StakingError> {
+        let (total, delegated, commission_bps) = {
+            let v = self
+                .validators
+                .get(&validator)
+                .ok_or(StakingError::NotValidator)?;
+            (v.total(), v.delegated, v.commission_bps)
+        };
+        if self.jail.contains_key(&validator) {
+            return Err(StakingError::Jailed);
+        }
+        if reward == 0 {
+            return Ok(());
+        }
+        if total == 0 {
+            return Err(StakingError::NotValidator);
+        }
+        self.rewards_pool = self
+            .rewards_pool
+            .checked_add(reward)
+            .ok_or(StakingError::RewardsCapExceeded)?;
+        let delegated_share = (reward as u128 * delegated as u128 / total as u128) as u64;
+        let commission =
+            (delegated_share as u128 * commission_bps as u128 / BPS_DENOMINATOR as u128) as u64;
+        let validator_reward = reward - delegated_share + commission;
+        if let Some(v) = self.validators.get_mut(&validator) {
+            v.pending_rewards = v.pending_rewards.saturating_add(validator_reward);
+        }
+        let delegator_pool = delegated_share - commission;
+        if delegated > 0 && delegator_pool > 0 {
+            self.reward_accumulators
+                .entry(validator)
+                .or_default()
+                .accrue(delegator_pool, delegated);
+        }
+        Ok(())
+    }
+
     /// The validator's current scaled reward rate (the accumulator value).
     fn reward_rate(&self, validator: &ValidatorId) -> u128 {
         self.reward_accumulators
@@ -4115,7 +4779,6 @@ impl StakingLedger {
             .map(|a| a.reward_per_token)
             .unwrap_or(0)
     }
-
     /// The delegator's UNSETTLED entitlement for `validator`: what the
     /// accumulator says it has earned since its last settlement.
     ///

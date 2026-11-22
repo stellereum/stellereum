@@ -927,7 +927,7 @@ impl LightHeader {
             if vp == 0 {
                 continue; // membership first: a valid signature is not evidence
             }
-            if let Some((scheme, pk)) = crate::consensus::get_validator_pq_key(pubkey) {
+            if let Some((scheme, pk)) = crate::consensus::pq_key_at_height(pubkey, self.height) {
                 if pure_pq && (!scheme.is_post_quantum() || scheme.is_disabled()) {
                     continue; // classical/disabled registration lends no power in pure-PQ
                 }

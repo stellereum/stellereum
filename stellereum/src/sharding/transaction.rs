@@ -745,6 +745,22 @@ impl Transaction {
     ///   deterministically; `gas_limit` is carried verbatim as the nano fee
     ///   so consensus verification stays a pure function of the tx bytes).
     pub fn verify_evm_signature(&self) -> bool {
+        // Legacy entry point: the pre-activation (truncating) sub-nano policy,
+        // byte-identical to the historical behaviour. Consensus callers that
+        // KNOW the block height use `verify_evm_signature_at_height`.
+        self.verify_evm_signature_at(false)
+    }
+
+    /// Height-aware [`Self::verify_evm_signature`]: once
+    /// `SUB_NANO_STRICT_ACTIVATION_HEIGHT` is reached a Wei value that is not a
+    /// whole nano-STELL is refused (`wei_to_nano_exact`), instead of being
+    /// silently truncated. Below the gate the legacy truncation is preserved so
+    /// historical blocks re-apply deterministically.
+    pub fn verify_evm_signature_at_height(&self, height: u64) -> bool {
+        self.verify_evm_signature_at(crate::tokenomics::sub_nano_strict_active_at(height))
+    }
+
+    fn verify_evm_signature_at(&self, strict_sub_nano: bool) -> bool {
         let Some(raw) = self.evm_raw() else {
             return false;
         };
@@ -779,7 +795,13 @@ impl Transaction {
         if decoded.gas_limit() != self.gas_limit {
             return false;
         }
-        if crate::evm_adapter::wei_to_nano(decoded.value()) != self.amount {
+        if strict_sub_nano {
+            // No silent truncation: a 1.5-nano intent is refused outright.
+            match crate::evm_adapter::wei_to_nano_exact(decoded.value()) {
+                Ok(nano) if nano == self.amount => {}
+                _ => return false,
+            }
+        } else if crate::evm_adapter::wei_to_nano(decoded.value()) != self.amount {
             return false;
         }
         // EVM-settled transactions carry no SVM payload (no mixed execution

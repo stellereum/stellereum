@@ -14,6 +14,20 @@ use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::storage::{ConsensusCheckpoint, Storage};
 
+/// sled releases its exclusive flock asynchronously after the handle is
+/// dropped; under a parallel gate run the reopen can observe `WouldBlock` for
+/// a few tens of milliseconds. Retry (bounded) instead of flaking — the
+/// assertions that follow are unchanged.
+fn reopen_store(dir: &std::path::Path) -> Storage {
+    for _ in 0..40 {
+        match Storage::open(dir) {
+            Ok(s) => return s,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
+    Storage::open(dir).expect("reopen the store after the previous handle is released")
+}
+
 fn det32(seed: u8, i: u64) -> [u8; 32] {
     let mut b = [seed; 32];
     b[..8].copy_from_slice(&i.to_be_bytes());
@@ -56,7 +70,8 @@ fn det_block(height: u64, ntx: usize) -> Block {
         mmr_epoch_root: [0u8; 32],
         cnvrf_v3: None,
         round: 0,
-    }}
+    }
+}
 
 fn tmpdir(tag: &str) -> std::path::PathBuf {
     // Process-unique AND test-unique: a monotonic counter removes the
@@ -195,7 +210,7 @@ fn batched_writes_survive_reopen() {
         // see everything the flush barrier covered.
     }
     {
-        let st = Storage::open(&dir).unwrap();
+        let st = reopen_store(&dir);
         let got = st.get_block(&bh_final).unwrap().expect("body survives");
         assert_eq!(got.height, 3);
         assert_eq!(st.finalized().unwrap().unwrap(), (3, bh_final));

@@ -37,6 +37,20 @@ const CAP: usize = 50_000;
 /// Oldest height that fits in the 50k window (55_000 - 50_000 + 1).
 const FIRST_KEPT_HEIGHT: u64 = TOTAL - CAP as u64 + 1;
 
+/// sled releases its exclusive flock asynchronously after the handle is
+/// dropped; under a parallel gate run the reopen can observe `WouldBlock` for
+/// a few tens of milliseconds. Retry (bounded) instead of flaking — the
+/// assertions that follow are unchanged.
+fn reopen_store(dir: &std::path::Path) -> Storage {
+    for _ in 0..40 {
+        match Storage::open(dir) {
+            Ok(s) => return s,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
+    Storage::open(dir).expect("reopen the store after the previous handle is released")
+}
+
 fn tx_hash(height: u64) -> [u8; 32] {
     // Deliberately NOT ordered by height: a lexicographic slice of these hashes
     // is the bug's trigger.
@@ -125,7 +139,7 @@ async fn restart_hydrates_newest_receipts_not_a_hash_prefix() {
     );
 
     // Restart: reopen the store and read the tip window.
-    let st = Storage::open(&dir).expect("reopen store");
+    let st = reopen_store(&dir);
     let latest = st.latest_receipts_capped(CAP).expect("latest receipts");
     assert_eq!(latest.len(), CAP, "a full 50k tip window");
     assert_eq!(
@@ -201,7 +215,7 @@ fn prune_removes_receipts_from_the_tip_index() {
     drop(st);
 
     // The invariant survives a restart.
-    let st = Storage::open(&dir).expect("reopen store");
+    let st = reopen_store(&dir);
     assert_eq!(
         st.latest_receipts_capped(10_000).expect("latest").len(),
         100
@@ -237,7 +251,7 @@ fn open_backfills_tip_index_for_a_pre_upgrade_store() {
         drop(st);
     }
 
-    let st = Storage::open(&dir).expect("reopen store");
+    let st = reopen_store(&dir);
     assert_eq!(
         st.receipts_by_height_tree_for_test().len(),
         64,

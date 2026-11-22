@@ -92,7 +92,7 @@ fn current_shape_still_decodes_directly() {
 #[test]
 fn v7_pre_jail_trio_bytes_decode_with_empty_new_maps() {
     use stellereum::staking::{StakingLedger, MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
-    use stellereum::storage::{DomainSnapshotV7, StakingLedgerV4};
+    use stellereum::storage::{DomainSnapshotV7, StakingLedgerV4, ValidatorStakeV1};
 
     // A live ledger in the V7-era shape: bonded, delegated, and carrying
     // LAZY accumulator state (the whole point of V7 over V3 is that the
@@ -111,9 +111,27 @@ fn v7_pre_jail_trio_bytes_decode_with_empty_new_maps() {
 
     // The OLD bytes: the ledger WITHOUT the three jail-trio maps —
     // byte-identical to what a pre-upgrade node wrote.
+    let v1_validators = live
+        .validators
+        .iter()
+        .map(|(k, v)| {
+            (
+                *k,
+                ValidatorStakeV1 {
+                    self_bond: v.self_bond,
+                    delegated: v.delegated,
+                    commission_bps: v.commission_bps,
+                    pending_rewards: v.pending_rewards,
+                    total_slashed: v.total_slashed,
+                    missed: v.missed,
+                    last_downtime_penalty: v.last_downtime_penalty,
+                },
+            )
+        })
+        .collect();
     let old = DomainSnapshotV7 {
         staking: StakingLedgerV4 {
-            validators: live.validators.clone(),
+            validators: v1_validators,
             delegations: live.delegations.clone(),
             delegator_rewards: live.delegator_rewards.clone(),
             unbonding: live.unbonding.clone(),
@@ -188,7 +206,7 @@ fn v7_pre_jail_trio_bytes_decode_with_empty_new_maps() {
 #[test]
 fn v8_ledger_bytes_decode_with_empty_full_exit_map_and_current_roundtrips_it() {
     use stellereum::staking::StakingLedger as Ledger;
-    use stellereum::storage::{DomainSnapshotV8, StakingLedgerV5};
+    use stellereum::storage::{DomainSnapshotV8, StakingLedgerV5, ValidatorStakeV1};
 
     let mut live = Ledger::default();
     let v = [0x43u8; 32];
@@ -208,9 +226,27 @@ fn v8_ledger_bytes_decode_with_empty_full_exit_map_and_current_roundtrips_it() {
     assert_eq!(back.staking.full_exits_at(7), vec![(v, MIN_VALIDATOR_BOND)]);
 
     // Pre-field shape (V5) drops to an empty map — exact at a block boundary.
+    let v1_validators = live
+        .validators
+        .iter()
+        .map(|(k, v)| {
+            (
+                *k,
+                ValidatorStakeV1 {
+                    self_bond: v.self_bond,
+                    delegated: v.delegated,
+                    commission_bps: v.commission_bps,
+                    pending_rewards: v.pending_rewards,
+                    total_slashed: v.total_slashed,
+                    missed: v.missed,
+                    last_downtime_penalty: v.last_downtime_penalty,
+                },
+            )
+        })
+        .collect();
     let old = DomainSnapshotV8 {
         staking: StakingLedgerV5 {
-            validators: live.validators.clone(),
+            validators: v1_validators,
             delegations: live.delegations.clone(),
             delegator_rewards: live.delegator_rewards.clone(),
             unbonding: live.unbonding.clone(),

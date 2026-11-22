@@ -2186,6 +2186,36 @@ pub fn eth_estimate_gas_with_floor(params: &Value, floor: u64) -> Result<String,
     Ok(format_u64_hex(est.max(floor)))
 }
 
+/// Converts a reward percentile in `[0, 100]` into integer millionths
+/// (`p_micro = round(p * 10_000)`).
+///
+/// This is the ONLY place `eth_feeHistory` converts a percentile to/from
+/// `f64`; every returned Wei value is then computed with integer arithmetic.
+/// Non-finite (`NaN`, `±inf`) and out-of-range input is refused, never
+/// coerced.
+fn reward_percentile_micro(p: f64) -> Result<u128, JsonRpcError> {
+    if !p.is_finite() || !(0.0..=100.0).contains(&p) {
+        return Err(JsonRpcError::invalid_params(format!(
+            "percentile must be a finite number between 0 and 100, got {p}"
+        )));
+    }
+    Ok((p * 10_000.0).round() as u128)
+}
+
+/// Integer `(value * p_micro + 500_000) / 1_000_000` (round half up) without
+/// `f64` and without overflowing `u128`.
+///
+/// Splits `value` into whole and remainder millionths, so `whole * p_micro`
+/// never exceeds `value` (as `p_micro <= 1_000_000`) and only the small
+/// remainder product is scaled. Mathematically identical to the naive formula.
+fn percent_of_u128_round(value: u128, p_micro: u128) -> u128 {
+    let whole = value / 1_000_000;
+    let rem = value % 1_000_000;
+    whole
+        .saturating_mul(p_micro)
+        .saturating_add((rem.saturating_mul(p_micro).saturating_add(500_000)) / 1_000_000)
+}
+
 /// Core implementation of `eth_feeHistory`.
 pub fn fee_history_impl(
     params: &Value,
@@ -2235,6 +2265,17 @@ pub fn fee_history_impl(
         Some(v) => parse_reward_percentiles(v)?,
         None => None,
     };
+    // Convert every percentile to integer millionths ONCE, fail-closed. From
+    // here on no `f64` touches a returned value (W4 §2.3 п.5).
+    let percentile_micros = match reward_percentiles {
+        Some(percentiles) => Some(
+            percentiles
+                .into_iter()
+                .map(reward_percentile_micro)
+                .collect::<Result<Vec<u128>, JsonRpcError>>()?,
+        ),
+        None => None,
+    };
 
     let actual_count = block_count.min(newest_block + 1);
     let oldest_block_num = newest_block + 1 - actual_count;
@@ -2244,18 +2285,18 @@ pub fn fee_history_impl(
     let base_fee_per_gas = vec![base_fee_hex; (actual_count + 1) as usize];
     let gas_used_ratio = vec![gas_used_ratio_val; actual_count as usize];
 
-    let reward = reward_percentiles.map(|percentiles| {
+    let reward = percentile_micros.map(|percentiles| {
         (0..actual_count)
             .map(|_| {
                 percentiles
                     .iter()
-                    .map(|&p| {
-                        let tip = if max_priority_fee == 0 || p <= 0.0 {
+                    .map(|&p_micro| {
+                        let tip = if max_priority_fee == 0 || p_micro == 0 {
                             0
-                        } else if p >= 100.0 {
+                        } else if p_micro >= 1_000_000 {
                             max_priority_fee
                         } else {
-                            ((max_priority_fee as f64) * (p / 100.0)).round() as u128
+                            percent_of_u128_round(max_priority_fee, p_micro)
                         };
                         format_u128_hex(tip)
                     })
@@ -3039,4 +3080,69 @@ pub fn eth_getUncleByBlockNumberAndIndex(
     index: u64,
 ) -> Result<Option<Value>, JsonRpcError> {
     eth_get_uncle_by_block_number_and_index(tag, index)
+}
+
+#[cfg(test)]
+mod fee_history_percentile_tests {
+    use super::*;
+
+    #[test]
+    fn percentiles_on_boundaries_are_integer_exact() {
+        let hist = fee_history_impl(
+            &json!([1, 0, [0.0, 50.0, 100.0]]),
+            0,
+            DEFAULT_BASE_FEE,
+            DEFAULT_MAX_PRIORITY_FEE,
+            0.5,
+        )
+        .expect("fee history");
+        let reward = hist.reward.expect("rewards");
+        assert_eq!(reward.len(), 1);
+        // 0% -> 0, 50% of 1 Gwei -> 500_000_000, 100% -> 1_000_000_000.
+        assert_eq!(
+            reward[0],
+            vec![
+                "0x0".to_string(),
+                "0x1dcd6500".to_string(),
+                "0x3b9aca00".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn fractional_percentile_rounds_to_integer_micros() {
+        // 12.3456% of 1 Gwei = 123_456_000 wei exactly (p_micro = 123_456).
+        let hist = fee_history_impl(
+            &json!([1, 0, [12.3456]]),
+            0,
+            DEFAULT_BASE_FEE,
+            DEFAULT_MAX_PRIORITY_FEE,
+            0.5,
+        )
+        .expect("fee history");
+        assert_eq!(hist.reward.unwrap()[0][0], "0x75bca00");
+    }
+
+    #[test]
+    fn percentile_round_half_up_without_float_result() {
+        // 1 wei * 50% = 0.5 wei -> rounds to 1 wei.
+        assert_eq!(percent_of_u128_round(1, 500_000), 1);
+        // 1 wei * 25% = 0.25 wei -> rounds to 0.
+        assert_eq!(percent_of_u128_round(1, 250_000), 0);
+        // u128::MAX at 100% must not overflow or panic.
+        assert_eq!(percent_of_u128_round(u128::MAX, 1_000_000), u128::MAX);
+    }
+
+    #[test]
+    fn non_finite_percentiles_are_refused_without_panic() {
+        for raw in [json!([1, 0, ["NaN"]]), json!([1, 0, ["inf"]])] {
+            let err = fee_history_impl(&raw, 0, DEFAULT_BASE_FEE, DEFAULT_MAX_PRIORITY_FEE, 0.5)
+                .expect_err("non-finite percentile must be refused");
+            assert_eq!(err.code, INVALID_PARAMS_CODE);
+        }
+        assert!(reward_percentile_micro(f64::NAN).is_err());
+        assert!(reward_percentile_micro(f64::INFINITY).is_err());
+        assert!(reward_percentile_micro(-0.5).is_err());
+        assert!(reward_percentile_micro(100.5).is_err());
+    }
 }

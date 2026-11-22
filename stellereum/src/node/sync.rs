@@ -454,6 +454,13 @@ pub(crate) async fn try_snapshot_sync(
 
         // The snapshot's root is verified. Record the boundary so the normal
         // machinery continues from here.
+        {
+            let pq_reg = rt.state.pq_registry_read().await;
+            let active = stellereum::pq_registry::pq_lifecycle_active_at(boundary);
+            if active || !pq_reg.is_empty() {
+                stellereum::consensus::sync_committed_pq_registry(&pq_reg, active);
+            }
+        }
         //
         // Safety invariant (W1 §2.6): snapshot sync NEVER clears, overwrites, or
         // resets `safety_record_v1`, `ConsensusCheckpoint`, or `VoteWatermark`;
@@ -1292,6 +1299,13 @@ async fn walk_chain_once(
             rt.parent_evidence_missing = false;
         }
         rt.apply_and_advance(bh, &b).await;
+        {
+            let pq_reg = rt.state.pq_registry_read().await;
+            let active = stellereum::pq_registry::pq_lifecycle_active_at(b.height);
+            if active || !pq_reg.is_empty() {
+                stellereum::consensus::sync_committed_pq_registry(&pq_reg, active);
+            }
+        }
         // Replication for walked heights (same as the adopt path): file this
         // application's outcome so the serve path covers walked heights
         // too. Verified data only: every block here passed validate_sync_chain

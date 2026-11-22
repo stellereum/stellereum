@@ -600,6 +600,10 @@ pub struct Node {
     /// R6: unix-ms завершения последнего persist'а kv (0 = ещё не было).
     /// От него же отсчитывается debounce-окно.
     kv_last_flush_ms: AtomicI64,
+    /// Unix-ms последнего `KvStore::sweep` в `persist_kv_inner` (0 = ещё не было).
+    /// Троттлится до `KV_SWEEP_INTERVAL_MS` (10 с), чтобы частые flush не держали
+    /// write-лок на полном `retain` всей карты.
+    kv_last_sweep_ms: AtomicI64,
     /// R6: debounce-окно kv-флуша (мс). Поле, а не константа — тесты
     /// переопределяют, чтобы проверять окно без реальных пауз.
     kv_debounce_ms: AtomicU64,
@@ -678,6 +682,11 @@ const KV_BACKUP_INTERVAL_MS: i64 = 5 * 60 * 1000;
 /// занимает секунды — окно от конца гарантирует паузу, а не только паузу
 /// между стартами). Тесты подменяют значение через `Node::kv_debounce_ms`.
 const KV_FLUSH_DEBOUNCE_MS: u64 = 300_000;
+
+/// Минимальный интервал между `KvStore::sweep` внутри `persist_kv_inner` (мс).
+/// При частых flush не гоняем полный `HashMap::retain` под write-локом чаще
+/// раза в 10 с (при `kv_debounce_ms < 1000` в тестах sweep выполняется всегда).
+const KV_SWEEP_INTERVAL_MS: i64 = 10_000;
 
 /// Хвост `persist_kv`: ротация бэкапов + атомарная запись kv.json.
 /// Вынесено из async-контекста: весь файловый I/O выполняется в
@@ -901,6 +910,7 @@ impl Node {
             gates: PersistGates::new(),
             kv_dirty: AtomicBool::new(false),
             kv_last_flush_ms: AtomicI64::new(0),
+            kv_last_sweep_ms: AtomicI64::new(0),
             kv_debounce_ms: AtomicU64::new(
                 std::env::var("INFNODE_KV_DEBOUNCE_MS")
                     .ok()
@@ -4643,9 +4653,11 @@ impl Node {
     /// Хвост persist_kv. R6 (см. также `kv_persist_tail`):
     ///  * dirty очищается ДО снапшота — мутация после этого момента снова
     ///    поднимет флаг (паттерн outbox_dirty), ничего не теряется;
-    ///  * снапшот — один `Arc::clone` под read-локом (ранее здесь клонировалась
-    ///    ВСЯ карта, 48–85 МБ, прямо на async-воркере);
-    ///  * сериализация (≈1+ с CPU на 85 МБ) и запись едут ВНУТРИ
+    ///  * sweep под write-локом выполняется не чаще `KV_SWEEP_INTERVAL_MS`
+    ///    (или всегда в тестах при `kv_debounce_ms < 1000`);
+    ///  * снапшот — `Vec<(String, Arc<StoredValue>)>` под read-локом (0 байт
+    ///    копирования `StoredValue.value`; последующие мутации не клонируют карту);
+    ///  * сериализация (`serialize_kv_snapshot`) и запись едут ВНУТРИ
     ///    spawn_blocking под kv-гейтом: воркер не сжигает секунды на serde,
     ///    а из-за per-file гейтов outbox/subs/routes/dht.json за НИМ не ждут;
     ///  * стадии (gate/serialize/write) логируются только при >=200мс —
@@ -4653,67 +4665,77 @@ impl Node {
     async fn persist_kv_inner(&self, cause: &'static str) {
         let t0 = std::time::Instant::now();
         self.kv_dirty.store(false, Ordering::SeqCst);
-        // (a) Мёртвое выкидываем ДО снапшота, а не только при чтении:
-        // просроченные записи + dedup:* старше DEDUP_TTL_MS (см. KvStore::sweep).
-        let (swept, swept_dedup, swept_out) = self.kv.write().await.sweep(crate::dht::now_ms());
-        if swept > 0 {
-            crate::log::emit(
-                2,
-                "info",
-                &self.cfg.name,
-                0,
-                "kv_swept",
-                json!({ "removed": swept, "dedup": swept_dedup }),
-            );
-        }
-        // Sweep orphan chunks: an expired manifest whose chunk files stay on
-        // disk leaks forever (audit 2026-10-06: chunks/ 658M vs kv 113M).
-        // Only manifest-shaped values (JSON object with a "chunks" array)
-        // trigger deletes; plain kv/dedup entries never match the prefilter.
-        // Best-effort: a missing file or unparsable value just skips.
-        let mut swept_files: Vec<std::path::PathBuf> = Vec::new();
-        for (k, v) in &swept_out {
-            if !v.contains("\"chunks\"") {
-                continue;
+        // (a) Мёртвое выкидываем ДО снапшота, но не чаще раза в KV_SWEEP_INTERVAL_MS
+        // (или всегда при первом вызове / в тестах с kv_debounce_ms < 1000),
+        // чтобы при частых flush не гонять полный retain под write-локом.
+        let sweep_now = crate::dht::now_ms();
+        let last_sweep = self.kv_last_sweep_ms.load(Ordering::SeqCst);
+        let should_sweep = last_sweep == 0
+            || sweep_now.saturating_sub(last_sweep) >= KV_SWEEP_INTERVAL_MS
+            || self.kv_debounce_ms.load(Ordering::SeqCst) < 1_000;
+        if should_sweep {
+            let (swept, swept_dedup, swept_out) = self.kv.write().await.sweep(sweep_now);
+            self.kv_last_sweep_ms
+                .store(crate::dht::now_ms(), Ordering::SeqCst);
+            if swept > 0 {
+                crate::log::emit(
+                    2,
+                    "info",
+                    &self.cfg.name,
+                    0,
+                    "kv_swept",
+                    json!({ "removed": swept, "dedup": swept_dedup }),
+                );
             }
-            let Ok(manifest) = serde_json::from_str::<serde_json::Value>(v) else {
-                continue;
-            };
-            let Some(chunks) = manifest.get("chunks").and_then(|c| c.as_array()) else {
-                continue;
-            };
-            let Some((bucket, _)) = k.split_once(':') else {
-                continue;
-            };
-            let dir = self.chunks_dir(bucket);
-            for c in chunks {
-                if let Some(cid) = c.get("id").and_then(|i| i.as_str()) {
-                    swept_files.push(dir.join(cid));
+            // Sweep orphan chunks: an expired manifest whose chunk files stay on
+            // disk leaks forever (audit 2026-10-06: chunks/ 658M vs kv 113M).
+            // Only manifest-shaped values (JSON object with a "chunks" array)
+            // trigger deletes; plain kv/dedup entries never match the prefilter.
+            // Best-effort: a missing file or unparsable value just skips.
+            let mut swept_files: Vec<std::path::PathBuf> = Vec::new();
+            for (k, v) in &swept_out {
+                if !v.contains("\"chunks\"") {
+                    continue;
+                }
+                let Ok(manifest) = serde_json::from_str::<serde_json::Value>(v) else {
+                    continue;
+                };
+                let Some(chunks) = manifest.get("chunks").and_then(|c| c.as_array()) else {
+                    continue;
+                };
+                let Some((bucket, _)) = k.split_once(':') else {
+                    continue;
+                };
+                let dir = self.chunks_dir(bucket);
+                for c in chunks {
+                    if let Some(cid) = c.get("id").and_then(|i| i.as_str()) {
+                        swept_files.push(dir.join(cid));
+                    }
                 }
             }
-        }
-        let swept_chunks = swept_files.len();
-        if !swept_files.is_empty() {
-            tokio::task::spawn_blocking(move || {
-                for path in swept_files {
-                    let _ = std::fs::remove_file(path);
-                }
-            });
-        }
-        if swept_chunks > 0 {
-            crate::log::emit(
-                2,
-                "info",
-                &self.cfg.name,
-                0,
-                "kv_swept_chunks",
-                json!({ "deleted": swept_chunks }),
-            );
+            let swept_chunks = swept_files.len();
+            if !swept_files.is_empty() {
+                tokio::task::spawn_blocking(move || {
+                    for path in swept_files {
+                        let _ = std::fs::remove_file(path);
+                    }
+                });
+            }
+            if swept_chunks > 0 {
+                crate::log::emit(
+                    2,
+                    "info",
+                    &self.cfg.name,
+                    0,
+                    "kv_swept_chunks",
+                    json!({ "deleted": swept_chunks }),
+                );
+            }
         }
         let t_snap = std::time::Instant::now();
-        let map = self.kv.read().await.entries_snapshot();
+        let snapshot = self.kv.read().await.entries_snapshot();
         let snap_us = t_snap.elapsed().as_micros() as u64;
-        let entries = map.len();
+        let entries = snapshot.len();
         let t_gate = std::time::Instant::now();
         let _gate = self.gates.kv.lock().await;
         let gate_ms = t_gate.elapsed().as_millis() as u64;
@@ -4721,9 +4743,10 @@ impl Node {
         let m = self.metrics.clone();
         let t_block = std::time::Instant::now();
         let written = tokio::task::spawn_blocking(move || {
-            // сериализация ЗДЕСЬ: вне async-воркера, вне какого-либо лока
+            // сериализация ЗДЕСЬ: вне async-воркера, вне какого-либо лока,
+            // без аллокации промежуточной HashMap и без копирования значений.
             let t_ser = std::time::Instant::now();
-            let json = serde_json::to_string(map.as_ref());
+            let json = crate::dht::serialize_kv_snapshot(&snapshot);
             let ser_ms = t_ser.elapsed().as_millis() as u64;
             let t_wr = std::time::Instant::now();
             let bytes = match json {
@@ -5286,8 +5309,12 @@ impl Node {
                         .into_bytes(),
                 );
             }
-            let local_sa = self.kv.read().await.stored_at(&key);
+            // Один проход под write-локом: избегаем двойного read -> write и
+            // гонки LWW между проверкой `stored_at` и записью.
+            let mut kv = self.kv.write().await;
+            let local_sa = kv.stored_at(&key);
             if sa <= local_sa {
+                drop(kv);
                 return Some(
                     json!({ "ok": true, "stored": key, "lww": "local" })
                         .to_string()
@@ -5297,10 +5324,8 @@ impl Node {
             // Replica with original age (audit 2026-10-06): preserve the
             // sender's clock so TTL fires on the original schedule instead of
             // resetting at every republish hop (immortal entries).
-            self.kv
-                .write()
-                .await
-                .store_replica(&key, value, ttl * 1000, self.id, sa);
+            kv.store_replica(&key, value, ttl * 1000, self.id, sa);
+            drop(kv);
             self.mark_kv_dirty();
             return Some(
                 json!({ "ok": true, "stored": key, "replica": true })
@@ -5310,17 +5335,17 @@ impl Node {
         }
         // No clock on the sender: keep a present local value (audit follow-up
         // — legacy peers used to clobber newer locals AND reset their age).
-        if self.kv.read().await.stored_at(&key) > 0 {
+        let mut kv = self.kv.write().await;
+        if kv.stored_at(&key) > 0 {
+            drop(kv);
             return Some(
                 json!({ "ok": true, "stored": key, "lww": "local-present" })
                     .to_string()
                     .into_bytes(),
             );
         }
-        self.kv
-            .write()
-            .await
-            .store(&key, value, ttl * 1000, self.id);
+        kv.store(&key, value, ttl * 1000, self.id);
+        drop(kv);
         // R6: всплеск dht.store => ОДНО отложенное сохранение, а не N полных
         // перезаписей kv.json ( response клиенту не меняется ).
         self.mark_kv_dirty();

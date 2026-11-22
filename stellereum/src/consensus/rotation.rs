@@ -59,7 +59,9 @@ static PQ_COMMITTED_REGISTRY: std::sync::LazyLock<
 /// semantics, reused not duplicated): when the validator has a tracked record,
 /// that record is authoritative fail-closed (`None` = no key at this height —
 /// unknown validator, pre-activation, or pruned history). Validators never
-/// tracked fall back to the legacy head map (pre-rotation nodes/tests).
+/// tracked fall back to the legacy head map only when
+/// [`crate::pq_registry::pq_lifecycle_active_at`]`(height)` is `false`;
+/// post-W3 activation reads strictly from `PQ_COMMITTED_REGISTRY` (fail-closed).
 /// Fail-closed in every doubt branch: `None` refuses verification.
 pub fn pq_key_at_height(
     validator: &ValidatorId,
@@ -72,7 +74,65 @@ pub fn pq_key_at_height(
         return reg.get_active_key(validator, height);
     }
     drop(reg);
+    if crate::pq_registry::pq_lifecycle_active_at(height) {
+        return None;
+    }
     get_validator_pq_key(validator)
+}
+
+/// Resolve the authoritative PQ key for `validator` AT `height` strictly from
+/// `PQ_COMMITTED_REGISTRY` without falling back to the legacy head map
+/// (`PQ_VALIDATOR_KEYS`). Used when [`crate::pq_registry::pq_lifecycle_active_at`]
+/// is active so process-local key overrides can never leak into verification.
+pub fn pq_key_at_height_strict(
+    validator: &ValidatorId,
+    height: Height,
+) -> Option<(crate::post_quantum::PqScheme, Vec<u8>)> {
+    let reg = PQ_COMMITTED_REGISTRY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    reg.get_active_key(validator, height)
+}
+
+/// Synchronize `PQ_COMMITTED_REGISTRY` from the committed on-chain
+/// [`crate::pq_registry::PqRegistry`] after block finalization or state restore.
+///
+/// When `clear_legacy_map` is `true` (post-W3 when
+/// [`crate::pq_registry::pq_lifecycle_active_at`] is active), clears legacy
+/// `PQ_VALIDATOR_KEYS` so all readers (`pq_key_at_height`) rely solely on the
+/// height-indexed `PQ_COMMITTED_REGISTRY` with no process-local leakage.
+///
+/// Calls `clear_verified_vote_cache()` ONLY when `PQ_COMMITTED_REGISTRY` or
+/// `PQ_VALIDATOR_KEYS` actually changed, avoiding cache flushes on empty ticks.
+pub fn sync_committed_pq_registry(reg: &crate::pq_registry::PqRegistry, clear_legacy_map: bool) {
+    let registry_changed = {
+        let mut committed = PQ_COMMITTED_REGISTRY
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if committed.records() != reg.records() {
+            *committed = reg.clone();
+            true
+        } else {
+            false
+        }
+    };
+
+    let legacy_cleared = if clear_legacy_map {
+        let mut legacy = PQ_VALIDATOR_KEYS.write().unwrap_or_else(|e| e.into_inner());
+        match legacy.as_mut() {
+            Some(map) if !map.is_empty() => {
+                map.clear();
+                true
+            }
+            Some(_) | None => false,
+        }
+    } else {
+        false
+    };
+
+    if registry_changed || legacy_cleared {
+        clear_verified_vote_cache();
+    }
 }
 
 /// Announce a PQ key rotation for tests: the replacement takes effect at

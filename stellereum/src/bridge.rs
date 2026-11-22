@@ -46,6 +46,97 @@ pub const HOURLY_DEPOSIT_LIMIT_NANO: u64 = 500_000 * 1_000_000_000; // 500,000 S
 pub const BRIDGE_MINT_CAP_NANO: u64 = 100_000_000 * 1_000_000_000; // 100M STELL, cumulative
 /// Refund-after-expiry grace past unlock_at (audit follow-up F-G).
 pub const REFUND_GRACE_SECS: u64 = 24 * 3600;
+
+/// Domain tag for the V2 payout-receipt signing preimage
+/// ([`release_receipt_signing_message_v2`]).
+///
+/// Separate from the V1 header domain (`STELL_BRIDGE_HEADER_V1`), the V2 header
+/// domain (`STELL_BRIDGE_HEADER_V2`), deposit claims, deposit retractions
+/// (`STELL_BRIDGE_DEPOSIT_FAILURE_V1`) and consensus votes/QCs: a signature
+/// over one statement can never be replayed as another.
+pub const BRIDGE_RELEASE_RECEIPT_DOMAIN_V2: &[u8] = b"STELL_BRIDGE_RELEASE_RECEIPT_V2";
+
+/// Safety buffer before `refund_at = unlock_at + REFUND_GRACE_SECS`.
+///
+/// External release orders MUST expire at or before
+/// `refund_at - PAYOUT_SAFETY_MARGIN_SECS` (24h - 4h = 20h relayer window), so
+/// foreign finality completes with a 4h quiet margin before the sender's
+/// native refund becomes available.
+pub const PAYOUT_SAFETY_MARGIN_SECS: u64 = 4 * 3600;
+
+/// Evidence that a parked withdrawal was PAID on the target chain, signed by
+/// the committed 2/3 Falcon-512 quorum at `attestation_height`.
+///
+/// Carried inside [`BridgeIntent::ReleaseProof`] and paired with
+/// [`BridgeIntent::Release`] in the same payload (the exact `Attest` /
+/// `DepositProof` pattern). The field layout is part of the signed receipt
+/// preimage; appending fields needs a new domain, never a silent extension.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseReceiptEvidence {
+    /// The parked withdrawal this receipt settles.
+    pub req_id: u64,
+    /// Target chain the payout landed on (must match the parked request).
+    pub target_chain: SupportedChain,
+    /// Target-chain address paid (must match the parked request, exactly).
+    pub target_address: String,
+    /// Amount paid (must equal the parked request amount, exactly).
+    pub amount: u64,
+    /// Non-zero foreign-chain payout transaction hash (unique across all
+    /// releases: [`BridgeState::processed_payout_txs`] refuses replays).
+    pub external_tx_hash: [u8; 32],
+    /// Foreign finalized block/seqno/slot observed past chain finality depth.
+    pub finalized_head: u64,
+    /// Committed Stellereum height whose active PQ keys signed this receipt.
+    pub attestation_height: u64,
+    /// Distinct Falcon-512 validator signatures over
+    /// [`release_receipt_signing_message_v2`].
+    pub signatures: Vec<([u8; 32], Vec<u8>)>,
+}
+
+/// Canonical V2 payout-receipt preimage
+/// (`docs/specs/06_BRIDGE_RELEASE_AUTHORIZATION_DRAFT.md §2.1`):
+///
+/// ```text
+/// domain (31B) || chain_id (8B BE) || req_id (8B BE) || target chain tag (1B)
+///   || target_address.len() as u32 (4B BE) || target_address bytes
+///   || amount (8B BE) || external_tx_hash (32B) || finalized_head (8B BE)
+///   || attestation_height (8B BE)
+/// ```
+///
+/// `chain_id` binds the receipt to one Stellereum network (no cross-network
+/// replay); the chain tag binds it to one target chain (no cross-chain
+/// transplant, e.g. Arbitrum vs Ethereum); the length-prefixed address keeps
+/// the preimage unambiguous for any address length.
+pub fn release_receipt_signing_message_v2(
+    chain_id: u64,
+    receipt: &ReleaseReceiptEvidence,
+) -> Vec<u8> {
+    let mut b = Vec::with_capacity(
+        BRIDGE_RELEASE_RECEIPT_DOMAIN_V2.len()
+            + 8
+            + 8
+            + 1
+            + 4
+            + receipt.target_address.len()
+            + 8
+            + 32
+            + 8
+            + 8,
+    );
+    b.extend_from_slice(BRIDGE_RELEASE_RECEIPT_DOMAIN_V2);
+    b.extend_from_slice(&chain_id.to_be_bytes());
+    b.extend_from_slice(&receipt.req_id.to_be_bytes());
+    b.push(bridge_adapters::StoredHeader::chain_tag(
+        receipt.target_chain,
+    ));
+    b.extend_from_slice(&(receipt.target_address.len() as u32).to_be_bytes());
+    b.extend_from_slice(receipt.target_address.as_bytes());
+    b.extend_from_slice(&receipt.amount.to_be_bytes());
+    b.extend_from_slice(&receipt.external_tx_hash);
+    b.extend_from_slice(&receipt.finalized_head.to_be_bytes());
+    b.extend_from_slice(&receipt.attestation_height.to_be_bytes());
+    b
+}
 /// Bond a challenger locks per dispute (optimistic layer 1). Scales with the
 /// disputed amount at [`CHALLENGE_BOND_BPS`] (1%), floored at
 /// [`CHALLENGE_BOND_NANO`] (1 STELL): freezing a whale deposit must cost
@@ -141,6 +232,66 @@ pub const CHALLENGE_MAX_AGE_SECS: u64 = 24 * 3600;
 pub const DISPUTE_REWARD_BPS: u64 = 1000;
 /// Masterchain confirmations required before a TON deposit is credited.
 pub const MIN_TON_CONFIRMATIONS: u64 = 12;
+
+// ============================================================================
+// BRIDGE-FIX-FULL activation gate (docs/specs/06_BRIDGE_RELEASE_AUTHORIZATION_
+// DRAFT.md §1.3). Single source of truth: `chain_spec.rs` mirrors this const
+// (BF-2a) and `protocol.rs` folds it into the fork id; this module never reads
+// wall clocks, env vars or the binary version to decide activation.
+// ============================================================================
+
+/// First Stellereum height at which the BRIDGE-FIX-FULL rules apply:
+/// receipt-bound `Release`, refund tombstones, challengeable evidence-path
+/// deposits, retraction-first `Resolve`, and height-indexed committed-PQ-key
+/// quorums.
+///
+/// Frozen at `u64::MAX` (`GatedOff`) in release builds until the coordinated
+/// Ruleset/FORK_ID bump lands: no environment variable can move this in a
+/// release build, and [`bridge_v2_active_at`] returns `false` at EVERY height
+/// (including `u64::MAX`) while the gate is `GatedOff`.
+pub const BRIDGE_V2_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static BRIDGE_V2_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear with `None`) the TEST/DEBUG-ONLY `BRIDGE_V2_ACTIVATION_HEIGHT`
+/// override for the calling thread. Absent from release builds.
+#[cfg(any(test, debug_assertions))]
+pub fn set_bridge_v2_activation_override(activation: Option<u64>) {
+    BRIDGE_V2_ACTIVATION_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// Effective `BRIDGE_V2_ACTIVATION_HEIGHT` for the calling thread.
+pub fn effective_bridge_v2_activation_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(h) = BRIDGE_V2_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    BRIDGE_V2_ACTIVATION_HEIGHT
+}
+
+/// True iff the BRIDGE-FIX-FULL rules are active at `height`.
+///
+/// Strictly returns `false` for every height (including `u64::MAX`) when the
+/// effective gate is `u64::MAX` (`GatedOff`) — the exact
+/// [`crate::pq_registry::pq_lifecycle_active_at`] shape, so a gated-off bridge
+/// can never be "accidentally active at the top of the range".
+pub fn bridge_v2_active_at(height: u64) -> bool {
+    let gate = effective_bridge_v2_activation_height();
+    gate != u64::MAX && height >= gate
+}
+
+/// Maximum age (in Stellereum heights) between a payout receipt's
+/// `attestation_height` and the block that settles it.
+///
+/// Bounded by [`crate::pq_registry::PQ_EVIDENCE_RETENTION_HEIGHTS`] (720,000
+/// heights): an older attestation could name a pruned historical key, which no
+/// committed height-indexed lookup can resolve any more.
+pub const MAX_BRIDGE_ATTESTATION_AGE_HEIGHTS: u64 =
+    crate::pq_registry::PQ_EVIDENCE_RETENTION_HEIGHTS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum SupportedChain {
@@ -269,6 +420,13 @@ pub enum BridgeIntent {
     /// `block.timestamp >= unlock_at`. Marks the committed record executed
     /// (exactly once); the external payout is the `MultisigRelayer`'s job over
     /// the same request id, which is why this moves no coins itself.
+    ///
+    /// BRIDGE-FIX-FULL (`height >= BRIDGE_V2_ACTIVATION_HEIGHT`): a bare
+    /// `Release` is REFUSED fail-closed. It must be paired in the same payload
+    /// with a [`BridgeIntent::ReleaseProof`] for the SAME `req_id` carrying a
+    /// quorum-signed [`ReleaseReceiptEvidence`]: proof that the external leg
+    /// actually paid. Pre-activation historical replay keeps the legacy
+    /// `finalize_withdrawal` behavior.
     Release { req_id: u64 },
     /// Adapter evidence FOR a [`BridgeIntent::Deposit`] claim, carried IN THE
     /// SAME TRANSACTION and paired by `source_tx_hash` - exactly the
@@ -374,6 +532,23 @@ pub enum BridgeIntent {
     ///   as fraud (SEC-01: that is what let a challenger farm the 10%
     ///   bounty on an honest deposit).
     Resolve { dispute_id: u64 },
+    // APPENDED variant — strictly LAST (same layout-stability rule):
+    // Resolve must stay discriminant 7 (test-pinned), so ReleaseProof takes 8.
+    /// Verified external payout receipt, paired in the SAME payload with the
+    /// [`BridgeIntent::Release`] it authorizes (paired by `req_id`).
+    ///
+    /// Alone in a payload it is inert and commits nothing (same as a lone
+    /// `Attest` / `DepositProof`). At
+    /// `height >= BRIDGE_V2_ACTIVATION_HEIGHT` a `Release` with no valid
+    /// `ReleaseProof` is refused, so an outsider can no longer destroy the
+    /// sender's refund path with an unauthenticated release.
+    ReleaseProof {
+        /// The parked withdrawal this receipt settles.
+        req_id: u64,
+        /// The signed payout evidence (boxed: keeps the enum small and the
+        /// bincode layout a pointer-free fixed discriminant + payload).
+        receipt: Box<ReleaseReceiptEvidence>,
+    },
 }
 
 impl BridgeIntent {
@@ -415,6 +590,15 @@ impl BridgeIntent {
                 if signatures.is_empty() {
                     return Err("bridge attestation must carry at least one signature".to_string());
                 }
+                // Audit B-ATTEST-DOS: an unbounded vector burned verify time
+                // before the quorum could ever count it.
+                if signatures.len() > bridge_adapters::MAX_HEADER_SIGNATURES {
+                    return Err(format!(
+                        "bridge attestation carries too many signatures ({}, max {})",
+                        signatures.len(),
+                        bridge_adapters::MAX_HEADER_SIGNATURES,
+                    ));
+                }
                 Ok(())
             }
             BridgeIntent::Release { .. } => {
@@ -450,6 +634,40 @@ impl BridgeIntent {
                 evidence
                     .validate_shape()
                     .map_err(|e| format!("bridge deposit proof refused: {e}"))?;
+                Ok(())
+            }
+            BridgeIntent::ReleaseProof { req_id, receipt } => {
+                // Cheap shape caps only; the pairing with `Release { req_id }`,
+                // the committed-queue match and the quorum need settlement
+                // state (see `BridgeState::plan_at_height`).
+                if receipt.req_id != *req_id {
+                    return Err(format!(
+                        "bridge release proof refused: receipt req_id {} does not match intent req_id {req_id}",
+                        receipt.req_id,
+                    ));
+                }
+                if receipt.external_tx_hash == [0u8; 32] {
+                    return Err(
+                        "bridge release proof refused: zero external payout tx hash".to_string()
+                    );
+                }
+                if receipt.target_address.trim().is_empty() {
+                    return Err("bridge release proof refused: empty target address".to_string());
+                }
+                if receipt.amount == 0 {
+                    return Err(
+                        "bridge release proof refused: payout amount must be positive".to_string(),
+                    );
+                }
+                if receipt.signatures.is_empty()
+                    || receipt.signatures.len() > bridge_adapters::MAX_HEADER_SIGNATURES
+                {
+                    return Err(format!(
+                        "bridge release proof refused: signature count {} outside 1..={}",
+                        receipt.signatures.len(),
+                        bridge_adapters::MAX_HEADER_SIGNATURES,
+                    ));
+                }
                 Ok(())
             }
         }
@@ -545,39 +763,125 @@ pub fn quorum_threshold(n: usize) -> usize {
     bridge_threshold(n)
 }
 
+/// Consensus-deterministic PQ key lookup AT a committed height
+/// (`docs/specs/06_BRIDGE_RELEASE_AUTHORIZATION_DRAFT.md §3.1`).
+///
+/// THE ONLY way bridge quorum code resolves a signer key. Implementations are
+/// PURE reads of committed state (no global locks, no env, no wall clock), so
+/// every node verifies the same signatures against the same keys:
+///
+/// * [`crate::pq_registry::PqRegistry`] - the committed, height-indexed
+///   registry (production post-`BRIDGE_V2_ACTIVATION_HEIGHT`);
+/// * `(&StakingLedger, &PqRegistry)` - the same registry gated on the
+///   committed staking ledger (unknown validator fails closed);
+/// * [`PreV2ConsensusLookup`] - the legacy pre-V2 fallback shape, used ONLY by
+///   the pre-activation replay wrappers.
+///
+/// `Send + Sync` so a `&dyn PqKeyLookup` can cross an `.await` inside the async
+/// settlement path, where the payload executor holds it while it awaits the
+/// bridge write lock, and inside spawned lanes.
+pub trait PqKeyLookup: Send + Sync {
+    /// Resolve the authoritative PQ key for `validator` AT committed `height`.
+    /// Returns `None` fail-closed if unknown, pre-activation, or pruned.
+    fn pq_key_at(
+        &self,
+        validator: &[u8; 32],
+        height: u64,
+    ) -> Option<(crate::post_quantum::PqScheme, Vec<u8>)>;
+}
+
+impl PqKeyLookup for crate::pq_registry::PqRegistry {
+    fn pq_key_at(
+        &self,
+        validator: &[u8; 32],
+        height: u64,
+    ) -> Option<(crate::post_quantum::PqScheme, Vec<u8>)> {
+        self.get_active_key(validator, height)
+    }
+}
+
+impl PqKeyLookup
+    for (
+        &crate::staking::StakingLedger,
+        &crate::pq_registry::PqRegistry,
+    )
+{
+    fn pq_key_at(
+        &self,
+        validator: &[u8; 32],
+        height: u64,
+    ) -> Option<(crate::post_quantum::PqScheme, Vec<u8>)> {
+        self.0.pq_active_key(self.1, validator, height)
+    }
+}
+
+/// Legacy pre-V2 key lookup: [`crate::consensus::pq_key_at_height`].
+///
+/// Used ONLY by the pre-activation replay wrappers
+/// ([`verify_quorum_signatures`], [`distinct_falcon_signers`],
+/// [`MultisigRelayer::count_signers`]) at `attestation_height = 0`, and only
+/// while `height < BRIDGE_V2_ACTIVATION_HEIGHT` semantics apply. Post-V2
+/// settlement passes the committed `(&staking, &pq_registry)` lookup instead,
+/// so the process-local `PQ_VALIDATOR_KEYS` head map is never consulted for
+/// live verification (`get_validator_pq_key` is not referenced by this module).
+pub struct PreV2ConsensusLookup;
+
+impl PqKeyLookup for PreV2ConsensusLookup {
+    fn pq_key_at(
+        &self,
+        validator: &[u8; 32],
+        height: u64,
+    ) -> Option<(crate::post_quantum::PqScheme, Vec<u8>)> {
+        crate::consensus::pq_key_at_height(validator, height)
+    }
+}
+
 /// Count DISTINCT committed validators that signed `msg`, failing CLOSED
 /// unless the 2/3 threshold is reached. THE shared quorum rule: the offline
-/// [`TeleportBridgeEngine::process_deposit`], the live [`BridgeState::plan`]
-/// path (through the engine) and the adapter's quorum-attested evidence
-/// ([`bridge_adapters::verify_quorum_evidence`]) all count through here, so
-/// the three cannot drift.
+/// [`TeleportBridgeEngine::process_deposit`], the live
+/// [`BridgeState::plan_at_height`] path (through the engine and the receipt
+/// checks) and the adapter's quorum-attested evidence all count through here,
+/// so the three cannot drift.
 ///
-/// FULL-PQ (FIXES §1.1, sketch §4.2): each `(id, sig)` is checked against
-/// the REGISTERED Falcon-512 key for `id`
-/// ([`crate::consensus::get_validator_pq_key`], read-only) and verified with
-/// [`crate::consensus::verify_falcon_signature`]:
-///
-/// * one vote per validator (a single key signing twice counts once —
-///   `BTreeSet` dedup);
-/// * the `[u8; 32]` id is Ed IDENTITY only — an Ed25519 signature never
-///   verifies as Falcon (length-gated to 666 bytes) and a registered
-///   non-Falcon scheme refuses fail-closed;
-/// * only keys in `validators` count; an UNKNOWN signer (not in the set, no
-///   registered PQ key, or non-Falcon scheme) refuses fail-closed with `Err`
-///   (never a silent skip that a quorum could route around);
-/// * an invalid Falcon signature from a KNOWN signer does not count (a
-///   garbage bundle is sub-quorum, not a crash);
-/// * an EMPTY validator set fails closed even though the arithmetic
-///   threshold would be 0;
-/// * deterministic: the RETURNED COUNT is the only observable (no pubkey
-///   bytes in errors, no hash-order iteration leaks into messages).
+/// PRE-V2 WRAPPER: this is the legacy entry point (no height, no committed
+/// registry). It delegates to [`verify_quorum_signatures_at_height`] at
+/// `attestation_height = 0` with [`PreV2ConsensusLookup`], preserving the
+/// historical behavior byte-for-byte. Post-V2 callers MUST use the
+/// height-indexed form with the committed `PqKeyLookup`.
 pub fn verify_quorum_signatures(
     msg: &[u8],
     sigs: &[([u8; 32], Vec<u8>)],
     validators: &[[u8; 32]],
 ) -> Result<usize, String> {
+    verify_quorum_signatures_at_height(msg, sigs, validators, 0, &PreV2ConsensusLookup)
+}
+
+/// Count DISTINCT committed validators that signed `msg` AT
+/// `attestation_height`, failing CLOSED unless the 2/3 threshold is reached.
+///
+/// Every `(id, sig)` is checked against the authoritative key resolved by
+/// `pq_keys.pq_key_at(id, attestation_height)`:
+///
+/// * one vote per validator (`BTreeSet` dedup), and only ids in `validators`
+///   count;
+/// * an EMPTY validator set fails closed even though the arithmetic threshold
+///   would be 0;
+/// * an UNKNOWN signer (not in the set, no committed PQ key at that height, or
+///   non-Falcon-512 scheme) refuses the WHOLE bundle with `Err` — never a
+///   silent skip a quorum could route around;
+/// * an invalid Falcon signature from a KNOWN signer does not count (a garbage
+///   bundle is sub-quorum, not a crash);
+/// * deterministic: the RETURNED COUNT is the only observable.
+pub fn verify_quorum_signatures_at_height(
+    msg: &[u8],
+    sigs: &[([u8; 32], Vec<u8>)],
+    validators: &[[u8; 32]],
+    attestation_height: u64,
+    pq_keys: &dyn PqKeyLookup,
+) -> Result<usize, String> {
     let need = bridge_threshold(validators.len());
-    let count = distinct_falcon_signers(msg, sigs, validators)?;
+    let count =
+        distinct_falcon_signers_at_height(msg, sigs, validators, attestation_height, pq_keys)?;
     if count >= need {
         Ok(count)
     } else {
@@ -587,18 +891,21 @@ pub fn verify_quorum_signatures(
     }
 }
 
-/// DISTINCT Falcon-512 signer count behind [`verify_quorum_signatures`] and
-/// [`MultisigRelayer::count_signers`]: `Ok` = number of distinct validators
-/// in `validators` whose REGISTERED Falcon-512 key verifies `msg`; `Err` =
-/// fail-closed refusal (empty set, or ANY unknown/non-Falcon signer entry).
+/// DISTINCT Falcon-512 signer count behind [`verify_quorum_signatures_at_height`]
+/// and [`MultisigRelayer::count_signers_at_height`]: `Ok` = number of distinct
+/// validators in `validators` whose key AT `attestation_height` verifies `msg`;
+/// `Err` = fail-closed refusal (empty set, or ANY unknown/non-Falcon signer
+/// entry, or no committed key at that height).
 ///
 /// Fail-closed direction: an unknown entry aborts the whole count with `Err`
 /// instead of being skipped, so a bundle smuggling an unregistered key can
 /// never reach quorum no matter how many valid signatures accompany it.
-fn distinct_falcon_signers(
+pub fn distinct_falcon_signers_at_height(
     msg: &[u8],
     sigs: &[([u8; 32], Vec<u8>)],
     validators: &[[u8; 32]],
+    attestation_height: u64,
+    pq_keys: &dyn PqKeyLookup,
 ) -> Result<usize, String> {
     if validators.is_empty() {
         return Err("bridge quorum: empty validator set refuses fail-closed".to_string());
@@ -615,8 +922,9 @@ fn distinct_falcon_signers(
                     .to_string(),
             );
         }
-        let (scheme, pk) = crate::consensus::get_validator_pq_key(id).ok_or_else(|| {
-            "bridge quorum: no registered PQ key for signer refused fail-closed".to_string()
+        let (scheme, pk) = pq_keys.pq_key_at(id, attestation_height).ok_or_else(|| {
+            "bridge quorum: no committed PQ key at attestation height refused fail-closed"
+                .to_string()
         })?;
         if scheme != crate::post_quantum::PqScheme::Falcon512 {
             return Err(
@@ -630,6 +938,16 @@ fn distinct_falcon_signers(
         seen.insert(*id);
     }
     Ok(seen.len())
+}
+
+/// PRE-V2 WRAPPER around [`distinct_falcon_signers_at_height`] (legacy
+/// signature, `attestation_height = 0`, [`PreV2ConsensusLookup`]).
+pub fn distinct_falcon_signers(
+    msg: &[u8],
+    sigs: &[([u8; 32], Vec<u8>)],
+    validators: &[[u8; 32]],
+) -> Result<usize, String> {
+    distinct_falcon_signers_at_height(msg, sigs, validators, 0, &PreV2ConsensusLookup)
 }
 
 pub struct TeleportBridgeEngine {
@@ -1074,11 +1392,58 @@ pub struct BridgeState {
     pub disputes: std::collections::BTreeMap<u64, Dispute>,
     /// Next dispute id handed out.
     pub next_dispute_id: u64,
+    /// Verified external payout receipts, keyed by withdrawal request id.
+    ///
+    /// Written ONLY by [`BridgeState::plan_at_height`] after a paired
+    /// [`BridgeIntent::ReleaseProof`] verified (quorum + binding + freshness).
+    /// An `executed = true` flag from before BRIDGE-FIX-FULL is NEVER
+    /// retroactively elevated into a receipt here (snapshot upgrade starts the
+    /// map empty): absence of a receipt means "no proven payout", which is the
+    /// fail-closed direction.
+    #[serde(default)]
+    pub release_receipts: std::collections::BTreeMap<u64, ReleaseReceiptRecord>,
+    /// Foreign payout transaction hashes already settled. The replay guard
+    /// across ALL withdrawals: one foreign tx can settle at most one release.
+    #[serde(default)]
+    pub processed_payout_txs: std::collections::BTreeSet<[u8; 32]>,
+    /// Refund tombstones: request ids refunded after BRIDGE-FIX-FULL activated.
+    ///
+    /// The tombstone survives the deletion of the parked request so a late
+    /// `Release`/`ReleaseProof` after a refund fails LOUDLY
+    /// (`"Withdrawal already refunded"`) instead of silently mutating absent
+    /// state. Pre-activation refunds are absent (legacy replay: deletion alone
+    /// was the guard).
+    #[serde(default)]
+    pub refunded_withdrawals: std::collections::BTreeSet<u64>,
 }
 
-/// One settled deposit, as admitted. The challenge window reasons from this:
-/// only `via_quorum` deposits are challengeable (evidence-path deposits are
-/// math, not testimony), and only while fresh and undisputed.
+/// One verified external payout, as committed by the `Release + ReleaseProof`
+/// path. Kept after settlement as the audit trail: the foreign tx hash, the
+/// attested finalized head and the committed height whose keys signed it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseReceiptRecord {
+    pub target_chain: SupportedChain,
+    pub target_address: String,
+    pub amount: u64,
+    /// Non-zero foreign payout transaction hash (unique, see
+    /// [`BridgeState::processed_payout_txs`]).
+    pub external_tx_hash: [u8; 32],
+    /// Foreign finalized block/seqno/slot the payout was observed under.
+    pub finalized_head: u64,
+    /// Committed Stellereum height whose active PQ keys signed the receipt.
+    pub attestation_height: u64,
+    /// Block timestamp the receipt settled at (block clock, never wall clock).
+    pub settled_at: u64,
+}
+
+/// One settled deposit, as admitted. The challenge window reasons from this.
+///
+/// `via_quorum` is telemetry only at
+/// `height >= BRIDGE_V2_ACTIVATION_HEIGHT`: EVERY admitted deposit is
+/// challengeable within [`CHALLENGE_MAX_AGE_SECS`] and while undisputed (the
+/// `TonCell`/`EvmReceipt`/`SolanaTx` adapters are quorum-anchored today, so
+/// their evidence is testimony too — `docs/specs/06 §2.4`). Pre-activation
+/// replay keeps the legacy rule (only `via_quorum` deposits challengeable).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DepositRecord {
     /// Who was credited.
@@ -1088,8 +1453,9 @@ pub struct DepositRecord {
     /// Which foreign chain the deposit claims to come from (needed to
     /// rebuild the evidence claim on Resolve-confirm).
     pub chain: SupportedChain,
-    /// True when admitted via quorum attestations (challengeable), false
-    /// when admitted via adapter evidence (unchallengeable).
+    /// True when admitted via quorum attestations, false when admitted via
+    /// adapter evidence. Challengeability gate PRE-activation only; post-
+    /// activation this is telemetry (see the struct docs).
     pub via_quorum: bool,
     /// Block timestamp of admission (challenge age counts from here).
     pub deposited_at: u64,
@@ -1159,6 +1525,56 @@ impl BridgeStateV2 {
             deposit_records: std::collections::BTreeMap::new(),
             disputes: std::collections::BTreeMap::new(),
             next_dispute_id: 0,
+            release_receipts: std::collections::BTreeMap::new(),
+            processed_payout_txs: std::collections::BTreeSet::new(),
+            refunded_withdrawals: std::collections::BTreeSet::new(),
+        }
+    }
+}
+
+/// `BridgeState` as written before BRIDGE-FIX-FULL (`release_receipts`,
+/// `processed_payout_txs`, `refunded_withdrawals`).
+///
+/// This is the EXACT layout the previous `BridgeState` had (dispute layer
+/// included); [`Self::upgrade`] appends the three new containers EMPTY. The
+/// semantic gap is deliberate and fail-closed: `executed = true` withdrawals
+/// that predate the upgrade carry NO verified [`ReleaseReceiptRecord`], and no
+/// historical flag is retroactively promoted into one. Kept ONLY for reading
+/// old snapshots; NEVER written.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BridgeStateV3 {
+    pub processed_source_txs: std::collections::BTreeSet<[u8; 32]>,
+    pub pending_withdrawals: std::collections::BTreeMap<u64, TeleportWithdrawalRequest>,
+    pub next_withdrawal_id: u64,
+    pub hourly_withdrawn: u64,
+    pub last_rate_limit_reset: u64,
+    pub escrow_balance: u64,
+    pub hourly_deposited: u64,
+    pub last_deposit_reset: u64,
+    pub total_minted: u64,
+    pub deposit_records: std::collections::BTreeMap<[u8; 32], DepositRecord>,
+    pub disputes: std::collections::BTreeMap<u64, Dispute>,
+    pub next_dispute_id: u64,
+}
+
+impl BridgeStateV3 {
+    pub fn upgrade(self) -> BridgeState {
+        BridgeState {
+            processed_source_txs: self.processed_source_txs,
+            pending_withdrawals: self.pending_withdrawals,
+            next_withdrawal_id: self.next_withdrawal_id,
+            hourly_withdrawn: self.hourly_withdrawn,
+            last_rate_limit_reset: self.last_rate_limit_reset,
+            escrow_balance: self.escrow_balance,
+            hourly_deposited: self.hourly_deposited,
+            last_deposit_reset: self.last_deposit_reset,
+            total_minted: self.total_minted,
+            deposit_records: self.deposit_records,
+            disputes: self.disputes,
+            next_dispute_id: self.next_dispute_id,
+            release_receipts: std::collections::BTreeMap::new(),
+            processed_payout_txs: std::collections::BTreeSet::new(),
+            refunded_withdrawals: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -1199,6 +1615,9 @@ impl BridgeStateV1 {
             deposit_records: std::collections::BTreeMap::new(),
             disputes: std::collections::BTreeMap::new(),
             next_dispute_id: 0,
+            release_receipts: std::collections::BTreeMap::new(),
+            processed_payout_txs: std::collections::BTreeSet::new(),
+            refunded_withdrawals: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -1220,6 +1639,9 @@ impl BridgeState {
             && self.deposit_records.is_empty()
             && self.disputes.is_empty()
             && self.next_dispute_id == 0
+            && self.release_receipts.is_empty()
+            && self.processed_payout_txs.is_empty()
+            && self.refunded_withdrawals.is_empty()
     }
 
     /// Rebuild the policy engine's view of the committed state.
@@ -1291,6 +1713,10 @@ impl BridgeState {
     /// then stores `state`, so a refusal anywhere leaves the node untouched.
     ///
     /// `now` is `block.timestamp` (PROTOCOL.md I12), never a wall clock.
+    ///
+    /// PRE-V2 COMPATIBILITY WRAPPER: delegates to [`Self::plan_at_height`] at
+    /// `block_height = 0`, `chain_id = crate::zkml::effective_chain_id()` and
+    /// [`PreV2ConsensusLookup`], i.e. the legacy pre-activation rule set.
     pub fn plan(
         &self,
         intents: &[BridgeIntent],
@@ -1298,6 +1724,64 @@ impl BridgeState {
         payer: [u8; 32],
         now: u64,
     ) -> Result<BridgePlan, String> {
+        self.plan_at_height(
+            intents,
+            validators,
+            payer,
+            now,
+            0,
+            crate::zkml::effective_chain_id(),
+            &PreV2ConsensusLookup,
+        )
+    }
+
+    /// Plan one transaction's bridge intents against the COMMITTED state AT a
+    /// block height, with a committed height-indexed PQ key lookup.
+    ///
+    /// `block_height` decides whether the BRIDGE-FIX-FULL rules apply
+    /// ([`bridge_v2_active_at`]). `chain_id` is the Stellereum network id bound
+    /// into V2 payout-receipt preimages (no cross-network signature replay).
+    /// `pq_keys` is the ONLY key source for V2 quorum verification: pass the
+    /// committed `(&staking_ledger, &pq_registry)` tuple (implements
+    /// [`PqKeyLookup`]); no global process-local map is consulted.
+    ///
+    /// At `block_height >= BRIDGE_V2_ACTIVATION_HEIGHT`:
+    ///
+    /// * a bare [`BridgeIntent::Release`] fails closed
+    ///   (`"bridge release rejected: verified payout receipt required"`) unless
+    ///   paired with a valid [`BridgeIntent::ReleaseProof`];
+    /// * a [`BridgeIntent::Refund`] writes a `refunded_withdrawals` tombstone
+    ///   (so a late proof fails loudly as `"Withdrawal already refunded"`);
+    /// * EVERY admitted deposit is challengeable (evidence-path included):
+    ///   the three live adapters are quorum-anchored, not trustless clients;
+    /// * `Resolve` grades a verified quorum RETRACTION before any confirm
+    ///   evidence (a replayed deposit proof can never defeat its retraction).
+    ///
+    /// Everything is planned purely: the returned state is what the block
+    /// WOULD commit, and any error leaves the caller untouched.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: the settlement signature is pinned by the state-engine wiring
+    // (BF-2b); grouping height/chain/pq_keys into a struct would change the
+    // frozen call shape other workers are landing against.
+    pub fn plan_at_height(
+        &self,
+        intents: &[BridgeIntent],
+        validators: &[[u8; 32]],
+        payer: [u8; 32],
+        now: u64,
+        block_height: u64,
+        chain_id: u64,
+        pq_keys: &dyn PqKeyLookup,
+    ) -> Result<BridgePlan, String> {
+        let v2 = bridge_v2_active_at(block_height);
+        // PRE-V2 COMPATIBILITY: below the activation height the historical
+        // evidence paths keep resolving keys from the process-local consensus
+        // map exactly as they always did (`PreV2ConsensusLookup`), so replaying
+        // a pre-v7 block yields the same verdict it did when it was produced.
+        // At/after `H` ONLY the committed `PqRegistry` is consulted.
+        let legacy_lookup = PreV2ConsensusLookup;
+        let evidence_lookup: &dyn PqKeyLookup = if v2 { pq_keys } else { &legacy_lookup };
+
         // FAIL CLOSED on an empty relayer set. `TeleportBridgeEngine`'s rule is
         // `(n * 2 + 2) / 3`, which is 0 for n = 0 - a chain whose staking
         // ledger is empty would then mint deposits with no signature at all.
@@ -1322,6 +1806,11 @@ impl BridgeState {
         let mut records_map = self.deposit_records.clone();
         let mut disputes_map = self.disputes.clone();
         let mut next_dispute_id = self.next_dispute_id;
+        // BRIDGE-FIX-FULL working copies (cloned from COMMITTED state, written
+        // back atomically at the end; a refusal anywhere mutates nothing).
+        let mut release_receipts = self.release_receipts.clone();
+        let mut processed_payout_txs = self.processed_payout_txs.clone();
+        let mut refunded_withdrawals = self.refunded_withdrawals.clone();
 
         // Attestations first: a deposit may only claim signatures carried by
         // THIS payload, paired by source tx hash (several bundles for the same
@@ -1335,10 +1824,38 @@ impl BridgeState {
                 signatures,
             } = intent
             {
+                // Audit B-ATTEST-DOS: cap BEFORE merging, so a junk vector can
+                // never burn quorum-verify time (VM `validate()` mirrors this).
+                if signatures.len() > bridge_adapters::MAX_HEADER_SIGNATURES {
+                    return Err(format!(
+                        "bridge attestation rejected: too many signatures ({}, max {})",
+                        signatures.len(),
+                        bridge_adapters::MAX_HEADER_SIGNATURES,
+                    ));
+                }
                 attest
                     .entry(*source_tx_hash)
                     .or_default()
                     .extend(signatures.iter().cloned());
+            }
+        }
+
+        // BRIDGE-FIX-FULL: payout receipts, paired to their `Release` by
+        // `req_id` exactly like `Attest`/`DepositProof` pair by tx hash. A
+        // lone receipt is inert (consumed only by the `Release` arm), and
+        // several receipts for one request merge so a payload cannot be split
+        // into half-evidences.
+        #[allow(clippy::type_complexity)]
+        // GATE: receipt index maps req_id to full receipt evidence; the nested shape mirrors the payload.
+        let mut release_proofs: HashMap<u64, Vec<ReleaseReceiptEvidence>> = HashMap::new();
+        if v2 {
+            for intent in intents {
+                if let BridgeIntent::ReleaseProof { req_id, receipt } = intent {
+                    release_proofs
+                        .entry(*req_id)
+                        .or_default()
+                        .push((**receipt).clone());
+                }
             }
         }
 
@@ -1422,7 +1939,14 @@ impl BridgeState {
                             let mut last_err = String::new();
                             let mut admitted = false;
                             for bundle in &bundles {
-                                match bridge_adapters::verify_evidence(&claim, bundle, validators) {
+                                match bridge_adapters::verify_evidence_at_height(
+                                    &claim,
+                                    bundle,
+                                    validators,
+                                    block_height,
+                                    chain_id,
+                                    evidence_lookup,
+                                ) {
                                     Ok(verified) => {
                                         // Belt and suspenders: the adapter
                                         // echoes the claim; the echo must
@@ -1482,23 +2006,151 @@ impl BridgeState {
                     effects.push(BridgeEffect::Park { amount: *amount });
                 }
                 BridgeIntent::Release { req_id } => {
-                    // Refuses before unlock_at (the time-lock) and on a second
-                    // attempt (executed), against the COMMITTED queue.
-                    engine
-                        .finalize_withdrawal(*req_id, now)
-                        .map_err(|e| format!("bridge release rejected: {e}"))?;
+                    if !v2 {
+                        // Pre-activation historical replay: unchanged legacy
+                        // rule. Refuses before unlock_at (the time-lock) and
+                        // on a second attempt (executed), against the
+                        // COMMITTED queue.
+                        engine
+                            .finalize_withdrawal(*req_id, now)
+                            .map_err(|e| format!("bridge release rejected: {e}"))?;
+                    } else {
+                        // BRIDGE-FIX-FULL: NO bare release. An unauthenticated
+                        // `Release` at/after `unlock_at` used to permanently
+                        // destroy the sender's refund path without proving any
+                        // external payout (P0 regression
+                        // `outsider_release_cannot_destroy_the_senders_refund_path`).
+                        if refunded_withdrawals.contains(req_id) {
+                            return Err("Withdrawal already refunded".to_string());
+                        }
+                        let req =
+                            engine
+                                .pending_withdrawals
+                                .get(req_id)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    "bridge release rejected: Withdrawal request not found"
+                                        .to_string()
+                                })?;
+                        if req.executed {
+                            return Err(
+                                "bridge release rejected: Withdrawal already executed".to_string()
+                            );
+                        }
+                        if now < req.unlock_at {
+                            return Err(format!(
+                                "bridge release rejected: Withdrawal is time-locked until {} (current: {})",
+                                req.unlock_at, now
+                            ));
+                        }
+                        let receipts = release_proofs.get(req_id).ok_or_else(|| {
+                            "bridge release rejected: verified payout receipt required".to_string()
+                        })?;
+                        // At least one paired receipt must verify FULLY
+                        // (binding + freshness + replay + committed-key
+                        // quorum). Errors from every candidate are collapsed
+                        // into the last one; none commits partial state.
+                        let mut last_err = "verified payout receipt required".to_string();
+                        let mut settled: Option<&ReleaseReceiptEvidence> = None;
+                        for receipt in receipts {
+                            match verify_release_receipt_v2(
+                                chain_id,
+                                receipt,
+                                &req,
+                                block_height,
+                                validators,
+                                &processed_payout_txs,
+                                pq_keys,
+                            ) {
+                                Ok(()) => {
+                                    settled = Some(receipt);
+                                    break;
+                                }
+                                Err(e) => last_err = e,
+                            }
+                        }
+                        let receipt = settled
+                            .ok_or_else(|| format!("bridge release rejected: {last_err}"))?;
+                        // Commit atomically (the plan writes state only at the
+                        // end, so a later refusal reverts all of this).
+                        engine
+                            .finalize_withdrawal(*req_id, now)
+                            .map_err(|e| format!("bridge release rejected: {e}"))?;
+                        processed_payout_txs.insert(receipt.external_tx_hash);
+                        release_receipts.insert(
+                            *req_id,
+                            ReleaseReceiptRecord {
+                                target_chain: receipt.target_chain,
+                                target_address: receipt.target_address.clone(),
+                                amount: receipt.amount,
+                                external_tx_hash: receipt.external_tx_hash,
+                                finalized_head: receipt.finalized_head,
+                                attestation_height: receipt.attestation_height,
+                                settled_at: now,
+                            },
+                        );
+                    }
                 }
                 BridgeIntent::Refund { req_id } => {
-                    // Sender-only, unexecuted-only, past grace (see the
-                    // variant docs). The request is deleted: replay-safe by
-                    // absence, and a later Release finds nothing.
-                    let amount = engine
-                        .refund_withdrawal(*req_id, payer, now)
-                        .map_err(|e| format!("bridge refund rejected: {e}"))?;
-                    effects.push(BridgeEffect::Unpark {
-                        recipient: payer,
-                        amount,
-                    });
+                    if !v2 {
+                        // Pre-activation historical replay: legacy
+                        // sender-only/unexecuted/grace rule; the request is
+                        // DELETED (replay-safe by absence).
+                        let amount = engine
+                            .refund_withdrawal(*req_id, payer, now)
+                            .map_err(|e| format!("bridge refund rejected: {e}"))?;
+                        effects.push(BridgeEffect::Unpark {
+                            recipient: payer,
+                            amount,
+                        });
+                    } else {
+                        // BRIDGE-FIX-FULL: same preconditions plus a durable
+                        // refund tombstone, so a late `ReleaseProof` after this
+                        // refund fails LOUDLY instead of silently mutating
+                        // absent state. A verified release (executed == true)
+                        // wins over the refund — at most one outcome, ever.
+                        if refunded_withdrawals.contains(req_id) {
+                            return Err("Withdrawal already refunded".to_string());
+                        }
+                        let req =
+                            engine
+                                .pending_withdrawals
+                                .get(req_id)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    "bridge refund rejected: Withdrawal request not found"
+                                        .to_string()
+                                })?;
+                        if req.executed {
+                            return Err(
+                                "bridge refund rejected: Withdrawal already executed: refund refused"
+                                    .to_string(),
+                            );
+                        }
+                        if req.sender != payer {
+                            return Err(
+                                "bridge refund rejected: Only the original sender may refund"
+                                    .to_string(),
+                            );
+                        }
+                        let refund_at = req.unlock_at.saturating_add(REFUND_GRACE_SECS);
+                        if now < refund_at {
+                            return Err(format!(
+                                "bridge refund rejected: Refund locked until {} (current: {})",
+                                refund_at, now
+                            ));
+                        }
+                        let amount = req.amount;
+                        engine.pending_withdrawals.remove(req_id);
+                        // Un-park the hourly accounting too: refunded value
+                        // never left.
+                        engine.hourly_withdrawn = engine.hourly_withdrawn.saturating_sub(amount);
+                        refunded_withdrawals.insert(*req_id);
+                        effects.push(BridgeEffect::Unpark {
+                            recipient: payer,
+                            amount,
+                        });
+                    }
                 }
                 BridgeIntent::Challenge { source_tx_hash } => {
                     // Freeze a quorum-path deposit: claw its full amount back
@@ -1510,7 +2162,15 @@ impl BridgeState {
                     let record = records_map.get_mut(source_tx_hash).ok_or_else(|| {
                         "bridge challenge rejected: unknown deposit (no record; pre-dispute deposits cannot be challenged)".to_string()
                     })?;
-                    if !record.via_quorum {
+                    if !v2 && !record.via_quorum {
+                        // Pre-activation historical replay: evidence-path
+                        // deposits were treated as "math, not testimony".
+                        // Post-activation the three live adapters are
+                        // quorum-anchored (no trustless light client yet), so
+                        // EVERY admitted deposit is challengeable within
+                        // CHALLENGE_MAX_AGE_SECS — otherwise a compromised 2/3
+                        // quorum could bypass the optimistic layer simply by
+                        // submitting `DepositProof` instead of `Attest`.
                         return Err(
                             "bridge challenge rejected: evidence-path deposit is math, not testimony".to_string(),
                         );
@@ -1625,12 +2285,13 @@ impl BridgeState {
                     //    the layer has, and it is forge-proof: a challenger
                     //    without the quorum's keys cannot produce one.
                     //
-                    // PRECEDENCE: MATH > RETRACTION > TESTIMONY. The
-                    // retraction outranks the attestation because the
-                    // attestation is ALWAYS replayable (it is what admitted
-                    // the deposit), so a retraction that lost to it could
-                    // never take effect; but it loses to math, because an
-                    // inclusion proof outranks any relayer statement.
+                    // PRECEDENCE: pre-activation replay keeps MATH >
+                    // RETRACTION > TESTIMONY. At `height >=
+                    // BRIDGE_V2_ACTIVATION_HEIGHT` a verified RETRACTION is
+                    // graded FIRST: an inclusion-style `DepositProof` from the
+                    // same 2/3 quorum is testimony, not trustless math, so it
+                    // must never defeat the quorum's own withdrawal (see
+                    // `docs/specs/06 §2.4`).
                     //
                     // SEC-01 (preserved): unverifiable evidence is NOT a
                     // fraud signal. It fails to confirm the deposit and
@@ -1648,16 +2309,22 @@ impl BridgeState {
                             // a fraud signal either.
                             continue;
                         }
-                        let verifies =
-                            match bridge_adapters::verify_evidence(&claim, bundle, validators) {
-                                Ok(verified) => {
-                                    verified.chain == record.chain
-                                        && verified.source_tx_hash == dispute.source_tx_hash
-                                        && verified.recipient == record.recipient
-                                        && verified.amount == record.amount
-                                }
-                                Err(_) => false,
-                            };
+                        let verifies = match bridge_adapters::verify_evidence_at_height(
+                            &claim,
+                            bundle,
+                            validators,
+                            block_height,
+                            chain_id,
+                            evidence_lookup,
+                        ) {
+                            Ok(verified) => {
+                                verified.chain == record.chain
+                                    && verified.source_tx_hash == dispute.source_tx_hash
+                                    && verified.recipient == record.recipient
+                                    && verified.amount == record.amount
+                            }
+                            Err(_) => false,
+                        };
                         if let bridge_adapters::DepositEvidence::QuorumAttested { signatures } =
                             bundle
                         {
@@ -1668,8 +2335,12 @@ impl BridgeState {
                             // Not an attestation of THIS claim - is it a
                             // quorum RETRACTION of it? (The same signatures
                             // over the domain-separated failure preimage.)
-                            if bridge_adapters::verify_quorum_retraction(
-                                &claim, signatures, validators,
+                            if bridge_adapters::verify_quorum_retraction_at_height(
+                                &claim,
+                                signatures,
+                                validators,
+                                block_height,
+                                evidence_lookup,
                             )
                             .is_ok()
                             {
@@ -1681,7 +2352,14 @@ impl BridgeState {
                             confirmed_by_math = true;
                         }
                     }
-                    if confirmed_by_math || (confirmed_by_testimony && !fraud_proven) {
+                    // Truth grading (see the precedence note above). The V2
+                    // arm checks the retraction BEFORE any confirm bucket.
+                    let confirm_by_evidence = if v2 {
+                        !fraud_proven && (confirmed_by_math || confirmed_by_testimony)
+                    } else {
+                        confirmed_by_math || (confirmed_by_testimony && !fraud_proven)
+                    };
+                    if confirm_by_evidence {
                         // Path 1 - CONFIRM by evidence: the deposit stands.
                         // Clawback returns to the recipient; the bond slashes
                         // to the recipient as freeze compensation (spam-
@@ -1791,6 +2469,12 @@ impl BridgeState {
                     // and therefore commit nothing - exactly like a lone
                     // `Attest` bundle.
                 }
+                BridgeIntent::ReleaseProof { .. } => {
+                    // Payout receipts authorize nothing on their own: they are
+                    // consumed by the paired `Release` arm above (paired by
+                    // `req_id`), and only when BRIDGE-FIX-FULL is active. A
+                    // lone receipt commits nothing — same as a lone `Attest`.
+                }
             }
         }
 
@@ -1801,8 +2485,78 @@ impl BridgeState {
         state.deposit_records = records_map;
         state.disputes = disputes_map;
         state.next_dispute_id = next_dispute_id;
+        // BRIDGE-FIX-FULL containers (empty and unchanged pre-activation).
+        state.release_receipts = release_receipts;
+        state.processed_payout_txs = processed_payout_txs;
+        state.refunded_withdrawals = refunded_withdrawals;
         Ok(BridgePlan { state, effects })
     }
+}
+
+/// Verify one [`ReleaseReceiptEvidence`] against the parked withdrawal it
+/// claims to settle, the committed replay set, the block height and the
+/// committed height-indexed PQ keys.
+///
+/// Fail-closed on EVERY doubt (docs/specs/06 §2.3.1 step 4):
+/// binding mismatch (req_id / chain / address / amount), zero or already
+/// processed `external_tx_hash`, `attestation_height` in the future or older
+/// than [`MAX_BRIDGE_ATTESTATION_AGE_HEIGHTS`], an empty validator set, and a
+/// sub-threshold quorum over [`release_receipt_signing_message_v2`].
+fn verify_release_receipt_v2(
+    chain_id: u64,
+    receipt: &ReleaseReceiptEvidence,
+    req: &TeleportWithdrawalRequest,
+    block_height: u64,
+    validators: &[[u8; 32]],
+    processed_payout_txs: &std::collections::BTreeSet<[u8; 32]>,
+    pq_keys: &dyn PqKeyLookup,
+) -> Result<(), String> {
+    if receipt.req_id != req.req_id {
+        return Err(format!(
+            "payout receipt req_id {} does not match withdrawal {}",
+            receipt.req_id, req.req_id
+        ));
+    }
+    if receipt.target_chain != req.target_chain {
+        return Err("payout receipt target chain does not match the withdrawal".to_string());
+    }
+    if receipt.target_address != req.target_address {
+        return Err("payout receipt target address does not match the withdrawal".to_string());
+    }
+    if receipt.amount != req.amount {
+        return Err("payout receipt amount does not match the withdrawal".to_string());
+    }
+    if receipt.external_tx_hash == [0u8; 32] {
+        return Err("payout receipt carries a zero external tx hash".to_string());
+    }
+    if processed_payout_txs.contains(&receipt.external_tx_hash) {
+        return Err("payout external tx already settled (replay refused)".to_string());
+    }
+    if receipt.attestation_height > block_height {
+        return Err(format!(
+            "payout receipt attestation height {} is ahead of block height {block_height}",
+            receipt.attestation_height
+        ));
+    }
+    if block_height.saturating_sub(receipt.attestation_height) > MAX_BRIDGE_ATTESTATION_AGE_HEIGHTS
+    {
+        return Err(format!(
+            "payout receipt attestation height {} is older than the {} allowed heights",
+            receipt.attestation_height, MAX_BRIDGE_ATTESTATION_AGE_HEIGHTS
+        ));
+    }
+    if validators.is_empty() {
+        return Err("bridge quorum: empty validator set refuses fail-closed".to_string());
+    }
+    let msg = release_receipt_signing_message_v2(chain_id, receipt);
+    verify_quorum_signatures_at_height(
+        &msg,
+        &receipt.signatures,
+        validators,
+        receipt.attestation_height,
+        pq_keys,
+    )
+    .map(|_| ())
 }
 
 // ============================================================================
@@ -1889,6 +2643,31 @@ impl TonWatcher {
 // Multisig relayer for outbound (Stellereum -> external) releases
 // ============================================================================
 
+/// `(req_id, stellereum_chain_id)` binding for a V2 external release
+/// authorization.
+///
+/// Bound into [`MultisigRelayer::release_signing_message_v2`] so an off-chain
+/// relayer signature names ONE parked withdrawal on ONE Stellereum network —
+/// it cannot be replayed onto another request id or another chain.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseBinding {
+    pub req_id: u64,
+    pub stellereum_chain_id: u64,
+}
+
+/// Latest `expires_at` an external release order may carry for a withdrawal
+/// that unlocks at `unlock_at`:
+/// `unlock_at + REFUND_GRACE_SECS - PAYOUT_SAFETY_MARGIN_SECS`.
+///
+/// The 4h buffer means external finality must complete BEFORE the sender's
+/// native refund becomes available; saturating, so a tiny `unlock_at` yields 0
+/// (an order can never expire "before the epoch" and become eternally valid).
+pub fn payout_authorization_deadline(unlock_at: u64) -> u64 {
+    unlock_at
+        .saturating_add(REFUND_GRACE_SECS)
+        .saturating_sub(PAYOUT_SAFETY_MARGIN_SECS)
+}
+
 /// A threshold multisig over the relayer set. Used to authorize releases of
 /// locked value on the external chain (e.g. burning wSTELL and paying out on
 /// TON). Counts distinct validators and prevents double-release by operation id.
@@ -1904,10 +2683,10 @@ impl TonWatcher {
 /// MUST check the on-chain request still exists AND is unexecuted, and
 /// re-check at broadcast. A withdrawal refunded after `unlock_at +
 /// REFUND_GRACE_SECS` is deleted on chain; a late foreign payout for it pays
-/// twice (native refund + foreign coins) with no on-chain tripwire. The
-/// durable fix is an on-chain release receipt written by relayer quorum (see
-/// the [`BridgeIntent::Refund`] docs); until it lands, this check is the only
-/// bound on the theft window.
+/// twice (native refund + foreign coins). Under BRIDGE-FIX-FULL the on-chain
+/// [`BridgeIntent::ReleaseProof`] receipt closes the window durably
+/// (`processed_payout_txs` + `refunded_withdrawals` tombstones); pre-activation
+/// chains still rely on this operator rule.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MultisigRelayer {
     pub validators: HashSet<[u8; 32]>,
@@ -1936,14 +2715,31 @@ impl MultisigRelayer {
     }
 
     /// Number of DISTINCT valid Falcon-512 signers over `msg` (FIXES §1.1).
-    /// Counts through the shared [`verify_quorum_signatures`] rule: the
-    /// signer's REGISTERED Falcon-512 key must verify; duplicates count once;
-    /// unknown/non-Falcon signers refuse fail-closed as `0` so
-    /// [`MultisigRelayer::try_release`] (and every `is_approved` gate) refuses
-    /// the release.
+    ///
+    /// PRE-V2 WRAPPER: delegates to [`Self::count_signers_at_height`] at
+    /// `attestation_height = 0` with [`PreV2ConsensusLookup`]. Live V2 callers
+    /// MUST use the height-indexed form with committed keys.
     pub fn count_signers(&self, msg: &[u8], sigs: &[([u8; 32], Vec<u8>)]) -> usize {
+        self.count_signers_at_height(msg, sigs, 0, &PreV2ConsensusLookup)
+    }
+
+    /// Number of DISTINCT valid Falcon-512 signers over `msg`, resolving each
+    /// signer's key AT `attestation_height` through committed `pq_keys`.
+    ///
+    /// Counts through the shared [`distinct_falcon_signers_at_height`] rule:
+    /// an unknown/non-Falcon signer or a signer with no committed key at that
+    /// height refuses fail-closed as `0`, so every approval gate refuses the
+    /// release.
+    pub fn count_signers_at_height(
+        &self,
+        msg: &[u8],
+        sigs: &[([u8; 32], Vec<u8>)],
+        attestation_height: u64,
+        pq_keys: &dyn PqKeyLookup,
+    ) -> usize {
         let validators: Vec<[u8; 32]> = self.validators.iter().copied().collect();
-        distinct_falcon_signers(msg, sigs, &validators).unwrap_or(0)
+        distinct_falcon_signers_at_height(msg, sigs, &validators, attestation_height, pq_keys)
+            .unwrap_or(0)
     }
 
     /// Signing preimage for this offline model's release authorization.
@@ -1959,8 +2755,31 @@ impl MultisigRelayer {
         preimage
     }
 
+    /// V2 signing preimage binding the operation to a `(req_id, chain_id)`
+    /// pair and to a distinct domain.
+    ///
+    /// `STELLEREUM_MULTISIG_RELAYER_MODEL_RELEASE_V2 || stellereum_chain_id ||
+    /// req_id || op_id || msg` — a signature can never be replayed onto another
+    /// withdrawal or another Stellereum network, and never reused as a V1
+    /// authorization.
+    pub fn release_signing_message_v2(
+        binding: ReleaseBinding,
+        op_id: [u8; 32],
+        msg: &[u8],
+    ) -> Vec<u8> {
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(b"STELLEREUM_MULTISIG_RELAYER_MODEL_RELEASE_V2");
+        preimage.extend_from_slice(&binding.stellereum_chain_id.to_be_bytes());
+        preimage.extend_from_slice(&binding.req_id.to_be_bytes());
+        preimage.extend_from_slice(&op_id);
+        preimage.extend_from_slice(msg);
+        preimage
+    }
+
     /// Authorize a release exactly once. Signatures must cover
     /// [`Self::release_signing_message`], not the raw `msg`.
+    ///
+    /// PRE-V2 WRAPPER (legacy preimage, [`PreV2ConsensusLookup`] at height 0).
     pub fn try_release(
         &mut self,
         op_id: [u8; 32],
@@ -1974,6 +2793,35 @@ impl MultisigRelayer {
             return Err("Relayer set is empty: refusing to release".to_string());
         }
         if self.count_signers(&Self::release_signing_message(op_id, msg), sigs) < self.threshold {
+            return Err(format!(
+                "Insufficient multisig signatures: need {}",
+                self.threshold
+            ));
+        }
+        self.released.insert(op_id);
+        Ok(())
+    }
+
+    /// Authorize a V2 release exactly once. Signatures must cover
+    /// [`Self::release_signing_message_v2`] for the SAME [`ReleaseBinding`],
+    /// and are counted at `attestation_height` through committed `pq_keys`.
+    pub fn try_release_at_height(
+        &mut self,
+        binding: ReleaseBinding,
+        op_id: [u8; 32],
+        msg: &[u8],
+        sigs: &[([u8; 32], Vec<u8>)],
+        attestation_height: u64,
+        pq_keys: &dyn PqKeyLookup,
+    ) -> Result<(), String> {
+        if self.released.contains(&op_id) {
+            return Err("Operation already released".to_string());
+        }
+        if self.validators.is_empty() {
+            return Err("Relayer set is empty: refusing to release".to_string());
+        }
+        let msg = Self::release_signing_message_v2(binding, op_id, msg);
+        if self.count_signers_at_height(&msg, sigs, attestation_height, pq_keys) < self.threshold {
             return Err(format!(
                 "Insufficient multisig signatures: need {}",
                 self.threshold
@@ -2032,6 +2880,12 @@ impl TonJettonBurnPayload {
 }
 
 /// Outbound release order authorizing the TON Multisig Bridge contract to mint/payout wSTELL.
+///
+/// `req_id` + `stellereum_chain_id` bind the order to ONE parked withdrawal on
+/// ONE Stellereum network; both are inside the signed preimage. `expires_at`
+/// MUST stay at or before [`payout_authorization_deadline`] of the withdrawal's
+/// `unlock_at` (checked by [`Self::is_approved_for_withdrawal`]), leaving the
+/// [`PAYOUT_SAFETY_MARGIN_SECS`] quiet window before the native refund.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TonMultisigReleaseOrder {
     pub op_id: [u8; 32],
@@ -2039,6 +2893,13 @@ pub struct TonMultisigReleaseOrder {
     pub amount_nano: u64,
     pub expires_at: u64,
     pub signatures: Vec<([u8; 32], Vec<u8>)>,
+    /// The parked withdrawal this order pays out.
+    #[serde(default)]
+    pub req_id: u64,
+    /// Stellereum network the order was authorized on (cross-network replay
+    /// guard).
+    #[serde(default)]
+    pub stellereum_chain_id: u64,
 }
 
 impl TonMultisigReleaseOrder {
@@ -2047,6 +2908,8 @@ impl TonMultisigReleaseOrder {
         ton_recipient_hex: String,
         amount_nano: u64,
         expires_at: u64,
+        req_id: u64,
+        stellereum_chain_id: u64,
     ) -> Self {
         Self {
             op_id,
@@ -2054,13 +2917,17 @@ impl TonMultisigReleaseOrder {
             amount_nano,
             expires_at,
             signatures: Vec::new(),
+            req_id,
+            stellereum_chain_id,
         }
     }
 
-    /// Canonical bytes signed by relayers.
+    /// Canonical bytes signed by relayers (V2: binds `chain_id` + `req_id`).
     pub fn signing_message(&self) -> Vec<u8> {
         let mut b = Vec::new();
-        b.extend_from_slice(b"TON_MULTISIG_RELEASE_V1");
+        b.extend_from_slice(b"TON_MULTISIG_RELEASE_V2");
+        b.extend_from_slice(&self.stellereum_chain_id.to_be_bytes());
+        b.extend_from_slice(&self.req_id.to_be_bytes());
         b.extend_from_slice(&self.op_id);
         b.extend_from_slice(self.ton_recipient_hex.as_bytes());
         b.extend_from_slice(&self.amount_nano.to_be_bytes());
@@ -2068,12 +2935,52 @@ impl TonMultisigReleaseOrder {
         b
     }
 
-    /// Check if this release order has collected a 2/3 threshold quorum of distinct relayers.
-    pub fn is_approved(&self, relayer: &MultisigRelayer, now: u64) -> bool {
+    /// True when `expires_at` leaves the full [`PAYOUT_SAFETY_MARGIN_SECS`]
+    /// window before `unlock_at + REFUND_GRACE_SECS`.
+    pub fn expires_within_refund_window(&self, unlock_at: u64) -> bool {
+        self.expires_at <= payout_authorization_deadline(unlock_at)
+    }
+
+    /// Check if this release order has collected a 2/3 threshold quorum of
+    /// distinct relayers, resolving keys AT `attestation_height` through the
+    /// committed `pq_keys` lookup.
+    pub fn is_approved_at_height(
+        &self,
+        relayer: &MultisigRelayer,
+        now: u64,
+        attestation_height: u64,
+        pq_keys: &dyn PqKeyLookup,
+    ) -> bool {
         if now > self.expires_at {
             return false;
         }
-        relayer.count_signers(&self.signing_message(), &self.signatures) >= relayer.threshold
+        relayer.count_signers_at_height(
+            &self.signing_message(),
+            &self.signatures,
+            attestation_height,
+            pq_keys,
+        ) >= relayer.threshold
+    }
+
+    /// Full payout-authorization gate for a parked withdrawal: quorum at
+    /// `attestation_height`, not expired, AND expiring at or before
+    /// [`payout_authorization_deadline`] of `unlock_at`.
+    pub fn is_approved_for_withdrawal(
+        &self,
+        relayer: &MultisigRelayer,
+        now: u64,
+        unlock_at: u64,
+        attestation_height: u64,
+        pq_keys: &dyn PqKeyLookup,
+    ) -> bool {
+        self.expires_within_refund_window(unlock_at)
+            && self.is_approved_at_height(relayer, now, attestation_height, pq_keys)
+    }
+
+    /// PRE-V2 WRAPPER: legacy pre-activation key lookup at height 0 (no
+    /// refund-window bound — pre-activation replay only).
+    pub fn is_approved(&self, relayer: &MultisigRelayer, now: u64) -> bool {
+        self.is_approved_at_height(relayer, now, 0, &PreV2ConsensusLookup)
     }
 }
 
@@ -2162,6 +3069,11 @@ impl EvmWatcher {
 }
 
 /// Outbound release message signed by 2/3 relayers to unlock ERC-20 tokens on EVM.
+///
+/// `req_id` + `stellereum_chain_id` bind the order to ONE parked withdrawal on
+/// ONE Stellereum network; both are inside the signed preimage, and
+/// `expires_at` is bounded by [`payout_authorization_deadline`] via
+/// [`Self::is_approved_for_withdrawal`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EvmReleaseOrder {
     pub chain: SupportedChain,
@@ -2172,9 +3084,20 @@ pub struct EvmReleaseOrder {
     pub nonce: u64,
     pub expires_at: u64,
     pub signatures: Vec<([u8; 32], Vec<u8>)>,
+    /// The parked withdrawal this order pays out.
+    #[serde(default)]
+    pub req_id: u64,
+    /// Stellereum network the order was authorized on (cross-network replay
+    /// guard).
+    #[serde(default)]
+    pub stellereum_chain_id: u64,
 }
 
 impl EvmReleaseOrder {
+    #[allow(clippy::too_many_arguments)]
+    // GATE: the constructor mirrors the frozen EVM release-order wire fields
+    // one-for-one (chain, op, token, recipient, amount, nonce, expiry + the
+    // req_id/chain_id binding); grouping them would obscure the order layout.
     pub fn new(
         chain: SupportedChain,
         op_id: [u8; 32],
@@ -2183,6 +3106,8 @@ impl EvmReleaseOrder {
         amount_nano: u64,
         nonce: u64,
         expires_at: u64,
+        req_id: u64,
+        stellereum_chain_id: u64,
     ) -> Self {
         Self {
             chain,
@@ -2193,18 +3118,22 @@ impl EvmReleaseOrder {
             nonce,
             expires_at,
             signatures: Vec::new(),
+            req_id,
+            stellereum_chain_id,
         }
     }
 
-    /// Canonical bytes signed by relayers (EIP-712 structured data preimage).
+    /// Canonical bytes signed by relayers (V2: binds `chain_id` + `req_id`).
     pub fn signing_message(&self) -> Vec<u8> {
         let mut b = Vec::new();
-        b.extend_from_slice(b"EVM_TELEPORT_RELEASE_V1");
+        b.extend_from_slice(b"EVM_TELEPORT_RELEASE_V2");
         b.extend_from_slice(match self.chain {
             SupportedChain::Ethereum => b"ETH",
             SupportedChain::Arbitrum => b"ARB",
             _ => b"UNK",
         });
+        b.extend_from_slice(&self.stellereum_chain_id.to_be_bytes());
+        b.extend_from_slice(&self.req_id.to_be_bytes());
         b.extend_from_slice(&self.op_id);
         b.extend_from_slice(&self.token_address);
         b.extend_from_slice(&self.recipient);
@@ -2214,7 +3143,21 @@ impl EvmReleaseOrder {
         b
     }
 
-    pub fn is_approved(&self, relayer: &MultisigRelayer, now: u64) -> bool {
+    /// True when `expires_at` leaves the full [`PAYOUT_SAFETY_MARGIN_SECS`]
+    /// window before `unlock_at + REFUND_GRACE_SECS`.
+    pub fn expires_within_refund_window(&self, unlock_at: u64) -> bool {
+        self.expires_at <= payout_authorization_deadline(unlock_at)
+    }
+
+    /// Check if this release order has collected a 2/3 threshold quorum,
+    /// resolving keys AT `attestation_height` through committed `pq_keys`.
+    pub fn is_approved_at_height(
+        &self,
+        relayer: &MultisigRelayer,
+        now: u64,
+        attestation_height: u64,
+        pq_keys: &dyn PqKeyLookup,
+    ) -> bool {
         if now > self.expires_at {
             return false;
         }
@@ -2229,7 +3172,33 @@ impl EvmReleaseOrder {
         ) {
             return false;
         }
-        relayer.count_signers(&self.signing_message(), &self.signatures) >= relayer.threshold
+        relayer.count_signers_at_height(
+            &self.signing_message(),
+            &self.signatures,
+            attestation_height,
+            pq_keys,
+        ) >= relayer.threshold
+    }
+
+    /// Full payout-authorization gate for a parked withdrawal: quorum at
+    /// `attestation_height`, not expired, AND expiring at or before
+    /// [`payout_authorization_deadline`] of `unlock_at`.
+    pub fn is_approved_for_withdrawal(
+        &self,
+        relayer: &MultisigRelayer,
+        now: u64,
+        unlock_at: u64,
+        attestation_height: u64,
+        pq_keys: &dyn PqKeyLookup,
+    ) -> bool {
+        self.expires_within_refund_window(unlock_at)
+            && self.is_approved_at_height(relayer, now, attestation_height, pq_keys)
+    }
+
+    /// PRE-V2 WRAPPER: legacy pre-activation key lookup at height 0 (no
+    /// refund-window bound — pre-activation replay only).
+    pub fn is_approved(&self, relayer: &MultisigRelayer, now: u64) -> bool {
+        self.is_approved_at_height(relayer, now, 0, &PreV2ConsensusLookup)
     }
 }
 
@@ -2578,6 +3547,8 @@ mod tests {
             "EQD4FPq-PRDieyQKkKZ085...".to_string(),
             100_000_000_000,
             1_000,
+            0,
+            11,
         );
 
         let msg = order.signing_message();
@@ -2643,6 +3614,8 @@ mod tests {
             2_000_000_000,
             1,
             5_000,
+            0,
+            11,
         );
 
         let msg = order.signing_message();
@@ -2736,6 +3709,23 @@ mod tests {
             6
         );
         assert_eq!(discriminant(&BridgeIntent::Resolve { dispute_id: 0 }), 7);
+        // BRIDGE-FIX-FULL appended the payout receipt strictly last: 8.
+        assert_eq!(
+            discriminant(&BridgeIntent::ReleaseProof {
+                req_id: 0,
+                receipt: Box::new(ReleaseReceiptEvidence {
+                    req_id: 0,
+                    target_chain: SupportedChain::Ton,
+                    target_address: "x".to_string(),
+                    amount: 1,
+                    external_tx_hash: [1u8; 32],
+                    finalized_head: 0,
+                    attestation_height: 0,
+                    signatures: vec![([0u8; 32], vec![0u8; 64])],
+                }),
+            }),
+            8
+        );
     }
 
     /// FIXES §1.1: classical ed25519 signatures never count toward the
@@ -2922,5 +3912,285 @@ mod tests {
             verify_quorum_signatures(msg, &sigs, &validators).is_err(),
             "an Ed25519 signature must never count toward the Falcon quorum"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // BRIDGE-FIX-FULL (docs/specs/06 §1.3 / §2.1 / §2.2 / §2.3)
+    // ----------------------------------------------------------------
+
+    /// Thread-local gate override guard: always restores `GatedOff`.
+    struct BridgeV2GateGuard;
+
+    impl Drop for BridgeV2GateGuard {
+        fn drop(&mut self) {
+            set_bridge_v2_activation_override(None);
+        }
+    }
+
+    fn receipt_fixture() -> ReleaseReceiptEvidence {
+        ReleaseReceiptEvidence {
+            req_id: 7,
+            target_chain: SupportedChain::Ethereum,
+            target_address: "0x00ff".to_string(),
+            amount: 42,
+            external_tx_hash: [0xAB; 32],
+            finalized_head: 9_000,
+            attestation_height: 500,
+            signatures: vec![([1u8; 32], vec![2u8; 3])],
+        }
+    }
+
+    #[test]
+    fn bridge_v2_gate_is_gated_off_at_u64_max_and_override_is_honoured() {
+        let _guard = BridgeV2GateGuard;
+        // Default: `GatedOff` — FALSE even at the top of the range (the
+        // `pq_lifecycle_active_at` shape, not a bare `height >= gate`).
+        assert_eq!(
+            effective_bridge_v2_activation_height(),
+            BRIDGE_V2_ACTIVATION_HEIGHT
+        );
+        assert_eq!(BRIDGE_V2_ACTIVATION_HEIGHT, u64::MAX);
+        assert!(!bridge_v2_active_at(0));
+        assert!(!bridge_v2_active_at(u64::MAX - 1));
+        assert!(!bridge_v2_active_at(u64::MAX));
+        // Explicit override: active from the boundary height onward.
+        set_bridge_v2_activation_override(Some(100));
+        assert!(!bridge_v2_active_at(99));
+        assert!(bridge_v2_active_at(100));
+        assert!(bridge_v2_active_at(101));
+        // Overriding to u64::MAX re-gates it off everywhere.
+        set_bridge_v2_activation_override(Some(u64::MAX));
+        assert!(!bridge_v2_active_at(u64::MAX));
+        set_bridge_v2_activation_override(None);
+        assert_eq!(
+            effective_bridge_v2_activation_height(),
+            BRIDGE_V2_ACTIVATION_HEIGHT
+        );
+    }
+
+    #[test]
+    fn release_receipt_preimage_has_pinned_domain_and_length() {
+        let receipt = receipt_fixture();
+        let msg = release_receipt_signing_message_v2(11, &receipt);
+        assert_eq!(BRIDGE_RELEASE_RECEIPT_DOMAIN_V2.len(), 31);
+        assert!(msg.starts_with(BRIDGE_RELEASE_RECEIPT_DOMAIN_V2));
+        assert_eq!(
+            msg.len(),
+            BRIDGE_RELEASE_RECEIPT_DOMAIN_V2.len()
+                + 8
+                + 8
+                + 1
+                + 4
+                + receipt.target_address.len()
+                + 8
+                + 32
+                + 8
+                + 8
+        );
+        // chain_id is bound: no cross-network replay.
+        assert_ne!(msg, release_receipt_signing_message_v2(12, &receipt));
+        // Every signed field moves the preimage.
+        let mut other = receipt.clone();
+        other.req_id += 1;
+        assert_ne!(msg, release_receipt_signing_message_v2(11, &other));
+        let mut other = receipt.clone();
+        other.amount += 1;
+        assert_ne!(msg, release_receipt_signing_message_v2(11, &other));
+        let mut other = receipt.clone();
+        other.external_tx_hash[0] ^= 0xFF;
+        assert_ne!(msg, release_receipt_signing_message_v2(11, &other));
+        let mut other = receipt.clone();
+        other.finalized_head += 1;
+        assert_ne!(msg, release_receipt_signing_message_v2(11, &other));
+        let mut other = receipt.clone();
+        other.attestation_height += 1;
+        assert_ne!(msg, release_receipt_signing_message_v2(11, &other));
+        let mut other = receipt.clone();
+        other.target_address.push('x');
+        assert_ne!(msg, release_receipt_signing_message_v2(11, &other));
+        // Target-chain tag: no cross-chain transplant.
+        let mut other = receipt.clone();
+        other.target_chain = SupportedChain::Arbitrum;
+        assert_ne!(msg, release_receipt_signing_message_v2(11, &other));
+    }
+
+    #[test]
+    fn bridge_state_v3_upgrade_preserves_legacy_fields_and_starts_new_sets_empty() {
+        let v3 = BridgeStateV3 {
+            processed_source_txs: std::collections::BTreeSet::from([[0x11u8; 32]]),
+            pending_withdrawals: std::collections::BTreeMap::from([(
+                3,
+                TeleportWithdrawalRequest {
+                    req_id: 3,
+                    sender: [0x22u8; 32],
+                    target_chain: SupportedChain::Solana,
+                    target_address: "So1ana".to_string(),
+                    amount: 5_000,
+                    requested_at: 10,
+                    unlock_at: 20,
+                    executed: true,
+                },
+            )]),
+            next_withdrawal_id: 4,
+            hourly_withdrawn: 123,
+            last_rate_limit_reset: 9,
+            escrow_balance: 77,
+            hourly_deposited: 11,
+            last_deposit_reset: 3,
+            total_minted: 1_000,
+            deposit_records: std::collections::BTreeMap::from([(
+                [0x11u8; 32],
+                DepositRecord {
+                    recipient: [0x22u8; 32],
+                    amount: 1_000,
+                    chain: SupportedChain::Ton,
+                    via_quorum: true,
+                    deposited_at: 5,
+                    disputed: false,
+                },
+            )]),
+            next_dispute_id: 2,
+            ..BridgeStateV3::default()
+        };
+
+        // The V3 layout IS the pre-fix `BridgeState` layout: it round-trips as
+        // bytes and upgrades with the three new containers EMPTY.
+        let bytes = bincode::serialize(&v3).expect("v3 serializes");
+        let decoded: BridgeStateV3 = bincode::deserialize(&bytes).expect("v3 decodes");
+        let upgraded = decoded.upgrade();
+        assert_eq!(upgraded.processed_source_txs, v3.processed_source_txs);
+        assert_eq!(upgraded.pending_withdrawals.len(), 1);
+        assert!(upgraded.pending_withdrawals[&3].executed);
+        assert_eq!(upgraded.next_withdrawal_id, 4);
+        assert_eq!(upgraded.hourly_withdrawn, 123);
+        assert_eq!(upgraded.last_rate_limit_reset, 9);
+        assert_eq!(upgraded.escrow_balance, 77);
+        assert_eq!(upgraded.hourly_deposited, 11);
+        assert_eq!(upgraded.last_deposit_reset, 3);
+        assert_eq!(upgraded.total_minted, 1_000);
+        assert_eq!(upgraded.deposit_records.len(), 1);
+        assert_eq!(upgraded.next_dispute_id, 2);
+        // Fail-closed upgrade: no historical `executed = true` becomes a
+        // verified payout receipt.
+        assert!(upgraded.release_receipts.is_empty());
+        assert!(upgraded.processed_payout_txs.is_empty());
+        assert!(upgraded.refunded_withdrawals.is_empty());
+        assert!(!upgraded.is_empty());
+    }
+
+    #[test]
+    fn v2_bare_release_is_refused_and_sender_can_still_refund() {
+        let _guard = BridgeV2GateGuard;
+        set_bridge_v2_activation_override(Some(0));
+
+        let sender = [0x51u8; 32];
+        let outsider = [0x52u8; 32];
+        let now = 1_760_000_000u64;
+        let amount = 1_000_000_000u64;
+
+        let state = BridgeState {
+            next_withdrawal_id: 1,
+            hourly_withdrawn: amount,
+            pending_withdrawals: std::collections::BTreeMap::from([(
+                0,
+                TeleportWithdrawalRequest {
+                    req_id: 0,
+                    sender,
+                    target_chain: SupportedChain::Ton,
+                    target_address: "EQD4FPq-PRDieyQKkKZ085".to_string(),
+                    amount,
+                    requested_at: now,
+                    unlock_at: now,
+                    executed: false,
+                },
+            )]),
+            ..BridgeState::default()
+        };
+
+        // P0 regression: an outsider's bare `Release` at `now >= unlock_at`
+        // no longer destroys the sender's refund path.
+        let err = state
+            .plan_at_height(
+                &[BridgeIntent::Release { req_id: 0 }],
+                &[],
+                outsider,
+                now,
+                0,
+                11,
+                &PreV2ConsensusLookup,
+            )
+            .expect_err("bare release must be refused at/after BRIDGE_V2_ACTIVATION_HEIGHT");
+        assert!(
+            err.contains("verified payout receipt required"),
+            "unexpected refusal: {err}"
+        );
+        assert!(
+            !state.pending_withdrawals[&0].executed,
+            "a refused release must not mutate committed state"
+        );
+
+        // The sender still refunds at `unlock_at + REFUND_GRACE_SECS`.
+        let refund_at = now + REFUND_GRACE_SECS;
+        let refunded = state
+            .plan_at_height(
+                &[BridgeIntent::Refund { req_id: 0 }],
+                &[],
+                sender,
+                refund_at,
+                0,
+                11,
+                &PreV2ConsensusLookup,
+            )
+            .expect("the original sender must still be able to refund");
+        assert!(refunded.state.pending_withdrawals.is_empty());
+        assert!(refunded.state.refunded_withdrawals.contains(&0));
+        assert_eq!(refunded.state.hourly_withdrawn, 0);
+        assert_eq!(
+            refunded.effects,
+            vec![BridgeEffect::Unpark {
+                recipient: sender,
+                amount,
+            }]
+        );
+
+        // A late payout proof after the refund fails loudly, not silently.
+        let err = refunded
+            .state
+            .plan_at_height(
+                &[BridgeIntent::Release { req_id: 0 }],
+                &[],
+                outsider,
+                refund_at + 1,
+                0,
+                11,
+                &PreV2ConsensusLookup,
+            )
+            .expect_err("a release after a refund must be refused");
+        assert_eq!(err, "Withdrawal already refunded");
+    }
+
+    #[test]
+    fn v2_lone_release_proof_is_inert() {
+        let _guard = BridgeV2GateGuard;
+        set_bridge_v2_activation_override(Some(0));
+        let mut receipt = receipt_fixture();
+        receipt.req_id = 9;
+        let plan = BridgeState::default()
+            .plan_at_height(
+                &[BridgeIntent::ReleaseProof {
+                    req_id: 9,
+                    receipt: Box::new(receipt),
+                }],
+                &[],
+                [0x60u8; 32],
+                1_000,
+                0,
+                11,
+                &PreV2ConsensusLookup,
+            )
+            .expect("a lone receipt authorizes nothing and must not fail");
+        assert!(plan.effects.is_empty());
+        assert!(plan.state.release_receipts.is_empty());
+        assert!(plan.state.processed_payout_txs.is_empty());
     }
 }

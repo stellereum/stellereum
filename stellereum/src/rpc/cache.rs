@@ -376,3 +376,30 @@ pub fn estimate_fee_gas_budget(requested_max_gas: Option<u64>) -> Result<u64, St
 /// The cap is generous for a real query (a contract emits a handful of
 /// events per transaction) and the caller may lower it with `limit`.
 pub const MAX_EVENTS_RETURNED: usize = 1_000;
+
+// ===========================================================================
+// W4 E3 — CURSOR-PAGINATION LIMITS
+//
+// Shared by `stell_getAddressHistory`, `stell_getEvents` (`paginated`/cursor),
+// `stell_getProgramAccounts` and `stell_getTokenAccountsByOwner`. These reads
+// are tip-relative (a new finalized block changes the first page), so they are
+// deliberately NOT part of the finalized-read cache above: caching a page
+// would freeze a stale cursor window. The limits are local policy only.
+// ===========================================================================
+
+/// Default page size for the cursor-paginated reads.
+pub const DEFAULT_PAGE_LIMIT: usize = 50;
+/// Hard page-size cap for the cursor-paginated reads.
+pub const MAX_PAGE_LIMIT: usize = 200;
+/// Hard page-size cap for `stell_getProgramAccounts` (smaller than
+/// [`MAX_PAGE_LIMIT`] because every item can carry a Merkle proof).
+pub const MAX_PROGRAM_ACCOUNTS_LIMIT: usize = 100;
+/// Maximum entries INSPECTED by one `stell_getProgramAccounts` call. Hitting
+/// it sets `scan_truncated: true` and returns a continuation `next_cursor`.
+pub const MAX_PROGRAM_ACCOUNTS_SCAN: usize = 10_000;
+/// Maximum serialized response size for `stell_getProgramAccounts` (2 MiB).
+/// Items are dropped from the tail (with `has_more`/`next_cursor`) rather than
+/// building an unbounded JSON body.
+pub const MAX_PROGRAM_ACCOUNTS_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum items carrying a proof in one `stell_getProgramAccounts` page.
+pub const MAX_PROGRAM_ACCOUNTS_PROOFS: usize = 16;

@@ -68,6 +68,44 @@ fn restored_round(persisted_round: u32, vote_watermark_floor: Option<u32>) -> u3
     vote_watermark_floor.map_or(capped, |floor| capped.max(floor))
 }
 
+const SMALL_GAP_LIVE_CATCHUP_WINDOW_MS: u64 = 1_500;
+const SMALL_GAP_LIVE_CATCHUP_BUDGET_MS: u64 = 120;
+
+/// Cap the per-tick `try_catch_up` budget when the chain is actively finalizing
+/// (`since_last_finalized < 1500ms`) and the verified gap is at most 2 heights.
+/// Prevents a 1–2 block catch-up DHT probe from freezing the consensus tick for
+/// 500ms+ mid-round while preserving the full budget and snapshot-sync window
+/// whenever the gap is > 2 or the chain has stalled for >= 1500ms.
+fn effective_catchup_pass_budget(
+    base_budget: Duration,
+    budget_gap: u64,
+    since_last_finalized: Duration,
+) -> Duration {
+    if budget_gap <= 2
+        && since_last_finalized < Duration::from_millis(SMALL_GAP_LIVE_CATCHUP_WINDOW_MS)
+    {
+        base_budget.min(Duration::from_millis(SMALL_GAP_LIVE_CATCHUP_BUDGET_MS))
+    } else {
+        base_budget
+    }
+}
+
+/// Immediate DHT body/head publish gate on finalize/adopt: the block's proposer
+/// always publishes immediately, 1–2 validator setups always publish, and other
+/// nodes reinforce every 4th height (periodic `retro_publish_pass` covers any
+/// lagging peer). Cuts redundant `dht.store` storms by ~3-4x on 4-node clusters.
+fn should_publish_body_now(validator_count: usize, is_proposer: bool, height: u64) -> bool {
+    validator_count <= 2 || is_proposer || height.is_multiple_of(4)
+}
+
+/// Immediate DHT header publish gate on finalize/adopt: the block's proposer
+/// always persists the header immediately (keeping every height's header
+/// present for snapshot-anchor walks), 1–2 validator setups always persist, and
+/// non-proposers reinforce every 8th height.
+fn should_publish_header_now(validator_count: usize, is_proposer: bool, height: u64) -> bool {
+    validator_count <= 2 || is_proposer || height.is_multiple_of(8)
+}
+
 /// The finalized tip a restart MUST use for a loaded engine state.
 ///
 /// `snapshot_state_height` is the height whose POST-state the engine holds.
@@ -131,8 +169,39 @@ fn advance_vote_floor(floor: &mut Option<(u64, u32)>, height: u64, round: u32) {
     }
 }
 
+pub(crate) fn apply_peer_pq_keys_env_at(init_height: u64, peers_env: Option<&str>) {
+    if stellereum::pq_registry::pq_lifecycle_active_at(init_height) {
+        if peers_env.is_some_and(|s| !s.trim().is_empty()) {
+            tracing::warn!(
+                init_height,
+                "[post-quantum] ignoring STELL_PEER_PQ_KEYS: W3 PQ lifecycle is active at height {init_height}; committed on-chain PqRegistry is authoritative"
+            );
+            eprintln!(
+                "[WARN] ignoring STELL_PEER_PQ_KEYS at height {init_height}: W3 PQ lifecycle is active; committed on-chain PqRegistry is authoritative"
+            );
+        }
+        return;
+    }
+    if let Some(peers) = peers_env {
+        for entry in peers.split(',') {
+            let mut parts = entry.split(':');
+            if let (Some(ed_hex), Some(pq_hex)) = (parts.next(), parts.next()) {
+                if let (Ok(ed), Ok(pq)) = (hex::decode(ed_hex.trim()), hex::decode(pq_hex.trim())) {
+                    if let Ok(ed_arr) = ed.as_slice().try_into() {
+                        stellereum::consensus::register_validator_pq_key(
+                            ed_arr,
+                            stellereum::post_quantum::PqScheme::Falcon512,
+                            pq,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-// GATE: 15 consensus wiring inputs are required together; grouping would change call sites and sync semantics.
+// GATE: 16 consensus wiring inputs are required together; grouping would change call sites and sync semantics.
 #[allow(unused_assignments)]
 // GATE: restored-state height stores are crash-recovery bookkeeping; removing them would obscure healing flow.
 #[allow(irrefutable_let_patterns)]
@@ -157,6 +226,7 @@ pub(crate) async fn run_consensus_node(
     shared_gov: Arc<tokio::sync::RwLock<stellereum::governance::Governance>>,
     rpc: Arc<stellereum::rpc::RpcState>,
     remote_signer: Option<Arc<dyn stellereum::remote_signer::Signer>>,
+    pq_signer: Option<Arc<dyn stellereum::remote_signer::PqSigner>>,
     is_validator: bool,
     registry: ShardRegistry,
     header_registry: Arc<std::sync::RwLock<stellereum::sharding::FinalizedHeaderRegistry>>,
@@ -223,57 +293,75 @@ pub(crate) async fn run_consensus_node(
         info!("[engine] parallel execution: sequential fallback");
     }
     state.set_parallel_exec(parallel_exec);
-    // Post-quantum validator identity: persistent Falcon-512 keypair
-    // (generated once, never derived from public data — deriving a
-    // PRIVATE key deterministically from a PUBLIC validator id would let
-    // anyone forge any validator's votes). Path via STELL_FALCON_KEY_FILE
-    // (default ./keys/falcon.key, next to identity.key). Peers learn each
-    // other's Falcon pubkeys via STELL_PEER_PQ_KEYS="edpubhex:pqpubhex,..."
-    // (like the ed-pub entries in node.yaml). All keys are registered before
-    // consensus starts.
-    let falcon_path = std::env::var("STELL_FALCON_KEY_FILE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("./keys/falcon.key"));
-    let our_falcon: stellereum::post_quantum::FalconKeypair =
-        match stellereum::node_keys::load_or_generate_falcon_key(&falcon_path) {
-            Ok(k) => k,
-            Err(e) => {
-                panic!(
-                    "[fatal] failed to load or generate falcon key at {}: {e}",
-                    falcon_path.display()
+    // Post-quantum validator identity: persistent Falcon-512 keypair or
+    // v2 remote signer (`STELL_REMOTE_SIGNER_URL`). When a v2 signer is
+    // supplied (or `STELL_REMOTE_SIGNER_URL` is configured), NEVER open or
+    // generate `./keys/falcon.key`. At/after `PQ_LIFECYCLE_ACTIVATION_HEIGHT`,
+    // `STELL_PEER_PQ_KEYS` is ignored with a loud WARN and committed
+    // on-chain `PqRegistry` is authoritative.
+    let init_height = persistence
+        .as_ref()
+        .map(|ap| {
+            let s = ap.storage();
+            let fin = s.finalized().ok().flatten().map(|(h, _)| h).unwrap_or(0);
+            let st = s.latest_state_height().ok().flatten().unwrap_or(0);
+            fin.max(st)
+        })
+        .unwrap_or(0);
+    let w3_active_at_init = stellereum::pq_registry::pq_lifecycle_active_at(init_height);
+    let our_falcon: Option<stellereum::post_quantum::FalconKeypair> =
+        if let Some(ref ps) = pq_signer {
+            info!(
+                "[post-quantum] validator Falcon-512 pubkey (v2 signer): {}",
+                hex::encode(ps.public_key())
+            );
+            if !w3_active_at_init {
+                stellereum::consensus::register_validator_pq_key(
+                    self_vote_id,
+                    ps.scheme(),
+                    ps.public_key().to_vec(),
                 );
             }
-        };
-    info!(
-        "[post-quantum] validator Falcon-512 pubkey: {}",
-        hex::encode(&our_falcon.public_key)
-    );
-    stellereum::consensus::register_validator_pq_key(
-        self_vote_id,
-        stellereum::post_quantum::PqScheme::Falcon512,
-        our_falcon.public_key.clone(),
-    );
-    if let Ok(peers) = std::env::var("STELL_PEER_PQ_KEYS") {
-        for entry in peers.split(',') {
-            let mut parts = entry.split(':');
-            if let (Some(ed_hex), Some(pq_hex)) = (parts.next(), parts.next()) {
-                if let (Ok(ed), Ok(pq)) = (hex::decode(ed_hex.trim()), hex::decode(pq_hex.trim())) {
-                    if let (Ok(ed_arr),) = (ed.as_slice().try_into().map(|a: &[u8]| {
-                        let mut out = [0u8; 32];
-                        out.copy_from_slice(a);
-                        out
-                    }),)
-                    {
-                        stellereum::consensus::register_validator_pq_key(
-                            ed_arr,
-                            stellereum::post_quantum::PqScheme::Falcon512,
-                            pq,
+            None
+        } else if std::env::var(stellereum::remote_signer::REMOTE_SIGNER_URL_ENV)
+            .ok()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            panic!(
+                "[fatal] STELL_REMOTE_SIGNER_URL is configured but no v2 PqSigner was wired; \
+             refusing to open local ./keys/falcon.key (zero local fallback)"
+            );
+        } else {
+            let falcon_path = std::env::var("STELL_FALCON_KEY_FILE")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("./keys/falcon.key"));
+            let k: stellereum::post_quantum::FalconKeypair =
+                match stellereum::node_keys::load_or_generate_falcon_key(&falcon_path) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        panic!(
+                            "[fatal] failed to load or generate falcon key at {}: {e}",
+                            falcon_path.display()
                         );
                     }
-                }
+                };
+            info!(
+                "[post-quantum] validator Falcon-512 pubkey: {}",
+                hex::encode(&k.public_key)
+            );
+            if !w3_active_at_init {
+                stellereum::consensus::register_validator_pq_key(
+                    self_vote_id,
+                    stellereum::post_quantum::PqScheme::Falcon512,
+                    k.public_key.clone(),
+                );
             }
-        }
-    }
+            Some(k)
+        };
+    apply_peer_pq_keys_env_at(
+        init_height,
+        std::env::var("STELL_PEER_PQ_KEYS").ok().as_deref(),
+    );
     // Election is the canonical parent-hash draw (no key material provisioned).
     let mut rt = ValidatorRuntime::new(key, validators, state.clone(), 1)
         .with_mempool(rpc.mempool.clone())
@@ -283,7 +371,6 @@ pub(crate) async fn run_consensus_node(
         .with_shard(block_shard, registry.clone())
         .with_block_reward(BLOCK_REWARD_NANO)
         .with_parallel_exec(parallel_exec)
-        .with_falcon_key(our_falcon)
         // Fork-choice / invalidation wiring: the runtime records every
         // valid candidate branch it sees BEFORE finality and publishes an
         // invalidation signal whenever a branch is pruned (a competing
@@ -294,6 +381,11 @@ pub(crate) async fn run_consensus_node(
         // chain.
         .with_invalidation_sink(std::sync::Arc::new(
             |sig: stellereum::chain::InvalidationSignal| {
+                // Publication is a synchronous, non-blocking fan-out into a
+                // bounded broadcast: no `state.accounts` / `receipts` lock is
+                // held here, so a slow consumer cannot stall the fork-choice
+                // path. Account/token deltas of finalized blocks travel the
+                // same way from the record lane (`publish_block_deltas`).
                 stellereum::rpc::publish_invalidation(&sig);
             },
         ))
@@ -303,6 +395,21 @@ pub(crate) async fn run_consensus_node(
         // follows every masterchain rotation instead of freezing on the
         // config-defined set.
         .with_master_staking(master_staking.clone());
+    if let Some(ps) = pq_signer {
+        rt = rt
+            .with_pq_signer(ps)
+            .expect("pq signer validator_id must match the validator identity");
+    } else if let Some(fk) = our_falcon {
+        if w3_active_at_init {
+            let local_pq = stellereum::remote_signer::LocalPqSigner::new(fk, self_vote_id)
+                .expect("local falcon key must produce valid LocalPqSigner");
+            rt = rt
+                .with_pq_signer(Arc::new(local_pq))
+                .expect("local pq signer validator_id must match the validator identity");
+        } else {
+            rt = rt.with_falcon_key(fk);
+        }
+    }
     // CN-VRF v3 secret custody: only when the gate is actually live at this
     // node's height. Write-ahead `enc2:` persistence lives beside the node
     // keys; the boot self-check refuses to reveal/propose if the on-disk
@@ -497,6 +604,13 @@ pub(crate) async fn run_consensus_node(
                 // which the runtime shares by reference.
                 *rt.state.staking_write().await = ledger;
                 rt.governance = Some(gov);
+                {
+                    let pq_reg = rt.state.pq_registry_read().await;
+                    let active = stellereum::pq_registry::pq_lifecycle_active_at(h);
+                    if active || !pq_reg.is_empty() {
+                        stellereum::consensus::sync_committed_pq_registry(&pq_reg, active);
+                    }
+                }
                 // Same convergence as the snapshot path below: the restored
                 // ledger may name a different set than our config
                 // (bonds/slashes/rotations since genesis, or a stake that
@@ -770,6 +884,16 @@ pub(crate) async fn run_consensus_node(
                         {
                             Ok(reached) => {
                                 info!("[storage] healed engine to height {reached}");
+                                {
+                                    let pq_reg = rt.state.pq_registry_read().await;
+                                    let active =
+                                        stellereum::pq_registry::pq_lifecycle_active_at(reached);
+                                    if active || !pq_reg.is_empty() {
+                                        stellereum::consensus::sync_committed_pq_registry(
+                                            &pq_reg, active,
+                                        );
+                                    }
+                                }
                                 ap.snapshot_state(&rt.state, reached).await;
                                 let ledger = rt.staking_read().await.clone();
                                 let gov = rt.governance.clone().unwrap_or_default();
@@ -1934,10 +2058,15 @@ pub(crate) async fn run_consensus_node(
             // WAN round trip, while the chain now produces a block every
             // ~240 ms — a behind node retried forever without ever closing the
             // gap (and snapshot-sync could never fit at all).
-            let catchup_budget = Duration::from_millis(catchup_pass_budget_ms(
+            let base_catchup_budget = Duration::from_millis(catchup_pass_budget_ms(
                 catchup_budget().as_millis() as u64,
                 budget_gap,
             ));
+            let catchup_budget = effective_catchup_pass_budget(
+                base_catchup_budget,
+                budget_gap,
+                last_live_adopt.elapsed(),
+            );
             let caught = tokio::time::timeout(
                 catchup_budget,
                 try_catch_up(&adapter, &mut rt, block_shard, persistence.as_ref(), &rpc),
@@ -3640,6 +3769,16 @@ pub(crate) async fn run_consensus_node(
                             // quorum it is measured against.
                             match rt.adopt_committed(height, block.clone(), certificate).await {
                                 Ok(bh) => {
+                                    {
+                                        let pq_reg = rt.state.pq_registry_read().await;
+                                        let active =
+                                            stellereum::pq_registry::pq_lifecycle_active_at(height);
+                                        if active || !pq_reg.is_empty() {
+                                            stellereum::consensus::sync_committed_pq_registry(
+                                                &pq_reg, active,
+                                            );
+                                        }
+                                    }
                                     // Verified commit (QC checked inside adopt):
                                     // feed the syncing signal too (audit follow-up).
                                     stellereum::rpc::note_peer_height(height);
@@ -3657,12 +3796,31 @@ pub(crate) async fn run_consensus_node(
                                     // but on `publish_lane`: the tick keeps draining and the
                                     // next height adopts immediately.
                                     if let Some(body) = rt.blocks.get(&bh).cloned() {
-                                        let a = adapter.clone();
-                                        let shard_id = block_shard;
-                                        publish_lane.submit(async move {
-                                            let _ = a.retro_publish_blocks([&body], 1).await;
-                                            a.persist_block_header(shard_id, &body).await;
-                                        });
+                                        let is_proposer = body.proposer == self_vote_id;
+                                        let validator_count = rt.validators.len();
+                                        let publish_body = should_publish_body_now(
+                                            validator_count,
+                                            is_proposer,
+                                            height,
+                                        );
+                                        let publish_header = should_publish_header_now(
+                                            validator_count,
+                                            is_proposer,
+                                            height,
+                                        );
+                                        if publish_body || publish_header {
+                                            let a = adapter.clone();
+                                            let shard_id = block_shard;
+                                            publish_lane.submit(async move {
+                                                if publish_body {
+                                                    let _ =
+                                                        a.retro_publish_blocks([&body], 1).await;
+                                                }
+                                                if publish_header {
+                                                    a.persist_block_header(shard_id, &body).await;
+                                                }
+                                            });
+                                        }
                                     }
                                     // Replication for adopters (bodies + receipts):
                                     // the adopted block carries its transactions
@@ -3715,6 +3873,15 @@ pub(crate) async fn run_consensus_node(
                                                 height, bh, &txs, &statuses, &fees, &events, ts,
                                             )
                                             .await;
+                                            // GEYSER-LITE DELTAS: same contract
+                                            // as the finalize path — publish the
+                                            // block's real account deltas and
+                                            // token transfers OUTSIDE the
+                                            // receipts/head write locks, through
+                                            // the non-blocking fan-out.
+                                            stellereum::rpc::publish_block_deltas(
+                                                height, bh, block_shard, &txs, &statuses,
+                                            );
                                             if is_mc {
                                                 if let Some(store) = persist_store {
                                                     let exec_hardening =
@@ -3936,6 +4103,13 @@ pub(crate) async fn run_consensus_node(
             let height = completed.height;
             let bh = completed.hash;
             let root = completed.root;
+            {
+                let pq_reg = rt.state.pq_registry_read().await;
+                let active = stellereum::pq_registry::pq_lifecycle_active_at(height);
+                if active || !pq_reg.is_empty() {
+                    stellereum::consensus::sync_committed_pq_registry(&pq_reg, active);
+                }
+            }
             // Governed fee floor (audit follow-up): admission floor =
             // max(frozen, governed), refreshed every finalized height so a passed
             // SetMinGasLimit takes effect network-wide without restarts.
@@ -3976,30 +4150,40 @@ pub(crate) async fn run_consensus_node(
             // for a replica). They are submitted to `publish_lane` instead,
             // which runs them one at a time in submission order -- head, then
             // body, then header, exactly the order awaiting gave them.
-            {
-                let a = adapter.clone();
-                let shard_id = block_shard;
-                publish_lane.submit(async move {
-                    a.publish_head(shard_id, height, bh).await;
-                });
-            }
-            // Publish the fresh body immediately: the retro-publish cursor
-            // works bottom-up and reaches the tip last, so without this a peer
-            // that is exactly one block behind waits the whole window for the
-            // single body it needs -- observed live as a permanent 1-height
-            // stall with the body merely unpublished, never missing.
+            // Publish the fresh body and header immediately for the block's
+            // proposer (and on small sets / boundary heights), avoiding a
+            // cluster-wide dht.store storm on every single height while keeping
+            // every height's head/body/header available immediately.
             if let Some(block) = rt.blocks.get(&bh).cloned() {
-                let a = adapter.clone();
-                let shard_id = block_shard;
+                let is_proposer = block.proposer == self_vote_id;
+                let validator_count = rt.validators.len();
+                let publish_body = should_publish_body_now(validator_count, is_proposer, height);
+                let publish_header =
+                    should_publish_header_now(validator_count, is_proposer, height);
+                if publish_body {
+                    let a = adapter.clone();
+                    let shard_id = block_shard;
+                    publish_lane.submit(async move {
+                        a.publish_head(shard_id, height, bh).await;
+                    });
+                }
                 let h = block.height;
-                publish_lane.submit(async move {
-                    let _ = a.retro_publish_blocks([&block], 1).await;
-                    // Publish the HEADER at every height too. The snapshot anchor
-                    // (F1) walks headers from our finalized head to the snapshot's
-                    // successor; that walk can only be proven if a header exists at
-                    // every height, not just at 100-block snapshot boundaries.
-                    a.persist_block_header(shard_id, &block).await;
-                });
+                if publish_body || publish_header {
+                    let a = adapter.clone();
+                    let shard_id = block_shard;
+                    publish_lane.submit(async move {
+                        if publish_body {
+                            let _ = a.retro_publish_blocks([&block], 1).await;
+                        }
+                        if publish_header {
+                            // Publish the HEADER at every height too (by the
+                            // proposer, and reinforced on 8-height boundaries).
+                            // The snapshot anchor (F1) walks headers from our
+                            // finalized head to the snapshot's successor.
+                            a.persist_block_header(shard_id, &block).await;
+                        }
+                    });
+                }
                 // Retention prune rides its OWN lane (audit 2026-10-06, own lane
                 // since the live-adopt tempo fix): on publish_lane it queued
                 // behind replica-waiting store_blob jobs (seconds each), and on
@@ -4021,6 +4205,12 @@ pub(crate) async fn run_consensus_node(
                         g.store(false, std::sync::atomic::Ordering::Relaxed);
                     });
                 }
+            } else {
+                let a = adapter.clone();
+                let shard_id = block_shard;
+                publish_lane.submit(async move {
+                    a.publish_head(shard_id, height, bh).await;
+                });
             }
             // Tell peers what we committed. A node that missed the deciding
             // vote would otherwise never learn the outcome and would stall
@@ -4085,6 +4275,19 @@ pub(crate) async fn run_consensus_node(
                     )
                     .await;
                     r.record_block(height, bh, tx_count, block_ts).await;
+                    // GEYSER-LITE DELTAS (Zero Consensus Blocking): publish the
+                    // accounts this block actually changed and the token
+                    // transfers it included. Both `record_receipts_with_events`
+                    // and `record_block` have released their write locks above,
+                    // and this fan-out is a non-blocking broadcast — a stalled
+                    // subscriber cannot delay the record lane (or consensus).
+                    stellereum::rpc::publish_block_deltas(
+                        height,
+                        bh,
+                        block_shard,
+                        &block.transactions,
+                        &statuses,
+                    );
                     if let Some(store) = persist_store {
                         let _ = store.put_finalized_post_root(height, root);
                         if is_mc {
@@ -4527,6 +4730,7 @@ pub(crate) async fn run_consensus_node(
                             zkml_models,
                             cnvrf_v3,
                             evm_bindings,
+                            pq_registry,
                         } = bundle;
                         // Serialize on the blocking pool. Bytes are identical to
                         // the old inline `create_snapshot`/`bincode::serialize`
@@ -4559,6 +4763,7 @@ pub(crate) async fn run_consensus_node(
                         {
                             ap2.enqueue_cnvrf_v3(height, cnvrf_v3.clone());
                             ap2.enqueue_evm_bindings_state(height, evm_bindings.clone());
+                            ap2.enqueue_pq_registry(height, pq_registry.clone());
                             ap2.enqueue_domains(
                                 height,
                                 domain_bytes.clone(),
@@ -4596,6 +4801,7 @@ pub(crate) async fn run_consensus_node(
                                 ("cnvrf_v3", cnvrf_v3.clone()),
                                 ("pq_keys", pq_keys),
                                 ("evm_bindings", evm_bindings.clone()),
+                                ("pq_registry", pq_registry.clone()),
                             ];
                             debug_assert!(
                                 {
@@ -5570,5 +5776,118 @@ mod restart_height_tests {
         // recognizes the already-queued signed-round proposal and avoids duplicate enqueue.
         assert!(!outbox_has_proposal(&outbox, 9, 5));
         assert!(outbox_has_proposal(&outbox, b.height, b.round));
+    }
+}
+
+#[cfg(test)]
+mod publish_and_catchup_policy_tests {
+    use super::*;
+
+    #[test]
+    fn small_gap_live_catchup_budget_is_capped_at_120ms() {
+        let base = Duration::from_millis(2_000);
+        // Live chain (< 1500ms since last finalize/adopt) + gap <= 2 => 120ms cap.
+        assert_eq!(
+            effective_catchup_pass_budget(base, 0, Duration::from_millis(250)),
+            Duration::from_millis(120)
+        );
+        assert_eq!(
+            effective_catchup_pass_budget(base, 2, Duration::from_millis(1_499)),
+            Duration::from_millis(120)
+        );
+        // Smaller base stays untouched.
+        assert_eq!(
+            effective_catchup_pass_budget(Duration::from_millis(80), 1, Duration::from_millis(200)),
+            Duration::from_millis(80)
+        );
+        // Stalled chain (>= 1500ms) or deeper gap (> 2) keeps full base budget.
+        assert_eq!(
+            effective_catchup_pass_budget(base, 1, Duration::from_millis(1_500)),
+            base
+        );
+        assert_eq!(
+            effective_catchup_pass_budget(base, 3, Duration::from_millis(100)),
+            base
+        );
+    }
+
+    #[test]
+    fn dht_publish_gates_suppress_redundant_non_proposer_writes() {
+        // Small validator sets (<= 2) always publish immediately.
+        for v in [1usize, 2] {
+            for h in 1..=9u64 {
+                assert!(should_publish_body_now(v, false, h));
+                assert!(should_publish_header_now(v, false, h));
+            }
+        }
+        // On a 4-validator cluster, the proposer always publishes immediately.
+        for h in 1..=9u64 {
+            assert!(should_publish_body_now(4, true, h));
+            assert!(should_publish_header_now(4, true, h));
+        }
+        // Non-proposers only reinforce on mod-4 (body) / mod-8 (header).
+        assert!(!should_publish_body_now(4, false, 1));
+        assert!(!should_publish_body_now(4, false, 3));
+        assert!(should_publish_body_now(4, false, 4));
+        assert!(should_publish_body_now(4, false, 8));
+
+        assert!(!should_publish_header_now(4, false, 4));
+        assert!(should_publish_header_now(4, false, 8));
+    }
+}
+
+#[cfg(test)]
+mod r3_driver_pq_tests {
+    use super::*;
+
+    struct GateGuard;
+    impl GateGuard {
+        fn at(h: u64) -> Self {
+            stellereum::pq_registry::set_pq_lifecycle_activation_override(Some(h));
+            Self
+        }
+    }
+    impl Drop for GateGuard {
+        fn drop(&mut self) {
+            stellereum::pq_registry::set_pq_lifecycle_activation_override(None);
+        }
+    }
+
+    #[test]
+    fn peer_pq_keys_env_honored_before_w3_and_ignored_at_or_after_w3() {
+        let _g = GateGuard::at(100);
+        let peer_id = [0xD7u8; 32];
+        let fk = stellereum::post_quantum::FalconKeypair::generate_from_seed(0xD7);
+        let spec = format!("{}:{}", hex::encode(peer_id), hex::encode(&fk.public_key));
+
+        stellereum::consensus::clear_validator_pq_keys_for_tests();
+        stellereum::consensus::sync_committed_pq_registry(
+            &stellereum::pq_registry::PqRegistry::new(),
+            true,
+        );
+
+        // Pre-W3 (< 100): STELL_PEER_PQ_KEYS populates PQ_VALIDATOR_KEYS.
+        apply_peer_pq_keys_env_at(50, Some(&spec));
+        assert_eq!(
+            stellereum::consensus::pq_key_at_height(&peer_id, 50),
+            Some((
+                stellereum::post_quantum::PqScheme::Falcon512,
+                fk.public_key.clone()
+            ))
+        );
+
+        // Reset legacy + committed maps, then test >= 100: STELL_PEER_PQ_KEYS is ignored.
+        stellereum::consensus::clear_validator_pq_keys_for_tests();
+        stellereum::consensus::sync_committed_pq_registry(
+            &stellereum::pq_registry::PqRegistry::new(),
+            true,
+        );
+        apply_peer_pq_keys_env_at(100, Some(&spec));
+        assert_eq!(stellereum::consensus::pq_key_at_height(&peer_id, 100), None);
+        assert_eq!(
+            stellereum::consensus::get_validator_pq_key(&peer_id),
+            None,
+            "STELL_PEER_PQ_KEYS must not populate PQ_VALIDATOR_KEYS when pq_lifecycle_active_at(init_height) is true"
+        );
     }
 }

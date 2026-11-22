@@ -289,12 +289,28 @@ pub fn evm_send_refusal_from_params(params: &Value) -> JsonRpcError {
 /// canonical raw inside the `EV1` envelope of
 /// [`crate::sharding::Transaction::new_evm`].
 ///
+/// Default (legacy) policy: [`evm_raw_to_stell_transaction_at`] with
+/// `strict_sub_nano = false`.
+///
 /// * contract creation (`to == None`) is rejected — there is no Stell
 ///   recipient to invent for a deployment;
 /// * calldata (if any) is NOT executed — the carrier is a plain transfer of
 ///   the mapped value;
 /// * shards are masterchain (single-shard carrier lane).
 pub fn evm_raw_to_stell_transaction(raw: &[u8]) -> Result<crate::sharding::Transaction, String> {
+    evm_raw_to_stell_transaction_at(raw, false)
+}
+
+/// [`evm_raw_to_stell_transaction`] with an explicit sub-nano policy.
+///
+/// `strict_sub_nano == true` maps the EVM value through [`wei_to_nano_exact`],
+/// so RPC/admission can fail closed on a non-multiple-of-1e9 Wei amount
+/// immediately instead of truncating it. `false` keeps the historical
+/// truncating mapping byte-for-byte.
+pub fn evm_raw_to_stell_transaction_at(
+    raw: &[u8],
+    strict_sub_nano: bool,
+) -> Result<crate::sharding::Transaction, String> {
     if raw.is_empty() || raw.len() > MAX_EVM_RAW_TX_BYTES {
         return Err("empty or oversized raw transaction".to_string());
     }
@@ -305,10 +321,15 @@ pub fn evm_raw_to_stell_transaction(raw: &[u8]) -> Result<crate::sharding::Trans
     let evm_to = decoded.to().ok_or_else(|| {
         "EVM contract creation is not settled in Phase 2 (value transfers only)".to_string()
     })?;
+    let value_nano = if strict_sub_nano {
+        wei_to_nano_exact(decoded.value())?
+    } else {
+        wei_to_nano(decoded.value())
+    };
     Ok(crate::sharding::Transaction::new_evm(
         evm_to_stell_address(&evm_from),
         evm_to_stell_address(&evm_to),
-        wei_to_nano(decoded.value()),
+        value_nano,
         decoded.gas_limit(),
         decoded.nonce(),
         crate::sharding::MASTERCHAIN_SHARD,

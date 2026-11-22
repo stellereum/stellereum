@@ -340,21 +340,6 @@ pub fn finalized_headers() -> Arc<RwLock<std::collections::VecDeque<FinalizedHea
         .clone()
 }
 
-/// The process-wide PQ key registry view served by `stell_getPqKey` /
-/// `stell_getPqRegistryStatus`.
-///
-/// A node has ONE PQ rotation story (like it has ONE header chain, see
-/// [`finalized_headers`]): the registry is a property of the node, not of an
-/// RPC instance, so the read arms consult this handle instead of a per-state
-/// copy. The arms take only `.read()` — they never mutate. Writes arrive
-/// through the staking hooks / future announcement wiring (and tests), never
-/// through RPC: there is deliberately no state-mutating PQ endpoint.
-pub fn pq_registry_handle() -> &'static RwLock<crate::pq_registry::PqRegistry> {
-    static PQ_REGISTRY: std::sync::OnceLock<RwLock<crate::pq_registry::PqRegistry>> =
-        std::sync::OnceLock::new();
-    PQ_REGISTRY.get_or_init(|| RwLock::new(crate::pq_registry::PqRegistry::new()))
-}
-
 /// Max number of FINALIZED HEADERS (with their quorum certificates) retained
 /// for the light client.
 ///
@@ -512,12 +497,29 @@ impl RpcState {
         // Streaming: this IS the consensus finalize hook, so the `newHeads`
         // subscribers are notified here -- a subscriber sees every finalized
         // head of this node, in order, tagged `finality: "finalized"`.
-        publish_new_head(
+        //
+        // The head carries the shard THIS engine runs (a workchain node must
+        // report its real shard, never the masterchain constant) plus the
+        // quorum-certified header metadata (`prev_hash`, `state_root`,
+        // `proposer`) recorded moments earlier by
+        // [`Self::record_finalized_header`]. A node with no recorded header
+        // for this height is honest with `null`, never a fabricated root.
+        let header = if crate::rpc::hub().is_empty() {
+            None
+        } else {
+            let store = finalized_headers();
+            let hs = store.read().await;
+            hs.iter()
+                .find(|r| r.height == height && r.block_hash == hash)
+                .cloned()
+        };
+        publish_new_head_with_header(
             height,
             hash,
-            crate::sharding::MASTERCHAIN_SHARD,
+            self.engine.shard_id(),
             tx_count,
             timestamp,
+            header.as_ref(),
         );
     }
 

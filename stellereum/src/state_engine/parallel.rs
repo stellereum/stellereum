@@ -134,6 +134,7 @@ fn plan_plain_tx(
     cross_shard: bool,
     sponsor: Option<(u64, u64)>,
     exec_hardening: bool,
+    fee_market_v2: bool,
 ) -> PlainTxPlan {
     let mut plan = PlainTxPlan::default();
 
@@ -149,11 +150,13 @@ fn plan_plain_tx(
     // in full was the over-charge FEE-01 closes). F-01: the consensus floor
     // still raises the result. Both numbers come from the engine's helpers, so
     // they cannot drift from `commit_native`'s.
-    let fee = InMemoryStateEngine::fee_for_gas_at(tx, 0, floor_base, 0, exec_hardening);
+    let fee =
+        InMemoryStateEngine::fee_for_gas_at_v2(tx, 0, floor_base, 0, exec_hardening, fee_market_v2);
     // The failure price is `failure_fee_for` (the intrinsic envelope is
     // guaranteed consumption whether or not a payload ran); for a plain
     // transfer the two coincide, and the debug assertion pins that.
-    let fail_fee = InMemoryStateEngine::failure_fee_for(tx, floor_base, surcharge);
+    let fail_fee =
+        InMemoryStateEngine::failure_fee_for_v2(tx, floor_base, surcharge, fee_market_v2);
     debug_assert_eq!(fail_fee, fee.saturating_add(surcharge));
 
     // A live session-gate refusal is attributable: the floor is charged and
@@ -458,6 +461,7 @@ impl InMemoryStateEngine {
         fee_floors: &[(u64, u64)],
         vesting_floors: &HashMap<[u8; 32], u64>,
         exec_hardening: bool,
+        fee_market_v2: bool,
         applied: &mut usize,
         failed: &mut usize,
         fees_collected: &mut u64,
@@ -528,6 +532,7 @@ impl InMemoryStateEngine {
                                 tx.effective_sponsor()
                                     .and_then(|s| snapshot.get(&s).copied().flatten()),
                                 exec_hardening,
+                                fee_market_v2,
                             );
                             (i, plan)
                         })
@@ -611,6 +616,7 @@ impl InMemoryStateEngine {
                     burn_for_cross_shard && tx.source_shard != tx.target_shard,
                     sponsor,
                     exec_hardening,
+                    fee_market_v2,
                 );
                 commit_plain_plan(
                     &mut map,
@@ -759,6 +765,10 @@ impl InMemoryStateEngine {
         // re-verification. Chain-id/binding/session/nonce/balance checks below
         // still run for EVERY transaction, attested or not.
         let exec_hardening = crate::chain_spec::exec_hardening_v1_active_at(chain_height);
+        // W4 FEE_MARKET_V2: one gate decision for the whole block, shared by the
+        // sequential loop, the parallel plain wave and the failure fees, so the
+        // parallel and sequential roots cannot diverge.
+        let fee_market_v2 = crate::tokenomics::fee_market_v2_active_at(chain_height);
         let sig_valid = verify_block_tx_signatures_at_height(txs, self.chain_id, chain_height);
 
         // 2) Group transaction indices by sender, preserving order.
@@ -1044,7 +1054,7 @@ impl InMemoryStateEngine {
                 // at the consensus floor, plus the additive surcharge — never
                 // the declared limit (the failure arm of the VM result carries
                 // no consumption measurement; see `failure_fee_for`).
-                let fee = Self::failure_fee_for($tx, floor_base, surcharge);
+                let fee = Self::failure_fee_for_v2($tx, floor_base, surcharge, fee_market_v2);
                 if let Some(auth) = $tx.sponsored_grant() {
                     let (debited, charged_state) = self
                         .charge_sponsored_failure_fee($tx, &auth.sponsor, fee)
@@ -1114,6 +1124,7 @@ impl InMemoryStateEngine {
                         &fee_floors,
                         &vesting_floors,
                         exec_hardening,
+                        fee_market_v2,
                         &mut applied,
                         &mut failed,
                         &mut fees_collected,

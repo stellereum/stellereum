@@ -109,23 +109,33 @@ use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Width of an Ed25519 public key, in bytes.
+/// Width of an Ed25519 public key, in bytes (v1 legacy compatibility until R3-F).
 pub const PUBLIC_KEY_LEN: usize = 32;
-/// Width of an Ed25519 signature, in bytes.
+/// Width of an Ed25519 signature, in bytes (v1 legacy compatibility until R3-F).
 pub const SIGNATURE_LEN: usize = 64;
+
+/// Width of a Falcon-512 public key, in bytes (`0x09` header + 896-byte encoded `h`).
+pub const FALCON_PUBLIC_KEY_LEN: usize = crate::post_quantum::FALCON512_PUBKEY_LEN;
+/// Width of a Falcon-512 signature, in bytes.
+pub const FALCON_SIGNATURE_LEN: usize = crate::post_quantum::FALCON512_SIG_LEN;
 
 /// Default per-request timeout when talking to a remote signer.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Hard cap on a response body we will read from a remote signer. A signing
-/// response is a couple of hundred bytes; anything larger is either a
-/// misconfigured endpoint or a hostile one, and is not worth the memory.
+/// Hard cap on a response body we will read from a remote signer (`8 KiB`).
+/// Covers v2 Falcon-512 JSON responses (`1794` hex chars for public key,
+/// `1332` hex chars for signature) while rejecting oversized payloads.
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024;
 
-/// Default path (relative to the base URL) that returns the signer's public key.
+/// Default path (relative to the base URL) that returns the v1 signer's public key.
 pub const DEFAULT_PUBLIC_KEY_PATH: &str = "/public_key";
-/// Default path (relative to the base URL) that signs a message.
+/// Default path (relative to the base URL) that signs a v1 message.
 pub const DEFAULT_SIGN_PATH: &str = "/sign";
+
+/// Default v2 path (relative to the base URL) returning the Falcon-512 public key + validator id.
+pub const DEFAULT_V2_PUBLIC_KEY_PATH: &str = "/v2/public_key";
+/// Default v2 path (relative to the base URL) signing a structured consensus request.
+pub const DEFAULT_V2_SIGN_PATH: &str = "/v2/sign";
 
 // ============================================================================
 // Errors
@@ -179,6 +189,9 @@ pub enum SigningFailureKind {
     SignatureInvalid,
     /// The local key could not produce a signature.
     UnusableKey,
+    /// Structured consensus request validation failed (anti-oracle: mismatched
+    /// or non-consensus preimage, arbitrary bytes, or transaction payload).
+    InvalidRequest,
 }
 
 /// Every way signing can fail.
@@ -194,14 +207,26 @@ pub enum SignerError {
     Transport(TransportErrorKind),
     /// The remote signer answered with something we cannot interpret.
     MalformedResponse(MalformedResponseKind),
-    /// The public key was not [`PUBLIC_KEY_LEN`] bytes.
+    /// The public key was not the expected byte width.
     BadPublicKeyLength { got: usize },
-    /// The signature was not [`SIGNATURE_LEN`] bytes.
+    /// The signature was not the expected byte width.
     BadSignatureLength { got: usize },
     /// Signing failed for a reason other than transport or parsing.
     SigningFailed(SigningFailureKind),
     /// Locally configured key material could not be decoded into a key.
     MalformedKey,
+    /// Remote signer returned an unsupported or disabled PQ scheme id.
+    UnsupportedScheme { scheme_id: u8 },
+    /// Remote signer's validator_id does not match the expected validator_id.
+    ValidatorIdMismatch,
+    /// Remote signer's public key does not match the pinned/expected public key.
+    PublicKeyMismatch,
+    /// Request violates anti-equivocation safety monotonicity / lock rules.
+    SafetyViolation,
+    /// Durable safety record store is quarantined or missing initialization.
+    SafetyStoreQuarantined,
+    /// Plain `http://` is forbidden for non-loopback remote signer endpoints.
+    PlainHttpForbiddenOnNonLoopback,
 }
 
 impl fmt::Display for SignerError {
@@ -252,13 +277,13 @@ impl fmt::Display for SignerError {
             SignerError::BadPublicKeyLength { got } => {
                 write!(
                     f,
-                    "remote signer returned a {got}-byte public key, expected {PUBLIC_KEY_LEN}"
+                    "remote signer returned a {got}-byte public key (wrong width)"
                 )
             }
             SignerError::BadSignatureLength { got } => {
                 write!(
                     f,
-                    "remote signer returned a {got}-byte signature, expected {SIGNATURE_LEN}"
+                    "remote signer returned a {got}-byte signature (wrong width)"
                 )
             }
             SignerError::SigningFailed(SigningFailureKind::EmptyMessage) => {
@@ -271,10 +296,52 @@ impl fmt::Display for SignerError {
             SignerError::SigningFailed(SigningFailureKind::UnusableKey) => {
                 write!(f, "local signing key is unusable")
             }
+            SignerError::SigningFailed(SigningFailureKind::InvalidRequest) => {
+                write!(
+                    f,
+                    "refusing non-consensus or mismatched preimage signing request"
+                )
+            }
             SignerError::MalformedKey => {
                 write!(
                     f,
                     "signing key material is malformed (bad hex or wrong length)"
+                )
+            }
+            SignerError::UnsupportedScheme { scheme_id } => {
+                write!(
+                    f,
+                    "remote signer returned unsupported scheme_id {scheme_id} (only Falcon-512 0x02 accepted)"
+                )
+            }
+            SignerError::ValidatorIdMismatch => {
+                write!(
+                    f,
+                    "remote signer validator_id does not match expected validator"
+                )
+            }
+            SignerError::PublicKeyMismatch => {
+                write!(
+                    f,
+                    "remote signer public key does not match expected committed key"
+                )
+            }
+            SignerError::SafetyViolation => {
+                write!(
+                    f,
+                    "refusing to sign: consensus safety / anti-equivocation violation"
+                )
+            }
+            SignerError::SafetyStoreQuarantined => {
+                write!(
+                    f,
+                    "refusing to sign: safety record store is quarantined or uninitialized"
+                )
+            }
+            SignerError::PlainHttpForbiddenOnNonLoopback => {
+                write!(
+                    f,
+                    "plain http:// is forbidden for non-loopback remote signer URLs"
                 )
             }
         }
@@ -996,5 +1063,1270 @@ pub fn validator_signer_from_env(
     match remote_signer_from_config(url, token)? {
         Some(remote) => Ok(ValidatorSigner::Remote(remote)),
         None => Ok(ValidatorSigner::local(&local_seed)),
+    }
+}
+
+// ============================================================================
+// Ruleset v7 / W3: FULL-PQ Falcon-512 Remote & Local Consensus Signer (v2)
+// ============================================================================
+
+use crate::consensus::{VoteKind, VOTE_SIGN_DOMAIN};
+use crate::post_quantum::{verify_pq_signature, FalconKeypair, PqScheme};
+use crate::storage::SafetyRecordStore;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
+use std::sync::Mutex;
+
+const SAFETY_V2_MAGIC: &[u8; 4] = b"SQV2";
+
+/// Reconstruct the exact `STELLEREUM_BFT_VOTE_V3` preimage for an explicit
+/// `chain_id`, `shard_id`, `height`, `round`, `kind`, and `block_hash`.
+///
+/// Matches `crate::consensus::vote_sign_bytes_for_shard` byte-for-byte without
+/// relying on process-global `consensus_chain_id()`.
+pub fn vote_sign_bytes_with_chain(
+    chain_id: u64,
+    shard_id: u32,
+    height: u64,
+    round: u32,
+    kind: VoteKind,
+    block_hash: &Option<[u8; 32]>,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(88);
+    m.extend_from_slice(VOTE_SIGN_DOMAIN);
+    m.extend_from_slice(&chain_id.to_be_bytes());
+    m.extend_from_slice(&shard_id.to_be_bytes());
+    m.extend_from_slice(&height.to_be_bytes());
+    m.extend_from_slice(&round.to_be_bytes());
+    m.push(match kind {
+        VoteKind::Prevote => 0,
+        VoteKind::Precommit => 1,
+    });
+    match block_hash {
+        Some(h) => {
+            m.push(1);
+            m.extend_from_slice(h);
+        }
+        None => m.push(0),
+    }
+    m
+}
+
+/// Structured consensus signing request (anti-oracle: never signs arbitrary
+/// bytes, transactions, or non-consensus domains).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConsensusSignRequest {
+    Vote {
+        chain_id: u64,
+        shard_id: u32,
+        height: u64,
+        round: u32,
+        kind: VoteKind,
+        block_hash: Option<[u8; 32]>,
+    },
+    Proposal {
+        chain_id: u64,
+        shard_id: u32,
+        height: u64,
+        round: u32,
+        block_hash: [u8; 32],
+    },
+}
+
+impl ConsensusSignRequest {
+    pub fn chain_id(&self) -> u64 {
+        match self {
+            Self::Vote { chain_id, .. } | Self::Proposal { chain_id, .. } => *chain_id,
+        }
+    }
+
+    pub fn shard_id(&self) -> u32 {
+        match self {
+            Self::Vote { shard_id, .. } | Self::Proposal { shard_id, .. } => *shard_id,
+        }
+    }
+
+    pub fn height(&self) -> u64 {
+        match self {
+            Self::Vote { height, .. } | Self::Proposal { height, .. } => *height,
+        }
+    }
+
+    pub fn round(&self) -> u32 {
+        match self {
+            Self::Vote { round, .. } | Self::Proposal { round, .. } => *round,
+        }
+    }
+
+    /// Reconstruct the canonical bytes that must be signed by Falcon-512 for
+    /// this consensus message.
+    pub fn canonical_signing_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Vote {
+                chain_id,
+                shard_id,
+                height,
+                round,
+                kind,
+                block_hash,
+            } => {
+                vote_sign_bytes_with_chain(*chain_id, *shard_id, *height, *round, *kind, block_hash)
+            }
+            Self::Proposal { block_hash, .. } => block_hash.to_vec(),
+        }
+    }
+
+    /// Anti-oracle verification: verifies that `caller_preimage` is non-empty
+    /// and matches the canonical bytes reconstructed from `self`.
+    pub fn verify_preimage(&self, caller_preimage: &[u8]) -> Result<Vec<u8>, SignerError> {
+        if caller_preimage.is_empty() {
+            return Err(SignerError::SigningFailed(SigningFailureKind::EmptyMessage));
+        }
+        let canonical = self.canonical_signing_bytes();
+        if caller_preimage != canonical.as_slice() {
+            return Err(SignerError::SigningFailed(
+                SigningFailureKind::InvalidRequest,
+            ));
+        }
+        Ok(canonical)
+    }
+}
+
+/// Persisted stamp of the highest signed prevote or precommit at the current height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedVoteStamp {
+    pub height: u64,
+    pub round: u32,
+    pub target: Option<[u8; 32]>,
+}
+
+/// Persisted stamp of the highest signed proposal at the current height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedProposalStamp {
+    pub height: u64,
+    pub round: u32,
+    pub block_hash: [u8; 32],
+}
+
+/// Anti-equivocation watermark and lock state persisted in [`SafetyRecordStore`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsensusSafetyState {
+    pub height: u64,
+    pub locked_round: Option<u32>,
+    pub locked_value_id: Option<[u8; 32]>,
+    pub last_prevote: Option<SignedVoteStamp>,
+    pub last_precommit: Option<SignedVoteStamp>,
+    pub last_proposal: Option<SignedProposalStamp>,
+}
+
+impl ConsensusSafetyState {
+    /// Enforce strict height/round monotonicity and lock invariants for `req`.
+    pub fn check_and_advance(
+        &self,
+        req: &ConsensusSignRequest,
+        value_id: Option<[u8; 32]>,
+    ) -> Result<Self, SignerError> {
+        let req_height = req.height();
+        if req_height < self.height {
+            return Err(SignerError::SafetyViolation);
+        }
+        let mut next = if req_height > self.height {
+            Self {
+                height: req_height,
+                locked_round: None,
+                locked_value_id: None,
+                last_prevote: None,
+                last_precommit: None,
+                last_proposal: None,
+            }
+        } else {
+            self.clone()
+        };
+
+        match req {
+            ConsensusSignRequest::Vote {
+                round,
+                kind: VoteKind::Prevote,
+                block_hash,
+                ..
+            } => {
+                if let Some(last) = next.last_prevote {
+                    if *round <= last.round {
+                        return Err(SignerError::SafetyViolation);
+                    }
+                }
+                if block_hash.is_some() {
+                    if let (Some(_lr), Some(locked_vid), Some(vid)) =
+                        (next.locked_round, next.locked_value_id, value_id)
+                    {
+                        if vid != locked_vid {
+                            return Err(SignerError::SafetyViolation);
+                        }
+                    }
+                }
+                next.last_prevote = Some(SignedVoteStamp {
+                    height: next.height,
+                    round: *round,
+                    target: *block_hash,
+                });
+            }
+            ConsensusSignRequest::Vote {
+                round,
+                kind: VoteKind::Precommit,
+                block_hash,
+                ..
+            } => {
+                if let Some(last) = next.last_precommit {
+                    if *round <= last.round {
+                        return Err(SignerError::SafetyViolation);
+                    }
+                }
+                if block_hash.is_some() {
+                    if let (Some(_lr), Some(locked_vid), Some(vid)) =
+                        (next.locked_round, next.locked_value_id, value_id)
+                    {
+                        if vid != locked_vid {
+                            return Err(SignerError::SafetyViolation);
+                        }
+                    }
+                }
+                next.last_precommit = Some(SignedVoteStamp {
+                    height: next.height,
+                    round: *round,
+                    target: *block_hash,
+                });
+            }
+            ConsensusSignRequest::Proposal {
+                round, block_hash, ..
+            } => {
+                if let Some(last) = next.last_proposal {
+                    if *round <= last.round {
+                        return Err(SignerError::SafetyViolation);
+                    }
+                }
+                next.last_proposal = Some(SignedProposalStamp {
+                    height: next.height,
+                    round: *round,
+                    block_hash: *block_hash,
+                });
+            }
+        }
+        Ok(next)
+    }
+}
+
+fn encode_safety_state(state: &ConsensusSafetyState) -> Result<Vec<u8>, SignerError> {
+    let body = bincode::serialize(state).map_err(|_| SignerError::SafetyStoreQuarantined)?;
+    let mut out = Vec::with_capacity(SAFETY_V2_MAGIC.len() + body.len());
+    out.extend_from_slice(SAFETY_V2_MAGIC);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+fn decode_safety_state(bytes: &[u8]) -> Result<ConsensusSafetyState, SignerError> {
+    if bytes.len() < SAFETY_V2_MAGIC.len() || &bytes[..SAFETY_V2_MAGIC.len()] != SAFETY_V2_MAGIC {
+        return Err(SignerError::SafetyStoreQuarantined);
+    }
+    bincode::deserialize(&bytes[SAFETY_V2_MAGIC.len()..])
+        .map_err(|_| SignerError::SafetyStoreQuarantined)
+}
+
+struct SafetyGuardInner {
+    store: Option<SafetyRecordStore>,
+    generation: u64,
+    state: ConsensusSafetyState,
+    quarantined: bool,
+}
+
+/// Serialized check-persist-then-sign anti-equivocation guard backed by either
+/// a durable [`SafetyRecordStore`] or in-memory state (for unit tests).
+pub struct ConsensusSafetyGuard {
+    inner: Mutex<SafetyGuardInner>,
+}
+
+impl ConsensusSafetyGuard {
+    /// Ephemeral in-memory guard (for tests or mock signers without sled).
+    pub fn in_memory() -> Self {
+        Self {
+            inner: Mutex::new(SafetyGuardInner {
+                store: None,
+                generation: 0,
+                state: ConsensusSafetyState::default(),
+                quarantined: false,
+            }),
+        }
+    }
+
+    /// Open a durable guard backed by [`SafetyRecordStore`].
+    ///
+    /// Fails closed (`SafetyStoreQuarantined`) on any read/decode/identity error,
+    /// or when the record is absent and `allow_fresh_genesis_init == false`.
+    pub fn from_durable(
+        store: SafetyRecordStore,
+        allow_fresh_genesis_init: bool,
+    ) -> Result<Self, SignerError> {
+        let loaded = store
+            .load()
+            .map_err(|_| SignerError::SafetyStoreQuarantined)?;
+        match loaded {
+            None => {
+                if !allow_fresh_genesis_init {
+                    return Err(SignerError::SafetyStoreQuarantined);
+                }
+                let state = ConsensusSafetyState::default();
+                let encoded = encode_safety_state(&state)?;
+                let rec = store
+                    .persist(None, encoded)
+                    .map_err(|_| SignerError::SafetyStoreQuarantined)?;
+                Ok(Self {
+                    inner: Mutex::new(SafetyGuardInner {
+                        store: Some(store),
+                        generation: rec.generation,
+                        state,
+                        quarantined: false,
+                    }),
+                })
+            }
+            Some(rec) => {
+                let state = decode_safety_state(&rec.payload)?;
+                Ok(Self {
+                    inner: Mutex::new(SafetyGuardInner {
+                        store: Some(store),
+                        generation: rec.generation,
+                        state,
+                        quarantined: false,
+                    }),
+                })
+            }
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.inner.lock().map(|g| g.generation).unwrap_or(0)
+    }
+
+    pub fn is_quarantined(&self) -> bool {
+        self.inner.lock().map(|g| g.quarantined).unwrap_or(true)
+    }
+
+    pub fn state_snapshot(&self) -> Result<ConsensusSafetyState, SignerError> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| SignerError::SafetyStoreQuarantined)?;
+        if g.quarantined {
+            return Err(SignerError::SafetyStoreQuarantined);
+        }
+        Ok(g.state.clone())
+    }
+
+    /// Record a lock update durably (advancing generation before returning).
+    pub fn set_lock(&self, height: u64, round: u32, value_id: [u8; 32]) -> Result<(), SignerError> {
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| SignerError::SafetyStoreQuarantined)?;
+        if g.quarantined {
+            return Err(SignerError::SafetyStoreQuarantined);
+        }
+        if height < g.state.height {
+            return Err(SignerError::SafetyViolation);
+        }
+        let mut next = if height > g.state.height {
+            ConsensusSafetyState {
+                height,
+                ..Default::default()
+            }
+        } else {
+            g.state.clone()
+        };
+        if next.locked_round.is_some_and(|lr| round <= lr) {
+            return Err(SignerError::SafetyViolation);
+        }
+        next.locked_round = Some(round);
+        next.locked_value_id = Some(value_id);
+        if let Some(store) = &g.store {
+            let encoded = encode_safety_state(&next)?;
+            match store.persist(Some(g.generation), encoded) {
+                Ok(rec) => {
+                    g.generation = rec.generation;
+                    g.state = next;
+                }
+                Err(_) => {
+                    g.quarantined = true;
+                    return Err(SignerError::SafetyStoreQuarantined);
+                }
+            }
+        } else {
+            g.generation = g.generation.saturating_add(1);
+            g.state = next;
+        }
+        Ok(())
+    }
+
+    /// Serialized check-persist-then-sign:
+    /// 1. Validates safety invariants against current state.
+    /// 2. Persists `next_state` atomically BEFORE invoking `sign_fn`.
+    /// 3. On persist error, quarantines and returns `SafetyStoreQuarantined`.
+    /// 4. If `sign_fn` fails AFTER durable reservation, does NOT roll back.
+    pub fn reserve_and_sign<F>(
+        &self,
+        req: &ConsensusSignRequest,
+        value_id: Option<[u8; 32]>,
+        sign_fn: F,
+    ) -> Result<([u8; FALCON_SIGNATURE_LEN], u64), SignerError>
+    where
+        F: FnOnce() -> Result<[u8; FALCON_SIGNATURE_LEN], SignerError>,
+    {
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| SignerError::SafetyStoreQuarantined)?;
+        if g.quarantined {
+            return Err(SignerError::SafetyStoreQuarantined);
+        }
+        let next = g.state.check_and_advance(req, value_id)?;
+        let reserved_gen = if let Some(store) = &g.store {
+            let encoded = encode_safety_state(&next)?;
+            match store.persist(Some(g.generation), encoded) {
+                Ok(rec) => {
+                    g.generation = rec.generation;
+                    g.state = next;
+                    rec.generation
+                }
+                Err(_) => {
+                    g.quarantined = true;
+                    return Err(SignerError::SafetyStoreQuarantined);
+                }
+            }
+        } else {
+            g.generation = g.generation.saturating_add(1);
+            g.state = next;
+            g.generation
+        };
+        let sig = sign_fn()?;
+        Ok((sig, reserved_gen))
+    }
+}
+
+/// Verified public identity returned by `/v2/public_key`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemotePublicKeyInfo {
+    pub scheme: PqScheme,
+    pub public_key: [u8; FALCON_PUBLIC_KEY_LEN],
+    pub validator_id: [u8; 32],
+}
+
+/// JSON payload returned by `GET /v2/public_key`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicKeyResponseV2 {
+    pub scheme_id: u8,
+    pub public_key: String,
+    pub validator_id: String,
+}
+
+/// JSON payload sent to `POST /v2/sign`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignRequestV2 {
+    pub validator_id: [u8; 32],
+    pub request: ConsensusSignRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_id: Option<[u8; 32]>,
+    pub preimage: String,
+}
+
+impl SignRequestV2 {
+    /// Construct a canonical wire sign request from `validator_id` and `request`.
+    pub fn from_consensus(
+        validator_id: [u8; 32],
+        request: ConsensusSignRequest,
+        value_id: Option<[u8; 32]>,
+    ) -> Self {
+        let preimage = hex::encode(request.canonical_signing_bytes());
+        Self {
+            validator_id,
+            request,
+            value_id,
+            preimage,
+        }
+    }
+
+    /// Anti-oracle validation: verifies `validator_id == expected_validator_id`
+    /// and `hex::decode(preimage) == request.canonical_signing_bytes()`.
+    pub fn verify_and_extract_preimage(
+        &self,
+        expected_validator_id: &[u8; 32],
+    ) -> Result<Vec<u8>, SignerError> {
+        if &self.validator_id != expected_validator_id {
+            return Err(SignerError::ValidatorIdMismatch);
+        }
+        let raw = hex::decode(&self.preimage)
+            .map_err(|_| SignerError::SigningFailed(SigningFailureKind::InvalidRequest))?;
+        self.request.verify_preimage(&raw)
+    }
+}
+
+/// JSON payload returned by `POST /v2/sign`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignResponseV2 {
+    pub scheme_id: u8,
+    pub signature: String,
+    pub generation: u64,
+}
+
+/// Strictly typed FULL-PQ consensus signer interface (Falcon-512 only).
+pub trait PqSigner: Send + Sync {
+    fn scheme(&self) -> PqScheme {
+        PqScheme::Falcon512
+    }
+
+    fn public_key(&self) -> &[u8; FALCON_PUBLIC_KEY_LEN];
+
+    fn validator_id(&self) -> [u8; 32];
+
+    fn sign_consensus(
+        &self,
+        req: &ConsensusSignRequest,
+    ) -> Result<[u8; FALCON_SIGNATURE_LEN], SignerError>;
+
+    /// Verify caller-supplied preimage against `req` before signing (anti-oracle).
+    fn sign_consensus_checked(
+        &self,
+        req: &ConsensusSignRequest,
+        caller_preimage: &[u8],
+    ) -> Result<[u8; FALCON_SIGNATURE_LEN], SignerError> {
+        let _ = req.verify_preimage(caller_preimage)?;
+        self.sign_consensus(req)
+    }
+
+    /// Verify a 666-byte Falcon-512 signature over `req` against `self.public_key()`.
+    fn verify_consensus(
+        &self,
+        req: &ConsensusSignRequest,
+        sig: &[u8; FALCON_SIGNATURE_LEN],
+    ) -> bool {
+        let pk = self.public_key();
+        if pk[0] != 0x09 {
+            return false;
+        }
+        let msg = req.canonical_signing_bytes();
+        verify_pq_signature(self.scheme(), pk, &msg, sig)
+    }
+}
+
+/// Wire transport seam for [`RemotePqSigner`].
+pub trait PqSignerTransport: Send + Sync {
+    fn public_key_v2(&self) -> Result<RemotePublicKeyInfo, SignerError>;
+    fn sign_v2(
+        &self,
+        req: &SignRequestV2,
+    ) -> Result<([u8; FALCON_SIGNATURE_LEN], u64), SignerError>;
+}
+
+/// In-process Falcon-512 consensus signer with anti-oracle preimage
+/// reconstruction and serialized [`ConsensusSafetyGuard`] enforcement.
+pub struct LocalPqSigner {
+    keypair: Arc<FalconKeypair>,
+    public_key: [u8; FALCON_PUBLIC_KEY_LEN],
+    validator_id: [u8; 32],
+    safety: ConsensusSafetyGuard,
+}
+
+impl LocalPqSigner {
+    pub fn new(keypair: FalconKeypair, validator_id: [u8; 32]) -> Result<Self, SignerError> {
+        Self::with_safety_guard(keypair, validator_id, ConsensusSafetyGuard::in_memory())
+    }
+
+    pub fn with_safety_guard(
+        keypair: FalconKeypair,
+        validator_id: [u8; 32],
+        safety: ConsensusSafetyGuard,
+    ) -> Result<Self, SignerError> {
+        let pk_slice = keypair.public_key();
+        if pk_slice.len() != FALCON_PUBLIC_KEY_LEN {
+            return Err(SignerError::BadPublicKeyLength {
+                got: pk_slice.len(),
+            });
+        }
+        if pk_slice[0] != 0x09 {
+            return Err(SignerError::MalformedKey);
+        }
+        let mut public_key = [0u8; FALCON_PUBLIC_KEY_LEN];
+        public_key.copy_from_slice(pk_slice);
+        Ok(Self {
+            keypair: Arc::new(keypair),
+            public_key,
+            validator_id,
+            safety,
+        })
+    }
+
+    pub fn safety_guard(&self) -> &ConsensusSafetyGuard {
+        &self.safety
+    }
+
+    pub fn sign_consensus_with_generation(
+        &self,
+        req: &ConsensusSignRequest,
+        value_id: Option<[u8; 32]>,
+    ) -> Result<([u8; FALCON_SIGNATURE_LEN], u64), SignerError> {
+        let msg = req.canonical_signing_bytes();
+        self.safety.reserve_and_sign(req, value_id, || {
+            let sig_vec = self.keypair.sign(&msg);
+            if sig_vec.len() != FALCON_SIGNATURE_LEN {
+                return Err(SignerError::SigningFailed(SigningFailureKind::UnusableKey));
+            }
+            let mut sig = [0u8; FALCON_SIGNATURE_LEN];
+            sig.copy_from_slice(&sig_vec);
+            if !verify_pq_signature(PqScheme::Falcon512, &self.public_key, &msg, &sig) {
+                return Err(SignerError::SigningFailed(
+                    SigningFailureKind::SignatureInvalid,
+                ));
+            }
+            Ok(sig)
+        })
+    }
+}
+
+/// Shows only `validator_id` and `public_key` — never secret lattice material.
+impl fmt::Debug for LocalPqSigner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalPqSigner")
+            .field("validator_id", &hex::encode(self.validator_id))
+            .field("public_key", &hex::encode(self.public_key))
+            .finish_non_exhaustive()
+    }
+}
+
+impl PqSigner for LocalPqSigner {
+    fn public_key(&self) -> &[u8; FALCON_PUBLIC_KEY_LEN] {
+        &self.public_key
+    }
+
+    fn validator_id(&self) -> [u8; 32] {
+        self.validator_id
+    }
+
+    fn sign_consensus(
+        &self,
+        req: &ConsensusSignRequest,
+    ) -> Result<[u8; FALCON_SIGNATURE_LEN], SignerError> {
+        let (sig, _gen) = self.sign_consensus_with_generation(req, None)?;
+        Ok(sig)
+    }
+}
+
+/// Remote Falcon-512 consensus signer with pinned public key, validator_id
+/// binding, anti-oracle preimage reconstruction, [`ConsensusSafetyGuard`], and
+/// **zero local fallback** (no `FalconKeypair`, no `SigningKey`).
+pub struct RemotePqSigner {
+    transport: Arc<dyn PqSignerTransport>,
+    public_key: [u8; FALCON_PUBLIC_KEY_LEN],
+    validator_id: [u8; 32],
+    safety: ConsensusSafetyGuard,
+}
+
+impl RemotePqSigner {
+    /// Resolve `/v2/public_key` once, validate `scheme == Falcon512`,
+    /// `public_key.len() == 897`, `public_key[0] == 0x09`,
+    /// `validator_id == expected_validator_id`, and (when provided)
+    /// `public_key == expected_committed_pk`, then pin it.
+    pub fn new(
+        transport: Arc<dyn PqSignerTransport>,
+        expected_validator_id: [u8; 32],
+        expected_committed_pk: Option<&[u8]>,
+    ) -> Result<Self, SignerError> {
+        let info = transport.public_key_v2()?;
+        if info.scheme != PqScheme::Falcon512 || info.scheme.is_disabled() {
+            return Err(SignerError::UnsupportedScheme {
+                scheme_id: info.scheme.id(),
+            });
+        }
+        if info.public_key[0] != 0x09 {
+            return Err(SignerError::MalformedKey);
+        }
+        if info.validator_id != expected_validator_id {
+            return Err(SignerError::ValidatorIdMismatch);
+        }
+        if let Some(expected_pk) = expected_committed_pk {
+            if info.public_key.as_slice() != expected_pk {
+                return Err(SignerError::PublicKeyMismatch);
+            }
+        }
+        Ok(Self {
+            transport,
+            public_key: info.public_key,
+            validator_id: info.validator_id,
+            safety: ConsensusSafetyGuard::in_memory(),
+        })
+    }
+
+    pub fn with_safety_guard(mut self, safety: ConsensusSafetyGuard) -> Self {
+        self.safety = safety;
+        self
+    }
+
+    pub fn safety_guard(&self) -> &ConsensusSafetyGuard {
+        &self.safety
+    }
+
+    pub fn transport(&self) -> &Arc<dyn PqSignerTransport> {
+        &self.transport
+    }
+
+    pub fn sign_consensus_with_value_id(
+        &self,
+        req: &ConsensusSignRequest,
+        value_id: Option<[u8; 32]>,
+    ) -> Result<[u8; FALCON_SIGNATURE_LEN], SignerError> {
+        let msg = req.canonical_signing_bytes();
+        let wire_req = SignRequestV2::from_consensus(self.validator_id, req.clone(), value_id);
+        let (sig, _gen) = self.safety.reserve_and_sign(req, value_id, || {
+            let (sig, _remote_gen) = self.transport.sign_v2(&wire_req)?;
+            if !verify_pq_signature(PqScheme::Falcon512, &self.public_key, &msg, &sig) {
+                return Err(SignerError::SigningFailed(
+                    SigningFailureKind::SignatureInvalid,
+                ));
+            }
+            Ok(sig)
+        })?;
+        Ok(sig)
+    }
+}
+
+impl fmt::Debug for RemotePqSigner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemotePqSigner")
+            .field("validator_id", &hex::encode(self.validator_id))
+            .field("public_key", &hex::encode(self.public_key))
+            .finish_non_exhaustive()
+    }
+}
+
+impl PqSigner for RemotePqSigner {
+    fn public_key(&self) -> &[u8; FALCON_PUBLIC_KEY_LEN] {
+        &self.public_key
+    }
+
+    fn validator_id(&self) -> [u8; 32] {
+        self.validator_id
+    }
+
+    fn sign_consensus(
+        &self,
+        req: &ConsensusSignRequest,
+    ) -> Result<[u8; FALCON_SIGNATURE_LEN], SignerError> {
+        self.sign_consensus_with_value_id(req, None)
+    }
+}
+
+/// Returns `true` iff `base_url` points to a loopback interface
+/// (`127.0.0.1`, `[::1]`, or `localhost`).
+pub fn is_loopback_base_url(base_url: &str) -> bool {
+    let lower = base_url.trim().to_ascii_lowercase();
+    let rest = if let Some(r) = lower.strip_prefix("http://") {
+        r
+    } else if let Some(r) = lower.strip_prefix("https://") {
+        r
+    } else {
+        return false;
+    };
+    for host in ["127.0.0.1", "[::1]", "localhost"] {
+        if let Some(after) = rest.strip_prefix(host) {
+            if after.is_empty() || after.starts_with(':') || after.starts_with('/') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// HTTP v2 client transport speaking `/v2/public_key` and `/v2/sign` with
+/// Falcon-512 payloads, `MAX_RESPONSE_BYTES` (`8192`) cap, no redirects, no
+/// env proxy discovery, and automatic `https_only(true)` on non-loopback URLs.
+pub struct HttpPqSignerTransport {
+    base_url: String,
+    public_key_path: String,
+    sign_path: String,
+    auth: Option<(String, String)>,
+    timeout: Duration,
+    https_only: bool,
+    agent: ureq::Agent,
+}
+
+impl HttpPqSignerTransport {
+    pub fn new(base_url: impl Into<String>) -> Self {
+        let mut base_url = base_url.into();
+        while base_url.ends_with('/') {
+            base_url.pop();
+        }
+        let timeout = DEFAULT_TIMEOUT;
+        let https_only = !is_loopback_base_url(&base_url);
+        Self {
+            base_url,
+            public_key_path: DEFAULT_V2_PUBLIC_KEY_PATH.to_string(),
+            sign_path: DEFAULT_V2_SIGN_PATH.to_string(),
+            auth: None,
+            timeout,
+            https_only,
+            agent: build_agent(timeout, https_only),
+        }
+    }
+
+    pub fn with_paths(
+        mut self,
+        public_key_path: impl Into<String>,
+        sign_path: impl Into<String>,
+    ) -> Self {
+        self.public_key_path = public_key_path.into();
+        self.sign_path = sign_path.into();
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self.agent = build_agent(timeout, self.https_only);
+        self
+    }
+
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.auth = Some((
+            "Authorization".to_string(),
+            format!("Bearer {}", token.into()),
+        ));
+        self
+    }
+
+    pub fn with_auth_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.auth = Some((name.into(), value.into()));
+        self
+    }
+
+    pub fn https_only(mut self, enforce: bool) -> Self {
+        self.https_only = enforce;
+        self.agent = build_agent(self.timeout, enforce);
+        self
+    }
+
+    pub fn is_https_only(&self) -> bool {
+        self.https_only
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    fn check_scheme_policy(&self) -> Result<(), SignerError> {
+        if self.https_only
+            && self
+                .base_url
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("http://")
+        {
+            return Err(SignerError::PlainHttpForbiddenOnNonLoopback);
+        }
+        Ok(())
+    }
+
+    fn request(&self, method: &str, path: &str) -> ureq::Request {
+        let req = self
+            .agent
+            .request(method, &format!("{}{}", self.base_url, path));
+        match &self.auth {
+            Some((name, value)) => req.set(name, value),
+            None => req,
+        }
+    }
+
+    fn finish(&self, result: Result<ureq::Response, ureq::Error>) -> Result<Vec<u8>, SignerError> {
+        let resp = result.map_err(map_transport_error)?;
+        let status = resp.status();
+        if !(200..300).contains(&status) {
+            return Err(SignerError::Transport(TransportErrorKind::Rejected {
+                status,
+            }));
+        }
+        let mut body = Vec::new();
+        resp.into_reader()
+            .take(MAX_RESPONSE_BYTES as u64 + 1)
+            .read_to_end(&mut body)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    SignerError::Transport(TransportErrorKind::Timeout)
+                } else {
+                    SignerError::Transport(TransportErrorKind::UnreadableBody)
+                }
+            })?;
+        if body.len() > MAX_RESPONSE_BYTES {
+            return Err(SignerError::MalformedResponse(
+                MalformedResponseKind::BodyTooLarge,
+            ));
+        }
+        Ok(body)
+    }
+}
+
+impl fmt::Debug for HttpPqSignerTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpPqSignerTransport")
+            .field("base_url", &self.base_url)
+            .field("public_key_path", &self.public_key_path)
+            .field("sign_path", &self.sign_path)
+            .field("timeout", &self.timeout)
+            .field("https_only", &self.https_only)
+            .field("auth_header", &self.auth.as_ref().map(|(name, _)| name))
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Deserialize)]
+struct RawPublicKeyResponseV2 {
+    scheme_id: Option<u8>,
+    public_key: Option<String>,
+    validator_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawSignResponseV2 {
+    scheme_id: Option<u8>,
+    signature: Option<String>,
+    generation: Option<u64>,
+}
+
+impl PqSignerTransport for HttpPqSignerTransport {
+    fn public_key_v2(&self) -> Result<RemotePublicKeyInfo, SignerError> {
+        self.check_scheme_policy()?;
+        let body = self.finish(self.request("GET", &self.public_key_path).call())?;
+        let parsed: RawPublicKeyResponseV2 = serde_json::from_slice(&body).map_err(|e| {
+            tracing::debug!(
+                "[remote-signer-v2] public_key response is not valid json ({:?})",
+                e.classify()
+            );
+            SignerError::MalformedResponse(MalformedResponseKind::BadJson)
+        })?;
+        let scheme_id = parsed.scheme_id.ok_or(SignerError::MalformedResponse(
+            MalformedResponseKind::MissingField,
+        ))?;
+        let scheme = PqScheme::from_id(scheme_id)
+            .map_err(|_| SignerError::UnsupportedScheme { scheme_id })?;
+        if scheme != PqScheme::Falcon512 || scheme.is_disabled() {
+            return Err(SignerError::UnsupportedScheme { scheme_id });
+        }
+        let hex_pk = parsed.public_key.ok_or(SignerError::MalformedResponse(
+            MalformedResponseKind::MissingField,
+        ))?;
+        let raw_pk = hex::decode(&hex_pk)
+            .map_err(|_| SignerError::MalformedResponse(MalformedResponseKind::NotHex))?;
+        let got_pk = raw_pk.len();
+        let public_key: [u8; FALCON_PUBLIC_KEY_LEN] = raw_pk
+            .try_into()
+            .map_err(|_| SignerError::BadPublicKeyLength { got: got_pk })?;
+        if public_key[0] != 0x09 {
+            return Err(SignerError::MalformedKey);
+        }
+        let hex_vid = parsed.validator_id.ok_or(SignerError::MalformedResponse(
+            MalformedResponseKind::MissingField,
+        ))?;
+        let raw_vid = hex::decode(&hex_vid)
+            .map_err(|_| SignerError::MalformedResponse(MalformedResponseKind::NotHex))?;
+        let validator_id: [u8; 32] = raw_vid
+            .try_into()
+            .map_err(|_| SignerError::ValidatorIdMismatch)?;
+        Ok(RemotePublicKeyInfo {
+            scheme,
+            public_key,
+            validator_id,
+        })
+    }
+
+    fn sign_v2(
+        &self,
+        req: &SignRequestV2,
+    ) -> Result<([u8; FALCON_SIGNATURE_LEN], u64), SignerError> {
+        self.check_scheme_policy()?;
+        let request_body = serde_json::to_string(req)
+            .map_err(|_| SignerError::Transport(TransportErrorKind::Request))?;
+        let body = self.finish(
+            self.request("POST", &self.sign_path)
+                .set("Content-Type", "application/json")
+                .send_string(&request_body),
+        )?;
+        let parsed: RawSignResponseV2 = serde_json::from_slice(&body).map_err(|e| {
+            tracing::debug!(
+                "[remote-signer-v2] sign response is not valid json ({:?})",
+                e.classify()
+            );
+            SignerError::MalformedResponse(MalformedResponseKind::BadJson)
+        })?;
+        let scheme_id = parsed.scheme_id.ok_or(SignerError::MalformedResponse(
+            MalformedResponseKind::MissingField,
+        ))?;
+        let scheme = PqScheme::from_id(scheme_id)
+            .map_err(|_| SignerError::UnsupportedScheme { scheme_id })?;
+        if scheme != PqScheme::Falcon512 || scheme.is_disabled() {
+            return Err(SignerError::UnsupportedScheme { scheme_id });
+        }
+        let hex_sig = parsed.signature.ok_or(SignerError::MalformedResponse(
+            MalformedResponseKind::MissingField,
+        ))?;
+        let raw_sig = hex::decode(&hex_sig)
+            .map_err(|_| SignerError::MalformedResponse(MalformedResponseKind::NotHex))?;
+        let got_sig = raw_sig.len();
+        let signature: [u8; FALCON_SIGNATURE_LEN] = raw_sig
+            .try_into()
+            .map_err(|_| SignerError::BadSignatureLength { got: got_sig })?;
+        let generation = parsed.generation.ok_or(SignerError::MalformedResponse(
+            MalformedResponseKind::MissingField,
+        ))?;
+        Ok((signature, generation))
+    }
+}
+
+/// Reference HTTP v2 remote signer service enforcing anti-oracle preimage
+/// verification and durable/serialized anti-equivocation checks.
+pub struct PqSignerService {
+    signer: LocalPqSigner,
+    expected_bearer_token: Option<String>,
+}
+
+impl PqSignerService {
+    pub fn new(signer: LocalPqSigner) -> Self {
+        Self {
+            signer,
+            expected_bearer_token: None,
+        }
+    }
+
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.expected_bearer_token = Some(token.into());
+        self
+    }
+
+    pub fn signer(&self) -> &LocalPqSigner {
+        &self.signer
+    }
+
+    /// Process one v2 HTTP request, returning `(http_status, json_body)`.
+    pub fn handle_http_request(
+        &self,
+        method: &str,
+        path: &str,
+        auth_header: Option<&str>,
+        body: &[u8],
+    ) -> (u16, String) {
+        if let Some(expected_tok) = &self.expected_bearer_token {
+            let expected = format!("Bearer {expected_tok}");
+            if auth_header != Some(expected.as_str()) {
+                return (401, r#"{"error":"unauthorized"}"#.to_string());
+            }
+        }
+        match (method, path) {
+            ("GET", DEFAULT_V2_PUBLIC_KEY_PATH) => {
+                let resp = PublicKeyResponseV2 {
+                    scheme_id: PqScheme::Falcon512.id(),
+                    public_key: hex::encode(self.signer.public_key()),
+                    validator_id: hex::encode(self.signer.validator_id()),
+                };
+                match serde_json::to_string(&resp) {
+                    Ok(json) => (200, json),
+                    Err(_) => (500, r#"{"error":"serialization_failed"}"#.to_string()),
+                }
+            }
+            ("POST", DEFAULT_V2_SIGN_PATH) => {
+                let req: SignRequestV2 = match serde_json::from_slice(body) {
+                    Ok(r) => r,
+                    Err(_) => return (400, r#"{"error":"bad_json"}"#.to_string()),
+                };
+                if let Err(err) = req.verify_and_extract_preimage(&self.signer.validator_id()) {
+                    let status = match err {
+                        SignerError::ValidatorIdMismatch
+                        | SignerError::SigningFailed(SigningFailureKind::InvalidRequest)
+                        | SignerError::SigningFailed(SigningFailureKind::EmptyMessage) => 400,
+                        _ => 400,
+                    };
+                    return (
+                        status,
+                        r#"{"error":"invalid_consensus_request"}"#.to_string(),
+                    );
+                }
+                match self
+                    .signer
+                    .sign_consensus_with_generation(&req.request, req.value_id)
+                {
+                    Ok((sig, generation)) => {
+                        let resp = SignResponseV2 {
+                            scheme_id: PqScheme::Falcon512.id(),
+                            signature: hex::encode(sig),
+                            generation,
+                        };
+                        match serde_json::to_string(&resp) {
+                            Ok(json) => (200, json),
+                            Err(_) => (500, r#"{"error":"serialization_failed"}"#.to_string()),
+                        }
+                    }
+                    Err(SignerError::SafetyViolation) => {
+                        (409, r#"{"error":"safety_violation"}"#.to_string())
+                    }
+                    Err(SignerError::SafetyStoreQuarantined) => {
+                        (503, r#"{"error":"safety_store_quarantined"}"#.to_string())
+                    }
+                    Err(_) => (500, r#"{"error":"signing_failed"}"#.to_string()),
+                }
+            }
+            _ => (404, r#"{"error":"not_found"}"#.to_string()),
+        }
+    }
+}
+
+/// Serve a single HTTP/1.1 connection against [`PqSignerService`].
+pub fn serve_v2_http_connection(service: &PqSignerService, mut stream: TcpStream) {
+    let Ok(cloned) = stream.try_clone() else {
+        return;
+    };
+    let mut reader = BufReader::new(cloned);
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).is_err() {
+        return;
+    }
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("");
+
+    let mut content_length = 0usize;
+    let mut auth_header: Option<String> = None;
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, val)) = trimmed.split_once(':') {
+            if name.eq_ignore_ascii_case("Content-Length") {
+                content_length = val.trim().parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("Authorization") {
+                auth_header = Some(val.trim().to_string());
+            }
+        }
+    }
+
+    if content_length > 64 * 1024 {
+        let body = r#"{"error":"request_too_large"}"#;
+        let head = format!(
+            "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(body.as_bytes());
+        let _ = stream.flush();
+        return;
+    }
+
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 && reader.read_exact(&mut body).is_err() {
+        return;
+    }
+
+    let (status_code, resp_body) =
+        service.handle_http_request(method, path, auth_header.as_deref(), &body);
+    let reason = match status_code {
+        200 => "200 OK",
+        400 => "400 Bad Request",
+        401 => "401 Unauthorized",
+        404 => "404 Not Found",
+        409 => "409 Conflict",
+        503 => "503 Service Unavailable",
+        _ => "500 Internal Server Error",
+    };
+    let head = format!(
+        "HTTP/1.1 {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        resp_body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(resp_body.as_bytes());
+    let _ = stream.flush();
+}
+
+#[cfg(test)]
+mod v2_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    fn test_falcon_key(seed_byte: u8) -> (FalconKeypair, [u8; 32]) {
+        let kp = FalconKeypair::generate_from_seed_bytes(&[seed_byte; 32]);
+        let vid = kp.validator_id();
+        (kp, vid)
+    }
+
+    #[test]
+    fn v2_service_handles_http_roundtrip_and_rejects_anti_oracle() {
+        let (kp, vid) = test_falcon_key(0x55);
+        let expected_pk: [u8; FALCON_PUBLIC_KEY_LEN] =
+            kp.public_key().try_into().expect("897B falcon pk");
+        let service = Arc::new(PqSignerService::new(
+            LocalPqSigner::new(kp, vid).expect("local pq signer"),
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let svc = Arc::clone(&service);
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming().take(3).flatten() {
+                serve_v2_http_connection(&svc, stream);
+            }
+        });
+
+        let transport = HttpPqSignerTransport::new(format!("http://{addr}"));
+        assert!(!transport.is_https_only(), "loopback permits http");
+        let remote = RemotePqSigner::new(Arc::new(transport), vid, Some(&expected_pk))
+            .expect("remote pq signer pins key");
+        assert_eq!(remote.scheme(), PqScheme::Falcon512);
+        assert_eq!(remote.public_key(), &expected_pk);
+
+        let vote_req = ConsensusSignRequest::Vote {
+            chain_id: 5757,
+            shard_id: 0,
+            height: 12,
+            round: 1,
+            kind: VoteKind::Prevote,
+            block_hash: Some([0xAB; 32]),
+        };
+        let sig = remote.sign_consensus(&vote_req).expect("sign vote");
+        assert!(remote.verify_consensus(&vote_req, &sig));
+
+        // Anti-oracle: mismatched preimage (arbitrary tx bytes) refused by service -> 400
+        let bad_wire = SignRequestV2 {
+            validator_id: vid,
+            request: vote_req.clone(),
+            value_id: None,
+            preimage: hex::encode(b"STELL_ARBITRARY_TX_ORACLE_ATTACK"),
+        };
+        let bad_transport = HttpPqSignerTransport::new(format!("http://{addr}"));
+        assert_eq!(
+            bad_transport.sign_v2(&bad_wire).err(),
+            Some(SignerError::Transport(TransportErrorKind::Rejected {
+                status: 400
+            }))
+        );
+
+        handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn non_loopback_http_url_is_refused() {
+        let transport = HttpPqSignerTransport::new("http://signer.internal:8443");
+        assert!(transport.is_https_only());
+        assert_eq!(
+            transport.public_key_v2().err(),
+            Some(SignerError::PlainHttpForbiddenOnNonLoopback)
+        );
+        assert!(is_loopback_base_url("http://127.0.0.1:8080"));
+        assert!(is_loopback_base_url("http://[::1]:8080"));
+        assert!(is_loopback_base_url("http://localhost:8080"));
+        assert!(!is_loopback_base_url("http://localhost.evil.com:8080"));
     }
 }

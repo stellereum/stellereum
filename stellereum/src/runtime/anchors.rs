@@ -13,8 +13,46 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+type PqRuntimeSignerEntry = (Arc<dyn crate::remote_signer::PqSigner>, bool);
+
+static PQ_RUNTIME_SIGNER_TABLE: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<usize, PqRuntimeSignerEntry>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+struct PqBackedRuntimeSigner {
+    id: [u8; 32],
+    fallback_ed: Option<Arc<dyn crate::remote_signer::Signer>>,
+}
+
+impl Drop for PqBackedRuntimeSigner {
+    fn drop(&mut self) {
+        let key = self as *const Self as usize;
+        if let Ok(mut map) = PQ_RUNTIME_SIGNER_TABLE.lock() {
+            map.remove(&key);
+        }
+    }
+}
+
+impl crate::remote_signer::Signer for PqBackedRuntimeSigner {
+    fn public_key(&self) -> [u8; crate::remote_signer::PUBLIC_KEY_LEN] {
+        self.id
+    }
+
+    fn sign(
+        &self,
+        msg: &[u8],
+    ) -> Result<ed25519_dalek::Signature, crate::remote_signer::SignerError> {
+        match &self.fallback_ed {
+            Some(s) => s.sign(msg),
+            None => Ok(ed25519_dalek::Signature::from_bytes(&[0u8; 64])),
+        }
+    }
+}
+
 pub(super) struct RuntimeVoteSigner<'a> {
     pub(super) rt: &'a ValidatorRuntime,
+    pub(super) pq_req: Option<crate::remote_signer::ConsensusSignRequest>,
+    pub(super) cached_pq_sig: std::cell::RefCell<Option<(ValidatorId, Vec<u8>)>>,
 }
 
 impl crate::safety::VoteSigner for RuntimeVoteSigner<'_> {
@@ -23,6 +61,37 @@ impl crate::safety::VoteSigner for RuntimeVoteSigner<'_> {
     }
 
     fn sign_ed25519(&self, msg: &[u8]) -> Option<Vec<u8>> {
+        if let Some((ps, has_fallback_ed)) = self.rt.pq_signer_entry() {
+            let req = self.pq_req.as_ref()?;
+            match ps.sign_consensus_checked(req, msg) {
+                Ok(sig) => {
+                    *self.cached_pq_sig.borrow_mut() = Some((ps.validator_id(), sig.to_vec()));
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "[signer] refusing consensus signature: PqSigner v2 failed (zero local fallback)"
+                    );
+                    eprintln!(
+                        "[signer] refusing consensus signature: PqSigner v2 failed (zero local fallback): {e}"
+                    );
+                    return None;
+                }
+            }
+            if has_fallback_ed {
+                return match &self.rt.remote_signer {
+                    Some(s) => match s.sign(msg) {
+                        Ok(sig) => Some(sig.to_vec()),
+                        Err(e) => {
+                            eprintln!("[signer] refusing to vote, remote signer failed: {e}");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+            }
+            return Some(self.rt.key.sign(msg).to_vec());
+        }
         match &self.rt.remote_signer {
             Some(s) => match s.sign(msg) {
                 Ok(sig) => Some(sig.to_vec()),
@@ -36,6 +105,22 @@ impl crate::safety::VoteSigner for RuntimeVoteSigner<'_> {
     }
 
     fn sign_falcon(&self, msg: &[u8]) -> Option<(ValidatorId, Vec<u8>)> {
+        if let Some((ps, _)) = self.rt.pq_signer_entry() {
+            if let Some(cached) = self.cached_pq_sig.borrow_mut().take() {
+                return Some(cached);
+            }
+            let req = self.pq_req.as_ref()?;
+            return match ps.sign_consensus_checked(req, msg) {
+                Ok(sig) => Some((ps.validator_id(), sig.to_vec())),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "[signer] refusing consensus Falcon signature: PqSigner v2 failed (zero local fallback)"
+                    );
+                    None
+                }
+            };
+        }
         let fk = self.rt.falcon_signing_key()?;
         let sig = if self.rt.deterministic_sim_signing {
             let mut h = blake3::Hasher::new();
@@ -1633,7 +1718,9 @@ impl ValidatorRuntime {
                 return Err(format!(
                     "proposal: shard {} declares {} nano-STELL minted, above the chain-wide \
                      TOTAL_SUPPLY_CAP {}",
-                    h.shard_id, h.minted_total_nano, crate::tokenomics::TOTAL_SUPPLY_CAP
+                    h.shard_id,
+                    h.minted_total_nano,
+                    crate::tokenomics::TOTAL_SUPPLY_CAP
                 ));
             }
             if partition.contains_shard(h.shard_id) {
@@ -3108,8 +3195,81 @@ impl ValidatorRuntime {
                 hex::encode(&self.id[..8])
             ));
         }
-        self.remote_signer = Some(signer);
+        if let Some((existing_pq, _)) = self.pq_signer_entry() {
+            let wrapper = Arc::new(PqBackedRuntimeSigner {
+                id: self.id,
+                fallback_ed: Some(signer),
+            });
+            let ptr = Arc::as_ptr(&wrapper) as usize;
+            if let Ok(mut map) = PQ_RUNTIME_SIGNER_TABLE.lock() {
+                map.insert(ptr, (existing_pq, true));
+            }
+            self.remote_signer = Some(wrapper);
+        } else {
+            self.remote_signer = Some(signer);
+        }
         Ok(self)
+    }
+
+    /// Attach a FULL-PQ Falcon-512 v2 consensus signer (`LocalPqSigner` or
+    /// `RemotePqSigner`).
+    ///
+    /// Refuses a signer whose `validator_id` does not match `self.id`. When
+    /// attached, all consensus vote and proposal signing routes strictly
+    /// through this [`crate::remote_signer::PqSigner`] with zero fallback to
+    /// `falcon_key`.
+    pub fn with_pq_signer(
+        mut self,
+        signer: Arc<dyn crate::remote_signer::PqSigner>,
+    ) -> Result<Self, String> {
+        let vid = signer.validator_id();
+        if vid != self.id {
+            return Err(format!(
+                "pq signer validator_id {} does not match this node's validator identity {}",
+                hex::encode(&vid[..8]),
+                hex::encode(&self.id[..8])
+            ));
+        }
+        if !crate::pq_registry::pq_lifecycle_active_at(self.hc.height) {
+            crate::consensus::register_validator_pq_key(
+                self.id,
+                signer.scheme(),
+                signer.public_key().to_vec(),
+            );
+        }
+        let fallback_ed = self.remote_signer.take().filter(|s| {
+            let ptr = Arc::as_ptr(s) as *const () as usize;
+            PQ_RUNTIME_SIGNER_TABLE
+                .lock()
+                .map(|m| !m.contains_key(&ptr))
+                .unwrap_or(true)
+        });
+        let has_fallback_ed = fallback_ed.is_some();
+        let wrapper = Arc::new(PqBackedRuntimeSigner {
+            id: self.id,
+            fallback_ed,
+        });
+        let ptr = Arc::as_ptr(&wrapper) as usize;
+        if let Ok(mut map) = PQ_RUNTIME_SIGNER_TABLE.lock() {
+            map.insert(ptr, (signer, has_fallback_ed));
+        }
+        self.remote_signer = Some(wrapper);
+        Ok(self)
+    }
+
+    pub(super) fn pq_signer_entry(
+        &self,
+    ) -> Option<(Arc<dyn crate::remote_signer::PqSigner>, bool)> {
+        let s = self.remote_signer.as_ref()?;
+        let ptr = Arc::as_ptr(s) as *const () as usize;
+        PQ_RUNTIME_SIGNER_TABLE
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&ptr).cloned())
+    }
+
+    pub fn pq_signer(&self) -> Option<Arc<dyn crate::remote_signer::PqSigner>> {
+        self.pq_signer_entry().map(|(ps, _)| ps)
     }
 
     /// The public key this node votes with. For a remote signer this is the key the
@@ -3129,8 +3289,15 @@ impl ValidatorRuntime {
         self
     }
 
-    pub(super) fn vote_signer(&self) -> RuntimeVoteSigner<'_> {
-        RuntimeVoteSigner { rt: self }
+    pub(super) fn vote_signer_for(
+        &self,
+        req: crate::remote_signer::ConsensusSignRequest,
+    ) -> RuntimeVoteSigner<'_> {
+        RuntimeVoteSigner {
+            rt: self,
+            pq_req: Some(req),
+            cached_pq_sig: std::cell::RefCell::new(None),
+        }
     }
 
     /// Downtime slash for the certificate this runtime currently holds in `hc`:

@@ -1557,6 +1557,167 @@ impl ContractRegistry {
     }
 }
 
+/// Maximum number of contracts inspected by one creator-page call.
+///
+/// Same bounded-work rationale as [`crate::token::MAX_TOKENS_SORT_CAP`]: the
+/// registry is permissionless, so one read must never walk an unbounded map.
+pub const MAX_CONTRACTS_SORT_CAP: usize = 50_000;
+
+/// One contract storage cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContractSlot {
+    pub slot: i64,
+    pub value: i64,
+}
+
+/// Deterministic page of one contract's storage, ascending by `i64` slot key.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContractSlotPage {
+    pub items: Vec<ContractSlot>,
+    pub next_cursor: Option<i64>,
+    pub has_more: bool,
+    pub truncated: bool,
+    pub scanned: usize,
+}
+
+/// Code-free projection of a deployed contract (the `creator` program view).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContractSummary {
+    pub address: [u8; 32],
+    pub creator: [u8; 32],
+    pub code_hash: [u8; 32],
+    pub created_at: u64,
+    pub paused: bool,
+    pub balance: u64,
+    pub storage_len: usize,
+    pub has_abi: bool,
+    pub source_hash: Option<[u8; 32]>,
+}
+
+/// Deterministic page of a creator's contracts, ascending by address.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContractSummaryPage {
+    pub items: Vec<ContractSummary>,
+    pub next_cursor: Option<[u8; 32]>,
+    pub has_more: bool,
+    pub truncated: bool,
+    pub scanned: usize,
+}
+
+impl ContractRegistry {
+    /// Deterministic page of a contract's storage slots.
+    ///
+    /// Slots are sorted numerically (`i64`, not the `HashMap` iteration
+    /// order), `slot_from..=slot_to` is inclusive and `cursor` is a strict
+    /// keyset continuation (`slot > cursor`). A missing contract yields an
+    /// empty page — the RPC layer decides whether that is an error.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: contract + slot window + cursor/limit/scan cap are the documented
+    // RPC parameters.
+    pub fn storage_page(
+        &self,
+        contract: &[u8; 32],
+        slot_from: Option<i64>,
+        slot_to: Option<i64>,
+        cursor: Option<i64>,
+        limit: usize,
+        scan_cap: usize,
+    ) -> ContractSlotPage {
+        let limit = limit.max(1);
+        let mut page = ContractSlotPage::default();
+        let Some(c) = self.contracts.get(contract) else {
+            return page;
+        };
+        let mut slots: Vec<(i64, i64)> = c.storage.iter().map(|(k, v)| (*k, *v)).collect();
+        slots.sort_unstable_by_key(|(k, _)| *k);
+        let mut last_scanned: Option<i64> = None;
+        for (slot, value) in slots {
+            if page.scanned >= scan_cap {
+                page.truncated = true;
+                break;
+            }
+            page.scanned += 1;
+            last_scanned = Some(slot);
+            if cursor.map(|c| slot <= c).unwrap_or(false) {
+                continue;
+            }
+            if slot_from.map(|from| slot < from).unwrap_or(false) {
+                continue;
+            }
+            if slot_to.map(|to| slot > to).unwrap_or(false) {
+                continue;
+            }
+            if page.items.len() >= limit {
+                page.has_more = true;
+                break;
+            }
+            page.items.push(ContractSlot { slot, value });
+        }
+        page.has_more |= page.truncated;
+        page.next_cursor = if page.has_more {
+            page.items.last().map(|s| s.slot).or(last_scanned)
+        } else {
+            None
+        };
+        page
+    }
+
+    /// Deterministic page of the contracts deployed by `creator`.
+    ///
+    /// Iterates the address-sorted `BTreeMap` starting strictly after `cursor`,
+    /// so the page is stable under concurrent inserts and never depends on
+    /// `HashMap` order. At most `scan_cap` contract entries are inspected.
+    pub fn contracts_by_creator_page(
+        &self,
+        creator: &[u8; 32],
+        cursor: Option<[u8; 32]>,
+        limit: usize,
+        scan_cap: usize,
+    ) -> ContractSummaryPage {
+        use std::ops::Bound;
+        let limit = limit.max(1);
+        let mut page = ContractSummaryPage::default();
+        let start = match cursor {
+            Some(c) => Bound::Excluded(c),
+            None => Bound::Unbounded,
+        };
+        let mut last_scanned: Option<[u8; 32]> = None;
+        for (address, c) in self.contracts.range((start, Bound::Unbounded)) {
+            if page.scanned >= scan_cap {
+                page.truncated = true;
+                break;
+            }
+            page.scanned += 1;
+            last_scanned = Some(*address);
+            if c.creator != *creator {
+                continue;
+            }
+            if page.items.len() >= limit {
+                page.has_more = true;
+                break;
+            }
+            page.items.push(ContractSummary {
+                address: *address,
+                creator: c.creator,
+                code_hash: c.code_hash,
+                created_at: c.created_at,
+                paused: c.paused,
+                balance: c.balance,
+                storage_len: c.storage.len(),
+                has_abi: c.abi.is_some(),
+                source_hash: c.source_hash,
+            });
+        }
+        page.has_more |= page.truncated;
+        page.next_cursor = if page.has_more {
+            page.items.last().map(|c| c.address).or(last_scanned)
+        } else {
+            None
+        };
+        page
+    }
+}
+
 /// Maximum number of compiled `wasmi::Module` entries kept in the
 /// process-wide bounded FIFO module cache.
 pub const CONTRACT_MODULE_CACHE_CAP: usize = 1024;

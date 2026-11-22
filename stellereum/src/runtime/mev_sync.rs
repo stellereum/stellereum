@@ -910,7 +910,14 @@ impl ValidatorRuntime {
         out.validator_signatures.clear();
         // One hash for the proposer signature and the store key below.
         let digest = out.compute_hash();
-        let signer = self.vote_signer();
+        let req = crate::remote_signer::ConsensusSignRequest::Proposal {
+            chain_id: crate::consensus::consensus_chain_id(),
+            shard_id: self.shard_id,
+            height: out.height,
+            round,
+            block_hash: digest,
+        };
+        let signer = self.vote_signer_for(req);
         let (sig, falcon_sig) = self
             .safety
             .authorize_and_sign_proposal(out.height, round, digest, &signer)
@@ -948,11 +955,8 @@ impl ValidatorRuntime {
         // peer refuses it, and the node burns the round on a proposal nobody
         // can vote. This is the runtime-level backstop for a restored head
         // that could not be reconciled; the driver also gates it.
-        let (finalized_tip, finalized_hash) = self
-            .finalized
-            .last()
-            .copied()
-            .unwrap_or((0, [0u8; 32]));
+        let (finalized_tip, finalized_hash) =
+            self.finalized.last().copied().unwrap_or((0, [0u8; 32]));
         if finalized_tip.checked_add(1) != Some(self.hc.height) {
             tracing::warn!(
                 hc_height = self.hc.height,
@@ -1164,9 +1168,7 @@ impl ValidatorRuntime {
                 .blocks
                 .values()
                 .filter(|b| {
-                    b.height == self.hc.height
-                        && b.proposer == self.id
-                        && b.value_id() == value_id
+                    b.height == self.hc.height && b.proposer == self.id && b.value_id() == value_id
                 })
                 // Any signed copy is the same value; prefer the newest round
                 // for deterministic selection independent of map order.
@@ -1215,8 +1217,7 @@ impl ValidatorRuntime {
                         // Register both signed identities against the value,
                         // and keep the ORIGINAL body for body serving.
                         self.hc.note_value_id(bh, served.value_id());
-                        self.hc
-                            .note_value_id(body.compute_hash(), body.value_id());
+                        self.hc.note_value_id(body.compute_hash(), body.value_id());
                         self.blocks.insert(bh, served.clone());
                         let expected = self.expected_proposer_now();
                         self.hc.receive_proposal_for(self.id, bh, expected).ok()?;
@@ -2277,7 +2278,12 @@ impl ValidatorRuntime {
         // signature lengths BEFORE signing once through `SafetyAuthority`, so a
         // trimmed block never double-signs the same `(height, round)` (`SLASH-B`).
         block.validator_signatures.push((self.id, vec![0u8; 64]));
-        if let Some(fk) = self.falcon_signing_key() {
+        if let Some((ps, _)) = self.pq_signer_entry() {
+            block.validator_signatures.push((
+                ps.validator_id(),
+                vec![0u8; crate::post_quantum::FALCON512_SIG_LEN],
+            ));
+        } else if let Some(fk) = self.falcon_signing_key() {
             block.validator_signatures.push((
                 fk.validator_id(),
                 vec![0u8; crate::post_quantum::FALCON512_SIG_LEN],
@@ -2384,8 +2390,15 @@ impl ValidatorRuntime {
         }
         block.validator_signatures.clear();
         let proposal_msg = block.compute_hash();
+        let req = crate::remote_signer::ConsensusSignRequest::Proposal {
+            chain_id: crate::consensus::consensus_chain_id(),
+            shard_id: self.shard_id,
+            height: self.hc.height,
+            round: self.hc.round,
+            block_hash: proposal_msg,
+        };
         let (sig, falcon_sig) = {
-            let signer = self.vote_signer();
+            let signer = self.vote_signer_for(req);
             self.safety
                 .authorize_and_sign_proposal(self.hc.height, self.hc.round, proposal_msg, &signer)
                 .ok()?

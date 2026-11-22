@@ -1212,7 +1212,7 @@ pub(super) async fn dispatch_eth(
                 ));
             };
             // 2. A binding exists: the intent must be settleable at all.
-            let facts = match crate::evm_adapter::evm_transfer_facts(&raw) {
+            let facts = match crate::evm_adapter::evm_transfer_facts_at(&raw, true) {
                 Ok(f) => f,
                 Err(e) => {
                     return Some(rpc_error(
@@ -1325,12 +1325,13 @@ pub(super) async fn dispatch_eth(
             };
             // Step 2: the intent signature is known, so the payload (and the
             // exact carrier message that covers it) is deterministic.
-            let sign_this = match crate::evm_adapter::carrier_template_message(
+            let sign_this = match crate::evm_adapter::carrier_template_message_at(
                 &raw,
                 &auth.pq_pubkey,
                 intent_signature,
                 to_pq,
                 gas_limit,
+                true,
             ) {
                 Ok(m) => m,
                 Err(e) => return Some(err(id, -32602, e)),
@@ -1353,13 +1354,14 @@ pub(super) async fn dispatch_eth(
                 ));
             };
             // 3. Build exactly the transaction the signing message described.
-            let tx = match crate::evm_adapter::build_carrier_transaction(
+            let tx = match crate::evm_adapter::build_carrier_transaction_at(
                 &raw,
                 &auth.pq_pubkey,
                 intent_signature,
                 to_pq,
                 gas_limit,
                 tx_signature,
+                true,
             ) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1626,7 +1628,7 @@ pub(super) async fn dispatch_eth(
                 Err(e) => return Some(err(id, -32603, e)),
             };
             let evm_from_hex = crate::evm_adapter::evm_address_to_hex(&evm_from);
-            let facts = match crate::evm_adapter::evm_transfer_facts(&raw) {
+            let facts = match crate::evm_adapter::evm_transfer_facts_at(&raw, true) {
                 Ok(f) => f,
                 Err(e) => {
                     return Some(rpc_error(
@@ -1692,23 +1694,25 @@ pub(super) async fn dispatch_eth(
                     .max(facts.gas_limit),
                 Err(e) => return Some(err(id, -32602, e)),
             };
-            let sign_this = match crate::evm_adapter::carrier_template_message(
+            let sign_this = match crate::evm_adapter::carrier_template_message_at(
                 &raw,
                 &pq_pubkey,
                 &intent_signature,
                 to_pq,
                 gas_limit,
+                true,
             ) {
                 Ok(m) => m,
                 Err(e) => return Some(err(id, -32602, e)),
             };
-            let tx = match crate::evm_adapter::build_carrier_transaction(
+            let tx = match crate::evm_adapter::build_carrier_transaction_at(
                 &raw,
                 &pq_pubkey,
                 &intent_signature,
                 to_pq,
                 gas_limit,
                 &tx_signature,
+                true,
             ) {
                 Ok(t) => t,
                 Err(e) => {

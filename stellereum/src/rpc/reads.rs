@@ -2,6 +2,7 @@ use super::*;
 use crate::network::decode_wire_limited;
 use crate::sharding::{ShardId, Transaction};
 use crate::state_engine::{token_balance_key, AccountState};
+use crate::storage::{STORAGE_HISTORY_MAX_LIMIT, STORAGE_SCAN_HARD_CAP};
 use axum::Json;
 use serde_json::{json, Value};
 
@@ -108,6 +109,183 @@ async fn receipt_body_tx(st: &RpcState, r: &TxReceipt) -> Option<Transaction> {
 pub fn parse_addr(s: &str) -> Result<[u8; 32], String> {
     parse_addr_or_hash(s)
 }
+
+// ===========================================================================
+// W4 E3 — cursor pagination limits (shared by the history / program-account /
+// token-account reads; defined in `rpc/cache.rs` next to `MAX_EVENTS_RETURNED`
+// and re-exported through the rpc module).
+// ===========================================================================
+
+/// The params object of a call: bare object, or the first element of the
+/// standard positional array form.
+fn params_object(params: &Value) -> &Value {
+    if params.is_array() {
+        params.get(0).unwrap_or(params)
+    } else {
+        params
+    }
+}
+
+/// `limit` with a default and a hard cap (never 0).
+fn page_limit_param(p: &Value, default: usize, max: usize) -> usize {
+    p.get("limit")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(default)
+        .clamp(1, max)
+}
+
+fn parse_u64_loose(v: &Value) -> Option<u64> {
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    let s = v.as_str()?.trim();
+    let (radix, digits) = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => (16, hex),
+        None => (10, s),
+    };
+    u64::from_str_radix(digits, radix).ok()
+}
+
+fn parse_i64_loose(v: &Value) -> Option<i64> {
+    if let Some(n) = v.as_i64() {
+        return Some(n);
+    }
+    let s = v.as_str()?.trim();
+    let (sign, body) = match s.strip_prefix('-') {
+        Some(rest) => (-1i64, rest),
+        None => (1i64, s),
+    };
+    let (radix, digits) = match body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        Some(hex) => (16, hex),
+        None => (10, body),
+    };
+    i64::from_str_radix(digits, radix).ok().map(|n| n * sign)
+}
+
+fn optional_u64_param(p: &Value, names: &[&str]) -> Result<Option<u64>, String> {
+    for name in names {
+        match p.get(*name) {
+            None | Some(Value::Null) => continue,
+            Some(v) => {
+                return parse_u64_loose(v).map(Some).ok_or_else(|| {
+                    format!("invalid {name}: expected an unsigned integer or hex string")
+                })
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn optional_i64_param(p: &Value, names: &[&str]) -> Result<Option<i64>, String> {
+    for name in names {
+        match p.get(*name) {
+            None | Some(Value::Null) => continue,
+            Some(v) => {
+                return parse_i64_loose(v)
+                    .map(Some)
+                    .ok_or_else(|| format!("invalid {name}: expected an integer or hex string"))
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn optional_addr_param(p: &Value, name: &str) -> Result<Option<[u8; 32]>, String> {
+    match p.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => parse_rpc_address(s)
+            .map(Some)
+            .map_err(|e| format!("invalid {name}: {e}")),
+        Some(_) => Err(format!("invalid {name}: expected a hex/Stl57 string")),
+    }
+}
+
+fn bool_param(p: &Value, name: &str, default: bool) -> bool {
+    p.get(name).and_then(Value::as_bool).unwrap_or(default)
+}
+
+/// Rebuild the participant metadata of an in-memory receipt from its raw
+/// transaction bytes. Restart-hydrated receipts carry no `raw_tx`, so the
+/// participant fields are honestly absent (`None`) there.
+fn receipt_history_meta(r: &TxReceipt) -> Option<crate::storage::StoredReceiptMetaV2> {
+    let raw = r.raw_tx.as_ref()?;
+    let raw = raw.strip_prefix("0x").unwrap_or(raw);
+    let bytes = hex::decode(raw).ok()?;
+    let tx = bincode::deserialize::<Transaction>(&bytes).ok()?;
+    Some(crate::storage::StoredReceiptMetaV2 {
+        from: tx.from,
+        to: tx.to,
+        amount: tx.amount,
+        shard_id: tx.target_shard,
+        // No block timestamp in the in-memory index; the RPC arm fills it
+        // from the store header when one is attached.
+        timestamp: 0,
+    })
+}
+
+/// Role test shared by the archive and in-memory history sources.
+fn history_role_matches(
+    role: crate::storage::HistoryRole,
+    addr: &[u8; 32],
+    meta: Option<&crate::storage::StoredReceiptMetaV2>,
+) -> bool {
+    use crate::storage::HistoryRole;
+    match role {
+        HistoryRole::All => true,
+        HistoryRole::Sender => meta.map(|m| m.from == *addr).unwrap_or(false),
+        HistoryRole::Recipient => meta.map(|m| m.to == *addr).unwrap_or(false),
+    }
+}
+
+/// Decode `cursor` for `stell_getAddressHistory`.
+fn history_cursor_param(p: &Value) -> Result<Option<crate::storage::HistoryCursor>, String> {
+    match p.get("cursor") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => crate::storage::HistoryCursor::from_hex(s)
+            .map(Some)
+            .ok_or_else(|| "invalid cursor: expected 12 bytes of hex".to_string()),
+        Some(_) => Err("invalid cursor: expected a hex string".to_string()),
+    }
+}
+
+/// Decode `cursor` for paginated `stell_getEvents`.
+fn event_cursor_param(p: &Value) -> Result<Option<crate::storage::EventCursor>, String> {
+    match p.get("cursor") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => crate::storage::EventCursor::from_hex(s)
+            .map(Some)
+            .ok_or_else(|| "invalid cursor: expected 16 bytes of hex".to_string()),
+        Some(_) => Err("invalid cursor: expected a hex string".to_string()),
+    }
+}
+
+/// `(height, tx_index)` strictly older than `cursor` (tip-first order).
+fn older_than_history(
+    cursor: Option<crate::storage::HistoryCursor>,
+    height: u64,
+    tx_index: u32,
+) -> bool {
+    cursor
+        .map(|c| (height, tx_index) < (c.height, c.tx_index))
+        .unwrap_or(true)
+}
+
+/// `(height, tx_index, log_index)` strictly older than `cursor`.
+fn older_than_event(
+    cursor: Option<crate::storage::EventCursor>,
+    height: u64,
+    tx_index: u32,
+    log_index: u32,
+) -> bool {
+    cursor
+        .map(|c| (height, tx_index, log_index) < (c.height, c.tx_index, c.log_index))
+        .unwrap_or(true)
+}
+
+/// One merged event row used by paginated `stell_getEvents`:
+/// `(height, tx_index, log_index, tx_hash, topic, value)`.
+type EventHistoryRow = (u64, u32, u32, [u8; 32], i64, i64);
 
 /// Parse a single argument value for `stell_runGetMethod` into an `i64`.
 pub(super) fn parse_single_getter_arg(val: &Value) -> Result<i64, String> {
@@ -1968,17 +2146,13 @@ pub(super) async fn dispatch_reads(
         "stell_listTokens" => {
             // Paginated (audit 2026-10-06): creation is permissionless so the
             // registry is attacker-growable; an unbounded dump is a DoS
-            // amplifier. `limit` default 100, hard max 1000.
-            let p = if params.is_array() {
-                params.get(0).unwrap_or(params)
-            } else {
-                params
-            };
-            let limit = p
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(100)
-                .min(1000) as usize;
+            // amplifier. Legacy default stays 100 (backward compatible), hard
+            // cap is the shared `MAX_PAGE_LIMIT` (200). Cursor pages are a
+            // strict keyset over the deterministic `BTreeMap`; `offset` stays
+            // supported for old clients but is bounded by
+            // `MAX_TOKENS_SORT_CAP`.
+            let p = params_object(params);
+            let limit = page_limit_param(p, 100, MAX_PAGE_LIMIT);
             let cursor: Option<[u8; 32]> = match p.get("cursor").or_else(|| p.get("last_token_id"))
             {
                 None | Some(Value::Null) => None,
@@ -1994,46 +2168,21 @@ pub(super) async fn dispatch_reads(
 
             let tokens = st.engine.tokens_read().await;
             let total = tokens.token_count();
-            let mut ids: Vec<String> = Vec::with_capacity(limit);
-            let mut has_more = false;
-
-            if let Some(last_id) = cursor {
-                use std::ops::Bound;
-                for k in tokens
-                    .tokens
-                    .range((Bound::Excluded(last_id), Bound::Unbounded))
-                    .map(|(k, _)| k)
-                {
-                    if ids.len() < limit {
-                        ids.push(hex::encode(k));
-                    } else {
-                        has_more = true;
-                        break;
-                    }
-                }
-                let next_cursor = if has_more { ids.last().cloned() } else { None };
+            let page = tokens.token_ids_page(cursor, offset, limit);
+            let ids: Vec<String> = page.items.iter().map(hex::encode).collect();
+            let next_cursor = page.next_cursor.map(hex::encode);
+            if cursor.is_some() {
                 ok(
                     id,
                     json!({
                         "tokens": ids,
                         "total": total,
                         "next_cursor": next_cursor,
-                        "has_more": has_more,
+                        "has_more": page.has_more,
+                        "truncated": page.truncated,
                     }),
                 )
             } else {
-                // Bounded iteration (audit 2026-10-06) over deterministic
-                // BTreeMap order: walk the registry directly and stop after
-                // offset+limit+1 instead of materializing every id.
-                for k in tokens.tokens.keys().skip(offset) {
-                    if ids.len() < limit {
-                        ids.push(hex::encode(k));
-                    } else {
-                        has_more = true;
-                        break;
-                    }
-                }
-                let next_cursor = if has_more { ids.last().cloned() } else { None };
                 ok(
                     id,
                     json!({
@@ -2041,7 +2190,8 @@ pub(super) async fn dispatch_reads(
                         "total": total,
                         "offset": offset,
                         "next_cursor": next_cursor,
-                        "has_more": has_more,
+                        "has_more": page.has_more,
+                        "truncated": page.truncated,
                     }),
                 )
             }
@@ -2295,6 +2445,138 @@ pub(super) async fn dispatch_reads(
                         .unwrap_or(0);
                 let to_block = parse_block_num(p.get("to_block").or_else(|| p.get("toBlock")))
                     .unwrap_or(u64::MAX);
+                let topic_filter = p.get("topic").and_then(parse_i64_loose);
+                let cursor = match event_cursor_param(p) {
+                    Ok(c) => c,
+                    Err(e) => return err(id, -32602, e),
+                };
+                let paginated = cursor.is_some() || bool_param(p, "paginated", false);
+
+                if paginated {
+                    // Cursor pagination (W4 E3): merge the fresh in-memory
+                    // receipt index with the durable `events_by_contract`
+                    // index, tip-first, dedupe by `(height, tx_index,
+                    // log_index)` and resume strictly older than `cursor`.
+                    let limit = page_limit_param(p, DEFAULT_PAGE_LIMIT, STORAGE_HISTORY_MAX_LIMIT);
+                    let mut combined: Vec<EventHistoryRow> = Vec::new();
+                    let mut scanned = 0usize;
+                    let mut mem_truncated = false;
+                    {
+                        let idx = st.receipts.read().await;
+                        'receipts: for r in idx.map.values() {
+                            if r.height < from_block || r.height > to_block {
+                                continue;
+                            }
+                            for (log_index, e) in r.events.iter().enumerate() {
+                                if scanned >= STORAGE_SCAN_HARD_CAP {
+                                    mem_truncated = true;
+                                    break 'receipts;
+                                }
+                                scanned += 1;
+                                if e.contract != contract_addr {
+                                    continue;
+                                }
+                                if topic_filter.map(|t| t != e.topic).unwrap_or(false) {
+                                    continue;
+                                }
+                                if !older_than_event(cursor, r.height, r.index, log_index as u32) {
+                                    continue;
+                                }
+                                combined.push((
+                                    r.height,
+                                    r.index,
+                                    log_index as u32,
+                                    r.tx_hash,
+                                    e.topic,
+                                    e.value,
+                                ));
+                            }
+                        }
+                    }
+                    let mut archive_more = false;
+                    let mut archive_truncated = false;
+                    let mut archive_next = None;
+                    if let Some(store) = st.archive_store.as_ref() {
+                        match store.events_by_contract_range(
+                            &contract_addr,
+                            from_block,
+                            to_block,
+                            topic_filter,
+                            cursor,
+                            limit,
+                        ) {
+                            Ok(page) => {
+                                archive_more = page.has_more;
+                                archive_truncated = page.scan_truncated;
+                                archive_next = page.next_cursor;
+                                scanned += page.scanned;
+                                for item in page.items {
+                                    combined.push((
+                                        item.height,
+                                        item.tx_index,
+                                        item.log_index,
+                                        item.tx_hash,
+                                        item.topic,
+                                        item.value,
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                return err(id, -32000, format!("event index read failed: {e}"))
+                            }
+                        }
+                    }
+                    combined.sort_unstable_by_key(|r| {
+                        (
+                            std::cmp::Reverse(r.0),
+                            std::cmp::Reverse(r.1),
+                            std::cmp::Reverse(r.2),
+                        )
+                    });
+                    combined.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
+                    let more_local = combined.len() > limit;
+                    combined.truncate(limit);
+                    let scan_truncated = archive_truncated || mem_truncated;
+                    let has_more = more_local || archive_more || scan_truncated;
+                    let next_cursor = if has_more {
+                        combined
+                            .last()
+                            .map(|(h, i, l, _, _, _)| {
+                                crate::storage::EventCursor {
+                                    height: *h,
+                                    tx_index: *i,
+                                    log_index: *l,
+                                }
+                                .to_hex()
+                            })
+                            .or_else(|| archive_next.map(|c| c.to_hex()))
+                    } else {
+                        None
+                    };
+                    let events_view: Vec<Value> = combined
+                        .into_iter()
+                        .map(|(_, _, _, tx_hash, topic, value)| {
+                            json!({
+                                "contract": hex::encode(contract_addr),
+                                "contract_stl57": crate::address::encode_stl57_address(&contract_addr),
+                                "tx_hash": hex::encode(tx_hash),
+                                "topic": topic,
+                                "value": value,
+                            })
+                        })
+                        .collect();
+                    return ok(
+                        id,
+                        json!({
+                            "events": events_view,
+                            "next_cursor": next_cursor,
+                            "has_more": has_more,
+                            "scanned": scanned,
+                            "scan_truncated": scan_truncated,
+                        }),
+                    );
+                }
+
                 // Optional answer cap. The receipt index holds up to
                 // `MAX_RECEIPTS` (50 000) receipts and every receipt can carry
                 // up to `MAX_CONTRACT_EVENTS` (256) events, so an unfiltered
@@ -2321,23 +2603,647 @@ pub(super) async fn dispatch_reads(
                 let mut matched_events: Vec<Value> = Vec::new();
                 'scan: for r in matched_receipts {
                     for e in &r.events {
-                        if e.contract == contract_addr {
-                            if matched_events.len() >= limit {
-                                break 'scan;
-                            }
-                            matched_events.push(json!({
-                                "contract": hex::encode(e.contract),
-                                "contract_stl57": crate::address::encode_stl57_address(&e.contract),
-                                "topic": e.topic,
-                                "value": e.value,
-                            }));
+                        if e.contract != contract_addr {
+                            continue;
                         }
+                        if topic_filter.map(|t| t != e.topic).unwrap_or(false) {
+                            continue;
+                        }
+                        if matched_events.len() >= limit {
+                            break 'scan;
+                        }
+                        matched_events.push(json!({
+                            "contract": hex::encode(e.contract),
+                            "contract_stl57": crate::address::encode_stl57_address(&e.contract),
+                            "topic": e.topic,
+                            "value": e.value,
+                        }));
+                    }
+                }
+                drop(idx);
+                // Cold node (no in-memory events for this range): backfill the
+                // legacy ARRAY answer from the durable index, oldest first, so
+                // the historical shape and ordering stay unchanged.
+                if matched_events.is_empty() {
+                    let backfill = st.archive_store.as_ref().and_then(|store| {
+                        store
+                            .events_by_contract_range(
+                                &contract_addr,
+                                from_block,
+                                to_block,
+                                topic_filter,
+                                None,
+                                limit,
+                            )
+                            .ok()
+                    });
+                    if let Some(page) = backfill {
+                        matched_events = page
+                            .items
+                            .into_iter()
+                            .rev()
+                            .map(|item| {
+                                json!({
+                                    "contract": hex::encode(item.contract),
+                                    "contract_stl57": crate::address::encode_stl57_address(&item.contract),
+                                    "topic": item.topic,
+                                    "value": item.value,
+                                })
+                            })
+                            .collect();
                     }
                 }
                 return ok(id, json!(matched_events));
             }
 
             err(id, -32602, "missing 'tx_hash' or 'contract' parameter")
+        }
+        "stell_getAddressHistory" => {
+            // Read-only address history: durable `tx_by_addr` (tip-first) merged
+            // with the fresh in-memory receipt window, deduped by tx hash.
+            let p = params_object(params);
+            let address = match p.get("address").or_else(|| p.get("addr")) {
+                Some(Value::String(s)) => match parse_rpc_address(s) {
+                    Ok(a) => a,
+                    Err(e) => return err(id, -32602, format!("invalid address: {e}")),
+                },
+                _ => return err(id, -32602, "missing address"),
+            };
+            let from_height = match optional_u64_param(p, &["from_height", "fromHeight"]) {
+                Ok(v) => v.unwrap_or(0),
+                Err(e) => return err(id, -32602, e),
+            };
+            let to_height = match optional_u64_param(p, &["to_height", "toHeight"]) {
+                Ok(v) => v.unwrap_or(u64::MAX),
+                Err(e) => return err(id, -32602, e),
+            };
+            let role = match p.get("role").and_then(Value::as_str) {
+                None | Some("all") => crate::storage::HistoryRole::All,
+                Some(s) => match crate::storage::HistoryRole::parse(s) {
+                    Some(r) => r,
+                    None => {
+                        return err(
+                            id,
+                            -32602,
+                            "invalid role: expected all | sender | recipient",
+                        )
+                    }
+                },
+            };
+            let cursor = match history_cursor_param(p) {
+                Ok(c) => c,
+                Err(e) => return err(id, -32602, e),
+            };
+            let limit = page_limit_param(p, DEFAULT_PAGE_LIMIT, STORAGE_HISTORY_MAX_LIMIT);
+
+            let mut items: Vec<crate::storage::AddressHistoryItem> = Vec::new();
+            let mut scanned = 0usize;
+            let mut scan_truncated = false;
+            let mut archive_more = false;
+            let mut archive_next = None;
+            if let Some(store) = st.archive_store.as_ref() {
+                match store.address_history(&address, from_height, to_height, role, cursor, limit) {
+                    Ok(page) => {
+                        scanned += page.scanned;
+                        scan_truncated = page.scan_truncated;
+                        archive_more = page.has_more;
+                        archive_next = page.next_cursor;
+                        items.extend(page.items);
+                    }
+                    Err(e) => return err(id, -32000, format!("address history read failed: {e}")),
+                }
+            }
+            // Fresh in-memory window: receipts filed since the last durable
+            // flush (or on a node with no archive store attached at all).
+            let fresh: Vec<TxReceipt> = {
+                let idx = st.receipts.read().await;
+                idx.map
+                    .values()
+                    .filter(|r| r.height >= from_height && r.height <= to_height)
+                    .take(STORAGE_SCAN_HARD_CAP)
+                    .cloned()
+                    .collect()
+            };
+            for r in fresh {
+                scanned += 1;
+                if r.height < from_height || r.height > to_height {
+                    continue;
+                }
+                if !older_than_history(cursor, r.height, r.index) {
+                    continue;
+                }
+                let meta = receipt_history_meta(&r);
+                if !history_role_matches(role, &address, meta.as_ref()) {
+                    continue;
+                }
+                items.push(crate::storage::AddressHistoryItem {
+                    tx_hash: r.tx_hash,
+                    height: r.height,
+                    tx_index: r.index,
+                    meta,
+                });
+            }
+            items.sort_by_key(|item| {
+                (
+                    std::cmp::Reverse(item.height),
+                    std::cmp::Reverse(item.tx_index),
+                )
+            });
+            items.dedup_by(|a, b| a.tx_hash == b.tx_hash);
+            let more_local = items.len() > limit;
+            items.truncate(limit);
+            // Fill a missing in-memory timestamp from the prune-surviving
+            // header record (bounded by the page size).
+            if let Some(store) = st.archive_store.as_ref() {
+                for item in items.iter_mut() {
+                    let Some(meta) = item.meta.as_mut() else {
+                        continue;
+                    };
+                    if meta.timestamp == 0 {
+                        meta.timestamp = store
+                            .header_at(item.height)
+                            .ok()
+                            .flatten()
+                            .map(|h| h.timestamp)
+                            .unwrap_or(0);
+                    }
+                }
+            }
+            let has_more = more_local || archive_more || scan_truncated;
+            let next_cursor = if has_more {
+                items
+                    .last()
+                    .map(|item| {
+                        crate::storage::HistoryCursor {
+                            height: item.height,
+                            tx_index: item.tx_index,
+                        }
+                        .to_hex()
+                    })
+                    .or_else(|| archive_next.map(|c| c.to_hex()))
+            } else {
+                None
+            };
+            let items_view: Vec<Value> = items
+                .iter()
+                .map(|item| {
+                    json!({
+                        "tx_hash": hex::encode(item.tx_hash),
+                        "height": item.height,
+                        "tx_index": item.tx_index,
+                        "from": item.meta.map(|m| hex::encode(m.from)),
+                        "to": item.meta.map(|m| hex::encode(m.to)),
+                        "amount": item.meta.map(|m| m.amount.to_string()),
+                        "shard_id": item.meta.map(|m| m.shard_id),
+                        "timestamp": item.meta.map(|m| m.timestamp),
+                    })
+                })
+                .collect();
+            ok(
+                id,
+                json!({
+                    "address": hex::encode(address),
+                    "address_stl57": crate::address::encode_stl57_address(&address),
+                    "items": items_view,
+                    "next_cursor": next_cursor,
+                    "has_more": has_more,
+                    "scanned": scanned,
+                    "scan_truncated": scan_truncated,
+                }),
+            )
+        }
+        "stell_getProgramAccounts" => {
+            // Bounded `getProgramAccounts` analogue. Every branch is a
+            // deterministic keyset page; the unfiltered `system` dump is
+            // REFUSED because it would be an account enumeration oracle.
+            let p = params_object(params);
+            let program = match p.get("program").and_then(Value::as_str) {
+                Some(s) if s == "token" || s == "contract" || s == "system" => s,
+                Some(_) => {
+                    return err(
+                        id,
+                        -32602,
+                        "invalid program: expected token | contract | system",
+                    )
+                }
+                None => return err(id, -32602, "missing program"),
+            };
+            let with_proof = bool_param(p, "with_proof", false);
+            let mut limit = page_limit_param(p, DEFAULT_PAGE_LIMIT, MAX_PROGRAM_ACCOUNTS_LIMIT);
+            if with_proof {
+                limit = limit.min(MAX_PROGRAM_ACCOUNTS_PROOFS);
+            }
+            let include_zero = bool_param(p, "include_zero", false);
+
+            let mut entries: Vec<(Value, String)> = Vec::new();
+            let mut has_more: bool;
+            let mut scanned: usize;
+            let mut scan_truncated: bool;
+            let next_in: Option<String>;
+
+            if program == "token" {
+                let token_filter = match optional_addr_param(p, "token") {
+                    Ok(v) => v,
+                    Err(e) => return err(id, -32602, e),
+                };
+                let owner_filter = match optional_addr_param(p, "owner") {
+                    Ok(v) => v,
+                    Err(e) => return err(id, -32602, e),
+                };
+                if token_filter.is_none() && owner_filter.is_none() {
+                    return err(id, -32602, "token program requires `token` or `owner`");
+                }
+                let min_balance = match optional_u64_param(p, &["min_balance", "minBalance"]) {
+                    Ok(v) => v.unwrap_or(0),
+                    Err(e) => return err(id, -32602, e),
+                };
+                let cursor = match p.get("cursor") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(s)) => match parse_hash(s) {
+                        Ok(c) => Some(c),
+                        Err(e) => return err(id, -32602, format!("invalid cursor: {e}")),
+                    },
+                    Some(_) => return err(id, -32602, "invalid cursor: expected hex string"),
+                };
+                let tokens = st.engine.tokens_read().await;
+                if let Some(tid) = token_filter {
+                    let Some(actor) = tokens.get(&tid) else {
+                        return err(id, -32004, "unknown token");
+                    };
+                    let page = tokens.token_holders_page(
+                        &tid,
+                        min_balance,
+                        include_zero,
+                        cursor,
+                        limit,
+                        MAX_PROGRAM_ACCOUNTS_SCAN,
+                    );
+                    scanned = page.scanned;
+                    scan_truncated = page.truncated;
+                    has_more = page.has_more;
+                    next_in = page.next_cursor.map(hex::encode);
+                    for holding in page.items {
+                        if owner_filter.is_some_and(|owner| holding.holder != owner) {
+                            continue;
+                        }
+                        let mut item = json!({
+                            "program": "token",
+                            "token": hex::encode(tid),
+                            "token_stl57": crate::address::encode_stl57_address(&tid),
+                            "owner": hex::encode(holding.holder),
+                            "owner_stl57": crate::address::encode_stl57_address(&holding.holder),
+                            "balance": holding.balance.to_string(),
+                            "decimals": actor.metadata.decimals,
+                            "symbol": actor.metadata.symbol,
+                            "name": actor.metadata.name,
+                        });
+                        if with_proof {
+                            item["proof"] = serde_json::to_value(
+                                st.engine
+                                    .get_token_balance_proof(&tid, &holding.holder)
+                                    .await,
+                            )
+                            .unwrap_or(Value::Null);
+                        }
+                        entries.push((item, hex::encode(holding.holder)));
+                    }
+                } else {
+                    let owner = owner_filter.expect("checked above");
+                    let page = tokens.owner_token_page(
+                        &owner,
+                        None,
+                        include_zero,
+                        cursor,
+                        limit,
+                        MAX_PROGRAM_ACCOUNTS_SCAN,
+                    );
+                    scanned = page.scanned;
+                    scan_truncated = page.truncated;
+                    has_more = page.has_more;
+                    next_in = page.next_cursor.map(hex::encode);
+                    for holding in page.items {
+                        let Some(actor) = tokens.get(&holding.token_id) else {
+                            continue;
+                        };
+                        let mut item = json!({
+                            "program": "token",
+                            "token": hex::encode(holding.token_id),
+                            "token_stl57": crate::address::encode_stl57_address(&holding.token_id),
+                            "owner": hex::encode(owner),
+                            "owner_stl57": crate::address::encode_stl57_address(&owner),
+                            "balance": holding.balance.to_string(),
+                            "decimals": actor.metadata.decimals,
+                            "symbol": actor.metadata.symbol,
+                            "name": actor.metadata.name,
+                        });
+                        if with_proof {
+                            item["proof"] = serde_json::to_value(
+                                st.engine
+                                    .get_token_balance_proof(&holding.token_id, &owner)
+                                    .await,
+                            )
+                            .unwrap_or(Value::Null);
+                        }
+                        entries.push((item, hex::encode(holding.token_id)));
+                    }
+                }
+            } else if program == "contract" {
+                let contract_filter = match optional_addr_param(p, "contract") {
+                    Ok(v) => v,
+                    Err(e) => return err(id, -32602, e),
+                };
+                let creator_filter = match optional_addr_param(p, "creator") {
+                    Ok(v) => v,
+                    Err(e) => return err(id, -32602, e),
+                };
+                let include_code = bool_param(p, "include_code", false);
+                let contracts = st.engine.contracts_read().await;
+                if let Some(addr) = contract_filter {
+                    if !contracts.contracts.contains_key(&addr) {
+                        return err(id, -32004, "unknown contract");
+                    }
+                    let slot_from = match optional_i64_param(p, &["slot_from", "slotFrom"]) {
+                        Ok(v) => v,
+                        Err(e) => return err(id, -32602, e),
+                    };
+                    let slot_to = match optional_i64_param(p, &["slot_to", "slotTo"]) {
+                        Ok(v) => v,
+                        Err(e) => return err(id, -32602, e),
+                    };
+                    let cursor = match p.get("cursor") {
+                        None | Some(Value::Null) => None,
+                        Some(v) => match parse_i64_loose(v) {
+                            Some(c) => Some(c),
+                            None => {
+                                return err(
+                                    id,
+                                    -32602,
+                                    "invalid cursor: expected an integer slot key",
+                                )
+                            }
+                        },
+                    };
+                    let page = contracts.storage_page(
+                        &addr,
+                        slot_from,
+                        slot_to,
+                        cursor,
+                        limit,
+                        MAX_PROGRAM_ACCOUNTS_SCAN,
+                    );
+                    scanned = page.scanned;
+                    scan_truncated = page.truncated;
+                    has_more = page.has_more;
+                    next_in = page.next_cursor.map(|c| c.to_string());
+                    for slot in page.items {
+                        let mut item = json!({
+                            "program": "contract",
+                            "contract": hex::encode(addr),
+                            "contract_stl57": crate::address::encode_stl57_address(&addr),
+                            "slot": slot.slot.to_string(),
+                            "value": slot.value.to_string(),
+                        });
+                        if with_proof {
+                            // Storage slots are committed by the contract
+                            // digest, not individual trie leaves: say so
+                            // instead of attaching a proof that does not
+                            // cover the slot.
+                            item["proof"] = Value::Null;
+                            item["proof_note"] = json!(
+                                "storage slots are committed by the contract digest; use stell_getArchiveProof for the contract code/ABI leaf"
+                            );
+                        }
+                        entries.push((item, slot.slot.to_string()));
+                    }
+                } else if let Some(creator) = creator_filter {
+                    let cursor = match p.get("cursor") {
+                        None | Some(Value::Null) => None,
+                        Some(Value::String(s)) => match parse_hash(s) {
+                            Ok(c) => Some(c),
+                            Err(e) => return err(id, -32602, format!("invalid cursor: {e}")),
+                        },
+                        Some(_) => return err(id, -32602, "invalid cursor: expected hex string"),
+                    };
+                    let page = contracts.contracts_by_creator_page(
+                        &creator,
+                        cursor,
+                        limit,
+                        MAX_PROGRAM_ACCOUNTS_SCAN,
+                    );
+                    scanned = page.scanned;
+                    scan_truncated = page.truncated;
+                    has_more = page.has_more;
+                    next_in = page.next_cursor.map(hex::encode);
+                    for summary in page.items {
+                        let mut item = json!({
+                            "program": "contract",
+                            "contract": hex::encode(summary.address),
+                            "contract_stl57": crate::address::encode_stl57_address(&summary.address),
+                            "creator": hex::encode(summary.creator),
+                            "creator_stl57": crate::address::encode_stl57_address(&summary.creator),
+                            "code_hash": hex::encode(summary.code_hash),
+                            "created_at": summary.created_at,
+                            "paused": summary.paused,
+                            "balance": summary.balance.to_string(),
+                            "storage_len": summary.storage_len,
+                            "has_abi": summary.has_abi,
+                            "source_hash": summary.source_hash.map(hex::encode),
+                        });
+                        if include_code {
+                            let code = contracts
+                                .contracts
+                                .get(&summary.address)
+                                .map(|c| hex::encode(&c.code));
+                            item["code"] = code.map(Value::String).unwrap_or(Value::Null);
+                        }
+                        if with_proof {
+                            item["proof"] = serde_json::to_value(
+                                st.engine.get_account_proof(&summary.address).await,
+                            )
+                            .unwrap_or(Value::Null);
+                        }
+                        entries.push((item, hex::encode(summary.address)));
+                    }
+                } else {
+                    return err(
+                        id,
+                        -32602,
+                        "contract program requires `contract` or `creator`",
+                    );
+                }
+            } else {
+                // system
+                let owner = match optional_addr_param(p, "owner") {
+                    Ok(v) => v,
+                    Err(e) => return err(id, -32602, e),
+                };
+                let min_balance = match optional_u64_param(p, &["min_balance", "minBalance"]) {
+                    Ok(v) => v.unwrap_or(0),
+                    Err(e) => return err(id, -32602, e),
+                };
+                let cursor = match optional_addr_param(p, "cursor") {
+                    Ok(v) => v,
+                    Err(e) => return err(id, -32602, e),
+                };
+                if owner.is_none() && min_balance == 0 && cursor.is_none() {
+                    return err(
+                        id,
+                        -32602,
+                        "refusing an unfiltered system dump: pass `owner`, `min_balance` > 0, or an explicit `cursor`",
+                    );
+                }
+                has_more = false;
+                scanned = 0;
+                scan_truncated = false;
+                let snapshot = st.engine.capture_state_snapshot().await;
+                let mut last_scanned: Option<String> = None;
+                for account in snapshot.accounts {
+                    if scanned >= MAX_PROGRAM_ACCOUNTS_SCAN {
+                        scan_truncated = true;
+                        break;
+                    }
+                    scanned += 1;
+                    last_scanned = Some(hex::encode(account.address));
+                    if cursor.map(|c| account.address <= c).unwrap_or(false) {
+                        continue;
+                    }
+                    if owner.is_some_and(|owner| account.address != owner) {
+                        continue;
+                    }
+                    if account.balance < min_balance {
+                        continue;
+                    }
+                    if entries.len() >= limit {
+                        has_more = true;
+                        break;
+                    }
+                    let mut item = json!({
+                        "program": "system",
+                        "address": hex::encode(account.address),
+                        "address_stl57": crate::address::encode_stl57_address(&account.address),
+                        "balance": account.balance.to_string(),
+                        "nonce": account.nonce,
+                        "scheme": account.scheme,
+                        "code_hash": account.code_hash.map(hex::encode),
+                    });
+                    if with_proof {
+                        item["proof"] = serde_json::to_value(
+                            st.engine.get_account_proof(&account.address).await,
+                        )
+                        .unwrap_or(Value::Null);
+                    }
+                    entries.push((item, hex::encode(account.address)));
+                }
+                if scan_truncated {
+                    has_more = true;
+                }
+                next_in = if has_more {
+                    entries.last().map(|(_, c)| c.clone()).or(last_scanned)
+                } else {
+                    None
+                };
+            }
+
+            // Response-size cap: drop trailing items rather than build an
+            // unbounded body; a dropped tail flips `has_more` on.
+            let mut items_view: Vec<Value> = Vec::new();
+            let mut bytes = 0usize;
+            let mut trimmed = false;
+            let mut last_cursor: Option<String> = None;
+            for (item, cursor) in entries {
+                let n = serde_json::to_vec(&item).map_or(0, |b| b.len());
+                if bytes + n > MAX_PROGRAM_ACCOUNTS_RESPONSE_BYTES {
+                    trimmed = true;
+                    break;
+                }
+                bytes += n;
+                last_cursor = Some(cursor);
+                items_view.push(item);
+            }
+            if trimmed && items_view.is_empty() {
+                return err(
+                    id,
+                    -32602,
+                    "response exceeds MAX_PROGRAM_ACCOUNTS_RESPONSE_BYTES; reduce limit or disable include_code",
+                );
+            }
+            let has_more = has_more || trimmed;
+            let next_cursor = if has_more {
+                last_cursor.or(next_in)
+            } else {
+                None
+            };
+            ok(
+                id,
+                json!({
+                    "program": program,
+                    "items": items_view,
+                    "next_cursor": next_cursor,
+                    "has_more": has_more,
+                    "scanned": scanned,
+                    "scan_truncated": scan_truncated,
+                }),
+            )
+        }
+        "stell_getTokenAccountsByOwner" => {
+            let p = params_object(params);
+            let owner = match optional_addr_param(p, "owner") {
+                Ok(Some(a)) => a,
+                Ok(None) => return err(id, -32602, "missing owner"),
+                Err(e) => return err(id, -32602, e),
+            };
+            let token = match optional_addr_param(p, "token") {
+                Ok(v) => v,
+                Err(e) => return err(id, -32602, e),
+            };
+            let include_zero = bool_param(p, "include_zero", false);
+            let cursor = match p.get("cursor") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => match parse_hash(s) {
+                    Ok(c) => Some(c),
+                    Err(e) => return err(id, -32602, format!("invalid cursor: {e}")),
+                },
+                Some(_) => return err(id, -32602, "invalid cursor: expected hex string"),
+            };
+            let limit = page_limit_param(p, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT);
+            let tokens = st.engine.tokens_read().await;
+            let page = tokens.owner_token_page(
+                &owner,
+                token,
+                include_zero,
+                cursor,
+                limit,
+                MAX_PROGRAM_ACCOUNTS_SCAN,
+            );
+            let items_view: Vec<Value> = page
+                .items
+                .iter()
+                .filter_map(|holding| {
+                    let actor = tokens.get(&holding.token_id)?;
+                    Some(json!({
+                        "token": hex::encode(holding.token_id),
+                        "token_stl57": crate::address::encode_stl57_address(&holding.token_id),
+                        "owner": hex::encode(owner),
+                        "owner_stl57": crate::address::encode_stl57_address(&owner),
+                        "balance": holding.balance.to_string(),
+                        "decimals": actor.metadata.decimals,
+                        "symbol": actor.metadata.symbol,
+                        "name": actor.metadata.name,
+                    }))
+                })
+                .collect();
+            ok(
+                id,
+                json!({
+                    "owner": hex::encode(owner),
+                    "owner_stl57": crate::address::encode_stl57_address(&owner),
+                    "items": items_view,
+                    "next_cursor": page.next_cursor.map(hex::encode),
+                    "has_more": page.has_more,
+                    "scanned": page.scanned,
+                    "scan_truncated": page.truncated,
+                }),
+            )
         }
         "stell_getTransactionStatus" => {
             let h = match tx_hash_param(params) {
@@ -2409,6 +3315,7 @@ pub(super) async fn dispatch_reads(
                 None => return err(id, -32602, "missing validator"),
             };
             let l = st.engine.staking_read().await;
+            let reg = st.engine.pq_registry_read().await;
             let rec = l.validators.get(&v);
             let jail = l.jail_record(&v);
             let sched = l.commission_schedule_of(&v);
@@ -2423,6 +3330,8 @@ pub(super) async fn dispatch_reads(
                     "in_set": l.to_validator_set().validators.contains_key(&v),
                     "self_bond": rec.map(|r| r.self_bond.to_string()),
                     "commission_bps": rec.map(|r| r.commission_bps),
+                    "withdrawal_address": rec.and_then(|r| r.withdrawal_address.map(hex::encode)),
+                    "rotation_seq": reg.record_of(&v).map(|r| r.next_seq),
                     "pending_commission": sched.and_then(|s| s.pending.map(|p| json!({
                         "new_bps": p.new_bps,
                         "announced_height": p.announced_height,
@@ -2470,8 +3379,8 @@ pub(super) async fn dispatch_reads(
         // explorers and rotation watchers: the authoritative key AT a height
         // plus the pending rotation, and the registry-level constants. Mirrors
         // the `stell_getValidatorStatus` idiom: public read (no `auth_token`
-        // gate) over the state engine's staking ledger + the process-wide
-        // registry view ([`pq_registry_handle`]). Cheap BTreeMap lookups with
+        // gate) over the state engine's staking ledger + committed PQ registry
+        // (`st.engine.pq_registry_read()`). Cheap BTreeMap lookups with
         // a small bounded hex encoding, so these ride the standard per-IP
         // standalone limiter like every other cheap read — NOT the
         // expensive-read family (no new budget, no new env knob). Fail-closed:
@@ -2504,7 +3413,7 @@ pub(super) async fn dispatch_reads(
                 );
             }
             let ledger = st.engine.staking_read().await;
-            let reg = pq_registry_handle().read().await;
+            let reg = st.engine.pq_registry_read().await;
             // Membership-gated height-indexed read (the same `pq_active_key`
             // the consensus verification paths use): unknown validator or a
             // height outside every validity window is `None` → error.
@@ -2544,7 +3453,7 @@ pub(super) async fn dispatch_reads(
             )
         }
         "stell_getPqRegistryStatus" => {
-            let reg = pq_registry_handle().read().await;
+            let reg = st.engine.pq_registry_read().await;
             ok(
                 id,
                 json!({

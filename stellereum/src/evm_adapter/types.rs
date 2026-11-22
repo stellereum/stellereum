@@ -1313,8 +1313,40 @@ pub fn nano_to_wei(nano: u64) -> u128 {
     (nano as u128) * WEI_PER_NANO
 }
 
+/// Converts Wei (u128) to nano-STELL (u64) EXACTLY, refusing every lossy case.
+///
+/// Contract (W4 §2.3 п.1): a Wei amount is a valid nano-STELL amount only when
+/// it is an integer multiple of [`WEI_PER_NANO`], and the quotient must fit in
+/// `u64`. Nothing is truncated and nothing saturates:
+/// * `wei % WEI_PER_NANO != 0` → `Err("sub-nano wei remainder ...")`;
+/// * `wei / WEI_PER_NANO > u64::MAX` → `Err("wei amount overflows ...")`.
+///
+/// This is the fail-closed boundary new value-moving code must use; the legacy
+/// [`wei_to_nano`] stays for read-only `EV1` simulation and historical tests.
+pub fn wei_to_nano_exact(wei: u128) -> Result<u64, String> {
+    let remainder = wei % WEI_PER_NANO;
+    if remainder != 0 {
+        return Err(format!(
+            "sub-nano wei remainder {remainder}: value must be a multiple of 1_000_000_000 wei"
+        ));
+    }
+    let nano = wei / WEI_PER_NANO;
+    if nano > u64::MAX as u128 {
+        return Err("wei amount overflows u64 nano-STELL".to_string());
+    }
+    Ok(nano as u64)
+}
+
 /// Converts Wei (u128) to nano-STELL (u64).
-/// Sub-nano wei are truncated. Values above u64::MAX nano-STELL saturate at u64::MAX.
+///
+/// WARNING (W4 §2.3, LEGACY lossy boundary): sub-nano wei are TRUNCATED and
+/// values above `u64::MAX` nano-STELL SATURATE at `u64::MAX`. Kept only for
+/// read-only `EV1` simulation and historical tests; never add a value-moving
+/// caller. New code must use [`wei_to_nano_exact`] (fail-closed).
+///
+/// Deliberately NOT annotated `#[deprecated]`: it is still called from
+/// `sharding::transaction`, `rpc::tests` and the legacy adapters, and a
+/// `-D warnings` gate would fail on those out-of-scope call sites.
 pub fn wei_to_nano(wei: u128) -> u64 {
     let nano = wei / WEI_PER_NANO;
     if nano > u64::MAX as u128 {
@@ -2852,4 +2884,44 @@ pub fn parse_eip1559_envelope(raw: &[u8]) -> Result<Eip1559Transaction, String> 
 /// Alias for `parse_eip1559_envelope`.
 pub fn parse_eip1559_transaction(raw: &[u8]) -> Result<Eip1559Transaction, String> {
     Eip1559Transaction::parse_envelope(raw)
+}
+
+#[cfg(test)]
+mod sub_nano_exact_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_sub_nano_remainder() {
+        let err = wei_to_nano_exact(1_500_000_000).expect_err("sub-nano must be refused");
+        assert_eq!(
+            err,
+            "sub-nano wei remainder 500000000: value must be a multiple of 1_000_000_000 wei"
+        );
+    }
+
+    #[test]
+    fn accepts_exact_nano_multiple() {
+        assert_eq!(wei_to_nano_exact(2_000_000_000).unwrap(), 2);
+        assert_eq!(wei_to_nano_exact(0).unwrap(), 0);
+    }
+
+    #[test]
+    fn rejects_u64_overflow() {
+        let wei = (u64::MAX as u128 + 1) * WEI_PER_NANO;
+        let err = wei_to_nano_exact(wei).expect_err("overflow must be refused");
+        assert_eq!(err, "wei amount overflows u64 nano-STELL");
+    }
+
+    #[test]
+    fn accepts_u64_max_boundary() {
+        let wei = (u64::MAX as u128) * WEI_PER_NANO;
+        assert_eq!(wei_to_nano_exact(wei).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn legacy_helper_keeps_lossy_contract() {
+        // The legacy helper stays byte-compatible: truncation + saturation.
+        assert_eq!(wei_to_nano(1_500_000_000), 1);
+        assert_eq!(wei_to_nano((u64::MAX as u128 + 1) * WEI_PER_NANO), u64::MAX);
+    }
 }

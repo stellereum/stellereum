@@ -230,6 +230,120 @@ pub const EMISSIONCapEXACT_ACTIVATION_HEIGHT: u64 = u64::MAX;
 pub const CAP_EXACT_HALF_LIFE_BLOCKS: u64 = 55_398_240;
 pub const CAP_EXACT_R0_NANO: u64 = 4_379_227_780;
 
+// ---------------------------------------------------------------------------
+// Economic activation gates (W4 economics contract §2.2.2 / §2.3)
+// ---------------------------------------------------------------------------
+//
+// Three consensus-facing knobs live here as COMPILED constants, all `u64::MAX`
+// (`GatedOff`) until the lead flips them at rollout. They never read the
+// environment: every node applying the same block must reach the same verdict,
+// so an env knob would be a per-node fork window. Tests (and debug builds)
+// get a THREAD-LOCAL override, absent from release builds — the exact pattern
+// of [`crate::pq_registry::pq_lifecycle_active_at`].
+
+/// Height at which the STRICT sub-nano EVM/SVM bridge rule activates
+/// (`wei_to_nano_exact`: a wei amount that is not a multiple of
+/// `WEI_PER_NANO` is refused instead of silently truncated, §2.3 п.1).
+///
+/// INACTIVE by default (`u64::MAX`): every height, including `u64::MAX`,
+/// keeps today's lenient conversion so historical carrier txs replay
+/// byte-identically. Imported by `evm_adapter` / `svm` behind this gate.
+pub const SUB_NANO_STRICT_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static SUB_NANO_STRICT_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear with `None`) the TEST/DEBUG-ONLY
+/// [`SUB_NANO_STRICT_ACTIVATION_HEIGHT`] override for the calling thread.
+/// Absent from release builds.
+#[cfg(any(test, debug_assertions))]
+pub fn set_sub_nano_strict_activation_override(activation: Option<u64>) {
+    SUB_NANO_STRICT_ACTIVATION_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// Effective [`SUB_NANO_STRICT_ACTIVATION_HEIGHT`] for the calling thread.
+///
+/// Release builds always return the compiled constant (there is no override
+/// state at all in that configuration).
+pub fn effective_sub_nano_strict_activation_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(h) = SUB_NANO_STRICT_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    SUB_NANO_STRICT_ACTIVATION_HEIGHT
+}
+
+/// True iff the strict sub-nano rule is active at `height`.
+///
+/// Strictly `false` for EVERY height (including `u64::MAX`) while the
+/// effective gate is `u64::MAX` (`GatedOff`) — matching
+/// `chain_spec::ActivationStatus::GatedOff`.
+pub fn sub_nano_strict_active_at(height: u64) -> bool {
+    let gate = effective_sub_nano_strict_activation_height();
+    gate != u64::MAX && height >= gate
+}
+
+/// Height at which Fee Market v2 activates: exact `priority_fee_per_gas`
+/// charging and the Burn / Proposer / Staking-Pool split of block fees in
+/// `apply()` (§2.2.2).
+///
+/// INACTIVE by default (`u64::MAX`): `apply()` is byte-identical to today at
+/// every height while gated off. Registered additionally in
+/// `chain_spec::current_activation_schedule()` by the rollout owner.
+pub const FEE_MARKET_V2_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static FEE_MARKET_V2_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear with `None`) the TEST/DEBUG-ONLY
+/// [`FEE_MARKET_V2_ACTIVATION_HEIGHT`] override for the calling thread.
+/// Absent from release builds.
+#[cfg(any(test, debug_assertions))]
+pub fn set_fee_market_v2_activation_override(activation: Option<u64>) {
+    FEE_MARKET_V2_ACTIVATION_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// Effective [`FEE_MARKET_V2_ACTIVATION_HEIGHT`] for the calling thread.
+pub fn effective_fee_market_v2_activation_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(h) = FEE_MARKET_V2_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    FEE_MARKET_V2_ACTIVATION_HEIGHT
+}
+
+/// True iff Fee Market v2 is active at `height` (same `GatedOff` semantics as
+/// [`sub_nano_strict_active_at`]).
+pub fn fee_market_v2_active_at(height: u64) -> bool {
+    let gate = effective_fee_market_v2_activation_height();
+    gate != u64::MAX && height >= gate
+}
+
+/// Default share of block fees BURNED forever, in basis points (50%).
+///
+/// Burned value is never re-minted and never decrements `total_minted_nano`:
+/// `TOTAL_SUPPLY_CAP` bounds GROSS lifetime emission, so burning only reduces
+/// circulating supply (§2.2.2 invariant 2).
+pub const DEFAULT_FEE_BURN_BPS: u64 = 5_000;
+
+/// Default share of block fees credited directly to `block.proposer`, in bps
+/// (30%). The split is computed on the WHOLE block in `u128`; the proposer
+/// leg additionally receives every remainder nano
+/// (`proposer = fees - burn - staking`, exact, no dust lost).
+pub const DEFAULT_FEE_PROPOSER_BPS: u64 = 3_000;
+
+/// Default share of block fees routed to the staking rewards pool, in bps
+/// (20%). Redirected to the proposer when the proposer has no eligible
+/// validator/stake entry. Transfer, not emission: it must NOT touch
+/// `rewards_minted` / `REWARDS_EMISSION_CAP` (§2.2.2 invariant 4).
+pub const DEFAULT_FEE_STAKING_BPS: u64 = 2_000;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenAllocation {
     pub genesis_vault: u64,      // 25% - 250M
@@ -259,6 +373,77 @@ pub struct GenesisVault {
     pub gram_deposited_nano: u64,
 }
 
+/// Full 128×128 → 256-bit product, as four LITTLE-ENDIAN `u64` limbs.
+///
+/// Pure integer schoolbook multiplication on 64-bit limbs (no external crate,
+/// no float): `a * b = out[0] + out[1]·2^64 + out[2]·2^128 + out[3]·2^192`.
+fn mul_u128_wide(a: u128, b: u128) -> [u64; 4] {
+    let a0 = a as u64;
+    let a1 = (a >> 64) as u64;
+    let b0 = b as u64;
+    let b1 = (b >> 64) as u64;
+
+    let p00 = (a0 as u128) * (b0 as u128);
+    let p01 = (a0 as u128) * (b1 as u128);
+    let p10 = (a1 as u128) * (b0 as u128);
+    let p11 = (a1 as u128) * (b1 as u128);
+
+    let mut out = [0u64; 4];
+    out[0] = p00 as u64;
+    let mut carry = p00 >> 64;
+
+    let col1 = (p01 as u64 as u128) + (p10 as u64 as u128) + carry;
+    out[1] = col1 as u64;
+    carry = col1 >> 64;
+
+    let col2 = (p01 >> 64) + (p10 >> 64) + (p11 as u64 as u128) + carry;
+    out[2] = col2 as u64;
+    carry = col2 >> 64;
+
+    out[3] = ((p11 >> 64) + carry) as u64;
+    out
+}
+
+/// Exact `floor(a · b / denom)` over the full 256-bit intermediate product.
+///
+/// WHY: a two-step `(a · b) / x / y` (or `(a / x) · (b / y)`) floors twice and
+/// silently loses the exact remainder. This helper multiplies into 256 bits
+/// (`mul_u128_wide`, so `a · b` never overflows) and performs ONE binary
+/// long division of the 256-bit numerator by the 128-bit denominator, bit by
+/// bit from the most significant — pure `u128` arithmetic, no float, no
+/// external crate, deterministic on every platform.
+///
+/// The running remainder is kept below `denom`; the doubled remainder can need
+/// 129 bits, so the carry-out bit is tracked explicitly and re-injected with
+/// `wrapping_sub` (which computes `2^128 + rem − denom` exactly, and the
+/// result is `< denom < 2^128`). 256 iterations, constant time.
+///
+/// ERRORS (fail closed, no saturation):
+/// * `denom == 0` → `Err`;
+/// * a non-zero quotient bit at position `>= 128` → the true quotient does not
+///   fit `u128` → `Err`.
+pub fn mul_div_floor_256(a: u128, b: u128, denom: u128) -> Result<u128, &'static str> {
+    if denom == 0 {
+        return Err("mul_div_floor_256: denominator is zero");
+    }
+    let product = mul_u128_wide(a, b);
+    let mut rem: u128 = 0;
+    let mut quotient: u128 = 0;
+    for i in (0..256u32).rev() {
+        let bit = (product[(i / 64) as usize] >> (i % 64)) & 1;
+        let carry_out = rem >> 127;
+        rem = (rem << 1) | (bit as u128);
+        if carry_out != 0 || rem >= denom {
+            rem = rem.wrapping_sub(denom);
+            if i >= 128 {
+                return Err("mul_div_floor_256: quotient overflows u128");
+            }
+            quotient |= 1u128 << i;
+        }
+    }
+    Ok(quotient)
+}
+
 impl GenesisVault {
     pub fn new() -> Self {
         Self::default()
@@ -268,30 +453,27 @@ impl GenesisVault {
     /// asset_amount is in native decimals (micro for USDT, nano for TON/GRAM)
     /// price_micro_usd is in micro USD ($1 = 1_000_000)
     pub fn calculate_mint(asset_amount: u64, asset_decimals: u32, price_micro_usd: u64) -> u64 {
-        // Exact u128 quotient/remainder decomposition without intermediate
-        // truncation to whole micro-USD:
-        //   stell_nano = (asset_amount * price_micro_usd * 10^9) / (10^decimals * P0)
-        // Since u64 * u64 < 2^128, `p` never overflows u128; splitting by
-        // `asset_decimals >= 9` vs `< 9` keeps every intermediate term inside
-        // u128 while saturating absurd inputs to `u64::MAX` (refused over-cap
-        // by `deposit_and_mint` instead of panicking or wrapping).
-        let p = (asset_amount as u128) * (price_micro_usd as u128);
-        let stell_nano = if asset_decimals >= 9 {
-            let Some(scale) = 10u128.checked_pow(asset_decimals - 9) else {
-                return 0;
-            };
-            let Some(den) = scale.checked_mul(BASE_STELL_PRICE_MICRO_USD as u128) else {
-                return 0;
-            };
-            p / den
-        } else {
-            let den = 10u128.pow(asset_decimals) * (BASE_STELL_PRICE_MICRO_USD as u128);
-            let q = p / den;
-            let r = p % den;
-            q.saturating_mul(1_000_000_000u128)
-                .saturating_add((r * 1_000_000_000u128) / den)
+        // Exact single-step rational (§2.3 п.2), no intermediate truncation:
+        //   stell_nano = floor((asset_amount · price_micro_usd · 10^9)
+        //                      / (10^decimals · P0))
+        // evaluated as ONE `mul_div_floor_256` over a 256-bit product, instead
+        // of two chained floored divisions (which lose the exact sub-unit
+        // remainder). `asset_amount · price_micro_usd` fits u128; `10^decimals`
+        // and the denominator fail closed to 0 on absurd decimal counts
+        // (`checked_pow` / `checked_mul`). A quotient that does not fit u128 is
+        // saturated to `u64::MAX` (the long-standing contract: absurd inputs
+        // are refused later by `deposit_and_mint`'s cap check, never wrapped).
+        let numer = (asset_amount as u128) * (price_micro_usd as u128);
+        let Some(scale) = 10u128.checked_pow(asset_decimals) else {
+            return 0;
         };
-        u128::min(stell_nano, u64::MAX as u128) as u64
+        let Some(den) = scale.checked_mul(BASE_STELL_PRICE_MICRO_USD as u128) else {
+            return 0;
+        };
+        match mul_div_floor_256(numer, 1_000_000_000u128, den) {
+            Ok(stell_nano) => u128::min(stell_nano, u64::MAX as u128) as u64,
+            Err(_) => u64::MAX,
+        }
     }
 
     /// Deposit incoming asset and mint STELL from Genesis Vault
@@ -637,18 +819,19 @@ pub fn geometric_schedule_r0_nano(pool_nano: u64, half_life_blocks: u64) -> u64 
 /// Zero `f64` / `libm` dependency: bit-identical across all platforms and
 /// strictly a floor (`<=` exact real value, so emissions never exceed cap).
 fn pow_half_fixed(r0_nano: u64, half_life_blocks: u64, height: u64) -> u64 {
-    if r0_nano == 0 || half_life_blocks == 0 {
-        return 0;
-    }
-    let whole = height / half_life_blocks;
-    if whole >= 64 {
-        return 0;
-    }
-    let rem_h = height % half_life_blocks;
-    if rem_h == 0 {
-        return r0_nano >> whole;
-    }
+    pow_half_fixed_exact_q64(r0_nano, half_life_blocks, height).0
+}
 
+/// Q64.64 factor `2^(-rem_h / half_life_blocks)` for `rem_h in [0, h)`.
+///
+/// Binary decomposition of the fractional exponent: bit `i` of
+/// `rem_h / half_life_blocks` multiplies `acc` by `2^(-2^-i)`, each computed by
+/// repeated `u128::isqrt` (`s` starts at `2^(-1) = 1 << 63`). Pure integer, no
+/// float. Returns `1.0` in Q64.64 (`1 << 64`) for `rem_h == 0`.
+fn pow2_frac_q64(half_life_blocks: u64, rem_h: u64) -> u128 {
+    if rem_h == 0 {
+        return 1u128 << 64;
+    }
     let h = half_life_blocks as u128;
     let mut rem = rem_h as u128;
     let mut s = 1u128 << 63; // 2^(-1) in Q0.64
@@ -664,8 +847,73 @@ fn pow_half_fixed(r0_nano: u64, half_life_blocks: u64, height: u64) -> u64 {
             break;
         }
     }
-    let scaled = ((r0_nano as u128) * acc) >> 64;
-    (scaled >> whole) as u64
+    acc
+}
+
+/// Exact fixed-point `floor(r0_nano · 2^(-height / half_life_blocks))` PLUS the
+/// sub-nano remainder in Q64.64 (§2.3 п.4).
+///
+/// Returns `(floor_nano, frac_q64)` where the exact real reward is
+/// `floor_nano + frac_q64 / 2^64` nano-STELL. Unlike
+/// `pow_half_fixed`'s old `((r0 · acc) >> 64) >> whole`, this keeps the low
+/// 64 bits of `r0 · acc` and the bits shifted out by `whole`, so an external
+/// [`emit_with_q64_carry`] accumulator can emit them later instead of losing
+/// up to 1 nano per block forever.
+///
+/// * Whole halvings are an exact right shift of the 128-bit Q64.64 product
+///   (`whole >= 128` → `(0, 0)`: the value is below `2^-64` nano, i.e. dust
+///   that can never round up within `u64` nano accounting).
+/// * `half_life_blocks == 0` is defined deterministically as `(0, 0)` — no
+///   panic, no division by zero.
+/// * The floor equals the legacy `pow_half_fixed` output exactly (shifts
+///   compose: `(x >> 64) >> whole == x >> (64 + whole)`), so the LIVE
+///   geometric schedule does not change.
+pub fn pow_half_fixed_exact_q64(r0_nano: u64, half_life_blocks: u64, height: u64) -> (u64, u64) {
+    if r0_nano == 0 || half_life_blocks == 0 {
+        return (0, 0);
+    }
+    let whole = height / half_life_blocks;
+    let rem_h = height % half_life_blocks;
+    let acc = pow2_frac_q64(half_life_blocks, rem_h);
+    // r0 < 2^64 and acc <= 2^64, so the Q64.64 product always fits u128.
+    let exact_q64 = (r0_nano as u128) * acc;
+    let shifted = if whole >= 128 { 0 } else { exact_q64 >> whole };
+    ((shifted >> 64) as u64, shifted as u64)
+}
+
+/// One emission step with a Q64.64 carry: exact per-height reward plus the
+/// carried sub-nano remainder from previous heights.
+///
+/// `total_q64 = (reward_q64 + carry_q64)`, `emit_nano = floor(total)`, and the
+/// new carry is the low 64 bits of `total_q64` (always `< 2^64`). The caller
+/// stores the returned carry across heights; because every emitted nano comes
+/// from an exact floor of the cumulative reward, the SUM of emissions over any
+/// horizon never exceeds `floor(Σ exact rewards)` — the `P = 350M STELL`
+/// (and therefore `TOTAL_SUPPLY_CAP = 1B STELL`) bound still holds. The
+/// emission still has to pass `reserve_mint` / `REWARDS_EMISSION_CAP` at the
+/// call site (§2.3 п.4 hard invariant).
+///
+/// `half_life_blocks == 0` returns `(0, carry_q64)` deterministically (no
+/// panic, carry preserved). An absurd `r0_nano = u64::MAX` at `height = 0`
+/// with `carry_q64 = u64::MAX` would mathematically need `2^64`; the emitted
+/// nano saturates at `u64::MAX` instead of wrapping (unreachable at pool
+/// magnitudes: real `R0` is a few nano-billions).
+pub fn emit_with_q64_carry(
+    r0_nano: u64,
+    half_life_blocks: u64,
+    height: u64,
+    carry_q64: u64,
+) -> (u64, u64) {
+    if r0_nano == 0 || half_life_blocks == 0 {
+        return (0, carry_q64);
+    }
+    let (floor_nano, frac_q64) = pow_half_fixed_exact_q64(r0_nano, half_life_blocks, height);
+    let total_q64 = (frac_q64 as u128) + (carry_q64 as u128);
+    let emit_nano = (floor_nano as u128) + (total_q64 >> 64);
+    (
+        u128::min(emit_nano, u64::MAX as u128) as u64,
+        total_q64 as u64,
+    )
 }
 
 /// Geometric per-height reward (report §11, Eq. 4).
@@ -1043,5 +1291,297 @@ mod econ_truth_tests {
             sum * 100_000 >= pool as u128 * 99_999,
             "sum={sum} pool={pool}"
         );
+    }
+}
+
+#[cfg(test)]
+mod w4_economics_tests {
+    use super::*;
+
+    #[test]
+    fn activation_gates_are_inactive_at_every_height_by_default() {
+        assert_eq!(
+            SUB_NANO_STRICT_ACTIVATION_HEIGHT,
+            u64::MAX,
+            "strict sub-nano gate INACTIVE until rollout"
+        );
+        assert_eq!(
+            FEE_MARKET_V2_ACTIVATION_HEIGHT,
+            u64::MAX,
+            "fee market v2 gate INACTIVE until rollout"
+        );
+        for &h in &[0u64, 1, 100, u64::MAX - 1, u64::MAX] {
+            assert!(
+                !sub_nano_strict_active_at(h),
+                "strict sub-nano must be false @ {h}"
+            );
+            assert!(
+                !fee_market_v2_active_at(h),
+                "fee market v2 must be false @ {h}"
+            );
+        }
+    }
+
+    #[test]
+    fn activation_gate_overrides_take_effect_and_clear() {
+        set_sub_nano_strict_activation_override(Some(1_000));
+        assert!(!sub_nano_strict_active_at(999));
+        assert!(sub_nano_strict_active_at(1_000));
+        assert!(sub_nano_strict_active_at(u64::MAX));
+        assert_eq!(effective_sub_nano_strict_activation_height(), 1_000);
+        set_sub_nano_strict_activation_override(None);
+        assert_eq!(effective_sub_nano_strict_activation_height(), u64::MAX);
+        assert!(!sub_nano_strict_active_at(u64::MAX));
+
+        set_fee_market_v2_activation_override(Some(500));
+        assert!(!fee_market_v2_active_at(499));
+        assert!(fee_market_v2_active_at(500));
+        assert!(fee_market_v2_active_at(u64::MAX));
+        assert_eq!(effective_fee_market_v2_activation_height(), 500);
+        set_fee_market_v2_activation_override(None);
+        assert_eq!(effective_fee_market_v2_activation_height(), u64::MAX);
+        assert!(!fee_market_v2_active_at(u64::MAX));
+    }
+
+    #[test]
+    fn default_fee_split_sums_to_one_hundred_percent() {
+        assert_eq!(DEFAULT_FEE_BURN_BPS, 5_000);
+        assert_eq!(DEFAULT_FEE_PROPOSER_BPS, 3_000);
+        assert_eq!(DEFAULT_FEE_STAKING_BPS, 2_000);
+        assert_eq!(
+            DEFAULT_FEE_BURN_BPS + DEFAULT_FEE_PROPOSER_BPS + DEFAULT_FEE_STAKING_BPS,
+            10_000
+        );
+    }
+
+    #[test]
+    fn mul_div_floor_256_exact_and_fail_closed() {
+        // Basic floor semantics.
+        assert_eq!(mul_div_floor_256(0, 0, 5), Ok(0));
+        assert_eq!(mul_div_floor_256(0, 123, 7), Ok(0));
+        assert_eq!(mul_div_floor_256(10, 20, 8), Ok(25));
+        assert_eq!(mul_div_floor_256(7, 3, 10), Ok(2)); // 2.1 floor
+        assert_eq!(mul_div_floor_256(1, 1, 1), Ok(1));
+        assert_eq!(mul_div_floor_256(10, 10, u128::MAX), Ok(0));
+
+        // Boundaries: full-width operands whose quotient still fits u128.
+        assert_eq!(
+            mul_div_floor_256(u128::MAX, 2, 2),
+            Ok(u128::MAX),
+            "(2^128-1)*2/2"
+        );
+        assert_eq!(
+            mul_div_floor_256(u128::MAX, u128::MAX, u128::MAX),
+            Ok(u128::MAX),
+            "(2^128-1)^2/(2^128-1)"
+        );
+        assert_eq!(
+            mul_div_floor_256(1u128 << 127, 2, u128::MAX),
+            Ok(1),
+            "2^128/(2^128-1) floors to 1"
+        );
+
+        // Quotient overflow is refused, never truncated.
+        assert_eq!(
+            mul_div_floor_256(u128::MAX, 2, 1),
+            Err("mul_div_floor_256: quotient overflows u128")
+        );
+        assert_eq!(
+            mul_div_floor_256(u128::MAX, u128::MAX, 1),
+            Err("mul_div_floor_256: quotient overflows u128")
+        );
+
+        // Zero denominator is refused.
+        assert_eq!(
+            mul_div_floor_256(5, 5, 0),
+            Err("mul_div_floor_256: denominator is zero")
+        );
+
+        // Differential check against plain u128 arithmetic where it cannot
+        // overflow (an independent expression of the same floor division).
+        for &a in &[0u64, 1, 7, 1_000, 123_456_789, u32::MAX as u64] {
+            for &b in &[0u64, 1, 3, 999, 1_000_000] {
+                for &d in &[1u128, 3, 7, 10_000, 1_000_000_007] {
+                    let a = a as u128;
+                    let b = b as u128;
+                    assert_eq!(
+                        mul_div_floor_256(a, b, d),
+                        Ok((a * b) / d),
+                        "a={a} b={b} d={d}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn genesis_mint_is_one_step_exact_and_preserves_contract() {
+        // $1 of USDT at $1 → 4 STELL = 4e9 nano.
+        assert_eq!(
+            GenesisVault::calculate_mint(1_000_000, 6, 1_000_000),
+            4_000_000_000
+        );
+        // 1 TON (9 decimals) at $1 → the same 4 STELL.
+        assert_eq!(
+            GenesisVault::calculate_mint(1_000_000_000, 9, 1_000_000),
+            4_000_000_000
+        );
+        // 0.333333 USDT at $1 → 1.333332 STELL exactly.
+        assert_eq!(
+            GenesisVault::calculate_mint(333_333, 6, 1_000_000),
+            1_333_332_000
+        );
+        assert_eq!(GenesisVault::calculate_mint(0, 6, 1_000_000), 0);
+
+        // Absurd decimal count fails closed to 0; absurd price saturates.
+        assert_eq!(GenesisVault::calculate_mint(1, 100, 1_000_000), 0);
+        assert_eq!(
+            GenesisVault::calculate_mint(u64::MAX, 0, u64::MAX),
+            u64::MAX
+        );
+
+        // Differential check against the old two-branch quotient/remainder
+        // decomposition for decimals <= 9 (algebraically the same value).
+        for &amount in &[0u64, 1, 7, 333_333, 1_000_000, 12_345_678] {
+            for &decimals in &[0u32, 2, 6, 9] {
+                for &price in &[1u64, 250_000, 1_000_000, 3_000_000] {
+                    let p = (amount as u128) * (price as u128);
+                    let den = 10u128.pow(decimals) * (BASE_STELL_PRICE_MICRO_USD as u128);
+                    let expected =
+                        (p / den) * 1_000_000_000u128 + ((p % den) * 1_000_000_000u128) / den;
+                    assert_eq!(
+                        GenesisVault::calculate_mint(amount, decimals, price),
+                        u128::min(expected, u64::MAX as u128) as u64,
+                        "amount={amount} decimals={decimals} price={price}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_q64_floor_matches_legacy_reward() {
+        let r0 = 4_379_227_780u64;
+        let h = CAP_EXACT_HALF_LIFE_BLOCKS;
+        for &height in &[
+            0u64,
+            1,
+            2,
+            h - 1,
+            h,
+            h + 1,
+            2 * h,
+            7 * h + 123,
+            63 * h,
+            64 * h,
+            100 * h,
+        ] {
+            let (floor, _frac) = pow_half_fixed_exact_q64(r0, h, height);
+            assert_eq!(
+                floor,
+                geometric_reward_at_height(r0, h, height),
+                "floor must stay byte-identical to the live helper @ {height}"
+            );
+            assert!(floor <= r0, "reward never exceeds R0 @ {height}");
+        }
+        // At height 0 the fractional part is exactly zero.
+        assert_eq!(pow_half_fixed_exact_q64(r0, h, 0), (r0, 0));
+        // One half-life: exact halving (r0 is even → no fraction).
+        assert_eq!(pow_half_fixed_exact_q64(r0, h, h), (r0 / 2, 0));
+        // Degenerate inputs are deterministic, never panics.
+        assert_eq!(pow_half_fixed_exact_q64(5, 0, 10), (0, 0));
+        assert_eq!(pow_half_fixed_exact_q64(0, 10, 10), (0, 0));
+    }
+
+    #[test]
+    fn emit_with_q64_carry_is_capped_and_carry_stays_below_two_pow_64() {
+        let pool = StakingEmissionSchedule::default().total_pool as u128;
+
+        // CASE A — the whole geometric tail at H = 1 (r0 = pool/2): the exact
+        // infinite sum is exactly `2·r0 = pool`, so the carried emission can
+        // never exceed the pool (it lands 1 nano under: the sub-2^-128 tail is
+        // discarded as dust).
+        let r0_h1 = (pool / 2) as u64;
+        let mut carry = 0u64;
+        let mut sum: u128 = 0;
+        let mut accumulated_q64: u128 = 0;
+        let mut height = 0u64;
+        loop {
+            let (floor, frac) = pow_half_fixed_exact_q64(r0_h1, 1, height);
+            let (emit, next_carry) = emit_with_q64_carry(r0_h1, 1, height, carry);
+            assert!(
+                (next_carry as u128) < (1u128 << 64),
+                "carry must be < 2^64 @ {height}"
+            );
+            accumulated_q64 += ((floor as u128) << 64) + (frac as u128);
+            sum += emit as u128;
+            assert_eq!(
+                sum,
+                accumulated_q64 >> 64,
+                "emitted nanos are the exact floor of the cumulative reward @ {height}"
+            );
+            assert_eq!(
+                next_carry, accumulated_q64 as u64,
+                "carry is the fractional remainder of the cumulative reward @ {height}"
+            );
+            carry = next_carry;
+            height += 1;
+            if floor == 0 {
+                break;
+            }
+            assert!(height < 1_000, "H=1 tail must terminate");
+        }
+        assert!(sum <= pool, "Σemit {sum} must not exceed pool {pool}");
+        assert!(sum + 1 >= pool, "H=1 tail emits pool-1 at most: {sum}");
+        // Post-horizon carry is irreducible sub-nano dust, still a u64 fraction.
+        assert!((carry as u128) < (1u128 << 64));
+
+        // CASE B — a LONG horizon (H = 1024, 48k blocks until the reward
+        // floors to 0). `r0 = pool / (2H)` guarantees the mathematical
+        // ceiling `Σ exact = r0 / (1 - 2^(-1/H)) <= 2H·r0 <= pool`, so the
+        // carried emission must stay under the pool.
+        let half_life_blocks = 1_024u64;
+        let r0 = (pool / (2 * half_life_blocks as u128)) as u64;
+        assert!(r0 > 0);
+        let mut carry = 0u64;
+        let mut sum: u128 = 0;
+        let mut accumulated_q64: u128 = 0;
+        let mut height = 0u64;
+        loop {
+            let (floor, frac) = pow_half_fixed_exact_q64(r0, half_life_blocks, height);
+            let (emit, next_carry) = emit_with_q64_carry(r0, half_life_blocks, height, carry);
+            assert!(
+                (next_carry as u128) < (1u128 << 64),
+                "carry must be < 2^64 @ {height}"
+            );
+            let floor_only = geometric_reward_at_height(r0, half_life_blocks, height) as u128;
+            assert_eq!(floor as u128, floor_only, "floor matches the live helper");
+            assert!(
+                (emit as u128) >= floor_only,
+                "carry can only add value, never remove @ {height}"
+            );
+            accumulated_q64 += ((floor as u128) << 64) + (frac as u128);
+            sum += emit as u128;
+            assert_eq!(sum, accumulated_q64 >> 64);
+            assert_eq!(next_carry, accumulated_q64 as u64);
+            carry = next_carry;
+            height += 1;
+            if floor == 0 {
+                break;
+            }
+            assert!(
+                height < 1_000_000,
+                "geometric tail must reach zero (H={half_life_blocks})"
+            );
+        }
+        assert!(sum <= pool, "Σemit {sum} must not exceed pool {pool}");
+        // Post-horizon carry is irreducible sub-nano dust, still a u64 fraction.
+        assert!((carry as u128) < (1u128 << 64));
+
+        // Degenerate inputs preserve the carry deterministically.
+        assert_eq!(emit_with_q64_carry(5, 0, 10, 7), (0, 7));
+        assert_eq!(emit_with_q64_carry(0, 10, 10, 7), (0, 7));
+        // At height 0 the whole reward is emitted and nothing is carried.
+        assert_eq!(emit_with_q64_carry(r0, half_life_blocks, 0, 0), (r0, 0));
     }
 }

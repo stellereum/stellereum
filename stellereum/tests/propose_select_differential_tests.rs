@@ -120,6 +120,20 @@ where
             order.insert((t.priority_fee_per_gas, Mempool::effective_fee(t), h), h);
         }
     }
+    // MP04: the reference model ranks by fee DENSITY (priority per unit of the
+    // scarcest block resource), then priority, then declared fee, then hash —
+    // the same total order `Mempool::select_multi` uses. Keeping the model and
+    // the implementation in lockstep is the point of this differential test.
+    let mut ranked: Vec<TxHash> = order.values().copied().collect();
+    ranked.sort_unstable_by(|a, b| {
+        let ta = by_hash[a];
+        let tb = by_hash[b];
+        Mempool::fee_density(tb)
+            .cmp(&Mempool::fee_density(ta))
+            .then(tb.priority_fee_per_gas.cmp(&ta.priority_fee_per_gas))
+            .then(tb.gas_limit.cmp(&ta.gas_limit))
+            .then(a.cmp(b))
+    });
     let mut out: Vec<TxHash> = Vec::new();
     let mut taken: HashSet<TxHash> = HashSet::new();
     let mut gas = 0u64;
@@ -127,7 +141,7 @@ where
     let mut proofs = 0usize;
     for _ in 0..passes.max(1) {
         let before = out.len();
-        for ((_, _, h), _) in order.iter().rev() {
+        for h in &ranked {
             if out.len() >= max_txs {
                 break;
             }

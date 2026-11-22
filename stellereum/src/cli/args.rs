@@ -288,6 +288,213 @@ pub(crate) enum Commands {
         #[arg(long, default_value_t = false)]
         i_fenced_all_signers: bool,
     },
+    /// W3 PQ validator lifecycle transactions (OpCode 59..=64)
+    Validator {
+        #[command(subcommand)]
+        sub: ValidatorCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ValidatorCommands {
+    /// Register a new post-W3 PQ validator (OpCode 59: SysCallRegisterValidator)
+    RegisterValidator {
+        /// Cold withdrawal Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        withdrawal_seed: Option<String>,
+        /// Cold withdrawal Falcon-512 key file
+        #[arg(long)]
+        withdrawal_key_file: Option<PathBuf>,
+        /// Hot voting Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        voting_seed: Option<String>,
+        /// Hot voting Falcon-512 key file
+        #[arg(long)]
+        voting_key_file: Option<PathBuf>,
+        /// Initial self-bond amount in nano-STELL
+        #[arg(long)]
+        amount: u64,
+        /// Initial commission in basis points (0..=10000)
+        #[arg(long, default_value_t = stellereum::staking::DEFAULT_COMMISSION_BPS)]
+        commission_bps: u64,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit sender nonce
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Chain id bound into both the voting PoP and PQ1 envelope
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Only print the signed transaction instead of submitting
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Write-API token, when configured on the node
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Announce or cancel a Falcon-512 voting-key rotation (OpCode 60: SysCallRotateVotingKey)
+    RotateVotingKey {
+        /// Cold withdrawal Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        withdrawal_seed: Option<String>,
+        /// Cold withdrawal Falcon-512 key file
+        #[arg(long)]
+        withdrawal_key_file: Option<PathBuf>,
+        /// Immutable 32-byte validator_id in hex
+        #[arg(long)]
+        validator_id: String,
+        /// Expected PqKeyRecord::next_seq value
+        #[arg(long)]
+        rotation_seq: u64,
+        /// New hot voting Falcon-512 seed in hex (omit when --cancel)
+        #[arg(long)]
+        new_voting_seed: Option<String>,
+        /// New hot voting Falcon-512 key file (omit when --cancel)
+        #[arg(long)]
+        new_voting_key_file: Option<PathBuf>,
+        /// Cancel an unmatured pending rotation instead of announcing one
+        #[arg(long, default_value_t = false)]
+        cancel: bool,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit sender nonce
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Chain id bound into both the voting PoP and PQ1 envelope
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Only print the signed transaction instead of submitting
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Write-API token, when configured on the node
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Change a validator's cold withdrawal_address with new-key PoP (OpCode 61: SysCallChangeWithdrawal)
+    ChangeWithdrawal {
+        /// Current cold withdrawal Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        withdrawal_seed: Option<String>,
+        /// Current cold withdrawal Falcon-512 key file
+        #[arg(long)]
+        withdrawal_key_file: Option<PathBuf>,
+        /// Immutable 32-byte validator_id in hex
+        #[arg(long)]
+        validator_id: String,
+        /// New cold withdrawal Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        new_withdrawal_seed: Option<String>,
+        /// New cold withdrawal Falcon-512 key file
+        #[arg(long)]
+        new_withdrawal_key_file: Option<PathBuf>,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit sender nonce
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Chain id bound into both the withdrawal PoP and PQ1 envelope
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Only print the signed transaction instead of submitting
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Write-API token, when configured on the node
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// One-time migration to claim a cold withdrawal_address for a pre-W3 validator (OpCode 62)
+    ClaimWithdrawal {
+        /// New cold withdrawal Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        withdrawal_seed: Option<String>,
+        /// New cold withdrawal Falcon-512 key file
+        #[arg(long)]
+        withdrawal_key_file: Option<PathBuf>,
+        /// Pre-W3 validator_id in hex (32 bytes)
+        #[arg(long)]
+        validator_id: String,
+        /// Active hot voting Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        voting_seed: Option<String>,
+        /// Active hot voting Falcon-512 key file
+        #[arg(long)]
+        voting_key_file: Option<PathBuf>,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit sender nonce
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Chain id bound into both the claim signature and PQ1 envelope
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Only print the signed transaction instead of submitting
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Write-API token, when configured on the node
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Announce a validator commission change (OpCode 63: SysCallAnnounceCommission)
+    AnnounceCommission {
+        /// Cold withdrawal Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        withdrawal_seed: Option<String>,
+        /// Cold withdrawal Falcon-512 key file
+        #[arg(long)]
+        withdrawal_key_file: Option<PathBuf>,
+        /// Immutable 32-byte validator_id in hex
+        #[arg(long)]
+        validator_id: String,
+        /// New commission rate in basis points (0..=10000)
+        #[arg(long)]
+        new_bps: u64,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit sender nonce
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Chain id bound into the PQ1 envelope
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Only print the signed transaction instead of submitting
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Write-API token, when configured on the node
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Apply a matured validator commission change (OpCode 64: SysCallApplyCommission)
+    ApplyCommission {
+        /// Cold withdrawal Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        withdrawal_seed: Option<String>,
+        /// Cold withdrawal Falcon-512 key file
+        #[arg(long)]
+        withdrawal_key_file: Option<PathBuf>,
+        /// Immutable 32-byte validator_id in hex
+        #[arg(long)]
+        validator_id: String,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit sender nonce
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Chain id bound into the PQ1 envelope
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Only print the signed transaction instead of submitting
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Write-API token, when configured on the node
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 #[derive(Subcommand)]
 pub(crate) enum WalletCommands {

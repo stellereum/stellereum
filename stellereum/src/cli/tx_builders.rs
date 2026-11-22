@@ -812,6 +812,285 @@ pub(crate) fn resolve_nonce(
     }
 }
 
+/// Resolve a Falcon-512 keypair from either a key file (`--*-key-file`) or a
+/// 32-byte hex seed (`--*-seed`).
+pub(crate) fn resolve_falcon_keypair(
+    key_file: Option<PathBuf>,
+    seed_hex: Option<String>,
+    what: &str,
+) -> anyhow::Result<stellereum::post_quantum::FalconKeypair> {
+    if let Some(path) = key_file {
+        return stellereum::node_keys::load_falcon_key(&path)
+            .map_err(|e| anyhow::anyhow!("cannot load {what} key {}: {e}", path.display()));
+    }
+    if let Some(raw) = seed_hex {
+        return falcon_from_hex_seed(&raw, what);
+    }
+    anyhow::bail!("missing {what} key: pass key file or 32-byte hex seed");
+}
+
+/// Resolve an explicit `--chain-id` or query `stell_chainId` fail-closed.
+/// Used by W3 PQ validator lifecycle commands where PoP signatures always bind
+/// `chain_id`.
+pub(crate) fn resolve_required_chain_id(rpc: &str, explicit: Option<u64>) -> anyhow::Result<u64> {
+    if let Some(cid) = explicit {
+        return Ok(cid);
+    }
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "stell_chainId", "params": []
+    })
+    .to_string();
+    let resp: serde_json::Value = ureq::post(rpc)
+        .send_string(&body)
+        .map_err(|e| anyhow::anyhow!("cannot resolve chain_id from {rpc}: {e}; pass --chain-id"))?
+        .into_json()
+        .map_err(|e| anyhow::anyhow!("invalid stell_chainId JSON from {rpc}: {e}"))?;
+    if let Some(e) = resp.get("error") {
+        anyhow::bail!("stell_chainId error from {rpc}: {e}");
+    }
+    resp.get("result")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("node at {rpc} did not return chain_id; pass --chain-id"))
+}
+
+/// Build a chain-bound `OpCode 59: SysCallRegisterValidator` transaction with
+/// Falcon-512 PoP signed by `voting_key` at `rotation_seq = 0`.
+pub(crate) fn build_register_validator_tx_with_chain(
+    withdrawal_key: &stellereum::post_quantum::FalconKeypair,
+    voting_key: &stellereum::post_quantum::FalconKeypair,
+    amount: u64,
+    commission_bps: u64,
+    nonce: u64,
+    chain_id: u64,
+) -> (Transaction, [u8; 32]) {
+    let withdrawal_address = falcon_pq_address(withdrawal_key);
+    let validator_id = stellereum::pq_registry::derive_validator_id(
+        chain_id,
+        &withdrawal_address,
+        &voting_key.public_key,
+    );
+    let pop_msg = stellereum::pq_registry::pq_voting_key_pop_preimage(
+        chain_id,
+        &validator_id,
+        &withdrawal_address,
+        0,
+        stellereum::post_quantum::PqScheme::Falcon512,
+        &voting_key.public_key,
+    );
+    let voting_pop = voting_key.sign(&pop_msg);
+    let op = stellereum::svm::OpCode::SysCallRegisterValidator(Box::new(
+        stellereum::svm::RegisterValidatorPayload {
+            amount,
+            commission_bps,
+            withdrawal_address,
+            voting_scheme: stellereum::post_quantum::PqScheme::Falcon512.id(),
+            voting_pubkey: voting_key.public_key.clone(),
+            voting_pop,
+        },
+    ));
+    let gas = cli_tx_gas(stellereum::svm::opcode_gas(&op))
+        .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    let tx = sign_pq_explicit_payload_with_chain(
+        withdrawal_key,
+        withdrawal_address,
+        0,
+        gas,
+        nonce,
+        stellereum::sharding::MASTERCHAIN_SHARD,
+        stellereum::sharding::MASTERCHAIN_SHARD,
+        vec![op],
+        chain_id,
+    );
+    (tx, validator_id)
+}
+
+/// Build a chain-bound `OpCode 60: SysCallRotateVotingKey` transaction
+/// (announce with Falcon-512 PoP when `new_voting_key` is `Some`, or cancel
+/// when `None`).
+pub(crate) fn build_rotate_voting_key_tx_with_chain(
+    withdrawal_key: &stellereum::post_quantum::FalconKeypair,
+    validator_id: [u8; 32],
+    rotation_seq: u64,
+    new_voting_key: Option<&stellereum::post_quantum::FalconKeypair>,
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    let withdrawal_address = falcon_pq_address(withdrawal_key);
+    let payload = match new_voting_key {
+        Some(new_kp) => {
+            let pop_msg = stellereum::pq_registry::pq_voting_key_pop_preimage(
+                chain_id,
+                &validator_id,
+                &withdrawal_address,
+                rotation_seq,
+                stellereum::post_quantum::PqScheme::Falcon512,
+                &new_kp.public_key,
+            );
+            let pop_signature = new_kp.sign(&pop_msg);
+            stellereum::svm::RotateVotingKeyPayload {
+                validator_id,
+                rotation_seq,
+                new_scheme: stellereum::post_quantum::PqScheme::Falcon512.id(),
+                new_pubkey: new_kp.public_key.clone(),
+                pop_signature,
+                cancel: false,
+            }
+        }
+        None => stellereum::svm::RotateVotingKeyPayload {
+            validator_id,
+            rotation_seq,
+            new_scheme: 0,
+            new_pubkey: Vec::new(),
+            pop_signature: Vec::new(),
+            cancel: true,
+        },
+    };
+    let op = stellereum::svm::OpCode::SysCallRotateVotingKey(Box::new(payload));
+    let gas = cli_tx_gas(stellereum::svm::opcode_gas(&op))
+        .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    sign_pq_explicit_payload_with_chain(
+        withdrawal_key,
+        withdrawal_address,
+        0,
+        gas,
+        nonce,
+        stellereum::sharding::MASTERCHAIN_SHARD,
+        stellereum::sharding::MASTERCHAIN_SHARD,
+        vec![op],
+        chain_id,
+    )
+}
+
+/// Build a chain-bound `OpCode 61: SysCallChangeWithdrawal` transaction with
+/// Falcon-512 PoP signed by `new_withdrawal_key`.
+pub(crate) fn build_change_withdrawal_tx_with_chain(
+    current_withdrawal_key: &stellereum::post_quantum::FalconKeypair,
+    validator_id: [u8; 32],
+    new_withdrawal_key: &stellereum::post_quantum::FalconKeypair,
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    let current_withdrawal_address = falcon_pq_address(current_withdrawal_key);
+    let new_withdrawal_address = falcon_pq_address(new_withdrawal_key);
+    let pop_msg = stellereum::staking::pq_withdrawal_pop_preimage(
+        chain_id,
+        &validator_id,
+        &current_withdrawal_address,
+        &new_withdrawal_address,
+    );
+    let new_withdrawal_pop = new_withdrawal_key.sign(&pop_msg);
+    let op = stellereum::svm::OpCode::SysCallChangeWithdrawal(Box::new(
+        stellereum::svm::ChangeWithdrawalPayload {
+            validator_id,
+            new_withdrawal_address,
+            new_withdrawal_scheme: stellereum::post_quantum::PqScheme::Falcon512.id(),
+            new_withdrawal_pubkey: new_withdrawal_key.public_key.clone(),
+            new_withdrawal_salt: stellereum::post_quantum::DEFAULT_SALT,
+            new_withdrawal_pop,
+        },
+    ));
+    let gas = cli_tx_gas(stellereum::svm::opcode_gas(&op))
+        .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    sign_pq_explicit_payload_with_chain(
+        current_withdrawal_key,
+        current_withdrawal_address,
+        0,
+        gas,
+        nonce,
+        stellereum::sharding::MASTERCHAIN_SHARD,
+        stellereum::sharding::MASTERCHAIN_SHARD,
+        vec![op],
+        chain_id,
+    )
+}
+
+/// Build a chain-bound `OpCode 62: SysCallClaimWithdrawal` transaction signed
+/// by `withdrawal_key` (`ctx.sender`) and attested by `voting_key`.
+pub(crate) fn build_claim_withdrawal_tx_with_chain(
+    withdrawal_key: &stellereum::post_quantum::FalconKeypair,
+    validator_id: [u8; 32],
+    voting_key: &stellereum::post_quantum::FalconKeypair,
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    let withdrawal_address = falcon_pq_address(withdrawal_key);
+    let claim_msg = stellereum::staking::pq_claim_withdrawal_preimage(
+        chain_id,
+        &validator_id,
+        &withdrawal_address,
+    );
+    let voting_sig = voting_key.sign(&claim_msg);
+    let op = stellereum::svm::OpCode::SysCallClaimWithdrawal(Box::new(
+        stellereum::svm::ClaimWithdrawalPayload {
+            validator_id,
+            withdrawal_address,
+            voting_sig,
+        },
+    ));
+    let gas = cli_tx_gas(stellereum::svm::opcode_gas(&op))
+        .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    sign_pq_explicit_payload_with_chain(
+        withdrawal_key,
+        withdrawal_address,
+        0,
+        gas,
+        nonce,
+        stellereum::sharding::MASTERCHAIN_SHARD,
+        stellereum::sharding::MASTERCHAIN_SHARD,
+        vec![op],
+        chain_id,
+    )
+}
+
+/// Build a chain-bound `OpCode 63: SysCallAnnounceCommission` transaction.
+pub(crate) fn build_announce_commission_tx_with_chain(
+    withdrawal_key: &stellereum::post_quantum::FalconKeypair,
+    validator: [u8; 32],
+    new_bps: u64,
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    let withdrawal_address = falcon_pq_address(withdrawal_key);
+    let op = stellereum::svm::OpCode::SysCallAnnounceCommission { validator, new_bps };
+    let gas = cli_tx_gas(stellereum::svm::opcode_gas(&op))
+        .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    sign_pq_explicit_payload_with_chain(
+        withdrawal_key,
+        withdrawal_address,
+        0,
+        gas,
+        nonce,
+        stellereum::sharding::MASTERCHAIN_SHARD,
+        stellereum::sharding::MASTERCHAIN_SHARD,
+        vec![op],
+        chain_id,
+    )
+}
+
+/// Build a chain-bound `OpCode 64: SysCallApplyCommission` transaction.
+pub(crate) fn build_apply_commission_tx_with_chain(
+    withdrawal_key: &stellereum::post_quantum::FalconKeypair,
+    validator: [u8; 32],
+    nonce: u64,
+    chain_id: u64,
+) -> Transaction {
+    let withdrawal_address = falcon_pq_address(withdrawal_key);
+    let op = stellereum::svm::OpCode::SysCallApplyCommission { validator };
+    let gas = cli_tx_gas(stellereum::svm::opcode_gas(&op))
+        .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    sign_pq_explicit_payload_with_chain(
+        withdrawal_key,
+        withdrawal_address,
+        0,
+        gas,
+        nonce,
+        stellereum::sharding::MASTERCHAIN_SHARD,
+        stellereum::sharding::MASTERCHAIN_SHARD,
+        vec![op],
+        chain_id,
+    )
+}
+
 #[cfg(test)]
 mod unjail_builder_tests {
     use super::*;

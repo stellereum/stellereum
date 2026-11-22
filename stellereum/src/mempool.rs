@@ -1188,6 +1188,27 @@ impl Mempool {
         tx.gas_limit
     }
 
+    /// MP04 fee DENSITY: the priority bid per unit of the scarcest block
+    /// resource the transaction consumes.
+    ///
+    /// WHY: ranking by the raw bid lets a bloated low-bid transaction sit on
+    /// top of a batch of small high-bid ones, because the bid buys the whole
+    /// slot rather than each unit of block space. Density removes that
+    /// inversion. `PROOF_UNIT_WIRE_BYTES` converts verification units into a
+    /// wire-equivalent so the three caps (`gas`, wire bytes, proof units) are
+    /// comparable on one scale.
+    ///
+    /// Integer-only and scaled by `DENSITY_SCALE`, so the comparison is exact
+    /// and identical on every node (no float, no HashMap order).
+    pub fn fee_density(tx: &Transaction) -> u128 {
+        const DENSITY_SCALE: u128 = 1_000_000;
+        const PROOF_UNIT_WIRE_BYTES: u64 = 10_000;
+        let wire = Self::estimate_tx_wire_bytes(tx) as u64;
+        let proofs = (Self::count_tx_proof_units(tx) as u64).saturating_mul(PROOF_UNIT_WIRE_BYTES);
+        let weight = tx.gas_limit.max(wire).max(proofs).max(1);
+        (tx.priority_fee_per_gas as u128) * DENSITY_SCALE / (weight as u128)
+    }
+
     /// Admission floor for `tx`: includes failure penalty floor, plus
     /// the State Rent Surcharge (~45,000 gas) if this is an activation
     /// transaction carrying raw public keys.
@@ -1416,9 +1437,18 @@ impl Mempool {
         let mut out: Vec<crate::mev_epoch::SealedEnvelope> =
             self.sealed.values().cloned().collect();
         out.sort_by(|a, b| {
-            b.meta
-                .priority_fee_per_gas
-                .cmp(&a.meta.priority_fee_per_gas)
+            // MP04: the same density rule the plain pool uses, computed from the
+            // transparent metadata (the ciphertext carries no payload sizes).
+            let density = |m: &crate::mev_epoch::TransparentMeta| {
+                (m.priority_fee_per_gas as u128) * 1_000_000 / (m.gas_limit.max(1) as u128)
+            };
+            density(&b.meta)
+                .cmp(&density(&a.meta))
+                .then(
+                    b.meta
+                        .priority_fee_per_gas
+                        .cmp(&a.meta.priority_fee_per_gas),
+                )
                 .then(b.meta.gas_limit.cmp(&a.meta.gas_limit))
                 .then(a.tx_hash.cmp(&b.tx_hash))
         });
@@ -2623,7 +2653,12 @@ impl Mempool {
                 Ok(())
             }
             EvmPayload::Carrier(carrier) => {
-                let facts = crate::evm_adapter::verify_carrier_intent(carrier, &tx.from)
+                // LOCAL POLICY (never consensus): admission refuses a sub-nano
+                // Wei intent immediately so a user cannot pay gas for a
+                // transaction the strict consensus boundary will reject once
+                // `SUB_NANO_STRICT_ACTIVATION_HEIGHT` is reached. Consensus
+                // re-checks this itself via `verify_carrier_intent_at_height`.
+                let facts = crate::evm_adapter::verify_carrier_intent_at(carrier, &tx.from, true)
                     .map_err(MempoolError::EvmCarrierRefused)?;
                 // The intent and the leg must be the SAME payment. The EVM
                 // nonce doubles as the Stell nonce (`eth_getTransactionCount`
@@ -3027,13 +3062,22 @@ impl Mempool {
         let mut selected: Vec<&Transaction> = Vec::with_capacity(max_txs.min(txs.len()));
 
         if passes <= 1 {
-            for h in order.values().rev() {
+            // MP04 applies to the single-pass selector too: the whole pool is
+            // ranked once by fee density, so `select_for_block` and
+            // `select_for_block_multi` cannot disagree about what "best" means.
+            let mut ordered: Vec<&Transaction> =
+                order.values().rev().filter_map(|h| txs.get(h)).collect();
+            ordered.sort_unstable_by(|a, b| {
+                Self::fee_density(b)
+                    .cmp(&Self::fee_density(a))
+                    .then(b.priority_fee_per_gas.cmp(&a.priority_fee_per_gas))
+                    .then(b.gas_limit.cmp(&a.gas_limit))
+                    .then(a.compute_tx_hash().cmp(&b.compute_tx_hash()))
+            });
+            for tx in ordered {
                 if selected.len() >= max_txs {
                     break;
                 }
-                let Some(tx) = txs.get(h) else {
-                    continue;
-                };
                 if !accept(tx) {
                     continue;
                 }
@@ -3069,14 +3113,23 @@ impl Mempool {
             proofs: usize,
             taken: bool,
         }
-        let mut candidates: Vec<Candidate<'_>> = Vec::with_capacity(order.len());
-        for h in order.values().rev() {
+        // MP04: rank the whole pool by fee DENSITY before packing, so a small
+        // high-bid transaction is never displaced by a bloated low-bid one.
+        // The tie-breakers make the order total and deterministic.
+        let mut ordered: Vec<&Transaction> =
+            order.values().rev().filter_map(|h| txs.get(h)).collect();
+        ordered.sort_unstable_by(|a, b| {
+            Self::fee_density(b)
+                .cmp(&Self::fee_density(a))
+                .then(b.priority_fee_per_gas.cmp(&a.priority_fee_per_gas))
+                .then(b.gas_limit.cmp(&a.gas_limit))
+                .then(a.compute_tx_hash().cmp(&b.compute_tx_hash()))
+        });
+        let mut candidates: Vec<Candidate<'_>> = Vec::with_capacity(ordered.len());
+        for tx in ordered {
             if selected.len() >= max_txs {
                 break;
             }
-            let Some(tx) = txs.get(h) else {
-                continue;
-            };
             let idx = candidates.len();
             candidates.push(Candidate {
                 tx,
@@ -3236,6 +3289,12 @@ impl Mempool {
             OpCode::SysCallBindEvmAddress(c) => {
                 128 + c.pq_pubkey.len() + c.binding_signature.len() + c.evm_signature.len()
             }
+            OpCode::SysCallRegisterValidator(p) => 200 + p.voting_pubkey.len() + p.voting_pop.len(),
+            OpCode::SysCallRotateVotingKey(p) => 200 + p.new_pubkey.len() + p.pop_signature.len(),
+            OpCode::SysCallChangeWithdrawal(p) => {
+                200 + p.new_withdrawal_pubkey.len() + p.new_withdrawal_pop.len()
+            }
+            OpCode::SysCallClaimWithdrawal(p) => 200 + p.voting_sig.len(),
             OpCode::SysCallGovPropose { title, action, .. } => {
                 256 + title.len() + bincode::serialized_size(action).unwrap_or(0) as usize
             }

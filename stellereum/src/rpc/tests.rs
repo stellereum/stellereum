@@ -1408,6 +1408,10 @@ async fn submit_proposal_reaches_every_action_and_refuses_an_unknown_type() {
             json!({ "name": "v0.2.0", "height": 500, "sha256": hex::encode([0xC4u8; 32]) }),
         ),
         ("cancel_upgrade", json!({})),
+        (
+            "set_fee_split_bps",
+            json!({ "burn_bps": 5_000, "proposer_bps": 3_000, "staking_bps": 2_000 }),
+        ),
     ];
     assert_eq!(
         cases.len(),
@@ -7026,11 +7030,20 @@ async fn fanout_notifications_carry_the_subscription_id_and_the_payload() {
     assert_eq!(note.subscription, sub_id);
     assert_eq!(note.result["height"], json!(9));
     assert_eq!(note.result["finality"], json!("finalized"));
-    // The wire shape is exactly {"subscription":..., "result":...}.
+    // The wire shape is the historical envelope plus the Geyser-lite hop
+    // fields: `seq` always, and `height` lifted from a payload that carries
+    // one. Nothing invented may appear (`shard_id` stays absent: this payload
+    // names no shard).
     let wire = serde_json::to_value(&note).expect("serialize");
-    assert!(wire.get("subscription").is_some());
-    assert!(wire.get("result").is_some());
-    assert_eq!(wire.as_object().expect("object").len(), 2);
+    let obj = wire.as_object().expect("object");
+    assert!(obj.get("subscription").is_some());
+    assert!(obj.get("result").is_some());
+    assert!(obj.get("seq").is_some());
+    assert_eq!(obj.get("height"), Some(&json!(9)));
+    assert!(obj.get("shard_id").is_none());
+    let mut keys: Vec<&String> = obj.keys().collect();
+    keys.sort();
+    assert_eq!(keys, vec!["height", "result", "seq", "subscription"]);
 }
 
 #[tokio::test]

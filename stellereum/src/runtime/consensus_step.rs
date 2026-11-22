@@ -1090,14 +1090,11 @@ impl ValidatorRuntime {
         // per-height jump budget bounds whatever a single Byzantine reporter
         // can buy.
         let held_proposal = self.hc.proposal;
-        let same_value = vote_target.is_some()
-            && held_proposal.map(|(_, h)| h) == vote_target;
-        let min_supporters =
-            crate::consensus::round_corroboration_threshold(self.validators.len());
-        let corroboration_floor =
-            vote_round.saturating_sub(crate::consensus::ROUND_LOOKBACK);
-        let corroborated = same_value
-            || self.hc.supporting_peers_count(corroboration_floor) >= min_supporters;
+        let same_value = vote_target.is_some() && held_proposal.map(|(_, h)| h) == vote_target;
+        let min_supporters = crate::consensus::round_corroboration_threshold(self.validators.len());
+        let corroboration_floor = vote_round.saturating_sub(crate::consensus::ROUND_LOOKBACK);
+        let corroborated =
+            same_value || self.hc.supporting_peers_count(corroboration_floor) >= min_supporters;
         if !corroborated && self.last_followed_round == Some((vote_height, vote_round)) {
             return false;
         }
@@ -1341,8 +1338,7 @@ impl ValidatorRuntime {
         // (observed live at ruleset v5). A body within the lag window is still
         // a signed block for this height; voting it costs at most one round,
         // while rejecting it costs liveness.
-        if envelope_round
-            .saturating_add(crate::consensus_net::SUPERSEDED_ROUND_LAG)
+        if envelope_round.saturating_add(crate::consensus_net::SUPERSEDED_ROUND_LAG)
             <= self.hc.round
         {
             return Err("proposal: stale round".to_string());
@@ -1369,12 +1365,7 @@ impl ValidatorRuntime {
         if body_round > self.hc.round {
             // Near-future only. Far claims are answered by the verified vote
             // path (bounded chase), never by an unsigned envelope.
-            if body_round
-                > self
-                    .hc
-                    .round
-                    .saturating_add(PROPOSAL_ALIGN_WINDOW_ROUNDS)
-            {
+            if body_round > self.hc.round.saturating_add(PROPOSAL_ALIGN_WINDOW_ROUNDS) {
                 return Err("proposal: wrong proposer".to_string());
             }
             self.hc.sync_round_to(body_round);
@@ -1513,9 +1504,23 @@ impl ValidatorRuntime {
                 (self.prevote_round(), Some((bh, vid)))
             }
         };
-        let signer = self.vote_signer();
+        let req = crate::remote_signer::ConsensusSignRequest::Vote {
+            chain_id: crate::consensus::consensus_chain_id(),
+            shard_id: self.shard_id,
+            height: self.hc.height,
+            round,
+            kind: crate::consensus::VoteKind::Prevote,
+            block_hash: target_with_vid.map(|(bh, _)| bh),
+        };
+        let signer = self.vote_signer_for(req);
         self.safety
-            .authorize_and_sign_prevote(self.hc.height, round, self.shard_id, target_with_vid, &signer)
+            .authorize_and_sign_prevote(
+                self.hc.height,
+                round,
+                self.shard_id,
+                target_with_vid,
+                &signer,
+            )
             .ok()
     }
 
@@ -1639,8 +1644,16 @@ impl ValidatorRuntime {
 
         let validators = self.validator_set_for_height(self.hc.height);
         let schedule = self.hc.committee_schedule;
+        let req = crate::remote_signer::ConsensusSignRequest::Vote {
+            chain_id: crate::consensus::consensus_chain_id(),
+            shard_id: self.shard_id,
+            height: self.hc.height,
+            round: qc_round,
+            kind: crate::consensus::VoteKind::Precommit,
+            block_hash: Some(target),
+        };
         let res = {
-            let signer = self.vote_signer();
+            let signer = self.vote_signer_for(req);
             self.safety.authorize_and_sign_precommit(
                 self.hc.height,
                 qc_round,
@@ -2748,9 +2761,7 @@ impl ValidatorRuntime {
                     .hc
                     .precommit_set(certificate.round)
                     .and_then(|s| s.vote_by(&self.id))
-                    .is_some_and(|v| {
-                        v.kind == VoteKind::Precommit && v.block_hash == Some(bh)
-                    });
+                    .is_some_and(|v| v.kind == VoteKind::Precommit && v.block_hash == Some(bh));
             // LOCK COMPARISON (ruleset v6, site 7): a re-stamped round of the
             // locked value does not contradict the lock; a different value
             // still does.
@@ -2860,6 +2871,13 @@ impl ValidatorRuntime {
         self.parent_evidence_missing = false;
         self.blocks.insert(bh, block.clone());
         self.apply_and_advance(bh, &block).await;
+        {
+            let pq_reg = self.state.pq_registry_read().await;
+            let active = crate::pq_registry::pq_lifecycle_active_at(height);
+            if active || !pq_reg.is_empty() {
+                crate::consensus::sync_committed_pq_registry(&pq_reg, active);
+            }
+        }
         Ok(bh)
     }
 }

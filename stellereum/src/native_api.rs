@@ -1592,6 +1592,21 @@ async fn bridge_withdraw(engine: &InMemoryStateEngine, p: &Value) -> Result<Valu
     Ok(out)
 }
 
+/// JSON projection of one committed [`crate::bridge::ReleaseReceiptRecord`]
+/// (`stel_bridgeStatus` / `stell_bridgeReleaseEstimate`).
+fn release_receipt_json(req_id: u64, rec: &crate::bridge::ReleaseReceiptRecord) -> Value {
+    json!({
+        "req_id": req_id,
+        "chain": chain_name(rec.target_chain),
+        "target_address": rec.target_address,
+        "amount": rec.amount.to_string(),
+        "external_tx_hash": hex::encode(rec.external_tx_hash),
+        "finalized_head": rec.finalized_head,
+        "attestation_height": rec.attestation_height,
+        "settled_at": rec.settled_at,
+    })
+}
+
 async fn bridge_status(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, NativeApiError> {
     let br = engine.bridge_read().await;
     if let Some(src) = opt_str(p, "source_tx_hash") {
@@ -1620,6 +1635,19 @@ async fn bridge_status(engine: &InMemoryStateEngine, p: &Value) -> Result<Value,
         }));
     }
     if let Some(req) = opt_u64(p, "request_id") {
+        // BRIDGE-FIX-FULL committed containers, projected for THIS request
+        // (bounded 0/1 entries): a verified external payout receipt and the
+        // refund tombstone. Absence means "no proven payout" (fail closed).
+        let release_receipts: Vec<Value> = match br.release_receipts.get(&req) {
+            Some(rec) => vec![release_receipt_json(req, rec)],
+            None => Vec::new(),
+        };
+        let refunded_withdrawals: Vec<u64> = br
+            .refunded_withdrawals
+            .iter()
+            .filter(|id| **id == req)
+            .copied()
+            .collect();
         if let Some(w) = br.pending_withdrawals.get(&req) {
             let (sender_hex, _) = addr_pair(&w.sender);
             return Ok(json!({
@@ -1633,12 +1661,18 @@ async fn bridge_status(engine: &InMemoryStateEngine, p: &Value) -> Result<Value,
                 "requested_at": w.requested_at,
                 "unlock_at": w.unlock_at,
                 "executed": w.executed,
+                "release_receipts": release_receipts,
+                "refunded_withdrawals": refunded_withdrawals,
             }));
         }
+        // A refunded request is deleted from `pending_withdrawals`; the
+        // tombstone (and any late receipt) is still reportable here.
         return Ok(json!({
             "found": false,
             "kind": "withdrawal",
             "request_id": req,
+            "release_receipts": release_receipts,
+            "refunded_withdrawals": refunded_withdrawals,
         }));
     }
     Err(invalid(
@@ -1825,10 +1859,22 @@ async fn bridge_release_estimate(
     let required = crate::bridge::quorum_threshold(validators.len());
     let br = engine.bridge_read().await;
     let now = display_now_secs();
+    // BRIDGE-FIX-FULL (`docs/specs/06 §2.1/§2.3`): post-activation a bare
+    // `Release` is refused; the payload must pair it with a `ReleaseProof`
+    // intent carrying a 2/3 Falcon-512 receipt. The gate is the compiled
+    // activation height, never a wall clock or env var.
+    let release_proof_required = crate::bridge::effective_bridge_v2_activation_height() != u64::MAX;
+    let receipt = br.release_receipts.get(&req);
+    let release_receipt = match receipt {
+        Some(rec) => release_receipt_json(req, rec),
+        None => Value::Null,
+    };
     match br.pending_withdrawals.get(&req) {
         None => Ok(json!({
             "found": false,
             "request_id": req,
+            "release_receipt": release_receipt,
+            "release_proof_required": release_proof_required,
         })),
         Some(w) => {
             let (sender_hex, _) = addr_pair(&w.sender);
@@ -1842,6 +1888,8 @@ async fn bridge_release_estimate(
             // refuses on; `escrow-shortfall` flags the refund leg (refunds
             // fail closed when the escrow cannot cover them); `no-validator-set`
             // is context (an empty set fails deposits closed, never releases).
+            // `release-receipt` appears only once the V2 rule set is compiled
+            // on: a bare `Release` can no longer finalize a withdrawal.
             let mut missing: Vec<String> = Vec::new();
             if w.executed {
                 missing.push("already-executed".to_string());
@@ -1853,6 +1901,9 @@ async fn bridge_release_estimate(
             }
             if !quorum_met {
                 missing.push("no-validator-set".to_string());
+            }
+            if release_proof_required && !w.executed && receipt.is_none() {
+                missing.push("release-receipt".to_string());
             }
             Ok(json!({
                 "found": true,
@@ -1874,6 +1925,19 @@ async fn bridge_release_estimate(
                 "remaining_secs_estimate": w.unlock_at.saturating_sub(now),
                 "refundable_estimate": refundable_estimate,
                 "missing": missing,
+                "release_receipt": release_receipt,
+                "release_proof_required": release_proof_required,
+                // The `ReleaseProof` intent rides in the same payload as
+                // `Release` and costs one `SysCallBridge` charge.
+                "release_proof": {
+                    "intent": "ReleaseProof",
+                    "gas": crate::svm::GAS_BRIDGE_INTENT,
+                    "signing_domain": String::from_utf8_lossy(
+                        crate::bridge::BRIDGE_RELEASE_RECEIPT_DOMAIN_V2,
+                    ),
+                    "required": release_proof_required,
+                    "receipt_present": receipt.is_some(),
+                },
                 "clock_note": "remaining/refundable/matured are wall-clock estimates; settlement enforces unlock_at and refund_at against the block timestamp",
             }))
         }

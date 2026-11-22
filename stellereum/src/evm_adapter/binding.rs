@@ -156,7 +156,36 @@ pub fn evm_intent_digest(evm_tx: &[u8]) -> [u8; 32] {
 /// * a zero value is refused (nothing to settle);
 /// * a value below one nano-STELL is refused instead of silently truncating
 ///   the transfer to nothing.
+///
+/// This is the default (legacy, sub-nano-truncating) path: it is exactly
+/// [`evm_transfer_facts_at`] with `strict_sub_nano = false`.
 pub fn evm_transfer_facts(raw: &[u8]) -> Result<EvmTransferFacts, String> {
+    evm_transfer_facts_at(raw, false)
+}
+
+/// Height-activated variant of [`evm_transfer_facts_at`]: the strict sub-nano
+/// boundary is enabled by the `tokenomics` gate at `height`.
+///
+/// This is the single place the consensus gate is read, so the VM/RPC callers
+/// cannot disagree about the policy at a given block height. Below activation
+/// (including the `u64::MAX` "gated off" sentinel) the legacy truncating path
+/// is used byte-for-byte; at/above it a non-multiple-of-1e9 Wei value is
+/// refused instead of truncated.
+pub fn evm_transfer_facts_at_height(raw: &[u8], height: u64) -> Result<EvmTransferFacts, String> {
+    evm_transfer_facts_at(raw, crate::tokenomics::sub_nano_strict_active_at(height))
+}
+
+/// [`evm_transfer_facts`] with an explicit sub-nano policy.
+///
+/// `strict_sub_nano == false` is the historical path (truncate sub-nano Wei,
+/// refuse only when the whole value truncates to zero). `true` uses
+/// [`wei_to_nano_exact`], so any non-multiple-of-1e9 Wei value, or an amount
+/// that overflows `u64` nano-STELL, is refused. The rest of the validation
+/// (signature, chain id, recipient, calldata, non-zero value) is identical.
+pub fn evm_transfer_facts_at(
+    raw: &[u8],
+    strict_sub_nano: bool,
+) -> Result<EvmTransferFacts, String> {
     if raw.is_empty() || raw.len() > MAX_EVM_RAW_TX_BYTES {
         return Err("empty or oversized EVM transaction".to_string());
     }
@@ -184,13 +213,18 @@ pub fn evm_transfer_facts(raw: &[u8]) -> Result<EvmTransferFacts, String> {
             "EVM carrier settles value transfers only: the intent carries no value".to_string(),
         );
     }
-    let value_nano = wei_to_nano(value_wei);
-    if value_nano == 0 {
-        return Err(format!(
-            "EVM value {} wei is below one nano-STELL ({} wei): sub-nano value cannot be settled",
-            value_wei, WEI_PER_NANO
-        ));
-    }
+    let value_nano = if strict_sub_nano {
+        wei_to_nano_exact(value_wei)?
+    } else {
+        let nano = wei_to_nano(value_wei);
+        if nano == 0 {
+            return Err(format!(
+                "EVM value {} wei is below one nano-STELL ({} wei): sub-nano value cannot be settled",
+                value_wei, WEI_PER_NANO
+            ));
+        }
+        nano
+    };
     Ok(EvmTransferFacts {
         from,
         to,
@@ -218,9 +252,38 @@ pub fn evm_transfer_facts(raw: &[u8]) -> Result<EvmTransferFacts, String> {
 /// with no on-chain binding still yields a cryptographically true statement
 /// ("this PQ key authorises this EVM intent"), and admitting-or-not based on
 /// the index is policy ([`crate::mempool`]), never consensus.
+///
+/// Default (legacy) sub-nano policy: [`verify_carrier_intent_at`] with
+/// `strict_sub_nano = false`.
 pub fn verify_carrier_intent(
     carrier: &EvmCarrierIntent,
     sender: &[u8; 32],
+) -> Result<EvmTransferFacts, String> {
+    verify_carrier_intent_at(carrier, sender, false)
+}
+
+/// Height-activated [`verify_carrier_intent_at`]: the strict sub-nano boundary
+/// follows the `tokenomics` gate at `height`, so mempool admission and VM
+/// execution can share one policy decision.
+pub fn verify_carrier_intent_at_height(
+    carrier: &EvmCarrierIntent,
+    sender: &[u8; 32],
+    height: u64,
+) -> Result<EvmTransferFacts, String> {
+    verify_carrier_intent_at(
+        carrier,
+        sender,
+        crate::tokenomics::sub_nano_strict_active_at(height),
+    )
+}
+
+/// [`verify_carrier_intent`] with an explicit sub-nano policy forwarded to
+/// [`evm_transfer_facts_at`]. The Falcon-512 authorisation and the EVM
+/// signature checks are identical for both policies.
+pub fn verify_carrier_intent_at(
+    carrier: &EvmCarrierIntent,
+    sender: &[u8; 32],
+    strict_sub_nano: bool,
 ) -> Result<EvmTransferFacts, String> {
     if carrier.pq_pubkey.len() != FALCON512_PUBKEY_LEN {
         return Err(format!(
@@ -262,7 +325,7 @@ pub fn verify_carrier_intent(
             carrier.chain_id
         ));
     }
-    let facts = evm_transfer_facts(&carrier.evm_tx)?;
+    let facts = evm_transfer_facts_at(&carrier.evm_tx, strict_sub_nano)?;
     if facts.from != carrier.evm_address {
         return Err(format!(
             "EVM intent sender {} does not match the carried EVM address {}",
@@ -601,6 +664,9 @@ pub fn verified_binding_from_tx_at(
 /// transaction. The caller resolves `to_pq` (the recipient's bound PQ account)
 /// and `gas_limit` (the admission floor) — both are part of the message the
 /// wallet signs.
+///
+/// Default (legacy) policy: [`build_carrier_transaction_at`] with
+/// `strict_sub_nano = false`.
 pub fn build_carrier_transaction(
     raw: &[u8],
     pq_pubkey: &[u8],
@@ -609,8 +675,34 @@ pub fn build_carrier_transaction(
     gas_limit: u64,
     carrier_signature: &[u8],
 ) -> Result<Transaction, String> {
+    build_carrier_transaction_at(
+        raw,
+        pq_pubkey,
+        intent_signature,
+        to_pq,
+        gas_limit,
+        carrier_signature,
+        false,
+    )
+}
+
+/// [`build_carrier_transaction`] with an explicit sub-nano policy.
+///
+/// RPC/admission may pass `strict_sub_nano = true` to make a non-multiple-of-
+/// 1e9 Wei value fail closed at build time; the template helper must use the
+/// same flag ([`carrier_template_message_at`]) or the wallet would sign
+/// different bytes than the node rebuilds.
+pub fn build_carrier_transaction_at(
+    raw: &[u8],
+    pq_pubkey: &[u8],
+    intent_signature: &[u8],
+    to_pq: [u8; 32],
+    gas_limit: u64,
+    carrier_signature: &[u8],
+    strict_sub_nano: bool,
+) -> Result<Transaction, String> {
     let chain = effective_chain_id();
-    let facts = evm_transfer_facts(raw)?;
+    let facts = evm_transfer_facts_at(raw, strict_sub_nano)?;
     if to_pq == [0u8; 32] {
         return Err(
             "carrier recipient must be a real PQ account (zero address refused)".to_string(),
@@ -624,7 +716,7 @@ pub fn build_carrier_transaction(
         pq_pubkey: pq_pubkey.to_vec(),
         evm_signature: intent_signature.to_vec(),
     };
-    verify_carrier_intent(&carrier, &sender)?;
+    verify_carrier_intent_at(&carrier, &sender, strict_sub_nano)?;
     let tx = Transaction::new_pq_explicit_with_chain(
         PqScheme::Falcon512,
         pq_pubkey.to_vec(),
@@ -841,12 +933,31 @@ pub fn carrier_signing_message(tx: &Transaction) -> Vec<u8> {
 /// [`build_carrier_transaction`], so a wallet that signs the bytes returned
 /// here gets a transaction the node rebuilds byte-identically (including the
 /// EVM nonce, which the builder takes from the intent).
+///
+/// Default (legacy) policy: [`carrier_template_message_at`] with
+/// `strict_sub_nano = false`.
 pub fn carrier_template_message(
     raw: &[u8],
     pq_pubkey: &[u8],
     intent_signature: &[u8],
     to_pq: [u8; 32],
     gas_limit: u64,
+) -> Result<Vec<u8>, String> {
+    carrier_template_message_at(raw, pq_pubkey, intent_signature, to_pq, gas_limit, false)
+}
+
+/// [`carrier_template_message`] with an explicit sub-nano policy.
+///
+/// Must be called with the SAME flag as [`build_carrier_transaction_at`], or
+/// the template's `amount` (hence its signing message) can differ from the
+/// transaction the node actually builds.
+pub fn carrier_template_message_at(
+    raw: &[u8],
+    pq_pubkey: &[u8],
+    intent_signature: &[u8],
+    to_pq: [u8; 32],
+    gas_limit: u64,
+    strict_sub_nano: bool,
 ) -> Result<Vec<u8>, String> {
     if pq_pubkey.len() != FALCON512_PUBKEY_LEN {
         return Err(format!(
@@ -860,7 +971,7 @@ pub fn carrier_template_message(
         );
     }
     let chain = effective_chain_id();
-    let facts = evm_transfer_facts(raw)?;
+    let facts = evm_transfer_facts_at(raw, strict_sub_nano)?;
     let carrier = EvmCarrierIntent {
         chain_id: chain,
         evm_tx: raw.to_vec(),

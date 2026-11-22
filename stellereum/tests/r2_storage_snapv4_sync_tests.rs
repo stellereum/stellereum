@@ -498,8 +498,8 @@ async fn snapshot_publish_kinds_include_pq_keys_and_evm_bindings_and_fast_sync_r
     assert!(SNAPSHOT_PUBLISH_DOMAIN_KINDS.contains(&"evm_bindings"));
     assert!(SYNC_DOMAIN_KINDS.contains(&"pq_keys"));
     assert!(SYNC_DOMAIN_KINDS.contains(&"evm_bindings"));
-    assert_eq!(N_DOMAIN_UNITS, 16);
-    assert_eq!(TOTAL_UNIT_TAGS, 272);
+    assert_eq!(N_DOMAIN_UNITS, 17);
+    assert_eq!(TOTAL_UNIT_TAGS, 273);
     assert_eq!(DomainUnitId::EvmBindings.tag(), 271);
     assert_eq!(DomainUnitId::from_tag(271), Some(DomainUnitId::EvmBindings));
     assert_eq!(DomainUnitId::EvmBindings.name(), "EvmBindings");

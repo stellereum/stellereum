@@ -332,6 +332,38 @@ pub fn evm_binding_gas(pubkey_len: usize, signature_len: usize) -> u64 {
     GAS_EVM_CARRIER_BASE.saturating_add(pq_verify_gas(pubkey_len, 32, signature_len))
 }
 
+/// Gas for `SysCallRegisterValidator`: staking bond + Falcon-512 PoP verification.
+#[inline(always)]
+pub fn register_validator_gas(pubkey_len: usize, pop_len: usize) -> u64 {
+    GAS_STAKE_BOND.saturating_add(pq_verify_gas(pubkey_len, 128, pop_len))
+}
+
+/// Gas for `SysCallRotateVotingKey`: unbond base (+ Falcon-512 PoP verification unless cancelling).
+#[inline(always)]
+pub fn rotate_voting_key_gas(pubkey_len: usize, pop_len: usize, cancel: bool) -> u64 {
+    if cancel {
+        GAS_STAKE_UNBOND
+    } else {
+        GAS_STAKE_UNBOND.saturating_add(pq_verify_gas(pubkey_len, 128, pop_len))
+    }
+}
+
+/// Gas for `SysCallChangeWithdrawal`: unbond base + Falcon-512 PoP verification.
+#[inline(always)]
+pub fn change_withdrawal_gas(pubkey_len: usize, pop_len: usize) -> u64 {
+    GAS_STAKE_UNBOND.saturating_add(pq_verify_gas(pubkey_len, 128, pop_len))
+}
+
+/// Gas for `SysCallClaimWithdrawal`: unbond base + Falcon-512 voting-key signature verification.
+#[inline(always)]
+pub fn claim_withdrawal_gas(sig_len: usize) -> u64 {
+    GAS_STAKE_UNBOND.saturating_add(pq_verify_gas(
+        crate::post_quantum::FALCON512_PUBKEY_LEN,
+        128,
+        sig_len,
+    ))
+}
+
 /// Base gas for an equivocation report (`OpCode::SysCallReportEquivocation`):
 /// two signature verifications plus ledger-membership and dedup-key work.
 pub const GAS_EQUIVOCATION_REPORT_BASE: u64 = 2_500;
@@ -477,6 +509,19 @@ pub fn opcode_gas(op: &OpCode) -> u64 {
         ),
         OpCode::SysCallBindEvmAddress(claim) => {
             evm_binding_gas(claim.pq_pubkey.len(), claim.binding_signature.len())
+        }
+        OpCode::SysCallRegisterValidator(p) => {
+            register_validator_gas(p.voting_pubkey.len(), p.voting_pop.len())
+        }
+        OpCode::SysCallRotateVotingKey(p) => {
+            rotate_voting_key_gas(p.new_pubkey.len(), p.pop_signature.len(), p.cancel)
+        }
+        OpCode::SysCallChangeWithdrawal(p) => {
+            change_withdrawal_gas(p.new_withdrawal_pubkey.len(), p.new_withdrawal_pop.len())
+        }
+        OpCode::SysCallClaimWithdrawal(p) => claim_withdrawal_gas(p.voting_sig.len()),
+        OpCode::SysCallAnnounceCommission { .. } | OpCode::SysCallApplyCommission { .. } => {
+            GAS_STAKE_UNBOND
         }
         OpCode::Halt => GAS_HALT,
     }
@@ -1231,6 +1276,66 @@ pub enum OpCode {
     /// the deterministic binding index replays in block order (first claim
     /// wins, never evicted); a conflicting claim is refused at admission.
     SysCallBindEvmAddress(Box<EvmAddressClaim>),
+    // APPEND, never insert above: W3 PQ validator lifecycle opcodes (59..=64).
+    /// Register a new post-W3 PQ validator with an explicit cold `withdrawal_address`
+    /// and Falcon-512 `voting_pq_key` proven by PoP at `rotation_seq = 0`.
+    SysCallRegisterValidator(Box<RegisterValidatorPayload>),
+    /// Announce or cancel a PoP-authenticated Falcon-512 voting-key rotation.
+    SysCallRotateVotingKey(Box<RotateVotingKeyPayload>),
+    /// Rotate a validator's cold `withdrawal_address` with PoP of the new cold key.
+    SysCallChangeWithdrawal(Box<ChangeWithdrawalPayload>),
+    /// One-time W3 migration for pre-W3 validators (`withdrawal_address == None`).
+    SysCallClaimWithdrawal(Box<ClaimWithdrawalPayload>),
+    /// Announce a validator commission change (authorized by `withdrawal_address`).
+    SysCallAnnounceCommission {
+        validator: [u8; 32],
+        new_bps: u64,
+    },
+    /// Apply a matured commission change at `block.height >= effective_height`.
+    SysCallApplyCommission {
+        validator: [u8; 32],
+    },
+}
+
+/// Payload of [`OpCode::SysCallRegisterValidator`] (discriminant 59).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterValidatorPayload {
+    pub amount: u64,
+    pub commission_bps: u64,
+    pub withdrawal_address: [u8; 32],
+    pub voting_scheme: u8,
+    pub voting_pubkey: Vec<u8>,
+    pub voting_pop: Vec<u8>,
+}
+
+/// Payload of [`OpCode::SysCallRotateVotingKey`] (discriminant 60).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RotateVotingKeyPayload {
+    pub validator_id: [u8; 32],
+    pub rotation_seq: u64,
+    pub new_scheme: u8,
+    pub new_pubkey: Vec<u8>,
+    pub pop_signature: Vec<u8>,
+    pub cancel: bool,
+}
+
+/// Payload of [`OpCode::SysCallChangeWithdrawal`] (discriminant 61).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeWithdrawalPayload {
+    pub validator_id: [u8; 32],
+    pub new_withdrawal_address: [u8; 32],
+    pub new_withdrawal_scheme: u8,
+    pub new_withdrawal_pubkey: Vec<u8>,
+    pub new_withdrawal_salt: [u8; 16],
+    pub new_withdrawal_pop: Vec<u8>,
+}
+
+/// Payload of [`OpCode::SysCallClaimWithdrawal`] (discriminant 62).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimWithdrawalPayload {
+    pub validator_id: [u8; 32],
+    pub withdrawal_address: [u8; 32],
+    pub voting_sig: Vec<u8>,
 }
 
 /// Payload of [`OpCode::SysCallEvmCarrier`]: the EVM intent plus the PQ
@@ -1466,6 +1571,10 @@ pub struct VmExecOptions {
     pub wasm_pmm_hardening: bool,
     pub tx_nonce: u64,
     pub outbound_budget_from_accounts: Option<HashMap<[u8; 32], u64>>,
+    pub pq_lifecycle: bool,
+    pub chain_id: Option<u64>,
+    pub chain_height: u64,
+    pub pq_registry: Option<crate::pq_registry::PqRegistry>,
 }
 
 pub struct Svm;
@@ -2417,6 +2526,11 @@ impl Svm {
                     }
                     let applied = if ledger.validators.contains_key(validator) {
                         ledger.add_bond(*validator, *amount)
+                    } else if opts.pq_lifecycle {
+                        return VmExecutionResult::Reverted(
+                            "new validators must register via SysCallRegisterValidator after W3 PQ lifecycle activation"
+                                .to_string(),
+                        );
                     } else {
                         ledger.bond(*validator, *amount, ctx.default_commission_bps)
                     };
@@ -2472,6 +2586,11 @@ impl Svm {
                     // commission after bonding.
                     let applied = if ledger.validators.contains_key(validator) {
                         ledger.add_bond(*validator, *amount)
+                    } else if opts.pq_lifecycle {
+                        return VmExecutionResult::Reverted(
+                            "new validators must register via SysCallRegisterValidator after W3 PQ lifecycle activation"
+                                .to_string(),
+                        );
                     } else {
                         ledger.bond(*validator, *amount, *commission_bps)
                     };
@@ -2484,12 +2603,9 @@ impl Svm {
                 }
                 OpCode::SysCallUnbond { validator, amount } => {
                     charge!(GAS_STAKE_UNBOND);
-                    // Only the validator may unbond its own stake. Without this,
-                    // anyone can loop this opcode against a victim's id and drive
-                    // `self_bond` to zero, which drops them out of the validator
-                    // set (`to_validator_set` requires the minimum bond) - a
-                    // 50,000 STELL validator ejected for a few hundred gas.
-                    if ctx.sender != *validator {
+                    // Only the validator (or post-W3, its cold withdrawal_address)
+                    // may unbond its own stake.
+                    if !opts.pq_lifecycle && ctx.sender != *validator {
                         return VmExecutionResult::Reverted(
                             "only the validator may unbond its own stake".to_string(),
                         );
@@ -2500,6 +2616,15 @@ impl Svm {
                             "Staking ledger not available".to_string(),
                         );
                     };
+                    if opts.pq_lifecycle {
+                        if let Err(e) =
+                            ledger.authorize_validator_owner(validator, &ctx.sender, true)
+                        {
+                            return VmExecutionResult::Reverted(format!(
+                                "only the validator withdrawal_address may unbond: {e}"
+                            ));
+                        }
+                    }
                     if let Err(e) = ledger.unbond(*validator, *amount, ctx.timestamp) {
                         return VmExecutionResult::Reverted(format!("unbond failed: {e}"));
                     }
@@ -2507,10 +2632,9 @@ impl Svm {
                 }
                 OpCode::SysCallUnjail { validator } => {
                     charge!(GAS_STAKE_UNBOND);
-                    // Only the jailed validator itself may clear its own
-                    // jail (same grief rule as `SysCallUnbond`: a third party
-                    // must not drive another validator's lifecycle).
-                    if ctx.sender != *validator {
+                    // Only the jailed validator itself (or post-W3, its cold
+                    // withdrawal_address) may clear its own jail.
+                    if !opts.pq_lifecycle && ctx.sender != *validator {
                         return VmExecutionResult::Reverted(
                             "only the validator may unjail itself".to_string(),
                         );
@@ -2521,6 +2645,15 @@ impl Svm {
                             "Staking ledger not available".to_string(),
                         );
                     };
+                    if opts.pq_lifecycle {
+                        if let Err(e) =
+                            ledger.authorize_validator_owner(validator, &ctx.sender, true)
+                        {
+                            return VmExecutionResult::Reverted(format!(
+                                "only the validator withdrawal_address may unjail: {e}"
+                            ));
+                        }
+                    }
                     // Fail-closed checks that DO NOT need the block height:
                     // the jail record must exist and the bond must already be
                     // back at MIN+buffer. The release-height check lives in
@@ -2549,6 +2682,12 @@ impl Svm {
                     new_validator,
                 } => {
                     charge!(GAS_STAKE_UNBOND);
+                    if opts.pq_lifecycle {
+                        return VmExecutionResult::Reverted(
+                            "SysCallRotateValidatorKey disabled after W3 PQ lifecycle activation"
+                                .to_string(),
+                        );
+                    }
                     // Only the old key itself may rotate away from itself.
                     // Without this, anyone could exile a victim's record to
                     // a dead key (same grief class as the unbond rule above).
@@ -2657,13 +2796,9 @@ impl Svm {
                 }
                 OpCode::SysCallClaimRewards { validator } => {
                     charge!(GAS_STAKE_CLAIM);
-                    // The opcode's own documentation says "a validator the sender
-                    // is bonded to", but no such check existed: the payout
-                    // beneficiary is `ctx.sender`, so any account could name any
-                    // validator and take its accrued rewards. The pool paid out of
-                    // the victim's bonded principal and the victim's counter was
-                    // zeroed, so the loss was unrecoverable.
-                    if ctx.sender != *validator {
+                    // Only the validator (or post-W3, its cold withdrawal_address)
+                    // may claim its rewards; payout goes to `ctx.sender`.
+                    if !opts.pq_lifecycle && ctx.sender != *validator {
                         return VmExecutionResult::Reverted(
                             "only the validator may claim its own rewards".to_string(),
                         );
@@ -2674,6 +2809,15 @@ impl Svm {
                             "Staking ledger not available".to_string(),
                         );
                     };
+                    if opts.pq_lifecycle {
+                        if let Err(e) =
+                            ledger.authorize_validator_owner(validator, &ctx.sender, true)
+                        {
+                            return VmExecutionResult::Reverted(format!(
+                                "only the validator withdrawal_address may claim rewards: {e}"
+                            ));
+                        }
+                    }
                     let amount = match ledger.claim_validator_rewards(*validator) {
                         Ok(a) => a,
                         Err(e) => return VmExecutionResult::Reverted(format!("claim failed: {e}")),
@@ -2716,12 +2860,9 @@ impl Svm {
                 }
                 OpCode::SysCallWithdrawSelfBond { validator } => {
                     charge!(GAS_STAKE_UNBOND);
-                    // Only the validator may withdraw its own matured
-                    // self-bond. Without this, anyone could name a victim's
-                    // id and take its unbonded principal (same grief class
-                    // as the `SysCallUnbond` sender rule above: the payout
-                    // beneficiary is `ctx.sender`, so the id must match it).
-                    if ctx.sender != *validator {
+                    // Only the validator (or post-W3, its cold withdrawal_address)
+                    // may withdraw its matured self-bond; payout goes to `ctx.sender`.
+                    if !opts.pq_lifecycle && ctx.sender != *validator {
                         return VmExecutionResult::Reverted(
                             "only the validator may withdraw its own self-bond".to_string(),
                         );
@@ -2732,6 +2873,15 @@ impl Svm {
                             "Staking ledger not available".to_string(),
                         );
                     };
+                    if opts.pq_lifecycle {
+                        if let Err(e) =
+                            ledger.authorize_validator_owner(validator, &ctx.sender, true)
+                        {
+                            return VmExecutionResult::Reverted(format!(
+                                "only the validator withdrawal_address may withdraw self-bond: {e}"
+                            ));
+                        }
+                    }
                     // Withdraw MATURED self-bond (M1): consume the
                     // withdrawable entry and pay it out of STAKING_POOL,
                     // exactly once — the `SysCallUndelegate`-withdraw shape
@@ -2777,7 +2927,11 @@ impl Svm {
                     // this payload succeeds; the VM only proves the intent.
                     // A refusal reverts the whole transaction (fail-closed),
                     // exactly like every other refusal syscall.
-                    match crate::evm_adapter::verify_carrier_intent(carrier, &ctx.sender) {
+                    match crate::evm_adapter::verify_carrier_intent_at_height(
+                        carrier,
+                        &ctx.sender,
+                        opts.chain_height,
+                    ) {
                         Ok(_facts) => state.stack.push(1),
                         Err(e) => {
                             return VmExecutionResult::Reverted(format!(
@@ -3491,12 +3645,30 @@ impl Svm {
                     // the reporter. The standard 5% arm already makes PQ
                     // equivocation PUNISHABLE, which is the point of the
                     // opcode.
-                    let burned = match ledger.slash_pq_equivocation(evidence, false) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            return VmExecutionResult::Reverted(format!(
-                                "PQ equivocation evidence rejected: {e}"
-                            ))
+                    let burned = if opts.pq_lifecycle {
+                        let empty_reg = crate::pq_registry::PqRegistry::default();
+                        let reg = opts.pq_registry.as_ref().unwrap_or(&empty_reg);
+                        match ledger.slash_pq_equivocation_at_height(
+                            reg,
+                            evidence,
+                            false,
+                            opts.chain_height,
+                        ) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                return VmExecutionResult::Reverted(format!(
+                                    "PQ equivocation evidence rejected: {e}"
+                                ))
+                            }
+                        }
+                    } else {
+                        match ledger.slash_pq_equivocation(evidence, false) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                return VmExecutionResult::Reverted(format!(
+                                    "PQ equivocation evidence rejected: {e}"
+                                ))
+                            }
                         }
                     };
                     if burned > 0 {
@@ -3561,6 +3733,426 @@ impl Svm {
                 }
                 OpCode::SysCallGovVote { .. } => {
                     charge!(GAS_GOV_VOTE);
+                    state.stack.push(1);
+                }
+                OpCode::SysCallRegisterValidator(p) => {
+                    charge!(register_validator_gas(
+                        p.voting_pubkey.len(),
+                        p.voting_pop.len()
+                    ));
+                    if !opts.pq_lifecycle {
+                        return VmExecutionResult::Reverted(
+                            "SysCallRegisterValidator not active before PQ_LIFECYCLE_ACTIVATION_HEIGHT"
+                                .to_string(),
+                        );
+                    }
+                    if p.withdrawal_address == [0u8; 32] {
+                        return VmExecutionResult::Reverted(
+                            "withdrawal_address cannot be zero".to_string(),
+                        );
+                    }
+                    if ctx.sender != p.withdrawal_address {
+                        return VmExecutionResult::Reverted(
+                            "SysCallRegisterValidator requires sender == withdrawal_address"
+                                .to_string(),
+                        );
+                    }
+                    let floor = ctx
+                        .min_validator_bond
+                        .max(crate::staking::required_bond_floor_nano());
+                    if p.amount == 0 || p.amount < floor {
+                        return VmExecutionResult::Reverted(
+                            "stake below minimum validator bond".to_string(),
+                        );
+                    }
+                    if p.amount > current_balance {
+                        return VmExecutionResult::Reverted(
+                            "Insufficient balance to stake".to_string(),
+                        );
+                    }
+                    if p.commission_bps > crate::staking::BPS_DENOMINATOR {
+                        return VmExecutionResult::Reverted(format!(
+                            "commission must be <= {} bps",
+                            crate::staking::BPS_DENOMINATOR
+                        ));
+                    }
+                    let chain_id = opts
+                        .chain_id
+                        .unwrap_or_else(crate::zkml::effective_chain_id);
+                    let validator_id = crate::pq_registry::derive_validator_id(
+                        chain_id,
+                        &p.withdrawal_address,
+                        &p.voting_pubkey,
+                    );
+                    if validator_id == [0u8; 32] {
+                        return VmExecutionResult::Reverted(
+                            "derived validator_id cannot be zero".to_string(),
+                        );
+                    }
+                    if let Err(e) = crate::pq_registry::verify_voting_key_pop(
+                        chain_id,
+                        &validator_id,
+                        &p.withdrawal_address,
+                        0,
+                        p.voting_scheme,
+                        &p.voting_pubkey,
+                        &p.voting_pop,
+                    ) {
+                        return VmExecutionResult::Reverted(format!(
+                            "SysCallRegisterValidator PoP rejected: {e}"
+                        ));
+                    }
+                    ensure_working(&mut working_staking, ctx.staking.as_deref());
+                    let Some(ledger) = working_staking.as_mut() else {
+                        return VmExecutionResult::Reverted(
+                            "Staking ledger not available".to_string(),
+                        );
+                    };
+                    if ledger.validators.contains_key(&validator_id) {
+                        return VmExecutionResult::Reverted("validator already exists".to_string());
+                    }
+                    if ledger.validator_pq_keys.values().any(|(s, pk)| {
+                        *s == crate::post_quantum::PqScheme::Falcon512
+                            && pk.as_slice() == p.voting_pubkey.as_slice()
+                    }) {
+                        return VmExecutionResult::Reverted(
+                            "voting pubkey already registered".to_string(),
+                        );
+                    }
+                    if let Some(ref reg) = opts.pq_registry {
+                        if reg.record_of(&validator_id).is_some() {
+                            return VmExecutionResult::Reverted(
+                                "validator already registered in pq_registry".to_string(),
+                            );
+                        }
+                        if reg.records().values().any(|rec| {
+                            (rec.scheme == crate::post_quantum::PqScheme::Falcon512
+                                && rec.pubkey.as_slice() == p.voting_pubkey.as_slice())
+                                || rec.pending.as_ref().is_some_and(|pend| {
+                                    pend.scheme == crate::post_quantum::PqScheme::Falcon512
+                                        && pend.pubkey.as_slice() == p.voting_pubkey.as_slice()
+                                })
+                        }) {
+                            return VmExecutionResult::Reverted(
+                                "voting pubkey already registered or pending in pq_registry"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    if let Err(e) = ledger.bond_with_withdrawal(
+                        validator_id,
+                        p.amount,
+                        p.commission_bps,
+                        p.withdrawal_address,
+                    ) {
+                        return VmExecutionResult::Reverted(format!(
+                            "register validator bond failed: {e}"
+                        ));
+                    }
+                    ledger.validator_pq_keys.insert(
+                        validator_id,
+                        (
+                            crate::post_quantum::PqScheme::Falcon512,
+                            p.voting_pubkey.clone(),
+                        ),
+                    );
+                    current_balance -= p.amount;
+                    ctx.transfers.push((crate::staking::STAKING_POOL, p.amount));
+                    state.stack.push(1);
+                }
+                OpCode::SysCallRotateVotingKey(p) => {
+                    charge!(rotate_voting_key_gas(
+                        p.new_pubkey.len(),
+                        p.pop_signature.len(),
+                        p.cancel
+                    ));
+                    if !opts.pq_lifecycle {
+                        return VmExecutionResult::Reverted(
+                            "SysCallRotateVotingKey not active before PQ_LIFECYCLE_ACTIVATION_HEIGHT"
+                                .to_string(),
+                        );
+                    }
+                    ensure_working(&mut working_staking, ctx.staking.as_deref());
+                    let Some(ledger) = working_staking.as_mut() else {
+                        return VmExecutionResult::Reverted(
+                            "Staking ledger not available".to_string(),
+                        );
+                    };
+                    if let Err(e) =
+                        ledger.authorize_validator_owner(&p.validator_id, &ctx.sender, true)
+                    {
+                        return VmExecutionResult::Reverted(format!(
+                            "rotate voting key unauthorized: {e}"
+                        ));
+                    }
+                    let Some(withdrawal_address) = ledger.withdrawal_address_of(&p.validator_id)
+                    else {
+                        return VmExecutionResult::Reverted(
+                            "validator has no withdrawal_address".to_string(),
+                        );
+                    };
+                    let chain_id = opts
+                        .chain_id
+                        .unwrap_or_else(crate::zkml::effective_chain_id);
+                    if p.cancel {
+                        if !p.new_pubkey.is_empty() || !p.pop_signature.is_empty() {
+                            return VmExecutionResult::Reverted(
+                                "cancel rotation requires empty pubkey and signature".to_string(),
+                            );
+                        }
+                        if let Some(ref reg) = opts.pq_registry {
+                            let mut probe_reg = reg.clone();
+                            if let Err(e) = ledger.pq_cancel_rotation(
+                                &mut probe_reg,
+                                p.validator_id,
+                                ctx.sender,
+                                p.rotation_seq,
+                                opts.chain_height,
+                            ) {
+                                return VmExecutionResult::Reverted(format!(
+                                    "cancel rotation rejected: {e}"
+                                ));
+                            }
+                        }
+                    } else {
+                        if let Err(e) = crate::pq_registry::verify_voting_key_pop(
+                            chain_id,
+                            &p.validator_id,
+                            &withdrawal_address,
+                            p.rotation_seq,
+                            p.new_scheme,
+                            &p.new_pubkey,
+                            &p.pop_signature,
+                        ) {
+                            return VmExecutionResult::Reverted(format!(
+                                "rotate voting key PoP rejected: {e}"
+                            ));
+                        }
+                        if let Some(ref reg) = opts.pq_registry {
+                            let mut probe_reg = reg.clone();
+                            if let Err(e) = ledger.pq_announce_rotation_with_seq(
+                                &mut probe_reg,
+                                chain_id,
+                                p.validator_id,
+                                ctx.sender,
+                                p.rotation_seq,
+                                p.new_scheme,
+                                &p.new_pubkey,
+                                &p.pop_signature,
+                                opts.chain_height,
+                            ) {
+                                return VmExecutionResult::Reverted(format!(
+                                    "rotate voting key rejected: {e}"
+                                ));
+                            }
+                        }
+                    }
+                    state.stack.push(1);
+                }
+                OpCode::SysCallChangeWithdrawal(p) => {
+                    charge!(change_withdrawal_gas(
+                        p.new_withdrawal_pubkey.len(),
+                        p.new_withdrawal_pop.len()
+                    ));
+                    if !opts.pq_lifecycle {
+                        return VmExecutionResult::Reverted(
+                            "SysCallChangeWithdrawal not active before PQ_LIFECYCLE_ACTIVATION_HEIGHT"
+                                .to_string(),
+                        );
+                    }
+                    ensure_working(&mut working_staking, ctx.staking.as_deref());
+                    let Some(ledger) = working_staking.as_mut() else {
+                        return VmExecutionResult::Reverted(
+                            "Staking ledger not available".to_string(),
+                        );
+                    };
+                    if let Err(e) =
+                        ledger.authorize_validator_owner(&p.validator_id, &ctx.sender, true)
+                    {
+                        return VmExecutionResult::Reverted(format!(
+                            "change withdrawal unauthorized: {e}"
+                        ));
+                    }
+                    let Some(current) = ledger.withdrawal_address_of(&p.validator_id) else {
+                        return VmExecutionResult::Reverted(
+                            "validator has no withdrawal_address".to_string(),
+                        );
+                    };
+                    if p.new_withdrawal_address == [0u8; 32] || p.new_withdrawal_address == current
+                    {
+                        return VmExecutionResult::Reverted(
+                            "invalid new_withdrawal_address".to_string(),
+                        );
+                    }
+                    let Ok(scheme) =
+                        crate::post_quantum::PqScheme::from_id(p.new_withdrawal_scheme)
+                    else {
+                        return VmExecutionResult::Reverted(
+                            "invalid new_withdrawal_scheme".to_string(),
+                        );
+                    };
+                    if scheme.is_disabled() || scheme != crate::post_quantum::PqScheme::Falcon512 {
+                        return VmExecutionResult::Reverted(
+                            "new_withdrawal_scheme must be Falcon512".to_string(),
+                        );
+                    }
+                    if p.new_withdrawal_pubkey.len() != scheme.pubkey_size()
+                        || p.new_withdrawal_pop.len() != crate::post_quantum::FALCON512_SIG_LEN
+                    {
+                        return VmExecutionResult::Reverted(
+                            "invalid new withdrawal pubkey or PoP length".to_string(),
+                        );
+                    }
+                    let derived = crate::post_quantum::derive_pq_address(
+                        scheme,
+                        &p.new_withdrawal_pubkey,
+                        &p.new_withdrawal_salt,
+                    );
+                    if derived != p.new_withdrawal_address {
+                        return VmExecutionResult::Reverted(
+                            "new_withdrawal_address does not match derived PQ address".to_string(),
+                        );
+                    }
+                    let chain_id = opts
+                        .chain_id
+                        .unwrap_or_else(crate::zkml::effective_chain_id);
+                    let preimage = crate::staking::pq_withdrawal_pop_preimage(
+                        chain_id,
+                        &p.validator_id,
+                        &current,
+                        &p.new_withdrawal_address,
+                    );
+                    if !crate::post_quantum::verify_pq_signature(
+                        scheme,
+                        &p.new_withdrawal_pubkey,
+                        &preimage,
+                        &p.new_withdrawal_pop,
+                    ) {
+                        return VmExecutionResult::Reverted(
+                            "invalid new_withdrawal_pop signature".to_string(),
+                        );
+                    }
+                    if let Err(e) = ledger.set_withdrawal_address(
+                        p.validator_id,
+                        ctx.sender,
+                        p.new_withdrawal_address,
+                    ) {
+                        return VmExecutionResult::Reverted(format!(
+                            "change withdrawal failed: {e}"
+                        ));
+                    }
+                    state.stack.push(1);
+                }
+                OpCode::SysCallClaimWithdrawal(p) => {
+                    charge!(claim_withdrawal_gas(p.voting_sig.len()));
+                    if !opts.pq_lifecycle {
+                        return VmExecutionResult::Reverted(
+                            "SysCallClaimWithdrawal not active before PQ_LIFECYCLE_ACTIVATION_HEIGHT"
+                                .to_string(),
+                        );
+                    }
+                    if p.withdrawal_address == [0u8; 32]
+                        || ctx.sender == [0u8; 32]
+                        || ctx.sender != p.withdrawal_address
+                    {
+                        return VmExecutionResult::Reverted(
+                            "SysCallClaimWithdrawal requires non-zero sender == withdrawal_address"
+                                .to_string(),
+                        );
+                    }
+                    ensure_working(&mut working_staking, ctx.staking.as_deref());
+                    let Some(ledger) = working_staking.as_mut() else {
+                        return VmExecutionResult::Reverted(
+                            "Staking ledger not available".to_string(),
+                        );
+                    };
+                    let chain_id = opts
+                        .chain_id
+                        .unwrap_or_else(crate::zkml::effective_chain_id);
+                    let empty_reg = crate::pq_registry::PqRegistry::default();
+                    let reg = opts.pq_registry.as_ref().unwrap_or(&empty_reg);
+                    if let Err(e) = ledger.pq_claim_withdrawal(
+                        reg,
+                        chain_id,
+                        p.validator_id,
+                        ctx.sender,
+                        p.withdrawal_address,
+                        &p.voting_sig,
+                        opts.chain_height,
+                    ) {
+                        return VmExecutionResult::Reverted(format!(
+                            "claim withdrawal rejected: {e}"
+                        ));
+                    }
+                    state.stack.push(1);
+                }
+                OpCode::SysCallAnnounceCommission { validator, new_bps } => {
+                    charge!(GAS_STAKE_UNBOND);
+                    if !opts.pq_lifecycle {
+                        return VmExecutionResult::Reverted(
+                            "SysCallAnnounceCommission not active before PQ_LIFECYCLE_ACTIVATION_HEIGHT"
+                                .to_string(),
+                        );
+                    }
+                    ensure_working(&mut working_staking, ctx.staking.as_deref());
+                    let Some(ledger) = working_staking.as_mut() else {
+                        return VmExecutionResult::Reverted(
+                            "Staking ledger not available".to_string(),
+                        );
+                    };
+                    if let Err(e) = ledger.authorize_validator_owner(validator, &ctx.sender, true) {
+                        return VmExecutionResult::Reverted(format!(
+                            "announce commission unauthorized: {e}"
+                        ));
+                    }
+                    let current = ledger
+                        .validators
+                        .get(validator)
+                        .map(|v| v.commission_bps)
+                        .unwrap_or(0);
+                    if *new_bps > crate::staking::BPS_DENOMINATOR {
+                        return VmExecutionResult::Reverted(format!(
+                            "commission must be <= {} bps",
+                            crate::staking::BPS_DENOMINATOR
+                        ));
+                    }
+                    if *new_bps != current
+                        && new_bps.abs_diff(current) > crate::staking::COMMISSION_MAX_DELTA_BPS
+                    {
+                        return VmExecutionResult::Reverted(
+                            "commission delta exceeds maximum".to_string(),
+                        );
+                    }
+                    state.stack.push(1);
+                }
+                OpCode::SysCallApplyCommission { validator } => {
+                    charge!(GAS_STAKE_UNBOND);
+                    if !opts.pq_lifecycle {
+                        return VmExecutionResult::Reverted(
+                            "SysCallApplyCommission not active before PQ_LIFECYCLE_ACTIVATION_HEIGHT"
+                                .to_string(),
+                        );
+                    }
+                    ensure_working(&mut working_staking, ctx.staking.as_deref());
+                    let Some(ledger) = working_staking.as_mut() else {
+                        return VmExecutionResult::Reverted(
+                            "Staking ledger not available".to_string(),
+                        );
+                    };
+                    if let Err(e) = ledger.authorize_validator_owner(validator, &ctx.sender, true) {
+                        return VmExecutionResult::Reverted(format!(
+                            "apply commission unauthorized: {e}"
+                        ));
+                    }
+                    if ledger
+                        .commission_schedule_of(validator)
+                        .and_then(|s| s.pending)
+                        .is_none()
+                    {
+                        return VmExecutionResult::Reverted(
+                            "no pending commission change".to_string(),
+                        );
+                    }
                     state.stack.push(1);
                 }
             }

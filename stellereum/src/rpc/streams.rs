@@ -36,6 +36,32 @@ pub const SUBSCRIPTION_ID_BYTES: usize = 16;
 /// transport before the slow consumer is dropped).
 pub(super) const STREAM_BROADCAST_CAPACITY: usize = 1024;
 
+/// Maximum accounts one `accountUpdates` subscription may watch.
+///
+/// A wallet follows its own accounts; it does not follow "every account in
+/// the world". Each account is a heap `String` retained for the
+/// subscription's whole lifetime and scanned on every published block, so an
+/// unbounded list would let one client lodge megabytes per subscription (and,
+/// at [`MAX_SUBSCRIPTIONS_PER_CLIENT`] subscriptions, hundreds of megabytes
+/// per IP). 32 matches [`MAX_SUBSCRIPTION_TOPICS`].
+pub const MAX_SUBSCRIPTION_ACCOUNTS: usize = 32;
+
+/// Number of recent published events the hub retains for `after_seq` replay.
+///
+/// A reconnecting subscriber names the last `seq` it processed; the hub
+/// replays the matching events still in this window instead of leaving a
+/// silent hole. The window is a bounded ring buffer (memory O(512) whatever
+/// the traffic), never a growable log.
+pub const GEYSER_REPLAY_WINDOW: usize = 512;
+
+/// Maximum replay notifications delivered in ONE transport attach.
+///
+/// The window itself bounds the replay, but a burst of 512 full payloads
+/// would still be a spike a slow client did not ask for. 256 per attach is
+/// the cap; the rest is signalled explicitly (`lagged` / `backfill_required`)
+/// rather than delivered silently out of order.
+pub const MAX_REPLAY_BURST: usize = 256;
+
 /// A subscription created over plain HTTP (no transport attached yet) is
 /// swept after this many seconds. Keeps the registry bounded even if a
 /// client never unsubscribes. A subscription with a live transport is
@@ -66,6 +92,26 @@ pub enum SubscriptionTopic {
         /// Event topic ids to watch; empty = all.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         topics: Vec<String>,
+    },
+    /// Accounts whose state changed in a finalized block.
+    ///
+    /// The Geyser-lite delta stream: a subscriber names up to
+    /// [`MAX_SUBSCRIPTION_ACCOUNTS`] accounts and receives one notification
+    /// per account the block actually touched (never a full-state dump).
+    AccountUpdates {
+        /// Canonical hex (32 bytes) account addresses; `1..=MAX_SUBSCRIPTION_ACCOUNTS`.
+        accounts: Vec<String>,
+    },
+    /// Token transfers included in a finalized block, optionally filtered by
+    /// token id and/or an address taking part in the transfer.
+    TokenTransfers {
+        /// Canonical hex (32 bytes) token id to watch; `None` = every token.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        /// Canonical hex (32 bytes) address that must be the sender or the
+        /// recipient; `None` = no participant filter.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<String>,
     },
 }
 
@@ -102,6 +148,71 @@ pub struct Notification {
     pub subscription: String,
     /// The payload: a head, a transaction or a contract event.
     pub result: Value,
+    /// Strictly monotonic global event counter of the hub.
+    ///
+    /// `after_seq` replay and gap detection use it; absent on notifications
+    /// built by clients/tests that do not know it (never on a live push).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    /// Shard that produced the event, when the payload names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_id: Option<u32>,
+    /// Finalized height the event belongs to, when the payload names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u64>,
+}
+
+/// The `shard_id` / `height` an event payload carries, lifted onto the
+/// notification envelope so a client does not have to dig into `result`.
+fn notification_meta(payload: &Value) -> (Option<u32>, Option<u64>) {
+    let shard_id = payload
+        .get("shard_id")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok());
+    let height = payload.get("height").and_then(|v| v.as_u64());
+    (shard_id, height)
+}
+
+/// One retained event of the replay ring buffer.
+#[derive(Clone, Debug)]
+struct ReplayEntry {
+    seq: u64,
+    topic: SubscriptionTopic,
+    payload: Value,
+}
+
+/// The bounded `after_seq` replay window (oldest first).
+#[derive(Default)]
+struct ReplayWindow {
+    next_seq: u64,
+    entries: std::collections::VecDeque<ReplayEntry>,
+}
+
+/// The `after_seq` cursor fell out of the replay window.
+///
+/// This is an explicit refusal, never a silent gap: the client must backfill
+/// through the read RPCs or the indexer and resume from a live cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayCursorExpired {
+    /// Oldest sequence the window still holds (`None` = window empty).
+    pub oldest_available_seq: Option<u64>,
+}
+
+impl std::fmt::Display for ReplayCursorExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("replay cursor expired; backfill via RPC/indexer")
+    }
+}
+
+impl std::error::Error for ReplayCursorExpired {}
+
+/// The replay batch handed to a transport on attach.
+#[derive(Clone, Debug, Default)]
+pub struct ReplayBatch {
+    /// Matching events after the requested cursor, oldest first.
+    pub notifications: Vec<Notification>,
+    /// Matching events beyond [`MAX_REPLAY_BURST`] that were NOT delivered.
+    pub remaining: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,6 +240,43 @@ struct NormalizedEventsFilter {
     contract: Option<String>,
     wildcard: bool,
     topics: Vec<NormalizedTopicKey>,
+}
+
+/// Filter of a `tokenTransfers` subscription.
+#[derive(Clone, Debug)]
+struct TokenTransfersFilter {
+    token: Option<String>,
+    owner: Option<String>,
+}
+
+impl TokenTransfersFilter {
+    fn from_topic(token: Option<&str>, owner: Option<&str>) -> Self {
+        Self {
+            token: token.map(|t| t.trim().to_ascii_lowercase()),
+            owner: owner.map(|o| o.trim().to_ascii_lowercase()),
+        }
+    }
+
+    /// Does a published transfer (event topic `token` + payload participants)
+    /// match this filter?
+    fn matches(&self, ev_token: Option<&str>, payload: &Value) -> bool {
+        if let Some(want) = &self.token {
+            match ev_token {
+                Some(have) if have.eq_ignore_ascii_case(want) => {}
+                _ => return false,
+            }
+        }
+        if let Some(want) = &self.owner {
+            let hit = |v: Option<&Value>| {
+                v.and_then(|x| x.as_str())
+                    .is_some_and(|have| have.eq_ignore_ascii_case(want))
+            };
+            if !(hit(payload.get("from")) || hit(payload.get("to"))) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 impl NormalizedEventsFilter {
@@ -197,6 +345,8 @@ struct SubscriptionIndex {
     new_txs: HashSet<String>,
     invalidations: HashSet<String>,
     events: HashMap<String, NormalizedEventsFilter>,
+    account_updates: HashMap<String, HashSet<String>>,
+    token_transfers: HashMap<String, TokenTransfersFilter>,
     total_len: usize,
 }
 
@@ -223,6 +373,21 @@ impl SubscriptionIndex {
                 self.events.insert(
                     id.to_string(),
                     NormalizedEventsFilter::from_topic(contract.as_deref(), topics),
+                );
+            }
+            SubscriptionTopic::AccountUpdates { accounts } => {
+                self.account_updates.insert(
+                    id.to_string(),
+                    accounts
+                        .iter()
+                        .map(|a| a.trim().to_ascii_lowercase())
+                        .collect(),
+                );
+            }
+            SubscriptionTopic::TokenTransfers { token, owner } => {
+                self.token_transfers.insert(
+                    id.to_string(),
+                    TokenTransfersFilter::from_topic(token.as_deref(), owner.as_deref()),
                 );
             }
         }
@@ -252,6 +417,12 @@ impl SubscriptionIndex {
             SubscriptionTopic::Events { .. } => {
                 self.events.remove(id);
             }
+            SubscriptionTopic::AccountUpdates { .. } => {
+                self.account_updates.remove(id);
+            }
+            SubscriptionTopic::TokenTransfers { .. } => {
+                self.token_transfers.remove(id);
+            }
         }
         self.total_len = self.total_len.saturating_sub(1);
     }
@@ -262,32 +433,20 @@ impl SubscriptionIndex {
         self.new_txs.clear();
         self.invalidations.clear();
         self.events.clear();
+        self.account_updates.clear();
+        self.token_transfers.clear();
         self.total_len = 0;
         for (id, s) in reg {
             self.insert_entry(id, &s.topic, s.client.as_deref());
         }
     }
 
-    fn count_matching(&self, event: &SubscriptionTopic) -> usize {
-        match event {
-            SubscriptionTopic::NewHeads => self.new_heads.len(),
-            SubscriptionTopic::NewTxs => self.new_txs.len(),
-            SubscriptionTopic::Invalidations => self.invalidations.len(),
-            SubscriptionTopic::Events { contract, topics } => {
-                if self.events.is_empty() {
-                    return 0;
-                }
-                with_normalized_event_topics(topics, |ev_keys| {
-                    self.events
-                        .values()
-                        .filter(|f| f.matches(contract.as_deref(), ev_keys))
-                        .count()
-                })
-            }
-        }
-    }
-
-    fn collect_matching(&self, event: &SubscriptionTopic) -> Vec<String> {
+    /// The ids of the live subscriptions whose filter matches `event`.
+    ///
+    /// `payload` is consulted only by the `tokenTransfers` filter (its
+    /// `owner` may be either the sender or the recipient, which the topic
+    /// alone cannot express); every other topic matches on the topic shape.
+    fn collect_matching(&self, event: &SubscriptionTopic, payload: &Value) -> Vec<String> {
         match event {
             SubscriptionTopic::NewHeads => self.new_heads.iter().cloned().collect(),
             SubscriptionTopic::NewTxs => self.new_txs.iter().cloned().collect(),
@@ -303,6 +462,30 @@ impl SubscriptionIndex {
                         .map(|(id, _)| id.clone())
                         .collect()
                 })
+            }
+            SubscriptionTopic::AccountUpdates { accounts } => {
+                if self.account_updates.is_empty() || accounts.is_empty() {
+                    return Vec::new();
+                }
+                let changed: HashSet<&str> = accounts.iter().map(|a| a.as_str()).collect();
+                self.account_updates
+                    .iter()
+                    .filter(|(_, want)| {
+                        want.iter()
+                            .any(|w| changed.iter().any(|a| a.eq_ignore_ascii_case(w.as_str())))
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            }
+            SubscriptionTopic::TokenTransfers { token, .. } => {
+                if self.token_transfers.is_empty() {
+                    return Vec::new();
+                }
+                self.token_transfers
+                    .iter()
+                    .filter(|(_, f)| f.matches(token.as_deref(), payload))
+                    .map(|(id, _)| id.clone())
+                    .collect()
             }
         }
     }
@@ -335,6 +518,12 @@ pub struct SubscriptionHub {
     /// the push side (`stell_subscribe` with the `invalidations` topic).
     invalidations:
         Arc<std::sync::Mutex<std::collections::VecDeque<crate::chain::InvalidationSignal>>>,
+    /// Bounded `(seq, topic, payload)` window for `after_seq` replay.
+    ///
+    /// A SYNC mutex on purpose: the publish hook is called from the consensus
+    /// record lane, must never `.await`, and is held only for a push/pop of
+    /// [`GEYSER_REPLAY_WINDOW`] entries.
+    replay: std::sync::Mutex<ReplayWindow>,
 }
 
 impl std::fmt::Debug for SubscriptionHub {
@@ -357,6 +546,7 @@ impl SubscriptionHub {
             index: std::sync::RwLock::new(SubscriptionIndex::default()),
             tx,
             invalidations: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            replay: std::sync::Mutex::new(ReplayWindow::default()),
         }
     }
 
@@ -393,6 +583,96 @@ impl SubscriptionHub {
         win.clear();
     }
 
+    /// Sequence of the OLDEST event the replay window still holds.
+    ///
+    /// `None` when nothing was ever published (or the window is empty):
+    /// there is then no cursor that could be stale.
+    pub fn oldest_available_seq(&self) -> Option<u64> {
+        let w = self.replay.lock().unwrap_or_else(|e| e.into_inner());
+        w.entries.front().map(|e| e.seq)
+    }
+
+    /// Sequence of the NEWEST event in the replay window.
+    pub fn latest_seq(&self) -> Option<u64> {
+        let w = self.replay.lock().unwrap_or_else(|e| e.into_inner());
+        w.entries.back().map(|e| e.seq)
+    }
+
+    /// Is `after_seq` still serviceable by the replay window?
+    ///
+    /// Checked BEFORE a `stell_subscribe` creates a registry entry: an
+    /// expired cursor is refused explicitly (`-32005`) instead of opening a
+    /// stream with a silent hole.
+    pub fn check_replay_cursor(&self, after_seq: u64) -> Result<(), ReplayCursorExpired> {
+        let w = self.replay.lock().unwrap_or_else(|e| e.into_inner());
+        match w.entries.front().map(|e| e.seq) {
+            Some(oldest) if after_seq < oldest => Err(ReplayCursorExpired {
+                oldest_available_seq: Some(oldest),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// The events of `subscription_id`'s topic published after `after_seq`,
+    /// oldest first, capped at [`MAX_REPLAY_BURST`].
+    ///
+    /// Returns [`ReplayCursorExpired`] when the cursor fell out of the
+    /// window, so the transport can refuse instead of resuming with a gap.
+    pub fn replay_after(
+        &self,
+        subscription_id: &str,
+        after_seq: u64,
+    ) -> Result<ReplayBatch, ReplayCursorExpired> {
+        let Some(sub) = self.get(subscription_id) else {
+            return Ok(ReplayBatch::default());
+        };
+        let w = self.replay.lock().unwrap_or_else(|e| e.into_inner());
+        let oldest = w.entries.front().map(|e| e.seq);
+        if oldest.is_some_and(|o| after_seq < o) {
+            return Err(ReplayCursorExpired {
+                oldest_available_seq: oldest,
+            });
+        }
+        let mut batch = ReplayBatch::default();
+        for entry in w.entries.iter() {
+            if entry.seq <= after_seq {
+                continue;
+            }
+            if !topic_matches_payload(&sub.topic, &entry.topic, &entry.payload) {
+                continue;
+            }
+            if batch.notifications.len() >= MAX_REPLAY_BURST {
+                batch.remaining += 1;
+                continue;
+            }
+            let (shard_id, height) = notification_meta(&entry.payload);
+            batch.notifications.push(Notification {
+                subscription: subscription_id.to_string(),
+                result: entry.payload.clone(),
+                seq: Some(entry.seq),
+                shard_id,
+                height,
+            });
+        }
+        Ok(batch)
+    }
+
+    /// Append an event to the bounded replay window and return its `seq`.
+    fn record_replay(&self, topic: &SubscriptionTopic, payload: &Value) -> u64 {
+        let mut w = self.replay.lock().unwrap_or_else(|e| e.into_inner());
+        let seq = w.next_seq;
+        w.next_seq = w.next_seq.saturating_add(1);
+        w.entries.push_back(ReplayEntry {
+            seq,
+            topic: topic.clone(),
+            payload: payload.clone(),
+        });
+        while w.entries.len() > GEYSER_REPLAY_WINDOW {
+            w.entries.pop_front();
+        }
+        seq
+    }
+
     /// Register a subscription and return its id.
     pub fn subscribe(&self, topic: SubscriptionTopic) -> Result<String, String> {
         self.subscribe_for(topic, None)
@@ -410,6 +690,17 @@ impl SubscriptionHub {
         topic: SubscriptionTopic,
         client: Option<&str>,
     ) -> Result<String, String> {
+        // DoS bound (defense in depth: the JSON-RPC parse already refuses
+        // an out-of-range list with `-32602`, this also covers in-process
+        // callers).
+        if let SubscriptionTopic::AccountUpdates { accounts } = &topic {
+            if accounts.is_empty() || accounts.len() > MAX_SUBSCRIPTION_ACCOUNTS {
+                return Err(format!(
+                    "accountUpdates requires 1..={MAX_SUBSCRIPTION_ACCOUNTS} accounts (got {})",
+                    accounts.len()
+                ));
+            }
+        }
         let now = unix_now_secs();
         let mut reg = self.registry.write().unwrap_or_else(|e| e.into_inner());
         let mut idx = self.index.write().unwrap_or_else(|e| e.into_inner());
@@ -581,18 +872,42 @@ impl SubscriptionHub {
         self.tx.subscribe()
     }
 
+    /// True when at least one live subscription follows block deltas
+    /// (`accountUpdates` or `tokenTransfers`).
+    ///
+    /// The record lane consults this to do NO delta work (no per-account
+    /// publish calls) on a node nobody subscribed deltas on. Conservative on
+    /// an inconsistent index: a rebuild may turn a hidden subscriber up, so
+    /// an out-of-sync index answers `true`.
+    pub fn has_block_delta_subscribers(&self) -> bool {
+        let reg = self.registry.read().unwrap_or_else(|e| e.into_inner());
+        if reg.is_empty() {
+            return false;
+        }
+        let idx = self.index.read().unwrap_or_else(|e| e.into_inner());
+        if idx.total_len != reg.len() {
+            return true;
+        }
+        !idx.account_updates.is_empty() || !idx.token_transfers.is_empty()
+    }
+
     /// Address a payload to every subscription whose filter matches `event`.
     ///
     /// Returns the number of subscriptions addressed. Delivery itself is
     /// best-effort: a transport that is not attached (or is lagging) simply
     /// misses the notification -- the fan-out never blocks the publisher.
+    ///
+    /// Before fan-out the event is appended to the bounded replay window and
+    /// stamped with the hub's monotonic `seq`, so a client that reconnects
+    /// with `after_seq` can recover the events it missed (the ring buffer is
+    /// capped at [`GEYSER_REPLAY_WINDOW`]; an older cursor is an explicit
+    /// refusal, never a silent gap).
     pub fn publish(&self, event: &SubscriptionTopic, result: Value) -> usize {
         let targets: Vec<String> = {
             let reg = self.registry.read().unwrap_or_else(|e| e.into_inner());
             if reg.is_empty() {
                 return 0;
             }
-            let has_receivers = self.tx.receiver_count() > 0;
             let idx = self.index.read().unwrap_or_else(|e| e.into_inner());
             if idx.total_len != reg.len() {
                 drop(idx);
@@ -600,21 +915,20 @@ impl SubscriptionHub {
                 if idx_w.total_len != reg.len() {
                     idx_w.rebuild_from(&reg);
                 }
-                if !has_receivers {
-                    return idx_w.count_matching(event);
-                }
-                idx_w.collect_matching(event)
+                idx_w.collect_matching(event, &result)
             } else {
-                if !has_receivers {
-                    return idx.count_matching(event);
-                }
-                idx.collect_matching(event)
+                idx.collect_matching(event, &result)
             }
         };
         let addressed = targets.len();
         if addressed == 0 {
             return 0;
         }
+        // Record BEFORE sending: a reconnecting client that learns the head
+        // (and its seq) from this burst must find the very same event in the
+        // window.
+        let seq = self.record_replay(event, &result);
+        let (shard_id, height) = notification_meta(&result);
         let mut result = Some(result);
         for (i, id) in targets.into_iter().enumerate() {
             let val = if i + 1 == addressed {
@@ -627,6 +941,9 @@ impl SubscriptionHub {
             let _ = self.tx.send(Notification {
                 subscription: id,
                 result: val,
+                seq: Some(seq),
+                shard_id,
+                height,
             });
         }
         addressed
@@ -707,53 +1024,21 @@ pub(super) fn random_subscription_id() -> String {
     hex::encode(b)
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug)]
-enum TopicKeyRef<'a> {
-    Int(i64),
-    Text(&'a str),
-}
-
-#[cfg(test)]
-impl PartialEq for TopicKeyRef<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Int(a), Self::Int(b)) => a == b,
-            (Self::Text(a), Self::Text(b)) => {
-                if a.is_ascii() && b.is_ascii() {
-                    a.eq_ignore_ascii_case(b)
-                } else {
-                    a.to_lowercase() == b.to_lowercase()
-                }
-            }
-            _ => false,
-        }
-    }
-}
-
-#[cfg(test)]
-#[inline]
-fn topic_key_ref(s: &str) -> TopicKeyRef<'_> {
-    let t = s.trim();
-    if let Ok(n) = t.parse::<i64>() {
-        return TopicKeyRef::Int(n);
-    }
-    if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        if let Ok(n) = i64::from_str_radix(h, 16) {
-            return TopicKeyRef::Int(n);
-        }
-    }
-    TopicKeyRef::Text(t)
-}
-
 /// Does a subscriber's filter match an event?
 ///
 /// * `newHeads` matches `newHeads`, `newTxs` matches `newTxs`.
 /// * An `events` filter matches when the contract matches (a filter without a
 ///   contract matches every contract) AND the topic sets intersect (an empty
 ///   filter matches every topic; `*` / `#` are wildcards).
-#[cfg(test)]
-pub(super) fn topic_matches(filter: &SubscriptionTopic, event: &SubscriptionTopic) -> bool {
+/// * An `accountUpdates` filter matches when the block touched ANY of its
+///   accounts.
+/// * A `tokenTransfers` filter matches on the token and/or on the
+///   participant (`from` or `to`) named in `payload`.
+fn topic_matches_payload(
+    filter: &SubscriptionTopic,
+    event: &SubscriptionTopic,
+    payload: &Value,
+) -> bool {
     match (filter, event) {
         (SubscriptionTopic::NewHeads, SubscriptionTopic::NewHeads) => true,
         (SubscriptionTopic::NewTxs, SubscriptionTopic::NewTxs) => true,
@@ -768,26 +1053,33 @@ pub(super) fn topic_matches(filter: &SubscriptionTopic, event: &SubscriptionTopi
                 topics: ev_topics,
             },
         ) => {
-            if let Some(want) = want_contract {
-                match ev_contract {
-                    Some(have) if have.eq_ignore_ascii_case(want) => {}
-                    _ => return false,
-                }
-            }
-            if want_topics.is_empty() {
-                return true;
-            }
-            want_topics.iter().any(|w| {
-                let w = w.trim();
-                if w == "*" || w == "#" {
-                    return true;
-                }
-                let wk = topic_key_ref(w);
-                ev_topics.iter().any(|h| topic_key_ref(h) == wk)
+            let f = NormalizedEventsFilter::from_topic(want_contract.as_deref(), want_topics);
+            with_normalized_event_topics(ev_topics, |ev_keys| {
+                f.matches(ev_contract.as_deref(), ev_keys)
             })
         }
+        (
+            SubscriptionTopic::AccountUpdates { accounts: want },
+            SubscriptionTopic::AccountUpdates { accounts: have },
+        ) => want
+            .iter()
+            .any(|w| have.iter().any(|h| h.eq_ignore_ascii_case(w))),
+        (
+            SubscriptionTopic::TokenTransfers { token, owner },
+            SubscriptionTopic::TokenTransfers {
+                token: ev_token, ..
+            },
+        ) => TokenTransfersFilter::from_topic(token.as_deref(), owner.as_deref())
+            .matches(ev_token.as_deref(), payload),
         _ => false,
     }
+}
+
+/// Test-facing wrapper of [`topic_matches_payload`] (no payload available:
+/// a token `owner` filter therefore matches only when it is absent).
+#[cfg(test)]
+pub(super) fn topic_matches(filter: &SubscriptionTopic, event: &SubscriptionTopic) -> bool {
+    topic_matches_payload(filter, event, &Value::Null)
 }
 
 /// Publish a newly finalized head to the `newHeads` subscribers.
@@ -796,12 +1088,34 @@ pub(super) fn topic_matches(filter: &SubscriptionTopic, event: &SubscriptionTopi
 /// [`RpcState::record_block`] (the finalize and adopt paths both call it), so
 /// a subscriber sees every finalized head of this node, in order, tagged
 /// `finality: "finalized"`.
+///
+/// The payload always carries `shard_id`, `height`, `prev_hash`,
+/// `state_root` and `proposer`. The last three are `null` only when this node
+/// has no quorum-certified header for the height (an honest "not available",
+/// never a fabricated root); [`publish_new_head_with_header`] is the path
+/// that supplies them.
 pub fn publish_new_head(
     height: u64,
     hash: [u8; 32],
     shard_id: u32,
     tx_count: usize,
     timestamp: u64,
+) -> usize {
+    publish_new_head_with_header(height, hash, shard_id, tx_count, timestamp, None)
+}
+
+/// [`publish_new_head`] with the quorum-certified header metadata attached.
+///
+/// `header` is the finalized header this node recorded for `(height, hash)`
+/// (see `RpcState::record_finalized_header`); its `prev_hash`, `state_root`
+/// and `proposer` are what a light client checks the head against.
+pub fn publish_new_head_with_header(
+    height: u64,
+    hash: [u8; 32],
+    shard_id: u32,
+    tx_count: usize,
+    timestamp: u64,
+    header: Option<&crate::rpc::FinalizedHeaderRecord>,
 ) -> usize {
     let h = hub();
     if h.is_empty() {
@@ -816,6 +1130,9 @@ pub fn publish_new_head(
             "tx_count": tx_count,
             "timestamp": timestamp,
             "finality": "finalized",
+            "prev_hash": header.map(|r| hex::encode(r.prev_hash)),
+            "state_root": header.map(|r| hex::encode(r.state_root)),
+            "proposer": header.map(|r| hex::encode(r.proposer)),
         }),
     )
 }
@@ -880,6 +1197,175 @@ pub fn publish_contract_event(
     )
 }
 
+/// The accounts a finalized block actually changed.
+///
+/// Derived ONLY from the applied block body (never a scan of the state):
+///
+/// * every applied transaction's sender (fee + nonce changed even when the
+///   transfer itself reverted);
+/// * the recipient of a SUCCESSFUL transaction;
+/// * the participants of a token transfer op the transaction ran.
+///
+/// Deduplicated and ordered (deterministically, so two nodes publish the same
+/// sequence for the same block). The zero address is never streamed: it is
+/// not an account anyone can read.
+pub fn block_account_deltas(
+    txs: &[crate::sharding::Transaction],
+    statuses: &[bool],
+) -> Vec<[u8; 32]> {
+    use crate::svm::OpCode;
+    let mut changed = std::collections::BTreeSet::new();
+    for (i, tx) in txs.iter().enumerate() {
+        changed.insert(tx.from);
+        if !statuses.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        changed.insert(tx.to);
+        for op in &tx.payload {
+            match op {
+                OpCode::SysCallTokenTransfer { to, .. } => {
+                    changed.insert(*to);
+                }
+                OpCode::SysCallTokenTransferFrom { from, to, .. } => {
+                    changed.insert(*from);
+                    changed.insert(*to);
+                }
+                _ => {}
+            }
+        }
+    }
+    changed.into_iter().filter(|a| *a != [0u8; 32]).collect()
+}
+
+/// Publish one changed account to the `accountUpdates` subscribers.
+pub fn publish_account_update(
+    account: [u8; 32],
+    height: u64,
+    block_hash: [u8; 32],
+    shard_id: u32,
+) -> usize {
+    let h = hub();
+    if h.is_empty() {
+        return 0;
+    }
+    let account = hex::encode(account);
+    h.publish(
+        &SubscriptionTopic::AccountUpdates {
+            accounts: vec![account.clone()],
+        },
+        json!({
+            "account": account,
+            "height": height,
+            "shard_id": shard_id,
+            "block_hash": hex::encode(block_hash),
+            "finality": "finalized",
+        }),
+    )
+}
+
+/// Publish one token transfer included in a finalized block.
+pub fn publish_token_transfer(
+    token_id: [u8; 32],
+    from: [u8; 32],
+    to: [u8; 32],
+    amount: u64,
+    height: u64,
+    block_hash: [u8; 32],
+    shard_id: u32,
+) -> usize {
+    let h = hub();
+    if h.is_empty() {
+        return 0;
+    }
+    let token = hex::encode(token_id);
+    h.publish(
+        &SubscriptionTopic::TokenTransfers {
+            token: Some(token.clone()),
+            owner: None,
+        },
+        json!({
+            "token": token,
+            "from": hex::encode(from),
+            "to": hex::encode(to),
+            "amount": amount,
+            "height": height,
+            "shard_id": shard_id,
+            "block_hash": hex::encode(block_hash),
+            "finality": "finalized",
+        }),
+    )
+}
+
+/// Publish the Geyser-lite deltas of a FINALIZED block: the accounts its body
+/// actually changed and the token transfers it included.
+///
+/// Called from the consensus record lane AFTER the receipts and the head are
+/// filed. It takes no `state.accounts` / `receipts` lock and never `.await`s:
+/// the fan-out is a non-blocking broadcast, so a stalled subscriber cannot
+/// delay `record_block` (or consensus behind it). Returns
+/// `(addressed account updates, addressed token transfers)`.
+pub fn publish_block_deltas(
+    height: u64,
+    block_hash: [u8; 32],
+    shard_id: u32,
+    txs: &[crate::sharding::Transaction],
+    statuses: &[bool],
+) -> (usize, usize) {
+    if !hub().has_block_delta_subscribers() {
+        return (0, 0);
+    }
+    let mut account_hits = 0;
+    for account in block_account_deltas(txs, statuses) {
+        account_hits += publish_account_update(account, height, block_hash, shard_id);
+    }
+    let mut transfer_hits = 0;
+    for (i, tx) in txs.iter().enumerate() {
+        if !statuses.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        for op in &tx.payload {
+            match op {
+                crate::svm::OpCode::SysCallTokenTransfer {
+                    token_id,
+                    to,
+                    amount,
+                } => {
+                    transfer_hits += publish_token_transfer(
+                        *token_id, tx.from, *to, *amount, height, block_hash, shard_id,
+                    );
+                }
+                crate::svm::OpCode::SysCallTokenTransferFrom {
+                    token_id,
+                    from,
+                    to,
+                    amount,
+                } => {
+                    transfer_hits += publish_token_transfer(
+                        *token_id, *from, *to, *amount, height, block_hash, shard_id,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    (account_hits, transfer_hits)
+}
+
+/// The structured "you missed events" frame of both transports.
+///
+/// SSE wraps it in `event: lagged`, WS sends it as a JSON text frame. The
+/// subscription is `"*"` because the loss is transport-wide, not tied to one
+/// subscription id; `oldest_available_seq` is what the replay window can
+/// still serve (`null` when it holds nothing).
+pub fn lagged_notice(skipped: u64) -> Value {
+    json!({
+        "subscription": "*",
+        "lagged": skipped,
+        "oldest_available_seq": hub().oldest_available_seq(),
+        "action": "backfill_required",
+    })
+}
+
 /// The JSON view of an invalidation signal: the orphaned blocks as hex.
 ///
 /// The hashes are hex (not byte arrays) because this is what a client of
@@ -926,7 +1412,13 @@ pub fn recent_invalidations(limit: usize) -> Vec<crate::chain::InvalidationSigna
 /// * `["newHeads"]`
 /// * `["newTxs"]`
 /// * `["events", { "contract": "<addr>", "topics": ["1", "2"] }]`
+/// * `["accountUpdates", { "accounts": ["<addr>", ...] }]` (1..=32 accounts)
+/// * `["tokenTransfers", { "token": "<tokenId>", "owner": "<addr>" }]`
 /// * `{"type": "events", "contract": "<addr>", "topics": [...]}`
+///
+/// `after_seq` (replay cursor) is NOT part of the topic: it is validated and
+/// served by the transport (`parse_after_seq`), so the topic stays a pure
+/// filter value.
 pub(super) fn parse_subscribe_params(params: &Value) -> Result<SubscriptionTopic, String> {
     let (kind, filter) = match params {
         Value::Array(items) => {
@@ -956,11 +1448,125 @@ pub(super) fn parse_subscribe_params(params: &Value) -> Result<SubscriptionTopic
         "newTxs" | "new_txs" | "transactions" => Ok(SubscriptionTopic::NewTxs),
         "invalidations" | "invalidation" | "reorgs" => Ok(SubscriptionTopic::Invalidations),
         "events" | "logs" | "contractEvents" => parse_events_filter(&filter),
+        "accountUpdates" | "account_updates" | "accounts" => parse_account_updates_filter(&filter),
+        "tokenTransfers" | "token_transfers" | "transfers" => parse_token_transfers_filter(&filter),
         other => Err(format!(
             "unknown subscription type: {}",
             snip_for_error(other)
         )),
     }
+}
+
+/// The `after_seq` replay cursor of a `stell_subscribe` request, if any.
+///
+/// Accepted as `params.after_seq` / `params.afterSeq` on an object request,
+/// as a field of the filter object of the array form, or as a raw string
+/// number (clients that keep cursors in JSON strings).
+pub(super) fn parse_after_seq(params: &Value) -> Option<u64> {
+    fn from_value(v: Option<&Value>) -> Option<u64> {
+        let v = v?;
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+    }
+    from_value(
+        params
+            .get("after_seq")
+            .or_else(|| params.get("afterSeq"))
+            .or_else(|| params.get("after")),
+    )
+    .or_else(|| {
+        let filter = params.get(1)?;
+        from_value(
+            filter
+                .get("after_seq")
+                .or_else(|| filter.get("afterSeq"))
+                .or_else(|| filter.get("after")),
+        )
+    })
+}
+
+/// Parse the filter of an `accountUpdates` subscription.
+///
+/// The list must hold `1..=MAX_SUBSCRIPTION_ACCOUNTS` distinct addresses
+/// (a "watch every account in the world" subscription is not served on a
+/// public socket). Addresses are validated and canonicalized to 32-byte hex,
+/// so matching is byte-exact.
+pub(super) fn parse_account_updates_filter(filter: &Value) -> Result<SubscriptionTopic, String> {
+    let mut accounts: Vec<String> = Vec::new();
+    let push = |s: &str, accounts: &mut Vec<String>| -> Result<(), String> {
+        let addr = parse_rpc_address(s).map_err(|e| format!("invalid account address: {e}"))?;
+        let h = hex::encode(addr);
+        if !accounts.contains(&h) {
+            accounts.push(h);
+        }
+        Ok(())
+    };
+    let raw = filter.get("accounts").or_else(|| filter.get("account"));
+    match raw {
+        Some(Value::Array(items)) => {
+            if items.len() > MAX_SUBSCRIPTION_ACCOUNTS {
+                return Err(format!(
+                    "too many accounts: at most {MAX_SUBSCRIPTION_ACCOUNTS} per subscription"
+                ));
+            }
+            for it in items {
+                let s = it
+                    .as_str()
+                    .ok_or_else(|| "invalid accounts entry: expected a string".to_string())?;
+                push(s, &mut accounts)?;
+            }
+        }
+        Some(Value::String(s)) => {
+            for part in s.split(',') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                if accounts.len() >= MAX_SUBSCRIPTION_ACCOUNTS {
+                    return Err(format!(
+                        "too many accounts: at most {MAX_SUBSCRIPTION_ACCOUNTS} per subscription"
+                    ));
+                }
+                push(part, &mut accounts)?;
+            }
+        }
+        Some(Value::Null) | None => {}
+        Some(_) => return Err("invalid accounts parameter".to_string()),
+    }
+    if accounts.is_empty() {
+        return Err(format!(
+            "accountUpdates requires 1..={MAX_SUBSCRIPTION_ACCOUNTS} accounts"
+        ));
+    }
+    Ok(SubscriptionTopic::AccountUpdates { accounts })
+}
+
+/// Parse the filter of a `tokenTransfers` subscription.
+///
+/// `token` (token id) and `owner` (participant address) are both optional;
+/// when both are absent the subscription follows every token transfer.
+pub(super) fn parse_token_transfers_filter(filter: &Value) -> Result<SubscriptionTopic, String> {
+    let mut token = None;
+    let mut owner = None;
+    if let Some(v) = filter.get("token").or_else(|| filter.get("tokenId")) {
+        if !v.is_null() {
+            let s = v
+                .as_str()
+                .ok_or_else(|| "invalid token parameter: must be a string".to_string())?;
+            let id = parse_rpc_address(s).map_err(|e| format!("invalid token id: {e}"))?;
+            token = Some(hex::encode(id));
+        }
+    }
+    if let Some(v) = filter.get("owner").or_else(|| filter.get("address")) {
+        if !v.is_null() {
+            let s = v
+                .as_str()
+                .ok_or_else(|| "invalid owner parameter: must be a string".to_string())?;
+            let addr = parse_rpc_address(s).map_err(|e| format!("invalid owner address: {e}"))?;
+            owner = Some(hex::encode(addr));
+        }
+    }
+    Ok(SubscriptionTopic::TokenTransfers { token, owner })
 }
 
 /// Parse the filter object of an `events` subscription.
@@ -1269,8 +1875,16 @@ pub async fn sse_handler(
                         }
                     }
                     Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                        // Explicit lag notice instead of a silent gap: the
+                        // client learns it missed events and which sequence
+                        // the node can still replay from.
                         tracing::warn!(skipped, "SSE subscriber lagged behind the stream fan-out");
-                        continue;
+                        let notice = lagged_notice(skipped);
+                        let ev = axum::response::sse::Event::default()
+                            .event("lagged")
+                            .data(notice.to_string());
+                        let next_deadline = tokio::time::Instant::now() + idle;
+                        return Some((Ok(ev), (rx, ids, guard, next_deadline, idle)));
                     }
                     Ok(Err(broadcast::error::RecvError::Closed)) => return None,
                 }
@@ -1319,6 +1933,9 @@ pub async fn sse_handler(
 //     generation against the live trie.
 //   * `stell_runGetMethod` — executes contract code (`run_get_method[_typed]`,
 //     fuel-bounded but still execution).
+//   * `stell_getAddressHistory` / `stell_getProgramAccounts` /
+//     `stell_getTokenAccountsByOwner` — cursor walks over secondary indexes
+//     and a bounded account scan (`MAX_PROGRAM_ACCOUNTS_SCAN`).
 // Cheap lookups (balance, headers, chain id, events, ...) draw nothing.
 //
 // Over budget → a clean `-32000` error frame on the SAME socket (the socket
@@ -1351,7 +1968,7 @@ pub(super) fn ws_expensive_read_budget() -> &'static crate::explorer::RateLimite
 }
 
 /// True when a WS message's method is an expensive read (see above).
-pub(super) fn is_ws_expensive_method(method: &str) -> bool {
+pub fn is_ws_expensive_method(method: &str) -> bool {
     matches!(
         method,
         "stell_estimateFee"
@@ -1361,6 +1978,12 @@ pub(super) fn is_ws_expensive_method(method: &str) -> bool {
             | "stell_getBalanceSpv"
             | "stell_tokenBalanceSpv"
             | "stell_runGetMethod"
+            // W4/E3 history & bounded program-account scans: a cursor walk over
+            // the secondary indexes (or a bounded scan of up to
+            // `MAX_PROGRAM_ACCOUNTS_SCAN` accounts) is a heavy read.
+            | "stell_getAddressHistory"
+            | "stell_getProgramAccounts"
+            | "stell_getTokenAccountsByOwner"
     )
 }
 
@@ -1501,7 +2124,7 @@ pub(super) fn ws_idle_timeout() -> std::time::Duration {
 //   * `expensive`    — the 5/s per-IP estimate-fee budget enforced in
 //     `dispatch` (`estimate_fee_budget`) on ALL transports: `stell_estimateFee`.
 //   * `expensive-ws` — the 5/s per-IP WS per-message budget
-//     (`ws_expensive_read_budget`, `is_ws_expensive_method`): the 7 heavy
+//     (`ws_expensive_read_budget`, `is_ws_expensive_method`): the heavy
 //     methods below, ON WS FRAMES ONLY. On HTTP these same methods have no
 //     per-method budget beyond `transport`.
 //   * `subscription` — the registry caps in `subscribe_for`: global
@@ -1548,8 +2171,10 @@ pub(super) fn ws_idle_timeout() -> std::time::Duration {
 //     stell_getContractReceipt, stell_getInvalidations, stell_invalidationFeed,
 //     stell_unsubscribe, stell_getSubscriptions.
 //   transport + expensive + expensive-ws (1): stell_estimateFee.
-//   transport + expensive-ws (5): stell_getProof, stell_getArchiveProof,
-//     stell_getBalanceSpv, stell_tokenBalanceSpv, stell_runGetMethod.
+//   transport + expensive-ws (8): stell_getProof, stell_getArchiveProof,
+//     stell_getBalanceSpv, stell_tokenBalanceSpv, stell_runGetMethod,
+//     stell_getAddressHistory, stell_getProgramAccounts,
+//     stell_getTokenAccountsByOwner.
 //   transport + expensive-ws + subscription (1): stell_subscribe.
 //   transport + faucet (1): stell_faucet.
 //   transport + auth (11): stell_mempoolDump, stell_submitProposal, stell_vote,
@@ -1589,7 +2214,10 @@ pub fn rpc_rate_buckets(method: &str) -> &'static [&'static str] {
         | "stell_getArchiveProof"
         | "stell_getBalanceSpv"
         | "stell_tokenBalanceSpv"
-        | "stell_runGetMethod" => &["transport", "expensive-ws"],
+        | "stell_runGetMethod"
+        | "stell_getAddressHistory"
+        | "stell_getProgramAccounts"
+        | "stell_getTokenAccountsByOwner" => &["transport", "expensive-ws"],
         "stell_faucet" => &["transport", "faucet"],
         "stell_mempoolDump"
         | "stell_submitProposal"
@@ -1845,7 +2473,16 @@ pub(super) async fn handle_ws_with_timeout(
                     skipped,
                     "WebSocket subscriber lagged behind the stream fan-out"
                 );
-                continue;
+                // Explicit lag notice instead of a silent skip: the client
+                // learns it missed events and where replay can resume.
+                let out = lagged_notice(skipped).to_string();
+                if socket
+                    .send(axum::extract::ws::Message::Text(out))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
             WsIn::Note(Err(broadcast::error::RecvError::Closed)) => break,
         }
@@ -1966,6 +2603,25 @@ pub(super) async fn ws_handle_text(
                 .is_ok();
         }
     }
+    // GEYSER-LITE REPLAY CURSOR (see `GEYSER_REPLAY_WINDOW`): an expired
+    // `after_seq` is refused BEFORE dispatch, so a stale cursor creates no
+    // registry entry and no stream with a silent hole. The refusal is the
+    // explicit JSON-RPC `-32005`; the socket stays open.
+    let replay_after = if method == "stell_subscribe" {
+        parse_after_seq(&params)
+    } else {
+        None
+    };
+    if let Some(after_seq) = replay_after {
+        if let Err(e) = hub().check_replay_cursor(after_seq) {
+            let denied = err(id, -32005, e.to_string());
+            let out = serde_json::to_string(&denied.0).unwrap_or_default();
+            return socket
+                .send(axum::extract::ws::Message::Text(out))
+                .await
+                .is_ok();
+        }
+    }
     // PER-CONNECTION SUBSCRIPTION CAP (see `WS_MAX_SUBS_PER_CONNECTION`):
     // fail-closed BEFORE dispatch so a refused subscribe consumes neither a
     // registry slot nor any per-client budget. Over cap → a clean `-32000`
@@ -1985,13 +2641,45 @@ pub(super) async fn ws_handle_text(
             .await
             .is_ok();
     }
+    let id_for_replay = id.clone();
     let resp = dispatch_client(st.as_ref(), id, &method, &params, header_token, client).await;
     // Track the subscriptions this connection owns: they are pushed to it and
-    // they die with it.
+    // they die with it. A successful `after_seq` attach replays the events the
+    // client missed (bounded by `MAX_REPLAY_BURST`) right after the reply.
+    let mut replay: Vec<Notification> = Vec::new();
+    let mut replay_refused: Option<String> = None;
     if method == "stell_subscribe" {
         if let Some(sid) = resp.0.result.as_ref().and_then(|v| v.as_str()) {
-            owned.insert(sid.to_string());
-            hub().attach(sid);
+            let sid = sid.to_string();
+            owned.insert(sid.clone());
+            hub().attach(&sid);
+            if let Some(after_seq) = replay_after {
+                match hub().replay_after(&sid, after_seq) {
+                    Ok(batch) => {
+                        if batch.remaining > 0 {
+                            // More matching events than one attach may carry:
+                            // tell the client explicitly (same shape as a
+                            // transport lag) instead of dropping them silently.
+                            replay.push(Notification {
+                                subscription: "*".to_string(),
+                                result: lagged_notice(batch.remaining as u64),
+                                seq: None,
+                                shard_id: None,
+                                height: None,
+                            });
+                        }
+                        replay.extend(batch.notifications);
+                    }
+                    Err(e) => {
+                        // The window moved between the pre-flight check and
+                        // here: drop the just-created subscription (no leak)
+                        // and refuse explicitly.
+                        hub().unsubscribe(&sid);
+                        owned.remove(&sid);
+                        replay_refused = Some(e.to_string());
+                    }
+                }
+            }
         }
     } else if method == "stell_unsubscribe" {
         if let Some(sid) = params.get(0).and_then(|v| v.as_str()) {
@@ -1999,10 +2687,32 @@ pub(super) async fn ws_handle_text(
         }
     }
     let out = serde_json::to_string(&resp.0).unwrap_or_default();
-    socket
+    if socket
         .send(axum::extract::ws::Message::Text(out))
         .await
-        .is_ok()
+        .is_err()
+    {
+        return false;
+    }
+    if let Some(message) = replay_refused {
+        let denied = err(id_for_replay, -32005, message);
+        let out = serde_json::to_string(&denied.0).unwrap_or_default();
+        return socket
+            .send(axum::extract::ws::Message::Text(out))
+            .await
+            .is_ok();
+    }
+    for note in replay {
+        let out = serde_json::to_string(&note).unwrap_or_else(|_| "{}".to_string());
+        if socket
+            .send(axum::extract::ws::Message::Text(out))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
 }
 /// axum handler for the JSON-RPC endpoint.
 ///

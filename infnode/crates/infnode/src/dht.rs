@@ -232,16 +232,16 @@ impl RoutingTable {
 
 /// KV-хранилище DHT (для метаданных сети, сервисов и т.п.).
 ///
-/// R6: карта лежит под `Arc` (copy-on-write). Читателям (снапшот для
-/// persist_kv, перебор манифестов в storage.store, LWW-проверка dht.store)
-/// отдаётся `Arc::clone` — O(1) вместо клонирования всей карты (на стенде
-/// это был полный копир 48–85 МБ на КАЖДЫЙ такой запрос прямо на
-/// async-воркере). Мутации идут через `Arc::make_mut`: пока снапшот жив
-/// (идёт serialize+запись в blocking-пуле), мутирующая запись оплачивает
-/// один клон карты — это дешевле, чем клон на каждом чтении.
+/// Значения лежат в `Arc<StoredValue>`, а сама карта хранится напрямую (без
+/// `Arc<HashMap<...>>` + `Arc::make_mut`):
+/// - снапшот (`entries_snapshot`) копирует только ключи и инкрементирует
+///   счётчики ссылок `Arc<StoredValue>` — 0 байт копирования `StoredValue.value`;
+/// - мутация одного ключа (`store`/`store_replica`/`merge_replica`/`restore`)
+///   меняет ровно один слот карты и никогда не клонирует всю карту, даже пока
+///   предыдущий снапшот сериализуется в `spawn_blocking`.
 #[derive(Default)]
 pub struct KvStore {
-    entries: Arc<HashMap<String, StoredValue>>,
+    entries: HashMap<String, Arc<StoredValue>>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -254,23 +254,18 @@ pub struct StoredValue {
 }
 
 impl KvStore {
-    /// Единственная точка мутации карты (copy-on-write через `Arc::make_mut`).
-    fn entries_mut(&mut self) -> &mut HashMap<String, StoredValue> {
-        Arc::make_mut(&mut self.entries)
-    }
-
     pub fn store(&mut self, key: &str, value: String, ttl_ms: i64, origin: [u8; NODEID_LEN]) {
         let now = now_ms();
         let expires = now + ttl_ms;
-        self.entries_mut().insert(
+        self.entries.insert(
             key.to_string(),
-            StoredValue {
+            Arc::new(StoredValue {
                 value,
                 expires,
                 origin,
                 ttl_ms,
                 stored_at: now,
-            },
+            }),
         );
     }
 
@@ -293,15 +288,15 @@ impl KvStore {
         if expires <= now {
             return;
         }
-        self.entries_mut().insert(
+        self.entries.insert(
             key.to_string(),
-            StoredValue {
+            Arc::new(StoredValue {
                 value,
                 expires,
                 origin,
                 ttl_ms,
                 stored_at: sa,
-            },
+            }),
         );
     }
 
@@ -339,15 +334,15 @@ impl KvStore {
             Some(local) => stored_at > local.stored_at,
         };
         if apply {
-            self.entries_mut().insert(
+            self.entries.insert(
                 key.to_string(),
-                StoredValue {
+                Arc::new(StoredValue {
                     value,
                     expires,
                     origin,
                     ttl_ms,
                     stored_at,
-                },
+                }),
             );
         }
         apply
@@ -374,15 +369,15 @@ impl KvStore {
         let incoming: Vec<String> = serde_json::from_str(&value).unwrap_or_default();
         match self.entries.get(key) {
             None => {
-                self.entries_mut().insert(
+                self.entries.insert(
                     key.to_string(),
-                    StoredValue {
+                    Arc::new(StoredValue {
                         value,
                         expires: now + ttl_ms,
                         origin,
                         ttl_ms,
                         stored_at,
-                    },
+                    }),
                 );
                 true
             }
@@ -425,7 +420,7 @@ impl KvStore {
                         ttl_ms: ttl_ms.max(local.ttl_ms),
                         stored_at: stored_at.max(local.stored_at),
                     };
-                    self.entries_mut().insert(key.to_string(), newv);
+                    self.entries.insert(key.to_string(), Arc::new(newv));
                 }
                 changed
             }
@@ -446,15 +441,15 @@ impl KvStore {
             serde_json::from_str(&value).unwrap_or_default();
         match self.entries.get(key) {
             None => {
-                self.entries_mut().insert(
+                self.entries.insert(
                     key.to_string(),
-                    StoredValue {
+                    Arc::new(StoredValue {
                         value,
                         expires: now + ttl_ms,
                         origin,
                         ttl_ms,
                         stored_at,
-                    },
+                    }),
                 );
                 true
             }
@@ -478,7 +473,7 @@ impl KvStore {
                         ttl_ms: ttl_ms.max(local.ttl_ms),
                         stored_at: stored_at.max(local.stored_at),
                     };
-                    self.entries_mut().insert(key.to_string(), newv);
+                    self.entries.insert(key.to_string(), Arc::new(newv));
                 }
                 changed
             }
@@ -527,7 +522,7 @@ impl KvStore {
         match v {
             Some(v) if v.expires > now => Some(v.value.clone()),
             Some(_) => {
-                self.entries_mut().remove(key);
+                self.entries.remove(key);
                 None
             }
             None => None,
@@ -547,7 +542,7 @@ impl KvStore {
 
     /// Удалить значение по строковому ключу.
     pub fn remove(&mut self, key: &str) {
-        self.entries_mut().remove(key);
+        self.entries.remove(key);
     }
 
     pub fn len(&self) -> usize {
@@ -566,7 +561,7 @@ impl KvStore {
 
     pub fn prune(&mut self) {
         let now = now_ms();
-        self.entries_mut().retain(|_, v| v.expires > now);
+        self.entries.retain(|_, v| v.expires > now);
     }
 
     /// Выкинуть мёртвое ПЕРЕД сериализацией kv.json. Возвращает
@@ -584,7 +579,7 @@ impl KvStore {
         let mut expired = 0usize;
         let mut dedup = 0usize;
         let mut removed: Vec<(String, String)> = Vec::new();
-        self.entries_mut().retain(|k, v| {
+        self.entries.retain(|k, v| {
             if v.expires <= now {
                 expired += 1;
                 removed.push((k.clone(), v.value.clone()));
@@ -613,22 +608,44 @@ impl KvStore {
     }
 
     /// Владеющая копия всей карты (тесты/диагностика). Горячие пути берут
-    /// `entries_snapshot` — O(1) вместо клона десятков мегабайт.
+    /// `entries_snapshot` — вместо клона десятков мегабайт значений.
     pub fn entries_clone(&self) -> HashMap<String, StoredValue> {
-        (*self.entries).clone()
+        self.entries
+            .iter()
+            .map(|(k, v)| (k.clone(), (**v).clone()))
+            .collect()
     }
 
-    /// Дешёвый снапшот для чтения/сериализации: один `Arc::clone`,
-    /// блокировка kv отпускается сразу, карта не копируется.
-    pub fn entries_snapshot(&self) -> Arc<HashMap<String, StoredValue>> {
-        Arc::clone(&self.entries)
+    /// Дешёвый снапшот для чтения/сериализации: копируются только ключи и
+    /// инкрементируются `Arc<StoredValue>` (0 байт копирования `StoredValue.value`),
+    /// блокировка kv отпускается сразу, последующие мутации не клонируют карту.
+    pub fn entries_snapshot(&self) -> Vec<(String, Arc<StoredValue>)> {
+        self.entries
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect()
     }
 
     pub fn restore(&mut self, key: String, v: StoredValue) {
         if v.expires > now_ms() {
-            self.entries_mut().insert(key, v);
+            self.entries.insert(key, Arc::new(v));
         }
     }
+}
+
+/// Сериализовать снапшот `KvStore` в JSON-объект `{"key": StoredValue, ...}`
+/// без выделения промежуточной `HashMap` и без копирования строк `StoredValue.value`
+/// (формат совместим с `load_kv`: `serde_json::from_str::<HashMap<String, StoredValue>>`).
+pub fn serialize_kv_snapshot(
+    snapshot: &[(String, Arc<StoredValue>)],
+) -> serde_json::Result<String> {
+    struct SnapshotMap<'a>(&'a [(String, Arc<StoredValue>)]);
+    impl serde::Serialize for SnapshotMap<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_map(self.0.iter().map(|(k, v)| (k.as_str(), v.as_ref())))
+        }
+    }
+    serde_json::to_string(&SnapshotMap(snapshot))
 }
 
 #[cfg(test)]
@@ -827,5 +844,70 @@ mod kv_sweep_tests {
         // ...and an already-dead entry is not resurrected.
         kv.store_replica("mail:dead:index", "v".into(), ttl, [7u8; 20], now - ttl - 1);
         assert!(kv.get("mail:dead:index").is_none());
+    }
+
+    #[test]
+    fn snapshot_and_concurrent_store_share_arc_without_deep_cloning_values() {
+        let mut kv = KvStore::default();
+        let ttl = 600_000;
+        let org1 = [1u8; NODEID_LEN];
+        let org2 = [2u8; NODEID_LEN];
+        let big_v1 = "a".repeat(8192);
+        kv.store("k1", big_v1.clone(), ttl, org1);
+        kv.store("k2", "v2-old".into(), ttl, org1);
+
+        // Держим первый снапшот живым (имитация in-flight spawn_blocking persist_kv)
+        // и параллельно мутируем другой ключ + добавляем новые ключи.
+        let snap1 = kv.entries_snapshot();
+        kv.store("k2", "v2-new".into(), ttl, org2);
+        kv.store("k3", "v3".into(), ttl, org2);
+        kv.store_replica("k4", "v4-rep".into(), ttl, org2, now_ms() - 1_000);
+
+        let snap2 = kv.entries_snapshot();
+
+        let arc1_k1 = &snap1.iter().find(|(k, _)| k == "k1").unwrap().1;
+        let arc2_k1 = &snap2.iter().find(|(k, _)| k == "k1").unwrap().1;
+        assert!(
+            Arc::ptr_eq(arc1_k1, arc2_k1),
+            "неизменённая запись k1 должна разделять тот же Arc<StoredValue> без глубокого клона"
+        );
+
+        let arc1_k2 = &snap1.iter().find(|(k, _)| k == "k2").unwrap().1;
+        let arc2_k2 = &snap2.iter().find(|(k, _)| k == "k2").unwrap().1;
+        assert!(
+            !Arc::ptr_eq(arc1_k2, arc2_k2),
+            "перезаписанная запись k2 должна получить новый Arc<StoredValue>"
+        );
+        assert_eq!(arc1_k2.value, "v2-old");
+        assert_eq!(arc2_k2.value, "v2-new");
+        drop(snap1);
+
+        // JSON round-trip (формат load_kv) должен быть 100% эквивалентен HashMap<String, StoredValue>.
+        let json = serialize_kv_snapshot(&snap2).expect("serialize snapshot");
+        let parsed_val: serde_json::Value = serde_json::from_str(&json).expect("json value");
+        let direct_val: serde_json::Value =
+            serde_json::to_value(kv.entries_clone()).expect("direct json");
+        assert_eq!(
+            parsed_val, direct_val,
+            "JSON-формат снапшота должен совпадать 1:1"
+        );
+
+        let decoded: HashMap<String, StoredValue> =
+            serde_json::from_str(&json).expect("load_kv decode");
+        let mut reloaded = KvStore::default();
+        for (k, v) in decoded {
+            reloaded.restore(k, v);
+        }
+        let orig = kv.entries_clone();
+        let back = reloaded.entries_clone();
+        assert_eq!(back.len(), orig.len());
+        for (k, ev) in &orig {
+            let av = back.get(k).expect("restored key present");
+            assert_eq!(av.value, ev.value);
+            assert_eq!(av.expires, ev.expires);
+            assert_eq!(av.origin, ev.origin);
+            assert_eq!(av.ttl_ms, ev.ttl_ms);
+            assert_eq!(av.stored_at, ev.stored_at);
+        }
     }
 }

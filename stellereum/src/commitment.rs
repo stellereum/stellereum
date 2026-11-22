@@ -136,6 +136,7 @@ pub enum Domain {
     Zkml,
     CnVrf,
     EvmBindings,
+    PqRegistry,
 }
 
 impl Domain {
@@ -179,6 +180,7 @@ impl Domain {
             Domain::Zkml => "zkml",
             Domain::CnVrf => "cnvrf",
             Domain::EvmBindings => "evm_bindings",
+            Domain::PqRegistry => "pq_registry",
         }
     }
 }
@@ -211,6 +213,7 @@ pub struct DomainGenerations {
     pub zkml: std::sync::atomic::AtomicU64,
     pub cnvrf: std::sync::atomic::AtomicU64,
     pub evm_bindings: std::sync::atomic::AtomicU64,
+    pub pq_registry: std::sync::atomic::AtomicU64,
 }
 
 impl DomainGenerations {
@@ -244,6 +247,9 @@ impl DomainGenerations {
         let v = self.load(Domain::EvmBindings);
         dst.counter(Domain::EvmBindings)
             .store(v, std::sync::atomic::Ordering::Release);
+        let v = self.load(Domain::PqRegistry);
+        dst.counter(Domain::PqRegistry)
+            .store(v, std::sync::atomic::Ordering::Release);
     }
 
     fn counter(&self, domain: Domain) -> &std::sync::atomic::AtomicU64 {
@@ -263,6 +269,7 @@ impl DomainGenerations {
             Domain::Zkml => &self.zkml,
             Domain::CnVrf => &self.cnvrf,
             Domain::EvmBindings => &self.evm_bindings,
+            Domain::PqRegistry => &self.pq_registry,
         }
     }
 
@@ -281,6 +288,7 @@ impl DomainGenerations {
         }
         self.bump(Domain::CnVrf);
         self.bump(Domain::EvmBindings);
+        self.bump(Domain::PqRegistry);
     }
 }
 
@@ -399,6 +407,7 @@ pub struct DomainCache {
     slots: [Option<DomainSlot>; 13],
     cnvrf_slot: Option<DomainSlot>,
     evm_bindings_slot: Option<DomainSlot>,
+    pq_registry_slot: Option<DomainSlot>,
     /// Per-contract ABI JSON cache (feeds the contracts domain).
     pub abi: AbiJsonCache,
     /// Domain-level hits (reused preimage) since creation / last reset.
@@ -413,6 +422,7 @@ impl DomainCache {
         match domain {
             Domain::CnVrf => self.cnvrf_slot.as_ref(),
             Domain::EvmBindings => self.evm_bindings_slot.as_ref(),
+            Domain::PqRegistry => self.pq_registry_slot.as_ref(),
             other => self.slots[other.index()].as_ref(),
         }
     }
@@ -422,6 +432,7 @@ impl DomainCache {
         match domain {
             Domain::CnVrf => &mut self.cnvrf_slot,
             Domain::EvmBindings => &mut self.evm_bindings_slot,
+            Domain::PqRegistry => &mut self.pq_registry_slot,
             other => &mut self.slots[other.index()],
         }
     }
@@ -475,6 +486,21 @@ impl DomainCache {
         self.evm_bindings_slot = Some(DomainSlot { generation, bytes });
     }
 
+    /// Fetch the cached PQ registry preimage without altering the 13-domain
+    /// benchmark/regression hit/miss counters.
+    pub fn get_pq_registry_silent(&self, generation: u64) -> Option<Vec<u8>> {
+        match &self.pq_registry_slot {
+            Some(slot) if slot.generation == generation => Some(slot.bytes.clone()),
+            _ => None,
+        }
+    }
+
+    /// Store the PQ registry preimage under its generation without altering the
+    /// 13-domain hit/miss counters.
+    pub fn put_pq_registry_silent(&mut self, generation: u64, bytes: Vec<u8>) {
+        self.pq_registry_slot = Some(DomainSlot { generation, bytes });
+    }
+
     /// Borrow a cached preimage when its generation still matches.
     ///
     /// Zero-copy twin of [`get`](Self::get): the hit/miss accounting is
@@ -520,6 +546,7 @@ impl DomainCache {
         self.slots.iter().filter(|s| s.is_some()).count()
             + usize::from(self.cnvrf_slot.is_some())
             + usize::from(self.evm_bindings_slot.is_some())
+            + usize::from(self.pq_registry_slot.is_some())
     }
 
     /// Reset counters (tests / diagnostics; entries are kept).
@@ -697,6 +724,20 @@ fn governance_digest<S: PreimageSink>(h: &mut S, g: &crate::governance::Governan
             put_bytes(h, b"gov_prop_action_upg_name", name.as_bytes());
             put_bytes(h, b"gov_prop_action_upg_sha", sha256);
         }
+        // R4/W4 fee split: tag + value alone cannot distinguish
+        // `{5000,3000,2000}` from `{6000,3000,1000}`, so all three bps are
+        // committed. Emitted ONLY for the appended variant, so every
+        // already-committed proposal keeps its preimage byte-for-byte.
+        if let crate::governance::GovAction::SetFeeSplitBps {
+            burn_bps,
+            proposer_bps,
+            staking_bps,
+        } = &p.action
+        {
+            put_u64(h, b"gov_prop_fee_split_burn_bps", *burn_bps);
+            put_u64(h, b"gov_prop_fee_split_proposer_bps", *proposer_bps);
+            put_u64(h, b"gov_prop_fee_split_staking_bps", *staking_bps);
+        }
         put_u64(h, b"gov_prop_created_at", p.created_at);
         put_u64(h, b"gov_prop_voting_end", p.voting_end);
         // u128 tallies: split, because put_u64 only carries 64 bits.
@@ -855,6 +896,7 @@ fn gov_action_tag(a: &crate::governance::GovAction) -> u64 {
         SetMinGasLimit(_) => 10,
         SoftwareUpgrade { .. } => 11,
         CancelUpgrade => 12,
+        SetFeeSplitBps { .. } => 13,
     }
 }
 
@@ -876,7 +918,8 @@ fn gov_action_value(a: &crate::governance::GovAction) -> u64 {
         | RegisterOraclePublisher(_)
         | UnregisterOraclePublisher(_)
         | ResetOracleBreaker
-        | CancelUpgrade => 0,
+        | CancelUpgrade
+        | SetFeeSplitBps { .. } => 0,
     }
 }
 
@@ -1296,6 +1339,24 @@ fn staking_digest<S: PreimageSink>(h: &mut S, l: &StakingLedger) {
             put_u64(h, b"relock_until", *until);
         }
     }
+
+    // Conditional withdrawal-address domain (W3): writes ZERO bytes when every
+    // validator has `withdrawal_address == None`, preserving pre-W3 KATs and
+    // COMMITMENT_VERSION == 5 byte-for-byte.
+    let mut withdrawals: Vec<(&[u8; 32], &[u8; 32])> = l
+        .validators
+        .iter()
+        .filter_map(|(id, s)| s.withdrawal_address.as_ref().map(|addr| (id, addr)))
+        .collect();
+    if !withdrawals.is_empty() {
+        withdrawals.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        put_bytes(h, b"staking_withdrawal_domain", b"STAKING_WITHDRAWAL_V1");
+        put_u64(h, b"withdrawal_len", withdrawals.len() as u64);
+        for (id, addr) in withdrawals {
+            put_addr(h, b"withdrawal_validator", id);
+            put_addr(h, b"withdrawal_address", addr);
+        }
+    }
 }
 
 fn unbonding_digest<S: PreimageSink>(h: &mut S, e: &UnbondingEntry) {
@@ -1589,6 +1650,60 @@ fn bridge_digest<S: PreimageSink>(h: &mut S, b: &crate::bridge::BridgeState) {
         put_u64(h, b"bridge_req_requested_at", w.requested_at);
         put_u64(h, b"bridge_req_unlock_at", w.unlock_at);
         put_bool(h, b"bridge_req_executed", w.executed);
+    }
+
+    // R4 BRIDGE V2 (`06_BRIDGE_RELEASE_AUTHORIZATION_DRAFT.md` §2.2):
+    // verified payout receipts decide whether a release repeats (the
+    // `processed_payout_txs` set is the replay guard) and the refund tombstone
+    // decides whether a late receipt can still settle. All three are
+    // deterministic `BTree*` containers, so two nodes with identical receipts
+    // hash identical bytes; an untouched domain writes nothing here and every
+    // genesis KAT stays byte-identical.
+    put_u64(
+        h,
+        b"bridge_release_receipts_len",
+        b.release_receipts.len() as u64,
+    );
+    for (req_id, r) in &b.release_receipts {
+        put_u64(h, b"bridge_receipt_req_id", *req_id);
+        put_u64(
+            h,
+            b"bridge_receipt_chain",
+            match r.target_chain {
+                crate::bridge::SupportedChain::Ton => 0,
+                crate::bridge::SupportedChain::Arbitrum => 1,
+                crate::bridge::SupportedChain::Ethereum => 2,
+                crate::bridge::SupportedChain::Solana => 3,
+            },
+        );
+        put_bytes(h, b"bridge_receipt_target", r.target_address.as_bytes());
+        put_u64(h, b"bridge_receipt_amount", r.amount);
+        put_addr(h, b"bridge_receipt_external_tx", &r.external_tx_hash);
+        put_u64(h, b"bridge_receipt_finalized_head", r.finalized_head);
+        put_u64(
+            h,
+            b"bridge_receipt_attestation_height",
+            r.attestation_height,
+        );
+        put_u64(h, b"bridge_receipt_settled_at", r.settled_at);
+    }
+
+    put_u64(
+        h,
+        b"bridge_payout_replay_len",
+        b.processed_payout_txs.len() as u64,
+    );
+    for tx in &b.processed_payout_txs {
+        put_addr(h, b"bridge_payout_tx", tx);
+    }
+
+    put_u64(
+        h,
+        b"bridge_refunded_len",
+        b.refunded_withdrawals.len() as u64,
+    );
+    for id in &b.refunded_withdrawals {
+        put_u64(h, b"bridge_refunded_req_id", *id);
     }
 }
 
@@ -2092,6 +2207,57 @@ pub fn evm_bindings_digest(s: &crate::state_engine::EvmBindingsState) -> [u8; 32
     h.finalize().into()
 }
 
+/// Canonical PQ key registry domain commitment writer (`Domain::PqRegistry`).
+///
+/// CONDITIONAL DOMAIN: when `r.is_empty()`, emits ZERO bytes so pre-activation
+/// genesis roots and `COMMITMENT_VERSION` remain 100% unchanged.
+/// Iterates `r.records()` (`BTreeMap`) in deterministic validator-id order and
+/// commits every field (`scheme`, `pubkey`, `activated_at`, `next_seq`,
+/// `pending`, `history`).
+pub fn write_pq_registry_domain<S: PreimageSink>(h: &mut S, r: &crate::pq_registry::PqRegistry) {
+    if r.is_empty() {
+        return;
+    }
+    put_bytes(h, b"pq_registry_domain", b"PQ_REGISTRY_V1");
+    put_u64(h, b"pq_registry_len", r.records().len() as u64);
+    for (validator, rec) in r.records() {
+        put_addr(h, b"pq_rec_validator", validator);
+        put_u64(h, b"pq_rec_scheme", rec.scheme.id() as u64);
+        put_bytes(h, b"pq_rec_pubkey", &rec.pubkey);
+        put_u64(h, b"pq_rec_activated_at", rec.activated_at);
+        put_u64(h, b"pq_rec_next_seq", rec.next_seq);
+        match &rec.pending {
+            Some(p) => {
+                put_bool(h, b"pq_rec_has_pending", true);
+                put_u64(h, b"pq_pending_scheme", p.scheme.id() as u64);
+                put_bytes(h, b"pq_pending_pubkey", &p.pubkey);
+                put_u64(h, b"pq_pending_announced", p.announced_height);
+                put_u64(h, b"pq_pending_effective", p.effective_height);
+            }
+            None => put_bool(h, b"pq_rec_has_pending", false),
+        }
+        put_u64(h, b"pq_rec_history_len", rec.history.len() as u64);
+        for item in &rec.history {
+            put_u64(h, b"pq_hist_scheme", item.scheme.id() as u64);
+            put_bytes(h, b"pq_hist_pubkey", &item.pubkey);
+            put_u64(h, b"pq_hist_activated_at", item.activated_at);
+            put_u64(h, b"pq_hist_superseded_at", item.superseded_at);
+        }
+    }
+}
+
+/// PQ key registry domain preimage (zero bytes while empty).
+pub fn pq_registry_preimage(r: &crate::pq_registry::PqRegistry) -> Vec<u8> {
+    capture(|h| write_pq_registry_domain(h, r))
+}
+
+/// Standalone digest of the PQ key registry domain.
+pub fn pq_registry_digest(r: &crate::pq_registry::PqRegistry) -> [u8; 32] {
+    let mut h = Sha256::new();
+    write_pq_registry_domain(&mut h, r);
+    h.finalize().into()
+}
+
 /// Assemble the full §2-aware commitment digest from per-domain preimage
 /// bytes (digest order = [`Domain::ALL`]).
 ///
@@ -2137,12 +2303,28 @@ pub fn assemble_cached_digest_with_cnvrf_and_minted(
 /// canonical `Domain::EvmBindings` preimage bytes.
 ///
 /// Byte-identical to [`assemble_cached_digest_with_cnvrf_and_minted`] when
-/// `evm_bindings` is empty (0 bytes).
+/// `evm_bindings` is empty (0 bytes), and to [`assemble_cached_digest_with_all_domains`]
+/// when `pq_registry` is empty (0 bytes).
 pub fn assemble_cached_digest_with_cnvrf_minted_and_evm_bindings(
     domains: [&[u8]; 13],
     cnvrf: &[u8],
     total_minted_nano: u64,
     evm_bindings: &[u8],
+) -> [u8; 32] {
+    assemble_cached_digest_with_all_domains(domains, cnvrf, total_minted_nano, evm_bindings, &[])
+}
+
+/// Full cached commitment assembly across all domains including `CnVrf`,
+/// `total_minted_nano`, `EvmBindings`, and `PqRegistry`.
+///
+/// Byte-identical to [`assemble_cached_digest_with_cnvrf_minted_and_evm_bindings`]
+/// when `pq_registry` is empty (0 bytes).
+pub fn assemble_cached_digest_with_all_domains(
+    domains: [&[u8]; 13],
+    cnvrf: &[u8],
+    total_minted_nano: u64,
+    evm_bindings: &[u8],
+    pq_registry: &[u8],
 ) -> [u8; 32] {
     let mut h = Sha256::new();
     put_u64(&mut h, b"COMMITMENT_VERSION", COMMITMENT_VERSION as u64);
@@ -2154,6 +2336,7 @@ pub fn assemble_cached_digest_with_cnvrf_minted_and_evm_bindings(
         put_u64(&mut h, b"total_minted_nano", total_minted_nano);
     }
     h.update(evm_bindings);
+    h.update(pq_registry);
     h.finalize().into()
 }
 
@@ -2256,13 +2439,40 @@ pub fn commitment_digest_with_zkml_cnvrf_and_evm_bindings(
 }
 
 /// Full live-path commitment digest including conditional CN-VRF v3,
-/// `total_minted_nano`, and `Domain::EvmBindings` in canonical tail order.
+/// `total_minted_nano`, and `Domain::EvmBindings` in canonical tail order
+/// (with an empty `PqRegistry`).
 pub fn commitment_digest_with_zkml_cnvrf_minted_and_evm_bindings(
     s: &CommitmentSnapshot,
     zkml_models: &crate::zkml::ZkMlModelRegistry,
     cnvrf: &crate::state_engine::CnVrfV3EngineSnapshot,
     total_minted_nano: u64,
     evm_bindings: &crate::state_engine::EvmBindingsState,
+) -> [u8; 32] {
+    let empty_pq = crate::pq_registry::PqRegistry::default();
+    commitment_digest_with_all_domains(
+        s,
+        zkml_models,
+        cnvrf,
+        total_minted_nano,
+        evm_bindings,
+        &empty_pq,
+    )
+}
+
+/// Full live-path commitment digest across all domains including conditional
+/// CN-VRF v3, `total_minted_nano`, `Domain::EvmBindings`, and `Domain::PqRegistry`.
+///
+/// Byte-identical to [`commitment_digest_with_zkml_cnvrf_minted_and_evm_bindings`]
+/// when `pq_registry` is empty.
+#[allow(clippy::too_many_arguments)]
+// GATE: full-domain streaming commitment entry taking all independent non-trie domains.
+pub fn commitment_digest_with_all_domains(
+    s: &CommitmentSnapshot,
+    zkml_models: &crate::zkml::ZkMlModelRegistry,
+    cnvrf: &crate::state_engine::CnVrfV3EngineSnapshot,
+    total_minted_nano: u64,
+    evm_bindings: &crate::state_engine::EvmBindingsState,
+    pq_registry: &crate::pq_registry::PqRegistry,
 ) -> [u8; 32] {
     let mut h = Sha256::new();
     commitment_digest_into(&mut h, s);
@@ -2278,6 +2488,7 @@ pub fn commitment_digest_with_zkml_cnvrf_minted_and_evm_bindings(
         put_u64(&mut h, b"total_minted_nano", total_minted_nano);
     }
     write_evm_bindings_domain(&mut h, evm_bindings);
+    write_pq_registry_domain(&mut h, pq_registry);
     h.finalize().into()
 }
 
@@ -2766,6 +2977,7 @@ mod tests {
                     total_slashed: 0,
                     missed: 0,
                     last_downtime_penalty: 0,
+                    withdrawal_address: None,
                 },
             );
         }

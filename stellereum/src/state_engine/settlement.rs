@@ -5,8 +5,26 @@ use super::types::{
 use super::{AccountState, ActorMessage, InMemoryStateEngine};
 use crate::token::{TokenOp, TokenRegistry};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// S4 perf instrumentation: how many times a CLOB settlement cloned the WHOLE
+/// token registry to plan against a private copy.
+///
+/// The consensus apply paths own a payload-domain snapshot and therefore run
+/// the plan on the live registry (`stage_tokens == false`), so this counter
+/// must stay flat for them; only a caller that cannot restore the registry
+/// (the standalone/RPC execution entry points) pays for the clone. Purely
+/// observational: relaxed, no state root, never read by execution code.
+static SETTLE_TOKEN_STAGE_CLONES: AtomicU64 = AtomicU64::new(0);
 
 impl InMemoryStateEngine {
+    /// S4 perf instrumentation: number of whole-`TokenRegistry` clones taken
+    /// by `settle_clob_effects` planning (see `SETTLE_TOKEN_STAGE_CLONES`).
+    #[doc(hidden)]
+    pub fn perf_s4_token_stage_clones() -> u64 {
+        SETTLE_TOKEN_STAGE_CLONES.load(Ordering::Relaxed)
+    }
+
     // ==================== CLOB settlement (A7) ====================
 
     /// Quote value (wUSDT micro-units) for `base_nano` STELL at `price_micro` USD.
@@ -814,13 +832,17 @@ impl InMemoryStateEngine {
     /// both apply the IDENTICAL settlement; `ctx.trades` (the fills the VM
     /// recorded) reach it as `ClobEvent::Place::trades`.
     ///
-    /// ALL-OR-NOTHING. Everything is planned against private copies first (the
-    /// escrow working map, the staged token registry, projected native
-    /// balances) and the whole plan is validated before a single balance moves;
-    /// only then are the native movements applied under the accounts write lock
-    /// with an undo log and the staged copies committed. A refused settlement
-    /// therefore changes nothing anywhere - the caller only has to roll the
-    /// BOOK back, because the VM already committed that (see `execute_payload`).
+    /// ALL-OR-NOTHING. Everything is planned before a single balance moves: the
+    /// escrow working map and the projected native balances are private copies,
+    /// and the token ops run either against a private copy of the registry
+    /// (`stage_tokens`) or against the live registry when the CALLER owns a
+    /// full domain snapshot and restores it on `Err` (`!stage_tokens`, S4 -
+    /// avoids cloning every token and balance for a plan that is then thrown
+    /// away). Only after the whole plan is validated are the native movements
+    /// applied under the accounts write lock with an undo log. A refused
+    /// settlement therefore changes nothing the caller cannot restore; on the
+    /// in-place path the token writes it did perform are part of the
+    /// payload's domains and are reverted by `rollback_payload`.
     ///
     /// Quote conventions: `mode` decides what a TAKER pays out of its live
     /// balance (the SVM path pays native, because that is what its `order_cost`
@@ -844,13 +866,29 @@ impl InMemoryStateEngine {
         escrow: &mut HashMap<(u32, u64), EscrowRecord>,
         sender: [u8; 32],
         reserve_floor: u64,
+        stage_tokens: bool,
         order_absent: impl Fn(u32, u64) -> bool,
     ) -> Result<Vec<([u8; 32], Option<(u64, u64)>)>, String> {
         use crate::orderbook::{ClobEvent, OrderSide, OrderType};
 
-        // ---- Phase 1: plan on private copies, validate the whole plan -------
+        // ---- Phase 1: plan first, validate the whole plan -------------------
         let mut work = escrow.clone();
-        let mut staged = tokens.clone();
+        // S4: clone the WHOLE token registry (every token, every balance) only
+        // when the caller cannot restore it itself. The consensus apply paths
+        // pass `stage_tokens == false`: they hold a pre-payload domain snapshot
+        // and `rollback_payload` reverts whatever a refused plan wrote, which
+        // is the same end state this private copy provides. Everything below
+        // works on `staged` either way, so the plan logic is untouched.
+        let mut staged_owned: Option<TokenRegistry> = if stage_tokens {
+            SETTLE_TOKEN_STAGE_CLONES.fetch_add(1, Ordering::Relaxed);
+            Some(tokens.clone())
+        } else {
+            None
+        };
+        let staged: &mut TokenRegistry = match staged_owned.as_mut() {
+            Some(owned) => owned,
+            None => &mut *tokens,
+        };
         let mut native_moves: Vec<NativeMove> = Vec::new();
         let mut token_touched: HashSet<[u8; 32]> = HashSet::new();
         let mut supply_dirty = false;
@@ -879,30 +917,32 @@ impl InMemoryStateEngine {
             };
         }
 
-        // One token operation against the staged registry. Failures here happen
-        // during planning, so the real registry has not been touched yet.
-        let mut tok_op = |caller: [u8; 32], op: TokenOp| -> Result<(), String> {
-            let q = qid.ok_or_else(|| "CLOB settlement: quote token not configured".to_string())?;
-            match &op {
-                TokenOp::Transfer { to, .. } => {
-                    token_touched.insert(caller);
-                    token_touched.insert(*to);
+        // One token operation against the planning registry (the private copy
+        // when one was taken, the live registry otherwise). Failures here
+        // happen during planning; a restorable caller reverts what landed.
+        let mut tok_op =
+            |reg: &mut TokenRegistry, caller: [u8; 32], op: TokenOp| -> Result<(), String> {
+                let q =
+                    qid.ok_or_else(|| "CLOB settlement: quote token not configured".to_string())?;
+                match &op {
+                    TokenOp::Transfer { to, .. } => {
+                        token_touched.insert(caller);
+                        token_touched.insert(*to);
+                    }
+                    TokenOp::Mint { to, .. } => {
+                        token_touched.insert(*to);
+                        supply_dirty = true;
+                    }
+                    TokenOp::Burn { from, .. } => {
+                        token_touched.insert(*from);
+                        supply_dirty = true;
+                    }
+                    _ => {}
                 }
-                TokenOp::Mint { to, .. } => {
-                    token_touched.insert(*to);
-                    supply_dirty = true;
-                }
-                TokenOp::Burn { from, .. } => {
-                    token_touched.insert(*from);
-                    supply_dirty = true;
-                }
-                _ => {}
-            }
-            staged
-                .execute(&q, caller, op)
-                .map_err(|e| format!("CLOB settlement: token op failed: {e}"))?;
-            Ok(())
-        };
+                reg.execute(&q, caller, op)
+                    .map_err(|e| format!("CLOB settlement: token op failed: {e}"))?;
+                Ok(())
+            };
         let minter_or_err = || -> Result<[u8; 32], String> {
             minter.ok_or_else(|| "CLOB settlement: quote token not configured".to_string())
         };
@@ -951,6 +991,7 @@ impl InMemoryStateEngine {
                                     let take = rec.locked_quote_wusdt.min(q);
                                     rec.locked_quote_wusdt -= take;
                                     tok_op(
+                                        &mut *staged,
                                         minter_or_err()?,
                                         TokenOp::Mint {
                                             to: buyer,
@@ -1004,6 +1045,7 @@ impl InMemoryStateEngine {
                             if pays_wusdt {
                                 work.get_mut(&mkey).unwrap().locked_quote_wusdt -= q;
                                 tok_op(
+                                    &mut *staged,
                                     minter_or_err()?,
                                     TokenOp::Mint {
                                         to: seller,
@@ -1016,6 +1058,7 @@ impl InMemoryStateEngine {
                             }
                         } else if pays_wusdt {
                             tok_op(
+                                &mut *staged,
                                 buyer,
                                 TokenOp::Transfer {
                                     to: seller,
@@ -1116,6 +1159,7 @@ impl InMemoryStateEngine {
                         credit!(*trader, native, "cancel refund");
                         if rec.locked_quote_wusdt > 0 {
                             tok_op(
+                                &mut *staged,
                                 minter_or_err()?,
                                 TokenOp::Mint {
                                     to: *trader,
@@ -1149,14 +1193,19 @@ impl InMemoryStateEngine {
         drop(live);
 
         // ---- Phase 2: commit the plan -------------------------------------
-        // 1) Native first: it is the only leg that can still fail (everything
-        //    else was validated against a private copy and is infallible).
+        // 1) Native first: it is the only leg that can still fail (the rest of
+        //    the plan was validated above and is infallible; on the in-place
+        //    path the token writes already landed on the live registry and a
+        //    refusal here is the caller's to roll back).
         //    The snapshot is the caller's undo record if the enclosing
         //    transaction is refused after this leg (same shape and purpose as
         //    `pmm_native_snapshot`).
         let (touched, clob_snapshot) = self.apply_native_moves(&native_moves).await?;
-        // 2) Staged copies become the truth.
-        *tokens = staged;
+        // 2) A private staging copy, when one was taken, becomes the truth; an
+        //    in-place run (restorable caller) already wrote the live registry.
+        if let Some(owned) = staged_owned {
+            *tokens = owned;
+        }
         *escrow = work;
         // 3) Trie writes. Nothing below can fail.
         let mut trie = self.state_trie.write().await;

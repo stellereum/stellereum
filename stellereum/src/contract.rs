@@ -36,6 +36,7 @@ use crate::contract_abi::{AbiError, AbiValue, ContractAbi};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 use wasmi::{
     Config, Engine, Extern, ExternType, Instance, Linker, Memory, Module, Store, StoreLimits,
@@ -602,6 +603,19 @@ impl ContractRegistry {
         Self::default()
     }
 
+    /// S4 perf instrumentation: number of host `Linker` instances this
+    /// process has built.
+    ///
+    /// The shared `contract_engine` linker is built ONCE and reused for
+    /// every validation, read-only getter and hardened consensus call, so this
+    /// counter must stay flat across repeated calls of those paths (the
+    /// regression pinned by `tests/perf_s4_contract_linker.rs`). Purely
+    /// observational: never read by execution or consensus code.
+    #[doc(hidden)]
+    pub fn perf_s4_host_linker_builds() -> u64 {
+        HOST_LINKER_BUILDS.load(Ordering::Relaxed)
+    }
+
     /// Calculate deploy gas / validation costs scaling with bytecode size:
     /// `GAS_DEPLOY_BASE + bytes * GAS_PER_BYTE`.
     #[inline(always)]
@@ -655,7 +669,9 @@ impl ContractRegistry {
         };
         let mut store = Store::new(engine, host);
         store.limiter(|s| &mut s.limits);
-        let linker = host_linker(engine);
+        // Shared, immutable host linker for the process-wide engine: the same
+        // definitions every invocation, built once (S4 perf).
+        let linker = contract_linker();
         // A missing import, or a start function that traps, is a deploy-time error.
         linker
             .instantiate_and_start(&mut store, &module)
@@ -718,7 +734,7 @@ impl ContractRegistry {
         store
             .set_fuel(validate_fuel)
             .map_err(|_| ContractError::OutOfFuel)?;
-        let linker = host_linker(engine);
+        let linker = contract_linker();
         linker
             .instantiate_and_start(&mut store, &module)
             .map_err(|e| {
@@ -1471,7 +1487,7 @@ impl ContractRegistry {
             );
         }
 
-        let linker = host_linker(engine);
+        let linker = contract_linker();
         let instance = match linker.instantiate_and_start(&mut store, &module) {
             Ok(inst) => inst,
             Err(e) => {
@@ -1788,6 +1804,32 @@ fn module_cache() -> &'static RwLock<CompiledModuleCache> {
     CONTRACT_MODULE_CACHE.get_or_init(|| RwLock::new(CompiledModuleCache::new()))
 }
 
+/// Process-wide cache of the host [`Linker`] for the shared [`contract_engine`].
+///
+/// `Linker::instantiate_and_start` takes `&self` and holds no per-call
+/// state, so ONE linker built over the process-wide engine is reusable for
+/// every invocation: the per-invocation isolation lives in the
+/// `Store`/`Instance` (see [`HostState`]), not in the linker. The linker
+/// references the engine it was built for (`assert!(Engine::same(..))` on
+/// instantiate), which is why only `contract_engine()` — a `OnceLock`
+/// singleton — can use it; the pre-R1 `consensus_contract_engine()` is
+/// created per call and must keep building its own.
+static CONTRACT_LINKER: OnceLock<Linker<HostState>> = OnceLock::new();
+
+/// S4 perf instrumentation: how many host linkers this process has built.
+///
+/// Building a linker registers 14 host functions (string interning + a
+/// fresh `Func`/trampoline `Arc` each), so it is deliberately paid once for
+/// the shared engine. Exposed via
+/// [`ContractRegistry::perf_s4_host_linker_builds`]; not part of consensus
+/// state and never read on the execution path.
+static HOST_LINKER_BUILDS: AtomicU64 = AtomicU64::new(0);
+
+/// Return the cached host linker for the shared [`contract_engine`].
+fn contract_linker() -> &'static Linker<HostState> {
+    CONTRACT_LINKER.get_or_init(|| host_linker(contract_engine()))
+}
+
 /// Compile or retrieve a cached `wasmi::Module` keyed by `blake3(code)`.
 ///
 /// Only successfully parsed and validated modules enter the cache; invalid WASM
@@ -1918,6 +1960,7 @@ fn write_wasm_memory(
 /// Anything outside this list is unresolvable, which is what makes the sandbox
 /// closed: no clock, no network, no filesystem, no host memory.
 fn host_linker(engine: &Engine) -> Linker<HostState> {
+    HOST_LINKER_BUILDS.fetch_add(1, Ordering::Relaxed);
     let mut linker = <Linker<HostState>>::new(engine);
     let _ = linker.func_wrap(
         "host",
@@ -2494,7 +2537,18 @@ pub fn run_contract_hardened(
     store.limiter(|s| &mut s.limits);
     store.set_fuel(fuel).map_err(|_| ContractError::OutOfFuel)?;
 
-    let linker = host_linker(engine);
+    // `hardened` runs on the shared `contract_engine()`, whose host linker is
+    // built once and reused (S4 perf); the pre-R1 path owns a per-call engine
+    // and therefore must build its own linker over it.
+    let per_call_linker = if hardened {
+        None
+    } else {
+        Some(host_linker(engine))
+    };
+    let linker: &Linker<HostState> = match &per_call_linker {
+        Some(built) => built,
+        None => contract_linker(),
+    };
     let instance = linker
         .instantiate_and_start(&mut store, &module)
         .map_err(|e| {

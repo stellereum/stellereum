@@ -235,6 +235,29 @@ P0-LOCK-WATERMARK: локально реализован `SafetyAuthority` (`ste
 
 Проверено и **не подтверждено** на текущем дереве (ревью опиралось на код до hardening-гейтов; добавлены тесты-пины, чтобы не «починили» обратно): PQ-oracle rollback (`review_exec_pq_oracle_revert.rs`), `SysCallCallContractArgs` в снапшоте, публикация сообщений контракта до `commit_native`, bridge-opcode после `Halt` (`r1_frozen_apply_svm_tests`).
 
+## Аудит безопасности и оптимизаций (2026-11-23)
+
+| ID | Находка | Статус |
+|---|---|---|
+| SEC-VOTE-CACHE-DOS | **HIGH.** Ключ verified-vote кэша содержал полную подпись из сети; лимит был по числу записей, не по байтам. Публичные id + подпись до 32 MiB → десятки «голосов» раздували память ноды без ключа. | **FIXED (локально, не задеплоено)**: каноническая длина проверяется до построения ключа; вердикт не изменился, такой голос просто не кэшируется. Тест `sec_s3_vote_cache_dos_tests.rs`. |
+| SEC-SLASH-EVIDENCE-SCOPE | **MED.** Примитивы слэша не сверяли `shard_id`/`round` evidence с самим нарушением, хотя dedup-ключ их включал → повторный 5% burn за то же нарушение и false-slash на cross-round паре. | **FIXED (локально)**: проверки приведены к `verify_*_evidence`; в block-path и раньше отсекалось каноникализацией. Тесты `sec_s3_slash_envelope_scope_tests.rs`. |
+| SEC-INFNODE-HANDSHAKE-MAP | **HIGH.** `handshake_buckets` ограничивался `rate × 5 мин`; IPv6 /64 без аутентификации → неограниченный рост → OOM. | **FIXED (локально)**: кап 4096 + reaper + LRU. |
+| SEC-INFNODE-PEER-PROTOCOL-MAP | **MED.** Вердикты `peer_protocol` не чистились; ротация дешёвых Falcon-id росла вечно. | **FIXED**: кап 4096, `(state, Instant)`, вытеснение старейшего. |
+| SEC-INFNODE-AUTH-BANS | **MED.** «Живые» баны не вытеснялись; истёкшие без повторного IP оставались. | **FIXED**: кап 8192, вытеснение ближайшего к истечению. |
+| SEC-DHT-FIND-NODE-UNCAPPED | **MED.** Ответ `dht.find_node` обходился без лимита до валидации → десятки МБ `NodeInfo` с одного пира. | **FIXED**: `parse_dht_node_list` режет до `MAX_ROUTES_PER_UPDATE` до аллокаций. |
+| SEC-DHT-STORE-KV-BYPASS | **MED.** `dht.store` без `stored_at` шёл в локальный writer и обходил `MAX_KV_ENTRIES/BYTES`. | **FIXED**: `store_replica` с capacity-check, отказ `ok:false`. |
+| SEC-REP-SHARD-CAP | **MED.** Репутационный шард вставлял запись даже на «hard cap». | **FIXED**: вытеснение при капе. |
+| SEC-MIME-DEPTH | **MED.** MIME-парсер рекурсировал по `multipart/*` без глубины → stack overflow от одного письма. | **FIXED**: `MAX_MIME_DEPTH=16`. |
+| SEC-SNAP-UNIT-TAG-PANIC | **MED.** `group_units_by_tag` индексировал массив невалидным `unit_tag` из персистентного манифеста → panic при restore. | **FIXED**: `Result` + `UnknownUnitTag` до индексации. |
+| SEC-SNAP-MERKLE-DUP-LAST | **LOW, ACTIVATION.** Duplicate-last правило позволяет переlabelить proof в дерево большего размера; production verifier не вызывается. | **ACTIVATION-REQUIRED** (меняет digest манифеста / v4 checkpoint). |
+| SEC-PQ-EVIDENCE-SHARD | **MED, ACTIVATION.** PQ-evidence всегда использует masterchain-preimage; double-sign в другом шарде непроверяем → непунishable. | **ACTIVATION-REQUIRED** (wire: `shard_id` в evidence + новая dedup-домен). |
+| SEC-GOV-OPEN-PROPOSALS | **LOW, ACTIVATION.** Нет кэпа открытых proposal'ов → O(#proposals) на блок и рост состояния. | **ACTIVATION-REQUIRED** (admission policy). |
+| SEC-GOV-LEGACY-FINALIZE | **LOW.** Height-less `Governance::finalize` может дать `Passed` без timelock-записи. Живого вызова нет. | Report-only (убрать в следующем форке). |
+| SEC-SNAP-TIP-SKIP | **LOW.** При отсутствии `finalized_post_root_v1` снапшот принимается без внешнего anchor (spec-pinned compat). | Report-only; окно только при локальной записи/порче. |
+| SEC-DNS-BAILIWICK | **LOW.** Парсер принимает TXT с чужим owner-name; id всё равно должен выводиться из Falcon-ключа (≤32 пиров). | Report-only (fail-closed по ключу). |
+| SEC-DNS-LOOKUP-TIMEOUT | **LOW.** `resolve_peer_endpoints` без таймаута на хост; враждебная seed-зона может затянуть фоновый проход. | Report-only. |
+| PERF-S4-HOTPATH | 5 безопасных оптимизаций: один governance-снапшот, CLOB без клона `TokenRegistry` на консенсусных путях, без deep-clone `ClobEvent`, read-only mailbox fast path, `Linker` через `OnceLock`. | **FIXED (локально)**: counting-тесты `perf_s4_*`; wall-clock не измерялся. |
+
 ## Правило закрытия
 
 Дефект считается закрытым только если: (1) есть тест, падающий на коде до фикса;

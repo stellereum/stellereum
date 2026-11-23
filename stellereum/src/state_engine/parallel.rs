@@ -1343,7 +1343,7 @@ impl InMemoryStateEngine {
                                         .await,
                                 );
                                 match self
-                                    .execute_payload_with_preverify_at_height_and_parent(
+                                    .execute_payload_with_preverify_at_height_and_parent_restorable(
                                         tx,
                                         timestamp,
                                         chain_height,
@@ -1591,7 +1591,7 @@ impl InMemoryStateEngine {
                             .await,
                     );
                     match self
-                        .execute_payload_with_preverify_at_height_and_parent(
+                        .execute_payload_with_preverify_at_height_and_parent_restorable(
                             tx,
                             timestamp,
                             chain_height,

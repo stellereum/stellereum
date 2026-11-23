@@ -12,7 +12,40 @@ use super::{
 };
 use crate::token::TokenRegistry;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// ============================================================================
+// S4 perf instrumentation (observational only)
+// ============================================================================
+//
+// These counters exist so the regression tests can PIN a structural property
+// of the execution hot path ("one governed-policy snapshot per payload", "the
+// actor mailbox pass takes no write lock on the common block") instead of
+// relying on wall-clock timings. They are plain relaxed atomics on cold
+// branches - no ordering, no state root, no return value depends on them - and
+// are only ever read by `#[doc(hidden)]` accessors below.
+
+/// How many times one PAYLOAD resolved its governed policy snapshot.
+static GOV_PAYLOAD_SNAPSHOTS: AtomicU64 = AtomicU64::new(0);
+/// How many blocks took the read-only "no queued actor message" fast path.
+static ACTOR_MAILBOX_READ_FAST_PATHS: AtomicU64 = AtomicU64::new(0);
+
+impl InMemoryStateEngine {
+    /// S4 perf instrumentation: governed-policy snapshots taken per payload
+    /// execution (must be exactly one - `tests/perf_s4_execution_hot_path.rs`).
+    #[doc(hidden)]
+    pub fn perf_s4_gov_payload_snapshots() -> u64 {
+        GOV_PAYLOAD_SNAPSHOTS.load(Ordering::Relaxed)
+    }
+
+    /// S4 perf instrumentation: block mailbox passes that returned from the
+    /// read-only "nothing queued" check without taking the accounts write
+    /// lock.
+    #[doc(hidden)]
+    pub fn perf_s4_actor_mailbox_read_fast_paths() -> u64 {
+        ACTOR_MAILBOX_READ_FAST_PATHS.load(Ordering::Relaxed)
+    }
+}
 
 impl InMemoryStateEngine {
     /// Asynchronously send a message to an actor's inbox
@@ -493,6 +526,10 @@ impl InMemoryStateEngine {
     /// includes `cross_shard_out`), so it cannot be known before the payloads
     /// run. The parent is identical on every node applying the same block and
     /// across repeated executions of that block.
+    ///
+    /// S4: standalone callers keep the conservative "the payload may not be
+    /// restorable" execution mode (see
+    /// `execute_payload_with_preverify_at_height_and_parent_restorable`).
     // GATE: execution snapshot uses account tuple layout shared with commit path.
     pub async fn execute_payload_with_preverify_at_height_and_parent(
         &self,
@@ -500,6 +537,49 @@ impl InMemoryStateEngine {
         timestamp: u64,
         chain_height: u64,
         parent_block_hash: [u8; 32],
+    ) -> Result<(crate::svm::VmExecutionResult, ExecPostActions), String> {
+        self.execute_payload_inner(tx, timestamp, chain_height, parent_block_hash, false)
+            .await
+    }
+
+    /// [`Self::execute_payload_with_preverify_at_height_and_parent`] for a
+    /// caller that ALREADY snapshotted this payload's consensus domains
+    /// ([`Self::snapshot_payload_domains_at`]) and restores them through
+    /// [`Self::rollback_payload`] on every `Err`.
+    ///
+    /// The ONLY difference is which atomicity mechanism the CLOB settlement
+    /// uses (S4): with a restorable caller, `settle_clob_effects` applies its
+    /// token ops to the live registry instead of first cloning the WHOLE
+    /// `TokenRegistry` (every token, every balance) for a plan it then throws
+    /// away. A refused plan leaves partial token writes behind, which the
+    /// caller's domain restore reverts exactly like every other payload
+    /// effect - the committed state root is identical either way.
+    ///
+    /// Both consensus apply paths (single-transaction and block) satisfy the
+    /// contract: each takes `snapshot_payload_domains_at` before calling and
+    /// rolls back on `Err`.
+    // A refused CLOB plan on this path restores via `rollback_payload`, hence
+    // the boolean name: the domains ARE restorable here.
+    pub(super) async fn execute_payload_with_preverify_at_height_and_parent_restorable(
+        &self,
+        tx: &crate::sharding::Transaction,
+        timestamp: u64,
+        chain_height: u64,
+        parent_block_hash: [u8; 32],
+    ) -> Result<(crate::svm::VmExecutionResult, ExecPostActions), String> {
+        self.execute_payload_inner(tx, timestamp, chain_height, parent_block_hash, true)
+            .await
+    }
+
+    /// Shared body of the payload entry points (see the two public wrappers
+    /// above and [`Self::execute_payload`]).
+    async fn execute_payload_inner(
+        &self,
+        tx: &crate::sharding::Transaction,
+        timestamp: u64,
+        chain_height: u64,
+        parent_block_hash: [u8; 32],
+        domains_restorable: bool,
     ) -> Result<(crate::svm::VmExecutionResult, ExecPostActions), String> {
         let exec_hardening = crate::chain_spec::exec_hardening_v1_active_at(chain_height);
         let wasm_pmm_hardening =
@@ -850,6 +930,33 @@ impl InMemoryStateEngine {
             }
         }
 
+        // Governed policy for THIS payload: the PMM redemption buffer and the
+        // two staking parameters the VM context needs, resolved from ONE
+        // governance read (S4). They used to take three separate read guards
+        // inside the struct literal below; one snapshot is both cheaper and
+        // strictly more deterministic - every syscall of a payload already
+        // had to see the same policy ("Read once per transaction (not per
+        // opcode) so the policy cannot change mid-execution"), and three
+        // separate acquisitions could in principle straddle a concurrent
+        // writer. Consensus state cannot move mid-transaction here (payloads
+        // apply one at a time), so the values are bit-identical to the live
+        // reads they replace.
+        let (gov_pmm_buffer_bps, gov_min_validator_bond, gov_default_commission_bps) = {
+            let gov = self.governance.read().await;
+            (
+                gov.applied
+                    .pmm_redemption_buffer_bps
+                    .unwrap_or(crate::pmm::PMM_REDEMPTION_BUFFER_BPS),
+                gov.applied
+                    .min_validator_bond
+                    .unwrap_or(crate::staking::MIN_VALIDATOR_BOND),
+                gov.applied
+                    .default_commission_bps
+                    .unwrap_or(crate::staking::DEFAULT_COMMISSION_BPS),
+            )
+        };
+        GOV_PAYLOAD_SNAPSHOTS.fetch_add(1, Ordering::Relaxed);
+
         let mut ctx = crate::svm::VmContext {
             sender: tx.from,
             balance: sender_balance,
@@ -875,29 +982,14 @@ impl InMemoryStateEngine {
                 state: &mut pmm,
                 usdt_token: *self.pmm_usdt_token.read().await,
                 treasury: *self.pmm_treasury.read().await,
-                redemption_buffer_bps: {
-                    let gov = self.governance.read().await;
-                    gov.applied
-                        .pmm_redemption_buffer_bps
-                        .unwrap_or(crate::pmm::PMM_REDEMPTION_BUFFER_BPS)
-                },
+                redemption_buffer_bps: gov_pmm_buffer_bps,
                 events: Vec::new(),
             }),
             // Governed staking policy, resolved here so every SysCallStake in this
             // transaction sees the same values. Read once per transaction (not per
             // opcode) so the policy cannot change mid-execution.
-            min_validator_bond: {
-                let gov = self.governance.read().await;
-                gov.applied
-                    .min_validator_bond
-                    .unwrap_or(crate::staking::MIN_VALIDATOR_BOND)
-            },
-            default_commission_bps: {
-                let gov = self.governance.read().await;
-                gov.applied
-                    .default_commission_bps
-                    .unwrap_or(crate::staking::DEFAULT_COMMISSION_BPS)
-            },
+            min_validator_bond: gov_min_validator_bond,
+            default_commission_bps: gov_default_commission_bps,
             payouts: Vec::new(),
             // The committed oracle, so `SysCallSubmitPriceFeed` and the
             // `SysCallPlaceOrder` priority gates read and write consensus
@@ -1373,31 +1465,41 @@ impl InMemoryStateEngine {
                     .amount
                     .saturating_add(tx.gas_limit)
                     .saturating_add(vm_out);
-                let clob_events = clob_events.clone();
                 let mut escrow = self.order_escrow_write().await;
                 let quote_id = *self.pmm_usdt_token.read().await;
                 let books = &orderbooks.books;
                 let settled = self
                     .settle_clob_effects(
-                        &clob_events,
+                        // Borrowed straight from the VM result: no per-transaction
+                        // clone of the event vector (S4). Nothing below mutates
+                        // `res`; the immutable borrow ends before `match res`.
+                        clob_events,
                         ClobQuoteMode::NativeSvm,
                         quote_id,
                         &mut tokens,
                         &mut escrow,
                         tx.from,
                         reserve,
+                        // This payload's domains were snapshotted by the caller
+                        // (`apply_transaction_at_height` / the block path) and
+                        // are restored on ANY `Err` below, so the settlement may
+                        // run on the live registry instead of cloning the whole
+                        // token registry first.
+                        !domains_restorable,
                         |pair, id| books.get(&pair).is_none_or(|b| b.find_order(id).is_none()),
                     )
                     .await;
                 match settled {
                     Ok(snap) => clob_native_snapshot = snap,
                     Err(e) => {
-                        // The escrow settlement committed nothing (it plans on
-                        // private copies and only writes once the whole plan is
-                        // funded), so the swap, the bridge leg and the actor sends
-                        // above are the only native movements this payload made -
-                        // undo them (actor first: it was settled last), then undo
-                        // the VM's halves.
+                        // The escrow settlement plans before it writes and its
+                        // own native leg is atomic, so the swap, the bridge leg
+                        // and the actor sends above are the only committed
+                        // movements this payload made - undo them (actor first:
+                        // it was settled last), then undo the VM's halves. The
+                        // TOKEN effects of a failed plan (possible only on the
+                        // in-place path above) are part of this payload's
+                        // domains and are restored by the caller's rollback.
                         self.restore_actor_native(actor_snapshot.as_ref()).await;
                         if pmm_minted_nano > 0 {
                             self.release_mint_nano(pmm_minted_nano);
@@ -1701,8 +1803,15 @@ impl InMemoryStateEngine {
         // writes), filled on VM success for the commit-failure path below.
         let mut post_actions: Option<ExecPostActions> = None;
         if !tx.payload.is_empty() {
+            // Domains were snapshotted just above (`domain_snap`), so the
+            // settlement may run in place: this caller restores them on `Err`.
             let exec = self
-                .execute_payload_with_preverify_at_height(tx, timestamp, chain_height)
+                .execute_payload_with_preverify_at_height_and_parent_restorable(
+                    tx,
+                    timestamp,
+                    chain_height,
+                    [0u8; 32],
+                )
                 .await;
             let (res, actions) = match exec {
                 Ok(v) => v,
@@ -4112,9 +4221,11 @@ impl InMemoryStateEngine {
     ///
     /// Algorithm, and why each piece is where it is:
     ///
-    ///  * ONE accounts write lock for the whole pass, so a delivery can never
-    ///    interleave with another block, an RPC apply or a direct
-    ///    `send_message` and observe a half-updated inbox.
+    ///  * ONE accounts write lock for the whole DELIVERING pass, so a delivery
+    ///    can never interleave with another block, an RPC apply or a direct
+    ///    `send_message` and observe a half-updated inbox. A pass with nothing
+    ///    queued (the common block) returns from a read-only check instead of
+    ///    taking that exclusive lock at all (S4).
     ///  * Recipients are collected from the `HashMap` and then
     ///    `sort_unstable`-ed by ADDRESS. Iterating the map directly would
     ///    deliver in a per-process random order, and order is observable here:
@@ -4169,9 +4280,25 @@ impl InMemoryStateEngine {
             default_commission_bps,
         };
 
+        // S4: READ-ONLY fast path first. The overwhelming majority of blocks
+        // queue no actor message, and the pass used to take the exclusive
+        // accounts lock (blocking every concurrent reader: RPC balance/state
+        // reads, other applies' snapshots) just to discover that. A read guard
+        // proves the same thing without excluding anybody; the write guard
+        // below still re-checks, so a message enqueued concurrently is handled
+        // exactly as before (it either lands before this pass reads, or after
+        // the pass returns - in both versions it is a later block's work).
+        {
+            let map = self.accounts.read().await;
+            if map.values().all(|acc| acc.inbox.is_empty()) {
+                ACTOR_MAILBOX_READ_FAST_PATHS.fetch_add(1, Ordering::Relaxed);
+                return 0;
+            }
+        }
         let mut map = self.accounts.write().await;
-        // Fast path: the common block queues nothing, so the pass must not
-        // take the trie lock or allocate a touched set at all.
+        // Same check again under the exclusive guard (a message may have landed
+        // between the read guard above and this one): a block that queues
+        // nothing must not take the trie lock or allocate a touched set.
         if map.values().all(|acc| acc.inbox.is_empty()) {
             return 0;
         }

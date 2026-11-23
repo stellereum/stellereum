@@ -2392,6 +2392,7 @@ pub(crate) async fn run_consensus_node(
                         publish_lane: Some(&publish_lane),
                         consensus_net: Some(&net),
                     },
+                    peer_named_height,
                 ),
             )
             .await
@@ -3775,7 +3776,7 @@ pub(crate) async fn run_consensus_node(
                                 // FINALIZED tip is at least H-1 (the parent it
                                 // builds on) — that is the at-tip evidence.
                                 let tip = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
-                                peer_named_height = clamp_peer_named_height(
+                                peer_named_height = clamp_peer_evidence_height(
                                     tip,
                                     peer_named_height.max(height.saturating_sub(1)),
                                 );
@@ -3958,7 +3959,7 @@ pub(crate) async fn run_consensus_node(
                                     // A vote AT height H says the voter has
                                     // decided H-1 at least — at-tip evidence.
                                     let tip = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
-                                    peer_named_height = clamp_peer_named_height(
+                                    peer_named_height = clamp_peer_evidence_height(
                                         tip,
                                         peer_named_height.max(vh.saturating_sub(1)),
                                     );
@@ -3999,7 +4000,7 @@ pub(crate) async fn run_consensus_node(
                             // collecting "wrong height".
                             if named_ahead.is_some() {
                                 let tip = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
-                                peer_named_height = clamp_peer_named_height(
+                                peer_named_height = clamp_peer_evidence_height(
                                     tip,
                                     peer_named_height.max(vh.saturating_sub(1)),
                                 );
@@ -4089,57 +4090,108 @@ pub(crate) async fn run_consensus_node(
                                 // byte-limiter-exempt and may carry a 32 MiB
                                 // block plus thousands of µQC markers. A
                                 // far-ahead height is not adoptable under ANY
-                                // certificate (`adopt_committed` refuses it),
-                                // so do not hash the block or verify the QC;
-                                // the DHT head/walk is the catch-up path.
-                                if !committed_height_is_cheaply_relevant(our_tip, height) {
-                                    inbound_overcap_count += 1;
-                                    if inbound_overcap_count % 20 == 1 {
-                                        tracing::warn!(
-                                            "[sync][push] ignoring far-ahead commit #{height} (tip #{our_tip}, max lookahead {MAX_COMMITTED_LOOKAHEAD}) BEFORE QC verification; {inbound_overcap_count} time(s)"
-                                        );
-                                    }
-                                    // Still let `adopt_committed` cheaply refuse
-                                    // it below (it checks height first); no
-                                    // crypto was paid here.
-                                    continue;
-                                } else {
+                                // certificate (`adopt_committed` refuses it), so
+                                // the BODY is never hashed on that path.
+                                //
+                                // LIVENESS (live 2026-11-23, nodeC): this arm
+                                // used to `continue` BEFORE recording anything,
+                                // so a far-behind node whose only inbound
+                                // evidence was far-ahead commits learned NO head
+                                // at all. It then fell back to a DHT head read
+                                // that returned its own stale echo and a tip+1
+                                // QC probe whose sidecar was pruned — never the
+                                // snapshot path — and sat at its old height for
+                                // hours. A commit's QC is a quorum-signed
+                                // statement about `(height, block_hash)`, so it
+                                // can be verified WITHOUT the body: the
+                                // certificate signs its own `block_hash`, not
+                                // the 32 MiB blob. That verified head is exactly
+                                // what catch-up needs.
+                                let cheap = committed_height_is_cheaply_relevant(our_tip, height);
+                                let attested_hash = if cheap {
                                     let block_hash = block.compute_hash();
-                                    let proven = certificate.kind == VoteKind::Precommit
+                                    (certificate.kind == VoteKind::Precommit
                                         && certificate.height == height
                                         && certificate.block_hash == Some(block_hash)
                                         && certificate.verify_with_schedule(
                                             &rt.validator_set_for_height(height),
                                             rt.committee_schedule_at(height),
-                                        );
-                                    if proven {
-                                        // The certificate DECODED and VERIFIED
-                                        // (precommit kind + height + block hash
-                                        // + quorum under the set in force at
-                                        // this height): the `_hq_` sidecar for
-                                        // this height is now known, so lift any
-                                        // miss cooldown. `clear_qc_backoff` is
-                                        // only ever called on such a validated
-                                        // QC, never on a hint.
-                                        adapter.clear_qc_backoff(block_shard, height);
-                                        peer_named_height = clamp_peer_named_height(
-                                            our_tip,
-                                            peer_named_height.max(height),
-                                        );
-                                        if rt.peer_hint.map(|(ph, _)| ph < height).unwrap_or(true) {
-                                            rt.peer_hint = Some((height, block_hash));
-                                            peer_hint_at = Some(std::time::Instant::now());
+                                        ))
+                                    .then_some(block_hash)
+                                } else {
+                                    // Far ahead: verify the QC's OWN signed
+                                    // block-hash binding (no body hashing, no
+                                    // body/QC equality check). Adoption later
+                                    // still requires the walked body to match
+                                    // this hash and every block is re-verified.
+                                    match certificate.block_hash {
+                                        Some(bh)
+                                            if certificate.kind == VoteKind::Precommit
+                                                && certificate.height == height
+                                                && certificate.shard_id == block_shard
+                                                && block.shard_id == block_shard
+                                                && certificate.verify_with_schedule(
+                                                    &rt.validator_set_for_height(height),
+                                                    rt.committee_schedule_at(height),
+                                                ) =>
+                                        {
+                                            Some(bh)
                                         }
-                                        catchup_pending = true;
-                                        stellereum::rpc::note_peer_height(height);
-                                        info!(
-                                            "[sync][push] peer committed #{height} ahead of our tip #{our_tip}: catch-up scheduled for the next tick"
-                                        );
-                                    } else {
-                                        tracing::debug!(
-                                            "[sync][push] ignoring commit at #{height} above our tip #{our_tip}: certificate does not prove it"
+                                        _ => None,
+                                    }
+                                };
+                                if let Some(attested_hash) = attested_hash {
+                                    // The certificate DECODED and VERIFIED
+                                    // (precommit kind + height + a signed block
+                                    // hash + quorum under the set in force at
+                                    // this height): the `_hq_` sidecar for this
+                                    // height is now known, so lift any miss
+                                    // cooldown. `clear_qc_backoff` is only ever
+                                    // called on such a validated QC, never on a
+                                    // hint.
+                                    adapter.clear_qc_backoff(block_shard, height);
+                                    peer_named_height = clamp_peer_evidence_height(
+                                        our_tip,
+                                        peer_named_height.max(height),
+                                    );
+                                    // VERIFIED far-ahead head: retain it as
+                                    // catch-up evidence (the 64-height
+                                    // pre-hash gate must never delete it — that
+                                    // was nodeC's permanent stall). The hint
+                                    // carries the QC-signed hash so the walk
+                                    // anchors on exactly the decided head.
+                                    let accept =
+                                        rt.peer_hint.map(|(ph, _)| ph < height).unwrap_or(true);
+                                    if let Some(h) =
+                                        verified_head_hint(our_tip, height, attested_hash)
+                                            .filter(|_| accept)
+                                    {
+                                        rt.peer_hint = Some(h);
+                                        peer_hint_at = Some(std::time::Instant::now());
+                                    }
+                                    catchup_pending = true;
+                                    stellereum::rpc::note_peer_height(height);
+                                    info!(
+                                        "[sync][push] peer committed #{height} ahead of our tip #{our_tip}: catch-up scheduled for the next tick"
+                                    );
+                                    // A far-ahead commit can only be EVIDENCE
+                                    // (adopt requires our exact next height);
+                                    // skip the pointless adopt/bind work.
+                                    if !cheap {
+                                        continue;
+                                    }
+                                } else if !cheap {
+                                    inbound_overcap_count += 1;
+                                    if inbound_overcap_count % 20 == 1 {
+                                        tracing::warn!(
+                                            "[sync][push] ignoring far-ahead commit #{height} (tip #{our_tip}, max lookahead {MAX_COMMITTED_LOOKAHEAD}) without a verifying QC; {inbound_overcap_count} time(s)"
                                         );
                                     }
+                                    continue;
+                                } else {
+                                    tracing::debug!(
+                                        "[sync][push] ignoring commit at #{height} above our tip #{our_tip}: certificate does not prove it"
+                                    );
                                 }
                             }
                             // §7 Phase 2: adopting means executing, and the worker
@@ -4422,7 +4474,7 @@ pub(crate) async fn run_consensus_node(
         // failed attempt.
         {
             let tip = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
-            peer_named_height = clamp_peer_named_height(tip, peer_named_height);
+            peer_named_height = clamp_peer_evidence_height(tip, peer_named_height);
             if rt.peer_hint.is_some_and(|(ph, _)| ph > tip) || peer_named_height > tip {
                 catchup_pending = true;
             }

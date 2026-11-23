@@ -681,7 +681,36 @@ pub(crate) async fn try_catch_up(
     persist: Option<&std::sync::Arc<stellereum::storage::AsyncPersistence>>,
     rpc: &Arc<stellereum::rpc::RpcState>,
 ) -> Option<u64> {
-    try_catch_up_with_lanes(adapter, rt, shard, persist, rpc, SyncLanes::default()).await
+    try_catch_up_with_evidence(adapter, rt, shard, persist, rpc, 0).await
+}
+
+/// [`try_catch_up`] with the tallest height a VERIFIED peer message named, even
+/// when no block hash accompanies it (a vote names only `height`).
+///
+/// A vote cannot anchor a body walk (there is no `peer_hash`), but it is still
+/// proof the peer's chain is ahead. When the DHT head read is a stale echo and
+/// the tip+1 blind-QC sidecar is pruned, that height is the ONLY evidence left;
+/// the snapshot path needs no hash, so a material gap can still be bridged.
+/// Liveness only: the snapshot restores against a header-derived, quorum-signed
+/// root and every block above it is re-verified.
+pub(crate) async fn try_catch_up_with_evidence(
+    adapter: &Arc<P2pNetworkAdapter>,
+    rt: &mut ValidatorRuntime,
+    shard: u32,
+    persist: Option<&std::sync::Arc<stellereum::storage::AsyncPersistence>>,
+    rpc: &Arc<stellereum::rpc::RpcState>,
+    named_peer_height: u64,
+) -> Option<u64> {
+    try_catch_up_with_lanes(
+        adapter,
+        rt,
+        shard,
+        persist,
+        rpc,
+        SyncLanes::default(),
+        named_peer_height,
+    )
+    .await
 }
 
 pub(crate) async fn try_catch_up_with_lanes(
@@ -691,6 +720,7 @@ pub(crate) async fn try_catch_up_with_lanes(
     persist: Option<&std::sync::Arc<stellereum::storage::AsyncPersistence>>,
     rpc: &Arc<stellereum::rpc::RpcState>,
     lanes: SyncLanes<'_>,
+    named_peer_height: u64,
 ) -> Option<u64> {
     // Read the replicated head pointer, not the local one: `get_latest_shard_height`
     // reads this node's own KV, so it can only ever report our own height and the
@@ -781,13 +811,14 @@ pub(crate) async fn try_catch_up_with_lanes(
                     let mut anchor = (probe_h, raw_bh);
                     // VERIFIED EVIDENCE FOR THE DRIVER (liveness): the ladder
                     // proves decided heights ahead, so record the largest one
-                    // that fits `peer_hint`'s lookahead/TTL bounds. Without it
-                    // the driver had NO ahead evidence after a blind pass: the
-                    // end-of-tick latch could not re-arm, the follow-up pass
-                    // kept the 2 s blind budget (instead of the gap-scaled
-                    // one), and a timeout dropped it to the 120 s at-tip
-                    // cadence.
-                    let hint_cap = our_height.saturating_add(MAX_COMMITTED_LOOKAHEAD);
+                    // that fits `peer_hint`'s credible lookahead/TTL bounds.
+                    // Without it the driver had NO ahead evidence after a blind
+                    // pass: the end-of-tick latch could not re-arm, the
+                    // follow-up pass kept the 2 s blind budget (instead of the
+                    // gap-scaled one), and a timeout dropped it to the 120 s
+                    // at-tip cadence. The 64-height pre-hash gate used to cap
+                    // this too, discarding every rung past `+64` (nodeC).
+                    let hint_cap = our_height.saturating_add(PEER_HINT_MAX_LOOKAHEAD);
                     let mut hint_anchor = verified.map(|bh| (probe_h, bh));
                     for &step in BLIND_PROBE_LADDER {
                         let h = our_height.saturating_add(step);
@@ -828,6 +859,24 @@ pub(crate) async fn try_catch_up_with_lanes(
                     anchor
                 }
                 _ => {
+                    // VOTE-ONLY EVIDENCE (live 2026-11-23): a verified vote
+                    // names a height but no hash, so neither the DHT echo nor
+                    // the tip+1 sidecar can anchor a walk. A material gap can
+                    // still be bridged by the SNAPSHOT path, which needs no
+                    // peer hash — every restored root is derived from a
+                    // quorum-signed header and verified below. Without this a
+                    // node whose only ahead evidence is votes (or whose local
+                    // sidecars are pruned) never reaches snapshot-sync at all.
+                    if named_peer_height > our_height.saturating_add(100) {
+                        eprintln!(
+                            "[sync] no peer head/hash available, but a verified peer named height {named_peer_height} (ours={our_height}): trying snapshot-first"
+                        );
+                        if let Some(b) =
+                            try_snapshot_sync(adapter, rt, shard, named_peer_height).await
+                        {
+                            return Some(b);
+                        }
+                    }
                     static BLIND_MISS_N: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(0);
                     let n = BLIND_MISS_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

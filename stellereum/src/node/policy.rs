@@ -123,10 +123,50 @@ pub fn at_tip_silence_due(now_ms: u64, last_rx_ms: u64, last_probe_ms: u64) -> b
 /// How far above our FINALIZED tip a peer-named height may be before it is
 /// treated as "not this chain" for cheap pre-checks.
 ///
-/// A `Committed` beyond this is rejected BEFORE any block hashing or QC
-/// verification (pentest-2 F-5); the DHT head/walk remains the path for a
-/// genuinely far-behind node. Local DoS bound — never a quorum rule.
+/// A `Committed` beyond this is rejected BEFORE any block hashing (pentest-2
+/// F-5); the DHT head/walk remains the path for a genuinely far-behind node.
+/// Local DoS bound — never a quorum rule.
+///
+/// NOTE: this is NOT the bound for a VERIFIED head hint. The old
+/// `peer_hint_effective` reused this value and therefore DELETED every hint
+/// more than 64 heights ahead (live 2026-11-23: nodeC at 90 858 while peers
+/// were finalizing at 120 000+ — every verified far-ahead proposal/commit was
+/// recorded and then discarded at the next tick top, so catch-up fell back to
+/// a DHT read that returned our own stale echo and a tip+1 QC probe whose
+/// sidecar was pruned; it never reached the snapshot path). A hint is planted
+/// only from verified evidence (signature + membership for a proposal, a
+/// verified precommit quorum for a commit) and is still TTL-bounded, so the
+/// distance bound belongs on the CATCH-UP side, not on the evidence side.
 pub(crate) const MAX_COMMITTED_LOOKAHEAD: u64 = 64;
+
+/// Maximum distance a VERIFIED peer head hint may be ahead of our finalized
+/// tip and still be retained as catch-up evidence.
+///
+/// Chosen to match the walk's own refusal bound (`try_catch_up` refuses a
+/// claimed head more than 1 000 000 heights ahead): any plausible live gap is
+/// admitted, while an absurd signed claim (a Byzantine member signing
+/// `height = 10⁹`) still cannot pin the at-tip predicate / suppress the DHT
+/// read forever. TTL ([`PEER_HINT_TTL_MS`]) remains the time bound.
+pub(crate) const PEER_HINT_MAX_LOOKAHEAD: u64 = 1_000_000;
+
+/// Validated VERIFIED head evidence: `Some` only for a head strictly ahead of
+/// `our_tip` and inside [`PEER_HINT_MAX_LOOKAHEAD`].
+///
+/// This is the single choke point for "a verified peer told us its head".
+/// `block_hash` below is the hash the evidence actually attests to (a
+/// proposal's parent hash, or a commit certificate's SIGNED block hash), never
+/// an unauthenticated envelope field. Pure; node-local liveness policy.
+pub fn verified_head_hint(
+    our_tip: u64,
+    height: u64,
+    block_hash: [u8; 32],
+) -> Option<(u64, [u8; 32])> {
+    if height > our_tip && height <= our_tip.saturating_add(PEER_HINT_MAX_LOOKAHEAD) {
+        Some((height, block_hash))
+    } else {
+        None
+    }
+}
 
 /// Compact frames one peer may force us to process (index/mempool work) in a
 /// single tick. Honest traffic is a handful of frames per round; beyond this
@@ -368,36 +408,54 @@ pub fn should_probe_dht_head(our_height: u64, peer_hint: Option<(u64, [u8; 32])>
 /// Validated hint: `Some` only when it is AHEAD of `our_tip` and still inside
 /// [`PEER_HINT_TTL_MS`]. A stale or reached hint must not keep suppressing the
 /// DHT head read (pentest-2 F-2).
+///
+/// The distance bound is [`PEER_HINT_MAX_LOOKAHEAD`], NOT the 64-height
+/// pre-verification gate: a hint only reaches here from VERIFIED evidence, and
+/// discarding a genuinely far-ahead one is what stranded nodeC (2026-11-23)
+/// with no peer head at all, so its catch-up could never justify the
+/// snapshot-first path for the material gap.
 pub fn peer_hint_effective(
     our_tip: u64,
     hint: Option<(u64, [u8; 32])>,
     age_ms: u64,
 ) -> Option<(u64, [u8; 32])> {
     let hint = hint?;
-    if age_ms > PEER_HINT_TTL_MS
-        || !stellereum::network::peer_head_is_ahead(our_tip, hint.0)
-        || hint.0 > our_tip.saturating_add(MAX_COMMITTED_LOOKAHEAD)
-    {
+    if age_ms > PEER_HINT_TTL_MS {
         return None;
     }
-    Some(hint)
+    verified_head_hint(our_tip, hint.0, hint.1)
 }
 
 /// True when a `Committed` height is inside the cheap pre-verification window.
 ///
-/// Far-ahead commits are refused before `compute_hash`/QC work (F-5); the DHT
-/// head read is their catch-up path.
+/// Far-ahead commits do NOT hash the carried body (F-5); their QC is still
+/// verified against its own SIGNED `(height, block_hash)` so the head can feed
+/// catch-up. This predicate only decides whether the body may be hashed and
+/// bound to the certificate (adoption territory).
 pub fn committed_height_is_cheaply_relevant(our_tip: u64, height: u64) -> bool {
     height <= our_tip.saturating_add(MAX_COMMITTED_LOOKAHEAD)
 }
 
-/// Clamp a peer-named height to what this chain could plausibly be at.
+/// Clamp a peer-named height for the CHEAP at-tip predicate.
 ///
 /// A verified-but-absurd claim (a byzantine member signing `height = 10⁹`, or a
 /// replayed member vote) must not keep the at-tip predicate false forever.
 /// Clamping is arithmetic only; the evidence itself was already verified.
+#[allow(dead_code)] // GATE: public policy helper pinned by tests/pentest2_network_hardening.rs; the bin itself uses clamp_peer_evidence_height.
 pub fn clamp_peer_named_height(our_tip: u64, named: u64) -> u64 {
     named.min(our_tip.saturating_add(MAX_COMMITTED_LOOKAHEAD))
+}
+
+/// Clamp a peer-named height for PERSISTENT catch-up evidence.
+///
+/// Unlike [`clamp_peer_named_height`] (the 64-height cheap pre-hash gate), this
+/// bound must admit a genuine far-behind gap: a verified VOTE names only a
+/// height (no hash), so it cannot anchor a body walk — but it CAN and must
+/// drive the snapshot-first path. Clamping it to 64 destroyed that evidence
+/// every tick (live 2026-11-23, nodeC). Bounded by
+/// [`PEER_HINT_MAX_LOOKAHEAD`], the same credible ceiling as a head hint.
+pub fn clamp_peer_evidence_height(our_tip: u64, named: u64) -> u64 {
+    named.min(our_tip.saturating_add(PEER_HINT_MAX_LOOKAHEAD))
 }
 
 /// Compact announcements are only worth resolving at the height we are about

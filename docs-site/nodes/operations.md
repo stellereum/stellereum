@@ -413,11 +413,12 @@ private chain. A wipe is **whole `./data` on every node at the same moment**.
 | `persist queue full` | disk too slow | move to SSD; check `iostat`; reduce write pressure |
 | node restarts every 5 s | crash loop / bad config | `journalctl -u … -n 200`; `systemctl reset-failed` after fixing |
 
-::: danger A restart longer than 17 s jails the validator
-At the live 400 ms tempo, `DOWNTIME_MISS_THRESHOLD = 42` misses is only 16.8 s;
-a restart that keeps the validator silent for ~17 s is a 0.1 % slash plus a
-~27-minute jail that only the cold withdrawal key can clear. Pre-stage the
-binary and use the [live rolling deploy](/nodes/upgrades#live-rolling-deploy).
+::: danger A restart longer than the jail budget jails the validator
+`DOWNTIME_MISS_THRESHOLD = 42` misses is `42 × STELL_MIN_BLOCK_MS`: **33.6 s at
+the live 800 ms tempo** (16.8 s at 400 ms). A restart that keeps the validator
+silent longer than that is a 0.1 % slash plus a ~53-minute jail that only the
+cold withdrawal key can clear. Pre-stage the binary and use the
+[live rolling deploy](/nodes/upgrades#live-rolling-deploy).
 :::
 
 ## Watchdog

@@ -94,7 +94,7 @@ const glance = [
   { label: 'Ruleset', value: 'v7' },
   { label: 'Signatures', value: 'Falcon-512' },
   { label: 'Finality', value: '1 block' },
-  { label: 'Block tempo', value: '400 ms' },
+  { label: 'Block tempo', value: '800 ms' },
   { label: 'Execution', value: 'WASM' },
 ]
 

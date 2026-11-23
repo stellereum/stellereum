@@ -58,8 +58,13 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 CONF="${STELL_CONF:-$SCRIPT_DIR/cluster-nodes.conf}"
 
 JAIL_MISSES=42
-BLOCK_MS="${STELL_MIN_BLOCK_MS:-400}"
-DOWNTIME_WARN_MS=$((15 * 1000))
+# The jail budget is 42 consecutive missed heights; its length in SECONDS is
+# whatever the fleet's block tempo is. Take the operator override first, then
+# the value the cluster conf expects (the preflight enforces it), and only
+# then the historical 400 ms default.
+BLOCK_MS="${STELL_MIN_BLOCK_MS:-${EXPECT_STELL_MIN_BLOCK_MS:-400}}"
+# Warn at 90% of the real budget instead of a hardcoded 15 s.
+DOWNTIME_WARN_MS=$((JAIL_MISSES * BLOCK_MS * 9 / 10))
 CATCHUP_SECS="${STELL_ROLL_DEPLOY_CATCHUP_SECS:-300}"
 CLUSTER_SIZE="${STELL_CLUSTER_SIZE:-4}"
 PUBLIC_RPC="${STELL_PUBLIC_RPC:-https://rpc.stellereum.org}"
@@ -94,6 +99,11 @@ now_ms() {
 fmt_ms() {
     local ms="$1"
     printf '%d.%03ds' "$((ms / 1000))" "$((ms % 1000))"
+}
+
+fmt_s1() {
+    local ms="$1"
+    printf '%d.%01ds' "$((ms / 1000))" "$((ms % 1000 / 100))"
 }
 
 jail_budget_text() {
@@ -281,7 +291,7 @@ cluster_check() {
 show_plan() {
     local node dir ssh unit scope rpc validator digest_note=""
     note "DRY RUN — nothing is copied, restarted, or written."
-    note "jail budget: $(jail_budget_text); warn above 15 s"
+    note "jail budget: $(jail_budget_text); warn above $(fmt_s1 "$DOWNTIME_WARN_MS")"
     note "public RPC: $PUBLIC_RPC"
     if [ -n "$BINARY" ] && [ -f "$BINARY" ]; then
         digest_note="$(sha256sum "$BINARY" 2>/dev/null | cut -d' ' -f1 || true)"
@@ -503,9 +513,11 @@ activate_one() {
     fi
 
     deadline=$(( $(date +%s) + 120 ))
+    t_active=""
     while :; do
         if nrun "$node" "$sysctl is-active --quiet '$unit'" 2>/dev/null; then
             active=1
+            t_active="$(now_ms)"
             break
         fi
         if [ "$(date +%s)" -ge "$deadline" ]; then
@@ -549,7 +561,10 @@ activate_one() {
     t1="$(now_ms)"
     ms=$((t1 - t0))
     printf '\n'
-    note "[$node] measured downtime (T0 -> RPC within 5 blocks): $(fmt_ms "$ms")"
+    if [ -n "$t_active" ]; then
+        note "[$node] restart downtime (T0 -> unit active): $(fmt_ms $((t_active - t0)))"
+    fi
+    note "[$node] unvoting window (T0 -> within 5 blocks of tip): $(fmt_ms "$ms")"
     if [ "$caught" -ne 1 ]; then
         warn "[$node] did not catch up within ${CATCHUP_SECS}s (local=${local_h:-?} tip=${tip:-?})"
         fail=1
@@ -557,10 +572,10 @@ activate_one() {
     if [ "$ms" -gt "$DOWNTIME_WARN_MS" ]; then
         printf '\n'
         printf '%s\n' "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-        printf '[rolling-deploy] JAIL RISK: downtime %s exceeded 15 s\n' "$(fmt_ms "$ms")"
-        printf '[rolling-deploy] jail risk: threshold is %d misses = %d.%01d s at %d ms\n' \
-            "$JAIL_MISSES" "$((JAIL_MISSES * BLOCK_MS / 1000))" \
-            "$((JAIL_MISSES * BLOCK_MS % 1000 / 100))" "$BLOCK_MS"
+        printf '[rolling-deploy] JAIL RISK: the node was not voting for %s\n' "$(fmt_ms "$ms")"
+        printf '[rolling-deploy] jail budget is %d misses x %d ms = %s; warn above %s\n' \
+            "$JAIL_MISSES" "$BLOCK_MS" "$(jail_budget_text | sed 's/^.*= //')" \
+            "$(fmt_s1 "$DOWNTIME_WARN_MS")"
         printf '%s\n' "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
         printf '\n'
     fi
@@ -588,7 +603,7 @@ do_activate() {
         return 0
     fi
 
-    note "jail budget: $(jail_budget_text); warn above 15 s"
+    note "jail budget: $(jail_budget_text); warn above $(fmt_s1 "$DOWNTIME_WARN_MS")"
     note "public RPC: $PUBLIC_RPC"
 
     if ! json="$(fetch_cluster_json)"; then
@@ -634,6 +649,12 @@ done
 [ -r "$CONF" ] || die "cluster conf not found: $CONF"
 # shellcheck disable=SC1090
 . "$CONF"
+
+# The jail budget is `42 x tempo`, and the tempo comes from the fleet's
+# expected config (or an explicit operator override). Recompute AFTER the
+# conf is sourced so the reported budget matches the live 800 ms fleet.
+BLOCK_MS="${STELL_MIN_BLOCK_MS:-${EXPECT_STELL_MIN_BLOCK_MS:-$BLOCK_MS}}"
+DOWNTIME_WARN_MS=$((JAIL_MISSES * BLOCK_MS * 9 / 10))
 
 command -v jq >/dev/null 2>&1 || die "jq is required (local parsing only; nodes need no jq)"
 

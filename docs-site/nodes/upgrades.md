@@ -387,27 +387,30 @@ other shape: replace the binary on one live validator at a time, with no
 governance height and no halt. The constraint is not the binary, it is the
 downtime jail.
 
-### The 16.8 s arithmetic
+### The restart budget
 
-`DOWNTIME_MISS_THRESHOLD = 42` counts **consecutive missed heights**. At the
-live tempo (`STELL_MIN_BLOCK_MS=400`):
+`DOWNTIME_MISS_THRESHOLD = 42` counts **consecutive missed heights**. Its length
+in seconds is the block tempo, and the fleet is currently at
+`STELL_MIN_BLOCK_MS=800` (the 1-vCPU hosts have no headroom at 400 ms):
 
 ```text
-42 misses × 400 ms = 16 800 ms = 16.8 s
+42 misses × 800 ms = 33 600 ms = 33.6 s   (live tempo)
+42 misses × 400 ms = 16 800 ms = 16.8 s   (earlier tempo)
 ```
 
 That is the entire budget between the last vote a validator casts and the first
 one it casts after the restart. Past it, the chain jails the validator:
-`release_height = jailed_at_height + 4000`, which is `4000 × 400 ms ≈ 26 min
-40 s`, plus a **0.1 %** downtime slash. A jailed validator does not resume by
-itself, and the unjail transaction must be signed by the **cold withdrawal
-key** — not by the hot voting key on the node.
+`release_height = jailed_at_height + 4000` — about **53 minutes at 800 ms**
+(26 min 40 s at 400 ms) — plus a **0.1 %** downtime slash. A jailed validator
+does not resume by itself, and the unjail transaction must be signed by the
+**cold withdrawal key**, not by the hot voting key on the node.
 
 The 2026-11-23 incident made this concrete: a rolling deploy copied a **43 MB**
-binary to a 1-vCPU validator and restarted it in one window. The transfer
-starved the consensus thread on the single core, the restart and the ~600-block
-catch-up followed, and the total exceeded 16.8 s. Node D was jailed; A/B/C
-survived only because their windows were shorter.
+binary to a 1-vCPU validator and restarted it in one window, at the 400 ms
+tempo. The transfer starved the consensus thread on the single core, the restart
+and the ~600-block catch-up followed, and the total exceeded 16.8 s. Node D was
+jailed; A/B/C survived only because their windows were shorter. The fleet moved
+to 800 ms and every binary is pre-staged for exactly this reason.
 
 ### Why the binary is pre-staged
 
@@ -459,14 +462,15 @@ scripts/rolling-deploy.sh activate
 | Interval | Budget |
 | --- | --- |
 | binary transfer + SHA-256 verification | **outside** the restart window (`stage`) |
-| `cp`/`mv` + restart + `is-active` | inside the measured window |
-| local RPC reaching public tip − 5 | inside the measured window |
-| measured `T0` → caught up | **warn above 15 s**; 16.8 s is the jail |
+| `cp`/`mv` + restart + `is-active` | inside the measured window (restart downtime) |
+| local RPC reaching public tip − 5 | inside the measured window (catch-up) |
+| measured `T0` → caught up | **warn above 90 %** of `42 × STELL_MIN_BLOCK_MS` |
 
-The 1.8 s between 15 s and 16.8 s is not a safety margin; it is the difference
-between a warning and a jail. If `activate` warns, stop the rollout and
-investigate before restarting the next validator. A node that has not caught up
-within `STELL_ROLL_DEPLOY_CATCHUP_SECS` (300 s) also stops the rollout.
+The warning level is not a safety margin: at the live 800 ms tempo it is 30.2 s
+against a 33.6 s jail, and at 400 ms it was 15.1 s against 16.8 s. If `activate`
+warns, stop the rollout and investigate before restarting the next validator. A
+node that has not caught up within `STELL_ROLL_DEPLOY_CATCHUP_SECS` (300 s) also
+stops the rollout.
 
 Selection and inspection:
 

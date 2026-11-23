@@ -72,6 +72,14 @@ pub const CONSENSUS_HEIGHT: &str = "stell_consensus_height";
 /// Seconds between two consecutively finalized blocks.
 pub const BLOCK_INTERVAL_SECONDS: &str = "stell_block_interval_seconds";
 /// Votes observed, split by kind.
+/// Wall-clock time this node spent with a block apply IN FLIGHT, observed by
+/// the consensus driver (`has_pending_apply` true -> false). The proposer gate
+/// refuses to build a block while an apply is in flight, so this is the direct
+/// measure of how much of each block's budget is spent there.
+pub const APPLY_SECONDS: &str = "stell_apply_seconds";
+/// Rounds where this node owned the proposal slot and could not emit a block,
+/// by gate reason. `nil_rounds` says a round was lost; this says why.
+pub const PROPOSE_GATE_BLOCKED_TOTAL: &str = "stell_propose_gate_blocked_total";
 pub const CONSENSUS_VOTES_TOTAL: &str = "stell_consensus_votes_total";
 /// Round-trip latency to a consensus peer, per peer id.
 pub const PEER_LATENCY_SECONDS: &str = "stell_peer_latency_seconds";
@@ -155,6 +163,8 @@ pub const UNBOUND_REFUSED_TOTAL: &str = "stell_unbound_refused_total";
 pub const LABEL_KIND: &str = "kind";
 /// Label carrying a peer id.
 pub const LABEL_PEER: &str = "peer";
+/// Reason a proposal gate refused to fire (propose-gate diagnostics).
+pub const LABEL_REASON: &str = "reason";
 /// Label carrying the binary's semantic version.
 pub const LABEL_VERSION: &str = "version";
 /// Label carrying the build's git hash.
@@ -179,6 +189,10 @@ pub const DEFAULT_BLOCK_INTERVAL_BUCKETS: &[f64] =
     &[0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 30.0, 60.0];
 
 /// Same-clock round-trip (ms) through to a five-second outlier.
+pub const DEFAULT_APPLY_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
 pub const DEFAULT_PEER_LATENCY_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
 ];
@@ -480,6 +494,20 @@ impl Registry {
                 buckets: DEFAULT_BLOCK_INTERVAL_BUCKETS,
             },
             MetricDef {
+                name: APPLY_SECONDS,
+                help: "Time a block apply was in flight as seen by the consensus driver",
+                kind: MetricKind::Histogram,
+                labels: &[],
+                buckets: DEFAULT_APPLY_BUCKETS,
+            },
+            MetricDef {
+                name: PROPOSE_GATE_BLOCKED_TOTAL,
+                help: "Proposal slots this node owned but could not use, by gate reason",
+                kind: MetricKind::Counter,
+                labels: &[LABEL_REASON],
+                buckets: &[],
+            },
+            MetricDef {
                 name: CONSENSUS_VOTES_TOTAL,
                 help: "Consensus votes observed, by kind (prevote or precommit)",
                 kind: MetricKind::Counter,
@@ -751,6 +779,16 @@ impl Registry {
         );
         for kind in [VoteKind::Prevote, VoteKind::Precommit] {
             reg.seed(CONSENSUS_VOTES_TOTAL, &[(LABEL_KIND, kind.as_str())]);
+        }
+        reg.seed(APPLY_SECONDS, &[]);
+        for reason in [
+            "pending_apply",
+            "parent_not_finalized",
+            "not_can_vote",
+            "min_block_time",
+            "other",
+        ] {
+            reg.seed(PROPOSE_GATE_BLOCKED_TOTAL, &[(LABEL_REASON, reason)]);
         }
         reg
     }
@@ -1087,6 +1125,16 @@ impl Registry {
     /// affects peer selection, backoff or eviction.
     pub fn observe_peer_latency(&self, peer: &str, seconds: f64) {
         self.add(PEER_LATENCY_SECONDS, &[(LABEL_PEER, peer)], seconds);
+    }
+
+    /// One completed in-flight block apply, as observed by the driver.
+    pub fn observe_apply(&self, seconds: f64) {
+        self.add(APPLY_SECONDS, &[], seconds);
+    }
+
+    /// One proposal slot this node owned and could not use, by gate reason.
+    pub fn inc_propose_gate_blocked(&self, reason: &str) {
+        self.add(PROPOSE_GATE_BLOCKED_TOTAL, &[(LABEL_REASON, reason)], 1.0);
     }
 
     /// Rounds `peer` lags behind this node (assignment, not a sum — same
@@ -1873,12 +1921,39 @@ impl std::io::Write for RotatingLog {
 mod tests {
     use super::*;
 
+    /// Wave 1 observability: the driver's apply window and the propose-gate
+    /// reasons must actually reach the scrape, or the numbers that decide the
+    /// next liveness fix do not exist.
+    #[test]
+    fn apply_and_propose_gate_metrics_are_rendered() {
+        let m = Registry::new();
+        m.observe_apply(0.004);
+        m.observe_apply(0.250);
+        m.inc_propose_gate_blocked("pending_apply");
+        m.inc_propose_gate_blocked("min_block_time");
+        let text = m.render();
+        assert!(text.contains(APPLY_SECONDS), "apply histogram missing");
+        assert!(
+            text.contains(&format!(
+                "{PROPOSE_GATE_BLOCKED_TOTAL}{{reason=\"pending_apply\"}} 1"
+            )),
+            "gate counter missing\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "{PROPOSE_GATE_BLOCKED_TOTAL}{{reason=\"min_block_time\"}} 1"
+            )),
+            "gate reason series missing\n{text}"
+        );
+    }
+
     #[test]
     fn buckets_are_sorted_and_finite() {
         for set in [
             DEFAULT_BLOCK_INTERVAL_BUCKETS,
             DEFAULT_PEER_LATENCY_BUCKETS,
             DEFAULT_BLOCK_TXS_BUCKETS,
+            DEFAULT_APPLY_BUCKETS,
         ] {
             assert!(!set.is_empty());
             assert!(

@@ -1804,6 +1804,9 @@ pub(crate) async fn run_consensus_node(
             .unwrap_or(DEFAULT_MIN_BLOCK_MS),
     );
     let mut last_block_at = std::time::Instant::now() - min_block_time;
+    // Observability: the propose gate refuses to build a block while an apply is
+    // in flight, so the driver measures that window itself (`stell_apply_seconds`).
+    let mut apply_in_flight_since: Option<std::time::Instant> = None;
     let mut last_join = std::time::Instant::now() - Duration::from_secs(60);
     // Highest round at which a peer has been seen voting at OUR height, and when.
     //
@@ -2926,8 +2929,40 @@ pub(crate) async fn run_consensus_node(
         // does or does not fire. A silent proposer is indistinguishable from
         // a dead network without this; it separates gate-blocked (values
         // below) from send-blocked (gate passes but nothing arrives).
+        {
+            let pending = rt.has_pending_apply();
+            match (pending, apply_in_flight_since) {
+                (true, None) => apply_in_flight_since = Some(std::time::Instant::now()),
+                (false, Some(started)) => {
+                    apply_in_flight_since = None;
+                    stellereum::metrics::global().observe_apply(started.elapsed().as_secs_f64());
+                }
+                _ => {}
+            }
+        }
         if last_gate_diag != Some((height, round)) {
             last_gate_diag = Some((height, round));
+            // One increment per round we OWE a proposal and cannot emit it:
+            // `nil_rounds` says the round was lost, this says why.
+            if rt.is_proposer() && !rt.hc.has_live_proposal() {
+                let reason = if !can_vote {
+                    Some("not_can_vote")
+                } else if !proposal_parent_is_finalized(
+                    rt.finalized.last().map(|(h, _)| *h).unwrap_or(0),
+                    rt.hc.height,
+                ) {
+                    Some("parent_not_finalized")
+                } else if rt.has_pending_apply() {
+                    Some("pending_apply")
+                } else if last_block_at.elapsed() < min_block_time {
+                    Some("min_block_time")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    stellereum::metrics::global().inc_propose_gate_blocked(reason);
+                }
+            }
             tracing::debug!(
                 "[consensus] propose-gate h={} r={} can_vote={} pending_apply={} is_proposer={} live_proposal={} min_time_ok={} parent_ready={} scheduled={}",
                 height,

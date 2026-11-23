@@ -1,3 +1,8 @@
+// The node binary compiles several of these modules into its own tree (see
+// src/bin_tests.rs), so shared sources must reach crate paths in BOTH crates.
+// This alias makes `stellereum::…` resolve identically inside the lib.
+extern crate self as stellereum;
+
 pub mod address;
 pub mod bootstrap;
 pub mod bridge;

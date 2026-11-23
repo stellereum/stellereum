@@ -154,10 +154,15 @@ nrun() {
         if [ -n "$opts" ]; then
             read -r -a ssh_opts <<<"$opts"
         fi
-        ssh -o BatchMode=yes -o ConnectTimeout=10 \
+        # A 1-vCPU node can accept the TCP connection and then stall before the
+        # command runs; without a hard cap the probe hangs for minutes and the
+        # measured "downtime" becomes an SSH artifact (observed: 243 s while the
+        # node was actually voting). Kill the probe instead of trusting it.
+        timeout 30 ssh -o BatchMode=yes -o ConnectTimeout=10 \
+            -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
             "${ssh_opts[@]+"${ssh_opts[@]}"}" "$host" "$cmd"
     else
-        bash -c "$cmd"
+        timeout 30 bash -c "$cmd"
     fi
 }
 

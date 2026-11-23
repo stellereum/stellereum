@@ -31,7 +31,9 @@
 //!   `stell_fork_total`, `stell_mempool_size`, `stell_block_txs{histogram}`,
 //!   `stell_state_root_commits_total`, `stell_validator_set_size`,
 //!   `stell_validator_power_total`, `stell_validator_quorum_power`,
-//!   `stell_validator_set_fragile` — all mirror already-public RPC
+//!   `stell_validator_set_fragile`, `stell_validator_proposals_expected_total`,
+//!   `stell_validator_proposals_produced_total`,
+//!   `stell_validator_efficiency_ratio` — all mirror already-public RPC
 //!   (`stell_getValidators` etc.); no secret in any of them.
 //! * Node-local observability: `stell_data_dir_bytes`, `stell_snapshot_count`,
 //!   `stell_state_entries`, `stell_persist_queue_depth`,
@@ -92,6 +94,19 @@ pub const APPLY_SECONDS: &str = "stell_apply_seconds";
 /// Rounds where this node owned the proposal slot and could not emit a block,
 /// by gate reason. `nil_rounds` says a round was lost; this says why.
 pub const PROPOSE_GATE_BLOCKED_TOTAL: &str = "stell_propose_gate_blocked_total";
+/// Proposal opportunities this node owned: one per HEIGHT+ROUND-0 slot where
+/// this node was the scheduled proposer (TON's `check_ef` denominator,
+/// Solana's "expected leader slots").
+pub const VALIDATOR_PROPOSALS_EXPECTED_TOTAL: &str = "stell_validator_proposals_expected_total";
+/// Proposal opportunities this node actually filled with a proposal (the
+/// numerator of the validator-efficiency KPI).
+pub const VALIDATOR_PROPOSALS_PRODUCED_TOTAL: &str = "stell_validator_proposals_produced_total";
+/// Produced/expected proposals over a rolling window of the last
+/// [`VALIDATOR_EFFICIENCY_WINDOW`] opportunities, in `[0, 1]`; reads 1.0
+/// before the first opportunity so an idle node is not reported as failing.
+pub const VALIDATOR_EFFICIENCY_RATIO: &str = "stell_validator_efficiency_ratio";
+/// Opportunities retained in the [`VALIDATOR_EFFICIENCY_RATIO`] window.
+pub const VALIDATOR_EFFICIENCY_WINDOW: u64 = 1024;
 pub const CONSENSUS_VOTES_TOTAL: &str = "stell_consensus_votes_total";
 /// Round-trip latency to a consensus peer, per peer id.
 pub const PEER_LATENCY_SECONDS: &str = "stell_peer_latency_seconds";
@@ -473,6 +488,82 @@ pub struct Registry {
     /// panic while recording a metric must not make the metrics endpoint (and
     /// with it the operator's only view of consensus health) return 500.
     series: Mutex<BTreeMap<SeriesKey, Value>>,
+    /// Rolling window behind [`VALIDATOR_EFFICIENCY_RATIO`]. Separate from the
+    /// series lock because the ratio is derived state, not a scrape sample:
+    /// it is recomputed once per proposal event (once per round) and then
+    /// written back as a plain gauge.
+    proposal_window: Mutex<ProposalWindow>,
+}
+
+/// Fixed-size rolling window of proposal opportunities.
+///
+/// One `bool` per opportunity (filled or missed), plus two running counts, so
+/// computing the ratio costs one division and no scan of history. The window
+/// is exact: when a slot falls out, its flag is subtracted, so a validator
+/// that never misses reads 1.0 across the wrap (a decaying or halving counter
+/// would dip for the whole next window, which is precisely the noise an
+/// operator would page on).
+struct ProposalWindow {
+    /// `true` = the opportunity was filled. Ring order is oldest to newest.
+    slots: [bool; VALIDATOR_EFFICIENCY_WINDOW as usize],
+    /// Next slot to overwrite.
+    head: usize,
+    /// Live slots, saturating at `VALIDATOR_EFFICIENCY_WINDOW`.
+    len: u64,
+    /// Filled slots among the live ones.
+    produced: u64,
+}
+
+impl ProposalWindow {
+    const fn new() -> Self {
+        Self {
+            slots: [false; VALIDATOR_EFFICIENCY_WINDOW as usize],
+            head: 0,
+            len: 0,
+            produced: 0,
+        }
+    }
+
+    /// A new opportunity enters the window, evicting the oldest when full.
+    fn record_expected(&mut self) {
+        const N: usize = VALIDATOR_EFFICIENCY_WINDOW as usize;
+        if self.len == VALIDATOR_EFFICIENCY_WINDOW {
+            if self.slots[self.head] {
+                self.produced -= 1;
+            }
+        } else {
+            self.len += 1;
+        }
+        self.slots[self.head] = false;
+        self.head = (self.head + 1) % N;
+    }
+
+    /// Mark the newest still-unfilled opportunity as produced. Normally this
+    /// is the slot written by the immediately preceding `record_expected`
+    /// (same tick); the backward walk only matters when a later round finally
+    /// produces for a height whose round-0 slot was missed.
+    fn record_produced(&mut self) {
+        const N: usize = VALIDATOR_EFFICIENCY_WINDOW as usize;
+        for back in 0..self.len as usize {
+            let idx = (self.head + N - 1 - back) % N;
+            if !self.slots[idx] {
+                self.slots[idx] = true;
+                self.produced += 1;
+                return;
+            }
+        }
+        // Every live slot is already filled: a surplus production (e.g. a
+        // proposal emitted for a slot this node did not expect) cannot push
+        // the window above 1.0, so it is deliberately not stored.
+    }
+
+    fn ratio(&self) -> f64 {
+        if self.len == 0 {
+            1.0
+        } else {
+            self.produced as f64 / self.len as f64
+        }
+    }
 }
 
 impl Default for Registry {
@@ -540,6 +631,27 @@ impl Registry {
                 help: "Proposal slots this node owned but could not use, by gate reason",
                 kind: MetricKind::Counter,
                 labels: &[LABEL_REASON],
+                buckets: &[],
+            },
+            MetricDef {
+                name: VALIDATOR_PROPOSALS_EXPECTED_TOTAL,
+                help: "Proposal opportunities this node owned (HEIGHT plus ROUND-0 proposer slots)",
+                kind: MetricKind::Counter,
+                labels: &[],
+                buckets: &[],
+            },
+            MetricDef {
+                name: VALIDATOR_PROPOSALS_PRODUCED_TOTAL,
+                help: "Proposal opportunities this node filled with a proposal",
+                kind: MetricKind::Counter,
+                labels: &[],
+                buckets: &[],
+            },
+            MetricDef {
+                name: VALIDATOR_EFFICIENCY_RATIO,
+                help: "Proposals produced divided by proposals expected over the rolling window (1 when none expected)",
+                kind: MetricKind::Gauge,
+                labels: &[],
                 buckets: &[],
             },
             MetricDef {
@@ -767,6 +879,7 @@ impl Registry {
         let reg = Self {
             defs,
             series: Mutex::new(BTreeMap::new()),
+            proposal_window: Mutex::new(ProposalWindow::new()),
         };
 
         // Pre-seed every series whose label set is known up front, so the first
@@ -799,11 +912,17 @@ impl Registry {
             STATE_ENTRIES,
             PERSIST_QUEUE_DEPTH,
             PERSIST_QUEUE_DROPPED_TOTAL,
+            VALIDATOR_PROPOSALS_EXPECTED_TOTAL,
+            VALIDATOR_PROPOSALS_PRODUCED_TOTAL,
             UNBOUND_TX_TOTAL,
             UNBOUND_REFUSED_TOTAL,
         ] {
             reg.seed(name, &[]);
         }
+        // The ratio opens at 1.0 (expected == 0): a node that has not yet had
+        // a proposal slot is not failing, and an operator alerting on a dip
+        // must not fire on startup.
+        reg.set_scalar(VALIDATOR_EFFICIENCY_RATIO, &[], 1.0);
         // Build identity is a singleton series: exactly one sample whose labels
         // carry the version. Seeded here from compile-time values; the gateway
         // re-sets it with runtime-resolved values (git fallback) on each scrape.
@@ -1190,6 +1309,41 @@ impl Registry {
     /// One proposal slot this node owned and could not use, by gate reason.
     pub fn inc_propose_gate_blocked(&self, reason: &str) {
         self.add(PROPOSE_GATE_BLOCKED_TOTAL, &[(LABEL_REASON, reason)], 1.0);
+    }
+
+    /// One proposal opportunity this node owned: a HEIGHT+ROUND-0 slot where
+    /// this node was the scheduled proposer. Emitted by the driver's
+    /// once-per-round gate diagnostic, so a tick cannot count twice.
+    ///
+    /// Enterprise KPI denominator (TON `check_ef`, Solana expected leader
+    /// slots): counting only, never consulted by any consensus decision.
+    pub fn inc_validator_proposal_expected(&self) {
+        self.add(VALIDATOR_PROPOSALS_EXPECTED_TOTAL, &[], 1.0);
+        self.update_validator_efficiency(ProposalWindow::record_expected);
+    }
+
+    /// One proposal this node actually emitted. Fed from the normal propose
+    /// gate's success path; the rolling window stays within `[0, 1]` because a
+    /// production that cannot be attributed to a live opportunity is not
+    /// stored (see [`ProposalWindow::record_produced`]).
+    pub fn inc_validator_proposal_produced(&self) {
+        self.add(VALIDATOR_PROPOSALS_PRODUCED_TOTAL, &[], 1.0);
+        self.update_validator_efficiency(ProposalWindow::record_produced);
+    }
+
+    /// Move the rolling window, then republish the derived gauge. One division
+    /// per event; events arrive at most once per round, so this never sits on
+    /// a hot path.
+    fn update_validator_efficiency(&self, record: fn(&mut ProposalWindow)) {
+        let ratio = {
+            let mut window = self
+                .proposal_window
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            record(&mut window);
+            window.ratio()
+        };
+        self.set_scalar(VALIDATOR_EFFICIENCY_RATIO, &[], ratio);
     }
 
     /// Rounds `peer` lags behind this node (assignment, not a sum — same
@@ -2009,6 +2163,68 @@ mod tests {
                 "{PROPOSE_GATE_BLOCKED_TOTAL}{{reason=\"min_block_time\"}} 1"
             )),
             "gate reason series missing\n{text}"
+        );
+    }
+
+    /// Wave 1 enterprise KPI (TON `check_ef` / Solana skip rate): the two
+    /// counters and the rolling ratio must be in the base scrape even before
+    /// any opportunity, and an empty window must read 1.0 (not 0, which an
+    /// operator would alert on for a freshly started node).
+    #[test]
+    fn validator_efficiency_metrics_are_rendered() {
+        let m = Registry::new();
+        let text = m.render();
+        for name in [
+            VALIDATOR_PROPOSALS_EXPECTED_TOTAL,
+            VALIDATOR_PROPOSALS_PRODUCED_TOTAL,
+            VALIDATOR_EFFICIENCY_RATIO,
+        ] {
+            assert!(
+                text.lines()
+                    .any(|l| l.starts_with(name) && !l.starts_with('#')),
+                "{name} missing from the initial scrape\n{text}"
+            );
+        }
+        // expected == 0 => 1.0, by contract.
+        assert!(
+            text.lines()
+                .any(|l| l == format!("{VALIDATOR_EFFICIENCY_RATIO} 1")),
+            "empty efficiency window must read 1.0\n{text}"
+        );
+
+        // Two opportunities, one filled: 0.5 over the window.
+        m.inc_validator_proposal_expected();
+        m.inc_validator_proposal_expected();
+        m.inc_validator_proposal_produced();
+        let text = m.render();
+        assert!(
+            text.lines()
+                .any(|l| l == format!("{VALIDATOR_PROPOSALS_EXPECTED_TOTAL} 2")),
+            "expected counter did not move\n{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|l| l == format!("{VALIDATOR_PROPOSALS_PRODUCED_TOTAL} 1")),
+            "produced counter did not move\n{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|l| l == format!("{VALIDATOR_EFFICIENCY_RATIO} 0.5")),
+            "efficiency ratio did not follow the counters\n{text}"
+        );
+
+        // The window is exact across a wrap: a validator that fills every
+        // opportunity reads 1.0 after more than WINDOW opportunities, not a
+        // decaying approximation.
+        for _ in 0..(VALIDATOR_EFFICIENCY_WINDOW + 8) {
+            m.inc_validator_proposal_expected();
+            m.inc_validator_proposal_produced();
+        }
+        let text = m.render();
+        assert!(
+            text.lines()
+                .any(|l| l == format!("{VALIDATOR_EFFICIENCY_RATIO} 1")),
+            "fully productive window must read 1.0 after rollover\n{text}"
         );
     }
 

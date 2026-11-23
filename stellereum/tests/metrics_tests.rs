@@ -24,6 +24,18 @@ const REQUIRED: &[(&str, &str)] = &[
     ("stell_consensus_height", "gauge"),
     ("stell_block_interval_seconds", "histogram"),
     ("stell_consensus_votes_total", "counter"),
+    // Wave 1 validator-efficiency KPI (TON check_ef / Solana skip-rate analogue).
+    ("stell_validator_proposals_expected_total", "counter"),
+    ("stell_validator_proposals_produced_total", "counter"),
+    ("stell_validator_efficiency_ratio", "gauge"),
+    // Consensus-loop instrumentation (phases, apply window, propose gate,
+    // Falcon sign rate, per-block CPU): declared by the registry, so the
+    // exposition parser must accept them.
+    ("stell_phase_seconds", "histogram"),
+    ("stell_apply_seconds", "histogram"),
+    ("stell_cpu_per_block_seconds", "histogram"),
+    ("stell_propose_gate_blocked_total", "counter"),
+    ("stell_falcon_sign_total", "counter"),
     ("stell_peer_latency_seconds", "histogram"),
     ("stell_fork_total", "counter"),
     // #288000 execution-divergence firewall counter (see src/metrics.rs
@@ -1040,10 +1052,10 @@ fn every_exposition_line_is_parsable() {
         if sample.name.ends_with("_bucket") {
             assert!(keys.contains(&"le"), "bucket must carry `le`: {line:?}");
             // Exactly the family's own labels plus `le`, and nothing else.
-            let family_labels = if family == "stell_peer_latency_seconds" {
-                1
-            } else {
-                0
+            // Families whose histogram carries extra labels besides `le`.
+            let family_labels = match family {
+                "stell_peer_latency_seconds" | "stell_phase_seconds" => 1,
+                _ => 0,
             };
             assert_eq!(
                 keys.len(),

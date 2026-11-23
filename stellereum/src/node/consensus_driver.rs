@@ -2960,6 +2960,13 @@ pub(crate) async fn run_consensus_node(
         }
         if last_gate_diag != Some((height, round)) {
             last_gate_diag = Some((height, round));
+            // Enterprise KPI: one "expected" opportunity per HEIGHT+ROUND-0
+            // slot this node OWNS. This is the same once-per-round guard as
+            // the gate diagnostic below, so it cannot double-count a tick.
+            // Counting only: it never feeds the gate decision.
+            if round == 0 && rt.is_proposer() {
+                stellereum::metrics::global().inc_validator_proposal_expected();
+            }
             // One increment per round we OWE a proposal and cannot emit it:
             // `nil_rounds` says the round was lost, this says why.
             if rt.is_proposer() && !rt.hc.has_live_proposal() {
@@ -3096,6 +3103,12 @@ pub(crate) async fn run_consensus_node(
             let proposed = rt.propose(now_secs()).await;
             stellereum::metrics::global().observe_phase("propose", phase_t.elapsed().as_secs_f64());
             if let Some(block) = proposed {
+                // Enterprise KPI numerator: the normal propose gate above
+                // actually emitted a proposal. (The same-tick VEL-1
+                // fast-forward path further below uses the same `propose`
+                // call but is deliberately not counted here; see the note
+                // there. One counter, never a protocol input.)
+                stellereum::metrics::global().inc_validator_proposal_produced();
                 let bh = block.compute_hash();
                 let ntx = block.transactions.len();
                 // P3-H4: enqueue; proposals carry bodies so they flush at once.
@@ -5576,6 +5589,14 @@ pub(crate) async fn run_consensus_node(
                 stellereum::metrics::global()
                     .observe_phase("propose", phase_t.elapsed().as_secs_f64());
                 if let Some(block) = proposed {
+                    // Validator-efficiency KPI: the fast-forward path emits a
+                    // proposal but is NOT a second counting site for
+                    // `stell_validator_proposals_produced_total` (the normal
+                    // propose gate is the single site this KPI watches). A
+                    // height served by a prebuild-hit fast forward therefore
+                    // enters `expected` but not `produced`; the ratio reads
+                    // LOW for such heights, never high. Documented in the
+                    // Wave 1 metrics handoff rather than papered over here.
                     let height = rt.hc.height;
                     let round = rt.hc.round;
                     let bh = block.compute_hash();

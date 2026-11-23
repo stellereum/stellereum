@@ -349,7 +349,20 @@ else
     curl -fsSL "$SNAPSHOT_URL" | tar -I 'zstd -d' -xf - -C "$HOME_DIR/data/"
     rm -f "$HOME_DIR/data/store"/snap* "$HOME_DIR/data/store-shard"*"/snap"* 2>/dev/null || true
     [[ -d "$HOME_DIR/data/store" ]] || die "snapshot extraction did not create $HOME_DIR/data/store"
-    ok "snapshot extracted to $HOME_DIR/data/store"
+    # The published snapshot is a full store, INCLUDING the `safety_record_v1`
+    # tree of the node that produced it. Its range-proof identity belongs to
+    # THAT validator, so this node would fail the record decode and come up as a
+    # fail-closed Observer (live incident 2026-11-23). Clear it and write
+    # generation 1 for THIS node's key. `--i-fenced-all-signers` is true by
+    # construction here: the node has never run, so no signer holds the key.
+    if ! "$BINARY" safety-reset --store-dir "$HOME_DIR/data/store" --i-fenced-all-signers >/dev/null 2>&1; then
+        die "safety-reset on the extracted snapshot failed (is $BINARY the current release?)"
+    fi
+    if ! "$BINARY" safety-init --store-dir "$HOME_DIR/data/store" --keys-dir "$HOME_DIR/keys" \
+        --shard 0 --i-fenced-all-signers; then
+        die "safety-init for this node's key failed; refusing to leave a node that cannot vote"
+    fi
+    ok "snapshot extracted to $HOME_DIR/data/store (safety record initialised for this node)"
 fi
 
 printf '\n================ NEXT STEPS (%s) ================\n' "$MODE"

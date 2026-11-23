@@ -1295,9 +1295,17 @@ impl TeleportBridgeEngine {
             ));
         }
         let amount = req.amount;
+        // Un-park the hourly accounting too: refunded value never left. But
+        // only the amount THIS window actually counted: `hourly_withdrawn` is
+        // the usage of the window that started at `last_rate_limit_reset`, so
+        // a request parked before that boundary is not part of it. Subtracting
+        // it anyway (the old rule) drove the live usage to zero and handed the
+        // sender a full extra window of headroom per pre-parked request.
+        let counted_in_window = req.requested_at >= self.last_rate_limit_reset;
         self.pending_withdrawals.remove(&req_id);
-        // Un-park the hourly accounting too: refunded value never left.
-        self.hourly_withdrawn = self.hourly_withdrawn.saturating_sub(amount);
+        if counted_in_window {
+            self.hourly_withdrawn = self.hourly_withdrawn.saturating_sub(amount);
+        }
         Ok(amount)
     }
 }
@@ -2141,10 +2149,22 @@ impl BridgeState {
                             ));
                         }
                         let amount = req.amount;
+                        // Was this request counted by the CURRENT window?
+                        // `hourly_withdrawn` is the usage of the window that
+                        // began at `last_rate_limit_reset`, so an earlier-window
+                        // request is not in it. The old unconditional
+                        // `saturating_sub` zeroed live usage on every refund of
+                        // a pre-parked request (a rate-limit bypass worth a full
+                        // extra window per parked request).
+                        let counted_in_window = req.requested_at >= engine.last_rate_limit_reset;
                         engine.pending_withdrawals.remove(req_id);
                         // Un-park the hourly accounting too: refunded value
-                        // never left.
-                        engine.hourly_withdrawn = engine.hourly_withdrawn.saturating_sub(amount);
+                        // never left, so the window it occupied regains its
+                        // headroom (only when that window is the current one).
+                        if counted_in_window {
+                            engine.hourly_withdrawn =
+                                engine.hourly_withdrawn.saturating_sub(amount);
+                        }
                         refunded_withdrawals.insert(*req_id);
                         effects.push(BridgeEffect::Unpark {
                             recipient: payer,

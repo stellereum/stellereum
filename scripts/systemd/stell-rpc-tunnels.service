@@ -1,0 +1,20 @@
+[Unit]
+Description=Stellereum RPC load-balancer tunnels (D:8551, C:8552)
+Documentation=file:/root/stellereum/scripts/rpc-lb-tunnels.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The script spawns two ssh -N tunnels and waits; systemd restarts it if either
+# drops, which also re-creates both forwards.
+ExecStart=/usr/local/bin/rpc-lb-tunnels.sh
+Restart=always
+RestartSec=5
+# SSH keys live for root; the tunnel needs nothing else.
+User=root
+NoNewPrivileges=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

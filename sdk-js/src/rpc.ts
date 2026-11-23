@@ -89,15 +89,18 @@ export class JsonRpcClient {
         signal: controller?.signal,
       });
     } catch (error) {
+      if (timer !== undefined) clearTimeout(timer);
       throw new TransportError(
         method,
         error instanceof Error ? error.message : String(error),
         true,
       );
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
     }
 
+    // R2-X: the timeout must cover the BODY too. Clearing it as soon as the
+    // headers arrive let a slow/black-holed response hang the client forever
+    // (and `sendSigned`/`waitForReceipt` with it). Abort stays armed until
+    // the body has been read.
     let raw: string;
     try {
       raw = await response.text();
@@ -107,6 +110,8 @@ export class JsonRpcClient {
         error instanceof Error ? error.message : String(error),
         true,
       );
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
 
     let parsed: unknown;

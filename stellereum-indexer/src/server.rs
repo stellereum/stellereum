@@ -1947,6 +1947,53 @@ pub struct VerifyRequest {
     pub flags: Option<String>,
 }
 
+/// Exact source text the node will rebuild, from the two accepted forms.
+///
+/// Mirrors `stellereum/src/contract_source.rs::decode_source_bytes`:
+/// `source_hex` WINS when both are supplied. The indexer stores this text in
+/// the verified-source registry only after the node says `verified: true`, so
+/// a pair whose halves disagree is refused instead of storing an unverified
+/// lookalike.
+fn source_text_from_request(body: &VerifyRequest) -> Result<String, String> {
+    match (body.source.as_deref(), body.source_hex.as_deref()) {
+        (Some(text), Some(hex_text)) => {
+            let bytes = decode_source_hex(hex_text)?;
+            if bytes != text.as_bytes() {
+                return Err(
+                    "source and source_hex disagree; send exactly one form (they must encode the same .wat text)"
+                        .to_string(),
+                );
+            }
+            Ok(text.to_string())
+        }
+        (Some(text), None) => Ok(text.to_string()),
+        (None, Some(hex_text)) => {
+            let bytes = decode_source_hex(hex_text)?;
+            String::from_utf8(bytes).map_err(|_| "source_hex is not UTF-8 .wat text".to_string())
+        }
+        (None, None) => Err("missing source: provide 'source' or 'source_hex'".to_string()),
+    }
+}
+
+fn decode_source_hex(hex_text: &str) -> Result<Vec<u8>, String> {
+    let trimmed = hex_text.trim();
+    let clean = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if clean.is_empty() || !clean.len().is_multiple_of(2) {
+        return Err("source_hex: expected even-length hex".to_string());
+    }
+    let bytes = hex::decode(clean).map_err(|e| format!("source_hex: bad hex: {e}"))?;
+    if bytes.is_empty() {
+        return Err("source_hex is empty".to_string());
+    }
+    if bytes.len() > MAX_VERIFY_SOURCE_SIZE {
+        return Err("source_hex exceeds 1 MiB of source text".to_string());
+    }
+    Ok(bytes)
+}
+
 /// Ask the NODE to verify a claimed contract source.
 ///
 /// The indexer NEVER decides locally: the submission is forwarded to the
@@ -2009,6 +2056,17 @@ async fn verify_contract_source(
         )
             .into_response();
     }
+
+    // R2-X: the NODE prefers `source_hex` over `source` when BOTH are sent
+    // (`contract_source::decode_source_bytes`). A verified row's `source_text`
+    // must be exactly the text the node rebuilt; otherwise a caller holding
+    // the operator token could get legitimate bytes verified while the
+    // explorer stores (and later serves) a different, unverified source.
+    // Refuse an ambiguous pair (or undecodable/non-UTF-8 hex) fail-closed.
+    let verified_source_text = match source_text_from_request(&body) {
+        Ok(text) => text,
+        Err(msg) => return bad_request(msg),
+    };
 
     let compiler = body.compiler.as_deref().unwrap_or("wat2wasm-1.0");
     let flags = body
@@ -2079,34 +2137,16 @@ async fn verify_contract_source(
     let result = node_reply.get("result").cloned().unwrap_or(Value::Null);
     if result.get("verified").and_then(|v| v.as_bool()) == Some(true) {
         // The node confirmed the rebuild: NOW (and only now) the source is
-        // stored. The stored text is the canonical form the node hashed.
-        let source_text = body.source.clone().unwrap_or_else(|| {
-            let clean = body
-                .source_hex
-                .as_deref()
-                .unwrap_or("")
-                .trim()
-                .strip_prefix("0x")
-                .or_else(|| {
-                    body.source_hex
-                        .as_deref()
-                        .unwrap_or("")
-                        .trim()
-                        .strip_prefix("0X")
-                })
-                .unwrap_or(body.source_hex.as_deref().unwrap_or("").trim());
-            hex::decode(clean)
-                .ok()
-                .and_then(|b| String::from_utf8(b).ok())
-                .unwrap_or_default()
-        });
+        // stored. The text is the exact bytes the node rebuilt (see
+        // `source_text_from_request`; a mismatched `source`/`source_hex` pair
+        // was already refused), never a caller-supplied lookalike.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let row = VerifiedSource {
             contract: key.clone(),
-            source_text,
+            source_text: verified_source_text,
             compiler: result
                 .get("compiler")
                 .and_then(|v| v.as_str())
@@ -2612,6 +2652,10 @@ struct StreamLoopState {
     rx: broadcast::Receiver<IndexerStreamEvent>,
     filter: StreamFilter,
     _guard: SseClientGuard,
+    /// Overflow notice emitted BEFORE the replay burst when `after_seq`
+    /// matched more than `MAX_REPLAY_BURST` windowed events (pre-rendered
+    /// JSON body of the `lagged` frame).
+    pending_lag: Option<String>,
     pending_replay: VecDeque<IndexerStreamEvent>,
     last_sent_seq: u64,
     deadline: tokio::time::Instant,
@@ -2654,14 +2698,22 @@ async fn stream_events(
     // Subscribe BEFORE snapshotting replay so no live event is missed in between.
     let rx = state.stream_hub.subscribe();
     let mut pending_replay = VecDeque::new();
+    let mut replay_overflow = 0usize;
     if let Some(after_seq) = q.after_seq {
         match state.stream_hub.replay_since(after_seq) {
             Ok(events) => {
                 for ev in events {
                     if filter.matches(&ev) {
-                        pending_replay.push_back(ev);
-                        if pending_replay.len() >= MAX_REPLAY_BURST {
-                            break;
+                        if pending_replay.len() < MAX_REPLAY_BURST {
+                            pending_replay.push_back(ev);
+                        } else {
+                            // MAX_REPLAY_BURST is a hard cap (the node's stream
+                            // has the same one), but the events beyond it are
+                            // NOT in the live receiver either: they were
+                            // published before this subscription. Count them so
+                            // the client is TOLD to backfill instead of
+                            // resuming with a silent hole.
+                            replay_overflow += 1;
                         }
                     }
                 }
@@ -2679,12 +2731,23 @@ async fn stream_events(
             }
         }
     }
+    let pending_lag = if replay_overflow == 0 {
+        None
+    } else {
+        let payload = json!({
+            "lagged": replay_overflow,
+            "oldest_available_seq": state.stream_hub.oldest_available_seq(),
+            "action": "backfill_required",
+        });
+        Some(serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()))
+    };
 
     let idle_timeout = state.stream_hub.idle_timeout();
     let init_state = StreamLoopState {
         rx,
         filter,
         _guard: guard,
+        pending_lag,
         pending_replay,
         last_sent_seq: 0,
         deadline: tokio::time::Instant::now() + idle_timeout,
@@ -2694,6 +2757,9 @@ async fn stream_events(
 
     let stream: IndexerSseStream =
         Box::pin(futures::stream::unfold(init_state, |mut st| async move {
+            if let Some(lag_body) = st.pending_lag.take() {
+                return Some((Ok(SseEvent::default().event("lagged").data(lag_body)), st));
+            }
             if let Some(ev) = st.pending_replay.pop_front() {
                 st.last_sent_seq = st.last_sent_seq.max(ev.seq);
                 st.deadline = tokio::time::Instant::now() + st.idle_timeout;

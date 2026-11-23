@@ -685,6 +685,19 @@ impl Syncer {
                             )
                             .await;
                         }
+                    } else {
+                        // Block row already present and identical: its
+                        // transaction/event rows may still be incomplete if a
+                        // previous run stopped between `insert_block` and the
+                        // receipt indexing (the two are separate commits).
+                        self.repair_block_transactions_if_incomplete(
+                            blk.shard_id,
+                            blk.height,
+                            &blk.hash,
+                            blk.timestamp,
+                            blk.tx_count,
+                        )
+                        .await;
                     }
                 }
             }
@@ -719,6 +732,14 @@ impl Syncer {
             // replaces it and dependents re-index (audit B-IDX-2).
             if let Some(known) = self.db.get_block_by_shard_and_height(shard_id, height)? {
                 if known.hash == hash {
+                    // The block row survived a crash/restart but the
+                    // transaction & event rows may not have: they are written
+                    // in later, separate commits. Repair an incomplete block
+                    // instead of skipping it forever (idempotent writes).
+                    self.repair_block_transactions_if_incomplete(
+                        shard_id, height, &hash, timestamp, tx_count,
+                    )
+                    .await;
                     continue;
                 }
             }
@@ -829,6 +850,43 @@ impl Syncer {
             addresses: addrs,
             payload: serde_json::to_value(tx).unwrap_or(Value::Null),
         });
+    }
+
+    /// Finish indexing a block whose row is already stored.
+    ///
+    /// `insert_block` and the transaction/event writes are separate commits,
+    /// so a crash, a timeout, or a restart between them leaves a block with
+    /// fewer transaction rows than its `tx_count`. The next sync sees the
+    /// identical block (same hash) and would otherwise skip it forever,
+    /// leaving the explorer permanently missing transactions and events.
+    /// Every write involved is idempotent (`INSERT OR REPLACE` by global tx
+    /// hash / `(tx_hash, log_index)`), so a repair is safe to repeat.
+    async fn repair_block_transactions_if_incomplete(
+        &self,
+        shard_id: u32,
+        height: u64,
+        block_hash: &str,
+        timestamp: u64,
+        tx_count: u64,
+    ) {
+        if tx_count == 0 {
+            return;
+        }
+        let indexed = match self.db.count_block_txs_for_shard(shard_id, height) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!("[syncer] tx count read failed at {shard_id}:{height}: {e}");
+                return;
+            }
+        };
+        if indexed >= tx_count {
+            return;
+        }
+        warn!(
+            "[syncer] repairing block shard {shard_id} #{height}: {indexed}/{tx_count} transactions indexed"
+        );
+        self.index_block_transactions_in_shard(shard_id, height, block_hash, timestamp)
+            .await;
     }
 
     async fn index_block_transactions_in_shard(
@@ -1607,5 +1665,101 @@ mod tests {
         let s1_head = db.get_block_by_shard_and_height(1, 7).unwrap().unwrap();
         assert_eq!(s1_head.hash, "0xs1_b7");
         assert_eq!(s1_head.state_root.as_deref(), Some("0xroot1"));
+    }
+
+    /// Regression (R2-X): a block row committed by an earlier run must not
+    /// permanently hide its missing transaction rows. The block hash is
+    /// identical, so the syncer takes the "already indexed" path; it must
+    /// notice the transaction count is short and repair it.
+    #[tokio::test]
+    async fn r2x_identical_block_with_missing_txs_is_repaired() {
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
+
+        let db = Database::open(":memory:").unwrap();
+        // A previous run committed the block row, then died before the
+        // (separate) transaction commits.
+        db.insert_block(&BlockRecord {
+            shard_id: 0,
+            height: 1,
+            hash: "0xbh1".to_string(),
+            timestamp: 1_792_000_001,
+            tx_count: 1,
+            proposer: None,
+            proposer_stl57: None,
+            state_root: None,
+        })
+        .unwrap();
+        assert!(db.get_block_txs_for_shard(0, 1).unwrap().is_empty());
+
+        let mock_rest = Router::new().route(
+            "/api/blocks",
+            get(|| async {
+                Json(serde_json::json!([
+                    {
+                        "shard_id": 0,
+                        "height": 1,
+                        "hash": "0xbh1",
+                        "txs": 1,
+                        "timestamp": 1_792_000_001u64
+                    }
+                ]))
+            }),
+        );
+        let rest_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rest_url = format!("http://{}", rest_listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(rest_listener, mock_rest).await.unwrap() });
+
+        let mock_rpc = Router::new().route(
+            "/",
+            post(|Json(body): Json<Value>| async move {
+                let method = body["method"].as_str().unwrap_or("");
+                let result = match method {
+                    "stell_blockNumber" => serde_json::json!("0x1"),
+                    "stell_getShards" => serde_json::json!({
+                        "shards": [{
+                            "shard_id": 0,
+                            "type": "masterchain",
+                            "tip_height": 1,
+                            "tip_hash": "0xbh1",
+                            "local": true
+                        }],
+                        "total_shards": 1
+                    }),
+                    "stell_getBlockTransactions" => serde_json::json!({
+                        "txs": [{
+                            "tx_hash": "abc123",
+                            "index": 0,
+                            "status": "success",
+                            "raw_tx": {
+                                "from": format!("0x{}", "11".repeat(32)),
+                                "to": format!("0x{}", "22".repeat(32)),
+                                "amount": "5"
+                            }
+                        }]
+                    }),
+                    _ => Value::Null,
+                };
+                Json(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+            }),
+        );
+        let rpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_url = format!("http://{}", rpc_listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(rpc_listener, mock_rpc).await.unwrap() });
+
+        let syncer = Syncer::new(db.clone(), rest_url, rpc_url);
+        syncer.sync_step().await.expect("sync_step");
+
+        let txs = db.get_block_txs_for_shard(0, 1).unwrap();
+        assert_eq!(
+            txs.len(),
+            1,
+            "the missing transaction row must be repaired, not skipped"
+        );
+        assert_eq!(txs[0].tx_hash, "0xabc123");
+        assert_eq!(txs[0].from_addr, format!("0x{}", "11".repeat(32)));
+        assert_eq!(txs[0].to_addr, format!("0x{}", "22".repeat(32)));
     }
 }

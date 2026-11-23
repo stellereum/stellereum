@@ -341,6 +341,20 @@ export class HttpFalconSigner implements FalconSigner {
         signal: controller?.signal,
       });
     } catch (error) {
+      if (timer !== undefined) clearTimeout(timer);
+      throw new SignerError(
+        "transport",
+        error instanceof Error ? error.message : String(error),
+        true,
+      );
+    }
+    // R2-X: read the body while the abort timer is still armed. Clearing it
+    // after the headers let a stalled signer response hang the caller past
+    // `timeoutMs`.
+    let text: string;
+    try {
+      text = await response.text();
+    } catch (error) {
       throw new SignerError(
         "transport",
         error instanceof Error ? error.message : String(error),
@@ -349,7 +363,6 @@ export class HttpFalconSigner implements FalconSigner {
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
-    const text = await response.text();
     if (!response.ok) {
       let parsed: { error?: { code?: string; message?: string } } = {};
       try {

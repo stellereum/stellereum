@@ -208,8 +208,16 @@ pub extern "C" fn transfer_from(packed_arg: i64) -> i64 {
         return ERR_UNAUTHORIZED;
     }
 
-    sstore(a_slot, allowed - amount);
-    execute_transfer(from, to, amount)
+    // R2-X: never consume the grant for a transfer that FAILED. `execute_transfer`
+    // can still refuse after this point (owner balance below `amount`, fee
+    // dust with net == 0, or an overflowing credit) and host writes are
+    // immediate — debiting first burned the owner's allowance while moving
+    // nothing. Spend it only when the transfer actually applies.
+    let rc = execute_transfer(from, to, amount);
+    if rc == 1 {
+        sstore(a_slot, allowed - amount);
+    }
+    rc
 }
 
 fn execute_transfer(from: i64, to: i64, amount: i64) -> i64 {

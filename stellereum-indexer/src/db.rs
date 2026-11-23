@@ -1683,6 +1683,18 @@ impl Database {
         Ok(res)
     }
 
+    /// Number of indexed transactions of one `(shard, height)` block.
+    ///
+    /// A `COUNT(*)` instead of loading every row: the syncer calls this on
+    /// every tick to decide whether a block needs repair.
+    pub fn count_block_txs_for_shard(&self, shard_id: u32, height: u64) -> Result<u64> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*) FROM transactions WHERE shard_id = ?1 AND block_height = ?2",
+        )?;
+        stmt.query_row(params![shard_id, Self::clamp_u64(height)], |row| row.get(0))
+    }
+
     pub fn get_block_txs_for_shard(&self, shard_id: u32, height: u64) -> Result<Vec<TxRecord>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(

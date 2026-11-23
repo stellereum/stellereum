@@ -223,11 +223,18 @@ struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        if self.b.len() < self.i + n {
+        // A grant is decoded from attacker-supplied wire bytes (a tx's SF1
+        // trailer). An unchecked `self.i + n` overflows for a forged u64
+        // length prefix and the following slice would panic; refuse instead.
+        let end = self
+            .i
+            .checked_add(n)
+            .ok_or_else(|| SdkError::Decode("length overflow".into()))?;
+        if self.b.len() < end {
             return Err(SdkError::Decode("truncated grant".into()));
         }
-        let s = &self.b[self.i..self.i + n];
-        self.i += n;
+        let s = &self.b[self.i..end];
+        self.i = end;
         Ok(s)
     }
     fn u8(&mut self) -> Result<u8> {
@@ -276,5 +283,20 @@ mod tests {
         assert!(grant.verify_master());
         assert_eq!(SessionGrant::decode(&grant.encode()).unwrap(), grant);
         assert_eq!(grant.remaining_gas(), 10_000_000);
+    }
+
+    #[test]
+    fn r2x_grant_decode_refuses_an_overflowing_length_prefix() {
+        // Fixed prefix: master_address(32) + session_pubkey(32) + six u64s.
+        let mut bytes = vec![0u8; 32 + 32 + 6 * 8];
+        // The FIRST length-prefixed field is `master_signature`.
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        let err = SessionGrant::decode(&bytes).expect_err("forged length must be refused");
+        assert!(matches!(err, SdkError::Decode(_)), "got {err:?}");
+
+        // A large-but-not-overflowing length is a normal truncation refusal.
+        let mut bytes = vec![0u8; 32 + 32 + 6 * 8];
+        bytes.extend_from_slice(&(1u64 << 40).to_le_bytes());
+        assert!(SessionGrant::decode(&bytes).is_err());
     }
 }

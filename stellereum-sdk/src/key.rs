@@ -366,6 +366,16 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         opts.mode(0o600);
     }
     let mut f = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // `OpenOptionsExt::mode` applies ONLY when the file is created. An
+        // existing file (a re-export, or a path a previous version wrote with
+        // the process umask) would otherwise be truncated and rewritten with
+        // the SECRET KEY while keeping its old, possibly world-readable mode.
+        // Tighten it explicitly before a single secret byte is written.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     f.write_all(bytes)?;
     f.sync_all()?;
     Ok(())
@@ -403,5 +413,43 @@ mod tests {
         assert!(
             FalconKeypair::from_public_and_secret(a.public_key(), &b.secret_key_bytes()).is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r2x_save_key_file_tightens_an_existing_permissive_file() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "stell-sdk-r2x-keyfile-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("key.json");
+
+        // A pre-existing, world-readable file at the destination (the bug:
+        // save_key_file truncated it and left 0o644 on the secret).
+        std::fs::write(&path, b"stale").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let kp = FalconKeypair::generate().unwrap();
+        kp.save_key_file(&path).expect("save");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "rewriting an existing key file must tighten it to 0600 (got {mode:o})"
+        );
+        assert_eq!(
+            FalconKeypair::load_key_file(&path).expect("load").address(),
+            kp.address()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

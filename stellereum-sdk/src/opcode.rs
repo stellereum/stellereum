@@ -57,8 +57,13 @@ pub const GAS_CONTRACT_CALL_PER_ARG: u64 = 10;
 /// `GAS_CONTRACT_CALL_PER_BYTE` (`stellereum/src/svm.rs:70`).
 pub const GAS_CONTRACT_CALL_PER_BYTE: u64 = 2;
 
-/// Maximum ABI arguments (`stellereum/src/contract_abi.rs:62`).
-pub const MAX_ABI_ARGS: usize = 16;
+/// Maximum ABI arguments for one call.
+///
+/// Mirrors `stellereum/src/contract_abi.rs:MAX_ABI_ARGS` AND the VM's
+/// `stellereum/src/contract.rs:MAX_CONTRACT_CALL_ARGS`; both are 8. A wider
+/// call is refused by the VM at execution, so allowing more here would only
+/// let a wallet sign and pay for a transaction that is guaranteed to revert.
+pub const MAX_ABI_ARGS: usize = 8;
 /// Maximum ABI blob length (`stellereum/src/contract_abi.rs:64`).
 pub const MAX_ABI_BLOB_LEN: usize = 1024 * 1024;
 
@@ -384,5 +389,26 @@ mod tests {
         assert_eq!(bytes[15], 0x07);
         assert_eq!(&bytes[16..20], &2u32.to_le_bytes());
         assert_eq!(&bytes[20..22], b"hi");
+    }
+
+    #[test]
+    fn r2x_abi_arg_ceiling_matches_the_vm() {
+        // The VM accepts at most 8 scalar arguments (MAX_CONTRACT_CALL_ARGS)
+        // and the manifest validator caps a method at the same 8.
+        assert_eq!(MAX_ABI_ARGS, 8);
+
+        let eight: Vec<CallArg> = (0..8u64).map(CallArg::U64).collect();
+        assert!(encode_calldata(&eight).is_ok());
+        assert!(Op::call([0u8; 32], "f", &eight).is_ok());
+
+        let nine: Vec<CallArg> = (0..9u64).map(CallArg::U64).collect();
+        assert!(matches!(
+            encode_calldata(&nine),
+            Err(SdkError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            Op::call([0u8; 32], "f", &nine),
+            Err(SdkError::InvalidArgument(_))
+        ));
     }
 }

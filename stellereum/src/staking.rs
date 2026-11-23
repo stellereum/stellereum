@@ -3166,11 +3166,13 @@ impl StakingLedger {
     /// it), this primitive is fail-closed end to end:
     ///
     ///  1. SHAPE: same height/round/kind AND same shard with differing
-    ///     targets, and `voter` equal to both votes' voter. The shard check is
+    ///     targets, the envelope's `shard_id` equal to that shard, and `voter`
+    ///     equal to both votes' voter. The shard checks are
     ///     defence in depth: a key may legitimately sign different targets in
     ///     different shards at the same height/round, so a cross-shard pair is
     ///     never equivocation. Anything else (single vote repeated, cross-kind
-    ///     pair, cross-shard pair, framing with another key's vote) burns 0
+    ///     pair, cross-shard pair, envelope naming another shard, framing with
+    ///     another key's vote) burns 0
     ///     with a loud WARN — never an error, so block application can never
     ///     fail on hostile evidence.
     ///  2. SIGNATURES: both votes must [`crate::consensus::Vote::verify`].
@@ -3225,6 +3227,26 @@ impl StakingLedger {
                 "equivocation REFUSED (cross-shard pair: {} vs {}) for {}: refusing to slash",
                 a.shard_id,
                 b.shard_id,
+                hex::encode(voter),
+            );
+            return Ok(0);
+        }
+        // 1c. ENVELOPE SCOPE (sec_s3): the per-offense dedup key commits the
+        // ENVELOPE's `shard_id` (`EquivocationEvidence::offense_key`), while
+        // the checks above only force the two VOTES to share one shard. A
+        // caller that feeds an uncanonicalized envelope could therefore
+        // re-label ONE genuine offense with a different shard id: the dedup
+        // key would differ and the same 5% burn would fire again (and again).
+        // The block-carried path canonicalizes through
+        // `verify_equivocation_evidence` (which refuses exactly this
+        // mismatch), so this is the primitive's own contract; fail closed,
+        // because an envelope naming another shard is not evidence for THESE
+        // votes.
+        if evidence.shard_id != a.shard_id {
+            tracing::warn!(
+                "equivocation REFUSED (envelope shard {} != vote shard {}) for {}: refusing to slash",
+                evidence.shard_id,
+                a.shard_id,
                 hex::encode(voter),
             );
             return Ok(0);
@@ -3296,11 +3318,13 @@ impl StakingLedger {
     /// block in `apply_block_transition`, pool-debited at the call site like
     /// downtime).
     ///
-    ///  1. SHAPE: same height with differing block hashes, and `proposer`
-    ///     equal to both blocks' `proposer`. Anything else (one block
-    ///     repeated, cross-height pair, framing with another key's block)
-    ///     burns 0 with a loud WARN — never an error, so block application
-    ///     can never fail on hostile evidence.
+    ///  1. SHAPE: same shard/height/SIGNED round with differing block hashes,
+    ///     `proposer` equal to both blocks' `proposer`, and the envelope's
+    ///     claimed `round` equal to BOTH signed rounds. Anything else (one
+    ///     block repeated, cross-height pair, cross-shard pair, cross-round
+    ///     re-proposal, framing with another key's block) burns 0 with a loud
+    ///     WARN — never an error, so block application can never fail on
+    ///     hostile evidence.
     ///  2. SIGNATURES: both blocks must pass
     ///     [`crate::consensus::verify_proposer_signature`] under the accused
     ///     key. Forged blocks burn 0 with a loud WARN.
@@ -3309,7 +3333,8 @@ impl StakingLedger {
     ///     failure).
     ///  4. DEDUP: the per-offense key
     ///     ([`crate::consensus::ProposalEquivocationEvidence::offense_key`]:
-    ///     offender ‖ height ‖ conflicting hashes, canonical order) is
+    ///     offender ‖ shard ‖ height ‖ claimed-round ‖ conflicting hashes,
+    ///     canonical order) is
     ///     consumed on first processing in the shared [`Self::equivocation_dedup`]
     ///     set — the vote and proposal keys live under distinct BLAKE3
     ///     domains, so the sets can never collide. A repeat of the same
@@ -3335,6 +3360,40 @@ impl StakingLedger {
         if a.height != b.height {
             tracing::warn!(
                 "proposal equivocation REFUSED (cross-height pair) for {}: refusing to slash",
+                hex::encode(proposer),
+            );
+            return Ok(0);
+        }
+        // SAME SHARD (sec_s3): a validator is scheduled per shard and may
+        // honestly propose one block per shard at the same height, so a
+        // cross-shard pair is not a double-propose. The verifier enforces the
+        // same rule (`verify_proposal_equivocation_evidence`).
+        if a.shard_id != b.shard_id {
+            tracing::warn!(
+                "proposal equivocation REFUSED (cross-shard pair: {} vs {}) for {}: refusing to slash",
+                a.shard_id,
+                b.shard_id,
+                hex::encode(proposer),
+            );
+            return Ok(0);
+        }
+        // CLAIMED ROUND MUST BE THE SIGNED ROUND (sec_s3, ruleset v4): the
+        // envelope's `round` is not trusted metadata — it must equal BOTH
+        // blocks' SIGNED rounds. Without this check the primitive (a) burns
+        // an honest cross-round re-proposal (two genuine bodies at the same
+        // height, different rounds — which is NOT an offense), and (b) lets a
+        // reporter re-label the SAME genuine pair under a new `round`, so the
+        // per-offense dedup key (`ProposalEquivocationEvidence::offense_key`
+        // commits this field) no longer matches and every replay burns another
+        // 5%. The block-carried path canonicalizes through
+        // `verify_proposal_equivocation_evidence` (which refuses both), so
+        // this is the primitive's own contract.
+        if evidence.round != a.round || evidence.round != b.round {
+            tracing::warn!(
+                "proposal equivocation REFUSED (claimed round {} != signed rounds {}/{}) for {}: refusing to slash",
+                evidence.round,
+                a.round,
+                b.round,
                 hex::encode(proposer),
             );
             return Ok(0);

@@ -919,8 +919,19 @@ impl SafetyAuthority {
             target_hash,
             sig,
         );
-        if let Some((_, fsig)) = signer.sign_falcon(&msg) {
-            attach_vote_falcon_sig(&fsig, &mut vote.signature);
+        match signer.sign_falcon(&msg) {
+            Some((_, fsig)) => attach_vote_falcon_sig(&fsig, &mut vote.signature),
+            // F9 observability: the durable watermark is already advanced
+            // (write-ahead), so this round's vote cannot be retried, and an
+            // Ed25519-only vote is dropped by every FULL-PQ peer. Nothing can
+            // be recovered here, but the operator must be able to see that the
+            // PQ half failed instead of finding a silently wasted round.
+            None => tracing::error!(
+                height,
+                round,
+                "[safety] prevote signed WITHOUT a Falcon half (PQ signer unavailable): \
+                 the round is lost and peers will drop this vote"
+            ),
         }
         Ok(vote)
     }
@@ -1039,8 +1050,14 @@ impl SafetyAuthority {
             Some(target),
             sig,
         );
-        if let Some((_, fsig)) = signer.sign_falcon(&msg) {
-            attach_vote_falcon_sig(&fsig, &mut vote.signature);
+        match signer.sign_falcon(&msg) {
+            Some((_, fsig)) => attach_vote_falcon_sig(&fsig, &mut vote.signature),
+            None => tracing::error!(
+                height,
+                polka_round,
+                "[safety] precommit signed WITHOUT a Falcon half (PQ signer unavailable): \
+                 the round is lost and peers will drop this vote"
+            ),
         }
         Ok((vote, next_locked))
     }
@@ -1157,6 +1174,13 @@ impl SafetyAuthority {
             .sign_ed25519(&block_hash)
             .ok_or(SafetyRefusal::SignerFailed)?;
         let falcon_sig = signer.sign_falcon(&block_hash);
+        if falcon_sig.is_none() {
+            tracing::error!(
+                height,
+                "[safety] proposal signed WITHOUT a Falcon half (PQ signer unavailable): \
+                 peers will refuse the block"
+            );
+        }
         Ok((ed_sig, falcon_sig))
     }
 

@@ -1947,15 +1947,59 @@ impl ValidatorRuntime {
             block_hash: target_with_vid.map(|(bh, _)| bh),
         };
         let signer = self.vote_signer_for(req);
-        self.safety
-            .authorize_and_sign_prevote(
-                self.hc.height,
-                round,
-                self.shard_id,
-                target_with_vid,
-                &signer,
-            )
-            .ok()
+        match self.safety.authorize_and_sign_prevote(
+            self.hc.height,
+            round,
+            self.shard_id,
+            target_with_vid,
+            &signer,
+        ) {
+            Ok(vote) => Some(vote),
+            // F8 liveness: the durable lock names a DIFFERENT value from an
+            // EARLIER round while the engine has already unlocked (it observed a
+            // polka for this round's value). The durable authority therefore
+            // refuses the non-nil prevote, and refusing to vote at all costs the
+            // validator its whole round. A NIL prevote is always safe — it
+            // endorses no value, so it cannot break the lock — and it keeps the
+            // validator participating. The lock itself is NOT relaxed here.
+            Err(crate::safety::SafetyRefusal::LockedConflict { lock, .. })
+                if round > lock.round =>
+            {
+                tracing::warn!(
+                    height = self.hc.height,
+                    round,
+                    locked_round = lock.round,
+                    "[safety] locked for another value at an earlier round; \
+                     casting NIL prevote instead of staying silent"
+                );
+                let nil_req = crate::remote_signer::ConsensusSignRequest::Vote {
+                    chain_id: crate::consensus::consensus_chain_id(),
+                    shard_id: self.shard_id,
+                    height: self.hc.height,
+                    round,
+                    kind: crate::consensus::VoteKind::Prevote,
+                    block_hash: None,
+                };
+                let nil_signer = self.vote_signer_for(nil_req);
+                self.safety
+                    .authorize_and_sign_prevote(
+                        self.hc.height,
+                        round,
+                        self.shard_id,
+                        None,
+                        &nil_signer,
+                    )
+                    .ok()
+            }
+            Err(refusal) => {
+                tracing::debug!(
+                    height = self.hc.height,
+                    round,
+                    "[safety] prevote refused: {refusal}"
+                );
+                None
+            }
+        }
     }
 
     pub fn on_prevote(&mut self, v: Vote) -> Result<(), String> {
@@ -4291,5 +4335,69 @@ mod consensus_step_tests {
                 );
             }
         }
+    }
+
+    /// F8: the durable lock names a DIFFERENT value from an EARLIER round while
+    /// the engine has already moved on (it unlocked on a polka). The authority
+    /// refuses the non-nil prevote; the validator must then cast a NIL prevote
+    /// instead of going silent for the round. The lock itself is untouched.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // GATE: the committed PQ registry is process-global; these tests must not race it.
+    async fn f8_locked_conflict_casts_a_nil_prevote_instead_of_silence() {
+        use crate::consensus::Step;
+        use crate::post_quantum::PqScheme;
+        let _g = step_lock();
+
+        // One-validator set: a single prevote IS a polka, so a precommit (and
+        // therefore a durable lock) forms without driving a whole cluster.
+        let key = SigningKey::from_bytes(&[0x91u8; 32]);
+        let fk = FalconKeypair::generate_from_seed(0x92);
+        let id = key.verifying_key().to_bytes();
+        let validators = ValidatorSet::from_list(vec![(id, 10)]);
+        let st = Arc::new(InMemoryStateEngine::new());
+        crate::runtime::fund_genesis(&st, &validators, 1_000_000).await;
+        {
+            let mut ledger = st.staking_write().await;
+            let mut pq_reg = st.pq_registry_write().await;
+            ledger
+                .validator_pq_keys
+                .insert(id, (PqScheme::Falcon512, fk.public_key.clone()));
+            let _ =
+                pq_reg.adopt_legacy_key_at(id, PqScheme::Falcon512, fk.public_key.clone(), 0, true);
+            crate::consensus::sync_committed_pq_registry(&pq_reg, true);
+        }
+        let mut node = ValidatorRuntime::new(key, validators.clone(), st, 1).with_falcon_key(fk);
+
+        // Lock it on value A.
+        let a = node.propose(1_700_200_000).await.expect("proposal A");
+        let a_hash = a.compute_hash();
+        let pv = node.make_prevote().expect("prevote A");
+        node.on_prevote(pv).unwrap();
+        let pc = node.make_precommit().expect("precommit A");
+        node.on_precommit(pc).unwrap();
+        let lock = node.safety.locked().expect("locked on A");
+        assert_eq!(lock.block_hash, a_hash);
+        assert_eq!(lock.round, 0);
+
+        // Engine state after a polka unlock at a later round: no engine lock,
+        // live proposal B with a DIFFERENT value id, round 5.
+        let b_hash = [0xBBu8; 32];
+        let b_value = [0xCCu8; 32];
+        node.hc.note_value_id(b_hash, b_value);
+        node.hc.proposal = Some((node.hc.proposer().expect("proposer"), b_hash));
+        node.hc.locked = None;
+        node.hc.round = 5;
+        node.hc.step = Step::Propose;
+
+        let vote = node
+            .make_prevote()
+            .expect("F8: must cast a NIL prevote, not stay silent");
+        assert_eq!(vote.kind, VoteKind::Prevote);
+        assert_eq!(vote.round, 5);
+        assert_eq!(vote.block_hash, None, "the prevote must be NIL");
+        // The durable lock is NOT relaxed by the fallback.
+        let lock_after = node.safety.locked().expect("lock kept");
+        assert_eq!(lock_after.block_hash, a_hash);
+        assert_eq!(lock_after.round, 0);
     }
 }

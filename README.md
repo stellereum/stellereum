@@ -93,10 +93,17 @@ Run these from the repository root unless a step says otherwise.
 | Step | Command |
 | --- | --- |
 | 1. Clone | `git clone https://github.com/stellereum/stellereum.git && cd stellereum` |
-| 2. Build | `cd stellereum && cargo build --release --offline` |
+| 2. Build | `cd stellereum && cargo build --release --locked` |
 | 3. Local deterministic devnet | `./target/release/stellereum devnet --blocks 100` |
 | 4. Join testnet as an observer from a snapshot | `cd .. && ./scripts/join-testnet.sh --mode observer` |
 | 5. Run the fast verification gate | `./scripts/verify_testnet_ideal.sh --fast` |
+
+Running a node needs **only Rust and a checkout** — no Node, no npm, no web
+build. The HTML/CSS/JS trees (`stellereum/site/`, `docs-site/`,
+`explorer-site/`, `sdk-js/`) are the optional website, documentation portal,
+explorer and TypeScript SDK sources; none of them is on the node's build path.
+`--offline` works only with a pre-populated `~/.cargo` cache; a fresh clone
+should build online with `--locked`.
 
 The devnet is seeded and clock-free: the same `--seed` produces the same chain
 and state root. The observer script writes to `$HOME/stell-observer`, downloads

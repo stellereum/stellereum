@@ -27,9 +27,32 @@ mod bin_tests;
 // request then cost 0.4-1.8s while established connections limped along.
 // IO-bound tasks block; giving them their own workers costs nothing on an
 // idle box and is the difference between a liveness stall and a live chain.
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> anyhow::Result<()> {
+//
+// SIZING (single-vCPU thread explosion): the pool sizes now come from
+// `node::runtime_limits` instead of a hard-coded 4 workers plus Tokio's
+// default 512-thread blocking pool. On a four-or-more-core host the async
+// worker count is unchanged (4); on one vCPU it drops to 2 and the blocking
+// pool to 8, which bounds a process that was observed at 539 threads. Thread
+// counts are scheduling resources only -- no consensus input, wire byte or
+// hash reads them.
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    let limits = node::runtime_limits::detect();
+    tracing::info!(
+        "[runtime] worker_threads={} max_blocking_threads={} (derived from available_parallelism)",
+        limits.worker_threads,
+        limits.max_blocking_threads,
+    );
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(limits.worker_threads)
+        .max_blocking_threads(limits.max_blocking_threads)
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("tokio runtime: {e}"))?;
+    runtime.block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     // Protocol identity MUST be installed before any node handshake: it is
     // what every peer compares against (fork id mismatch = consensus refused,
     // loudly). Startup visibility is part of the contract.

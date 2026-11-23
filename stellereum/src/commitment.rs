@@ -410,6 +410,13 @@ pub struct DomainCache {
     pq_registry_slot: Option<DomainSlot>,
     /// Per-contract ABI JSON cache (feeds the contracts domain).
     pub abi: AbiJsonCache,
+    /// SHA-256 midstate immediately after `version || tokens`, tagged with
+    /// the tokens generation it was built from. Lets a fold skip re-hashing
+    /// an unchanged token registry (see
+    /// [`assemble_cached_digest_with_all_domains_midstate`]).
+    tokens_midstate: Option<(u64, Sha256)>,
+    /// Folds that resumed from `tokens_midstate` (observability/tests).
+    midstate_reuse_hits: u64,
     /// Domain-level hits (reused preimage) since creation / last reset.
     pub hits: u64,
     /// Domain-level misses (rebuilt preimage) since creation / last reset.
@@ -454,6 +461,35 @@ impl DomainCache {
     /// Store a freshly built preimage under its generation.
     pub fn put(&mut self, domain: Domain, generation: u64, bytes: Vec<u8>) {
         *self.slot_mut(domain) = Some(DomainSlot { generation, bytes });
+    }
+
+    /// The SHA-256 midstate after `version || tokens`, when it was built from
+    /// the SAME tokens generation asking for it. A different generation means
+    /// the token registry moved, so the prefix bytes no longer match and the
+    /// caller must start from scratch. A served hit is recorded in
+    /// `midstate_reuse_hits` (observability, not consensus).
+    pub(crate) fn tokens_midstate(&mut self, generation: u64) -> Option<Sha256> {
+        let hit = self
+            .tokens_midstate
+            .as_ref()
+            .filter(|(g, _)| *g == generation)
+            .map(|(_, h)| h.clone());
+        if hit.is_some() {
+            self.midstate_reuse_hits += 1;
+        }
+        hit
+    }
+
+    /// Record the midstate produced by
+    /// [`assemble_cached_digest_with_all_domains_midstate`] for `generation`.
+    pub(crate) fn put_tokens_midstate(&mut self, generation: u64, midstate: Sha256) {
+        self.tokens_midstate = Some((generation, midstate));
+    }
+
+    /// Folds that reused the tokens midstate. A pure counter: it never feeds
+    /// a digest, a root or any decision.
+    pub fn midstate_reuse_hits(&self) -> u64 {
+        self.midstate_reuse_hits
     }
 
     /// Fetch the cached CN-VRF v3 preimage without altering the 13-domain
@@ -2338,9 +2374,56 @@ pub fn assemble_cached_digest_with_all_domains(
     evm_bindings: &[u8],
     pq_registry: &[u8],
 ) -> [u8; 32] {
-    let mut h = Sha256::new();
-    put_u64(&mut h, b"COMMITMENT_VERSION", COMMITMENT_VERSION as u64);
-    for bytes in domains {
+    assemble_cached_digest_with_all_domains_midstate(
+        None,
+        domains,
+        cnvrf,
+        total_minted_nano,
+        evm_bindings,
+        pq_registry,
+    )
+    .0
+}
+
+/// [`assemble_cached_digest_with_all_domains`] with a reusable SHA-256
+/// midstate taken immediately after the TOKENS domain.
+///
+/// The digest is a plain SHA-256 over `version || tokens || staking || …`.
+/// On the live path the earliest domain that changes every block is STAKING
+/// (the proposer's pending reward moves in the ledger), so every root read
+/// re-hashed the whole token registry even though it had not changed. Tokens
+/// is the FIRST domain and, on a chain with a real balance set, the largest
+/// one; its bytes are the only prefix that can be skipped.
+///
+/// `start_after_tokens`: the state captured by the previous call, valid only
+/// while `domains[0]` (tokens) is byte-identical — the caller keys it on the
+/// tokens domain generation, the same soundness argument the domain cache
+/// already relies on. When `Some`, `domains[0]` is NOT hashed again and may
+/// be empty. Returns the digest plus the midstate to store for next time.
+///
+/// Byte-identity: resuming a cloned hasher with the remaining bytes is the
+/// same sequence of compression calls as hashing them all from scratch, so
+/// the digest is bit-for-bit the streaming one (pinned by the differential
+/// tests below).
+pub fn assemble_cached_digest_with_all_domains_midstate(
+    start_after_tokens: Option<Sha256>,
+    domains: [&[u8]; 13],
+    cnvrf: &[u8],
+    total_minted_nano: u64,
+    evm_bindings: &[u8],
+    pq_registry: &[u8],
+) -> ([u8; 32], Sha256) {
+    let mut h = match start_after_tokens {
+        Some(h) => h,
+        None => {
+            let mut h = Sha256::new();
+            put_u64(&mut h, b"COMMITMENT_VERSION", COMMITMENT_VERSION as u64);
+            h.update(domains[0]);
+            h
+        }
+    };
+    let tokens_midstate = h.clone();
+    for bytes in &domains[1..] {
         h.update(bytes);
     }
     h.update(cnvrf);
@@ -2349,7 +2432,7 @@ pub fn assemble_cached_digest_with_all_domains(
     }
     h.update(evm_bindings);
     h.update(pq_registry);
-    h.finalize().into()
+    (h.finalize().into(), tokens_midstate)
 }
 
 /// Zero-copy steady-state assembly: hash every cached domain preimage in
@@ -3856,5 +3939,138 @@ mod tests {
         let d_changed =
             commitment_digest_with_zkml_cnvrf_and_evm_bindings(&s, &zkml, &cnvrf, &changed);
         assert_ne!(d_changed, d_a);
+    }
+
+    /// Differential: resuming from the cached `version || tokens` midstate is
+    /// bit-for-bit identical to hashing the full sequence from scratch, for
+    /// every combination of token content, tail conditionals and minted value.
+    /// Any 1-bit divergence fails.
+    #[test]
+    fn tokens_midstate_assembly_is_byte_identical_across_content_and_tails() {
+        type Case = (Vec<u8>, Vec<u8>, u64, Vec<u8>, Vec<u8>);
+        let cases: [Case; 4] = [
+            (vec![], vec![], 0, vec![], vec![]),
+            (b"tokens-A".to_vec(), b"cnvrf".to_vec(), 0, vec![], vec![]),
+            (
+                b"tokens-B".to_vec(),
+                vec![],
+                1_234_567,
+                b"evm".to_vec(),
+                b"pq".to_vec(),
+            ),
+            (
+                vec![0xAB; 130],
+                vec![0xCD; 7],
+                u64::MAX,
+                vec![0x01; 3],
+                vec![0x02; 5],
+            ),
+        ];
+        for (tokens, cnvrf, minted, evm, pq) in cases {
+            let domains: [&[u8]; 13] = [
+                &tokens[..],
+                b"staking",
+                b"pmm",
+                b"contracts",
+                b"escrow",
+                b"gov",
+                b"oracle",
+                &[],
+                b"books",
+                &[],
+                b"xshard",
+                &[],
+                b"zkml",
+            ];
+            let from_scratch =
+                assemble_cached_digest_with_all_domains(domains, &cnvrf, minted, &evm, &pq);
+            // First fold builds the midstate; the second resumes from it. The
+            // resumed call receives an EMPTY tokens slice on purpose: the
+            // prefix bytes must come from the midstate, never from the slice.
+            let (first, midstate) = assemble_cached_digest_with_all_domains_midstate(
+                None, domains, &cnvrf, minted, &evm, &pq,
+            );
+            assert_eq!(first, from_scratch);
+            let resumed_domains: [&[u8]; 13] = [
+                &[],
+                b"staking",
+                b"pmm",
+                b"contracts",
+                b"escrow",
+                b"gov",
+                b"oracle",
+                &[],
+                b"books",
+                &[],
+                b"xshard",
+                &[],
+                b"zkml",
+            ];
+            let (resumed, midstate2) = assemble_cached_digest_with_all_domains_midstate(
+                Some(midstate),
+                resumed_domains,
+                &cnvrf,
+                minted,
+                &evm,
+                &pq,
+            );
+            assert_eq!(
+                resumed,
+                from_scratch,
+                "resumed midstate digest diverged (tokens={}B)",
+                tokens.len()
+            );
+            // Resuming twice from the re-derived midstate stays identical.
+            let (again, _) = assemble_cached_digest_with_all_domains_midstate(
+                Some(midstate2),
+                resumed_domains,
+                &cnvrf,
+                minted,
+                &evm,
+                &pq,
+            );
+            assert_eq!(again, from_scratch);
+        }
+        // A different token registry genuinely changes the digest (the
+        // midstate is not allowed to alias two different token sets).
+        let base: [&[u8]; 13] = [
+            b"tokens-A",
+            b"staking",
+            b"pmm",
+            b"contracts",
+            b"escrow",
+            b"gov",
+            b"oracle",
+            &[],
+            b"books",
+            &[],
+            b"xshard",
+            &[],
+            b"zkml",
+        ];
+        let (_, mid_a) =
+            assemble_cached_digest_with_all_domains_midstate(None, base, &[], 0, &[], &[]);
+        let other: [&[u8]; 13] = [
+            b"tokens-OTHER",
+            b"staking",
+            b"pmm",
+            b"contracts",
+            b"escrow",
+            b"gov",
+            b"oracle",
+            &[],
+            b"books",
+            &[],
+            b"xshard",
+            &[],
+            b"zkml",
+        ];
+        let changed = assemble_cached_digest_with_all_domains(other, &[], 0, &[], &[]);
+        let (aliased, _) =
+            assemble_cached_digest_with_all_domains_midstate(Some(mid_a), other, &[], 0, &[], &[]);
+        assert_ne!(
+            aliased, changed,
+            "a reused midstate must not hide a token change"
+        );
     }
 }

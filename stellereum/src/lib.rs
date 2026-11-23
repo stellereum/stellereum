@@ -99,6 +99,8 @@ pub mod network;
 pub mod node_keys;
 pub mod oracle;
 pub mod orderbook;
+/// Internal: the single gate deciding whether a Rayon split is worth taking.
+pub(crate) mod parallel;
 pub mod parallel_exec;
 pub mod pmm;
 pub mod post_quantum;

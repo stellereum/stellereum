@@ -976,6 +976,16 @@ impl InMemoryStateEngine {
         self.state_trie.read().await.root_hash()
     }
 
+    /// Number of commitment folds that reused the cached `version || tokens`
+    /// SHA-256 midstate. Observability/tests only — the value participates in
+    /// no digest, root or consensus decision.
+    pub fn commitment_midstate_reuse_hits(&self) -> u64 {
+        self.domain_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .midstate_reuse_hits()
+    }
+
     /// Write the commitment digest to the trie, skipping the O(state) recompute
     /// when no committed subsystem has been mutated since the last commit.
     ///
@@ -1036,26 +1046,38 @@ impl InMemoryStateEngine {
         use crate::commitment::Domain;
 
         // Tokens.
-        let gen = self.domain_gens.load(Domain::Tokens);
+        let tokens_gen = self.domain_gens.load(Domain::Tokens);
         let tokens_hit = self
             .domain_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(Domain::Tokens, gen);
+            .get(Domain::Tokens, tokens_gen);
         let tokens = match tokens_hit {
             Some(b) => b,
             None => {
                 let state = self.tokens.read().await.clone();
                 let b = crate::commitment::tokens_preimage(&state);
-                if self.domain_gens.load(Domain::Tokens) == gen {
+                if self.domain_gens.load(Domain::Tokens) == tokens_gen {
                     self.domain_cache
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .put(Domain::Tokens, gen, b.clone());
+                        .put(Domain::Tokens, tokens_gen, b.clone());
                 }
                 b
             }
         };
+        // PERF (per-block root read): the tokens domain is the first and
+        // usually the largest preimage, while the domain that changes every
+        // block is staking (the proposer's pending reward). Reuse the
+        // SHA-256 state captured after `version || tokens` from the previous
+        // fold while the tokens generation is unchanged, so the unchanged
+        // registry is not re-hashed. Sound for the same reason the domain
+        // cache is: an unchanged generation implies byte-identical tokens.
+        let tokens_midstate = self
+            .domain_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tokens_midstate(tokens_gen);
         // Staking.
         let gen = self.domain_gens.load(Domain::Staking);
         let staking_hit = self
@@ -1383,27 +1405,39 @@ impl InMemoryStateEngine {
             }
         };
 
-        crate::commitment::assemble_cached_digest_with_all_domains(
-            [
-                &tokens,
-                &staking,
-                &pmm,
-                &contracts,
-                &escrow,
-                &governance,
-                &oracle,
-                &session_keys,
-                &books,
-                &bridge,
-                &cross_shard,
-                &xpc,
-                &zkml,
-            ],
-            &cnvrf,
-            self.total_minted_nano(),
-            &evm_bindings,
-            &pq_registry,
-        )
+        let (digest, tokens_midstate_after) =
+            crate::commitment::assemble_cached_digest_with_all_domains_midstate(
+                tokens_midstate,
+                [
+                    &tokens,
+                    &staking,
+                    &pmm,
+                    &contracts,
+                    &escrow,
+                    &governance,
+                    &oracle,
+                    &session_keys,
+                    &books,
+                    &bridge,
+                    &cross_shard,
+                    &xpc,
+                    &zkml,
+                ],
+                &cnvrf,
+                self.total_minted_nano(),
+                &evm_bindings,
+                &pq_registry,
+            );
+        // Cache the midstate only while the tokens generation is still the
+        // one whose bytes were folded. A racing mutation moves the counter, so
+        // a stale midstate can never be keyed to newer bytes.
+        if self.domain_gens.load(Domain::Tokens) == tokens_gen {
+            self.domain_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .put_tokens_midstate(tokens_gen, tokens_midstate_after);
+        }
+        digest
     }
 
     /// Take a writer lock on a committed subsystem and mark the commitment dirty.

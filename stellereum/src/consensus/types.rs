@@ -1509,7 +1509,11 @@ impl Vote {
             return true;
         }
         // FULL-PQ: Falcon-only (old pure-PQ branch, now unconditional).
-        if votes.len() < 4 {
+        // PERF (single-core): `par_iter` on a one-worker pool only adds the
+        // split/join hand-off, so take the sequential iterator there. Both
+        // forms are the AND of the same per-item predicate (early stop cannot
+        // change a boolean), so the verdict is identical.
+        if !crate::parallel::split_worthwhile(votes.len(), 4) {
             votes.iter().all(|v| v.verify())
         } else {
             votes.par_iter().all(|v| v.verify())
@@ -1538,7 +1542,9 @@ impl Vote {
         // FULL-PQ: Falcon-only (old pure-PQ branch, now unconditional).
         // `verify()` consults/records the verified-vote cache, so batch
         // ingest keeps verify-once behavior with no Ed25519 screen.
-        if votes.len() < 4 {
+        // PERF (single-core): sequential on a one-worker pool; the mapped
+        // values and their input order are identical on both paths.
+        if !crate::parallel::split_worthwhile(votes.len(), 4) {
             votes.iter().map(|v| v.verify()).collect()
         } else {
             votes.par_iter().map(|v| v.verify()).collect()
@@ -1564,7 +1570,9 @@ impl Vote {
                 .expect("slot present during the signature screen")
                 .verify()
         };
-        if indices.len() < 2 {
+        // PERF (single-core): keep the input order, skip the pool hand-off
+        // when there is no second worker (or the list is tiny).
+        if !crate::parallel::split_worthwhile(indices.len(), 8) {
             indices.iter().map(one).collect()
         } else {
             indices.par_iter().map(one).collect()
@@ -2514,7 +2522,7 @@ impl QuorumCertificate {
                 crate::post_quantum::verify_pq_signature(scheme, pubkey, msg, sig)
             }
         }
-        if staged.len() < 2 {
+        if !crate::parallel::split_worthwhile(staged.len(), 8) {
             return staged
                 .iter()
                 .all(|(_, scheme, pubkey, sig)| one(*scheme, pubkey, msg, sig));

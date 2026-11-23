@@ -2085,7 +2085,10 @@ impl Transaction {
     pub fn verify_signatures_batch_parallel(txs: &[Transaction]) -> bool {
         use rayon::prelude::*;
         const CHUNK: usize = 16;
-        if txs.len() < CHUNK {
+        // PERF (single-core): a one-worker pool makes `par_chunks` pure
+        // overhead. Both branches apply the same per-chunk `all` to the same
+        // input order, so the verdict is unchanged.
+        if !crate::parallel::split_worthwhile(txs.len(), CHUNK) {
             return Self::verify_signatures_batch(txs);
         }
         txs.par_chunks(CHUNK).all(Self::verify_signatures_batch)
@@ -2095,7 +2098,8 @@ impl Transaction {
     pub fn verify_signatures_batch_parallel_at_height(txs: &[Transaction], height: u64) -> bool {
         use rayon::prelude::*;
         const CHUNK: usize = 16;
-        if txs.len() < CHUNK {
+        // PERF (single-core): same gate as the ungated batch above.
+        if !crate::parallel::split_worthwhile(txs.len(), CHUNK) {
             return Self::verify_signatures_batch_at_height(txs, height);
         }
         txs.par_chunks(CHUNK)
@@ -2130,7 +2134,7 @@ impl Transaction {
         if txs.is_empty() {
             return Vec::new();
         }
-        if txs.len() < 16 {
+        if !crate::parallel::split_worthwhile(txs.len(), 16) {
             txs.iter().map(Transaction::verify_signature).collect()
         } else {
             txs.par_iter().map(Transaction::verify_signature).collect()

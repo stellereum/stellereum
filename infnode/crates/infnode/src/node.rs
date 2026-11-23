@@ -13695,7 +13695,6 @@ mod perf_s7_hot_path_tests {
     //! regression shows up as a failing count instead of a silent slowdown.
 
     use super::*;
-    use base64::Engine as _;
     use std::sync::atomic::AtomicUsize;
 
     /// A payload that counts its clones: fan-out must not copy the message for

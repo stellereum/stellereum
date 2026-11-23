@@ -1173,7 +1173,10 @@ mod kv_sweep_tests {
             "chunks": [{"id": "cc33", "hash": "feedface"}]
         })
         .to_string();
-        assert!(kv.merge_replica("files:doc1", mf2, 60_000, origin(), now + 10));
+        // `store` stamps its own `now_ms()`; under load that can advance past a
+        // 10 ms margin and make the replica look stale (LWW refuses it). Use a
+        // deliberately generous future stamp so the test is deterministic.
+        assert!(kv.merge_replica("files:doc1", mf2, 60_000, origin(), now + 60_000));
         assert_eq!(kv.expected_chunk_hash("aa11"), None);
         assert_eq!(kv.expected_chunk_hash("cc33"), Some("feedface"));
 

@@ -47,4 +47,5 @@ dist-*/
 *.min.js
 *.min.css
 explorer-site/docs/references/
+explorer-site/explorer-v2/
 infnode/nft/

@@ -851,6 +851,23 @@ impl ValidatorRuntime {
                                 .to_string(),
                         );
                     }
+                    // XSHARD bounce-escrow gate: "the tx is present in the
+                    // block" is NOT proof that the source debited anybody (a
+                    // transaction can be included and fail at apply). At/above
+                    // the gate the outbound legacy record must carry the SAME
+                    // anchored source-escrow proof the inbound legacy credit
+                    // verifies (XSHARD-01). An outbound legacy message cannot
+                    // prove a same-block escrow (it anchors to the parent
+                    // root), so on a gate-active chain legacy cross-shard value
+                    // is disabled and the §9 2PC is the only delivery path.
+                    if crate::chain_spec::xshard_bounce_escrow_required_active_at(block.height)
+                        && !self.state.verify_cross_shard_escrow_anchored(msg)
+                    {
+                        return Err(format!(
+                            "proposal: outbound cross-shard legacy record {} has no anchored source escrow proof (XSHARD bounce gate)",
+                            hex::encode(&msg.msg_id[..8])
+                        ));
+                    }
                     continue;
                 }
                 if msg.is_inbound_for(self.shard_id) {
@@ -871,6 +888,24 @@ impl ValidatorRuntime {
                                 "proposal: cross-shard ack/bounce {} fails linkage/timeout",
                                 hex::encode(&msg.msg_id[..8])
                             ));
+                        }
+                        // XSHARD bounce-escrow gate: a control record must not
+                        // complete a transaction whose §9 2PC record rides the
+                        // SAME block (the runtime mirror is refreshed only on
+                        // apply, so the block scan closes the same-block gap).
+                        if crate::chain_spec::xshard_bounce_escrow_required_active_at(block.height)
+                        {
+                            let tx_hash = msg.tx.compute_tx_hash();
+                            if block
+                                .cross_shard_out
+                                .iter()
+                                .any(|m| m.is_xpc() && m.tx.compute_tx_hash() == tx_hash)
+                            {
+                                return Err(format!(
+                                    "proposal: cross-shard ack/bounce {} is for a transaction with a 2PC record in this block (XSHARD bounce gate)",
+                                    hex::encode(&msg.msg_id[..8])
+                                ));
+                            }
                         }
                     } else if msg.is_xpc() {
                         // §9 2PC: the inbound record must carry a valid proof

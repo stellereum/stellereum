@@ -4,7 +4,7 @@ use super::lanes::{
 use super::{ApplyCompleted, BlockHash, DecidedParentVotes, SnapBundle, ValidatorRuntime};
 use crate::consensus::{Height, HeightConsensus};
 use crate::sharding::{Block, CrossShardKey, CrossShardMessage};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Height-driven governance finalization on the live path (neural audit
 /// 2026-11-04 C-02, P0: `gov_finalize` was never called on the live path, so
@@ -319,6 +319,31 @@ impl ValidatorRuntime {
         // the ONLY credit a bounce performs — and validation refuses
         // proof-carrying control records, closing the source-side mint.
         if self.shard_registry.is_sharded() {
+            // XSHARD bounce-escrow gate: at/above the gate an outbound
+            // transfer enters the produced mirror ONLY when its transaction
+            // APPLIED (`status[i]`) and the committed XSHARD-01 escrow leaf
+            // proves the source debit. Recording a refused transaction is the
+            // mint side of the S6-2 defect: its outbound record exists, it
+            // debited nobody, and the timeout bounce would refund an amount
+            // the sender still holds. Below the gate the historical
+            // unconditional record is kept byte-identical.
+            let bounce_escrow_gate =
+                crate::chain_spec::xshard_bounce_escrow_required_active_at(block.height);
+            // XSHARD bounce-escrow gate, HISTORY CLEANSE (runtime mirror): the
+            // engine pruned every produced entry without a committed escrow
+            // leaf at the start of this apply; mirror that verdict here so the
+            // two sets (and therefore `cross_shard_replay_covers`) stay in
+            // lockstep across a restart. Post-apply leaves are exactly the
+            // engine's pre-apply leaves for previous blocks (no step deletes
+            // an escrow leaf), so the victim set is identical.
+            if bounce_escrow_gate {
+                let hashes: Vec<[u8; 32]> = self.produced_cross_shard.keys().copied().collect();
+                for tx_hash in hashes {
+                    if !self.state.legacy_escrow_leaf_committed(&tx_hash).await {
+                        self.produced_cross_shard.remove(&tx_hash);
+                    }
+                }
+            }
             // §9 2PC: refresh the runtime's mirror of the committed 2PC
             // records from the engine (the authority). The mirror is what
             // the SYNCHRONOUS proposal-validation path reads.
@@ -329,9 +354,31 @@ impl ValidatorRuntime {
                 .into_iter()
                 .map(|r| (r.tx_hash, r))
                 .collect();
+            // XSHARD bounce-escrow gate: every 2PC record in THIS block also
+            // refuses a control record for the same hash, even before the
+            // engine snapshot below was taken (the mirror refresh above runs
+            // after the block's own records are committed, but a same-block
+            // PREPARE + bounce must never be able to pay).
+            let xpc_in_block: HashSet<[u8; 32]> = block
+                .cross_shard_out
+                .iter()
+                .filter(|m| m.is_xpc())
+                .map(|m| m.tx.compute_tx_hash())
+                .collect();
             for msg in &block.cross_shard_out {
                 if msg.is_transfer() && msg.is_outbound_for(self.shard_id) {
                     let tx_hash = msg.tx.compute_tx_hash();
+                    if bounce_escrow_gate {
+                        let applied = block
+                            .transactions
+                            .iter()
+                            .position(|t| t.compute_tx_hash() == tx_hash)
+                            .and_then(|idx| outcome.status.get(idx).copied())
+                            .unwrap_or(false);
+                        if !applied || !self.state.has_legacy_escrow_leaf(&msg.tx).await {
+                            continue;
+                        }
+                    }
                     self.produced_cross_shard
                         .entry(tx_hash)
                         .or_insert((msg.tx.clone(), block.height));
@@ -400,10 +447,37 @@ impl ValidatorRuntime {
                     if !self.control_linkage_ok(msg, block.height) {
                         continue;
                     }
+                    let tx_hash = msg.tx.compute_tx_hash();
+                    // XSHARD bounce-escrow gate: refuse BEFORE the replay
+                    // claim (so the record stays replayable and the sets never
+                    // claim a completion that paid nothing). A bounce must be
+                    // backed by the committed source escrow leaf, and NO
+                    // control record may complete a transaction that owns a
+                    // §9 2PC record (in this block OR committed earlier).
+                    // Without this a hand-crafted bounce refunds the source
+                    // while the target's COMMIT credits the recipient — the
+                    // S6-2 double spend.
+                    if bounce_escrow_gate {
+                        if xpc_in_block.contains(&tx_hash)
+                            || self.xpc_records.contains_key(&tx_hash)
+                        {
+                            tracing::warn!(
+                                "cross-shard bounce/ack refused at the escrow gate: tx {} owns a 2PC record",
+                                hex::encode(&tx_hash[..8])
+                            );
+                            continue;
+                        }
+                        if msg.is_bounce() && !self.state.has_legacy_escrow_leaf(&msg.tx).await {
+                            tracing::warn!(
+                                "cross-shard bounce refused at the escrow gate: tx {} has no committed source escrow leaf",
+                                hex::encode(&tx_hash[..8])
+                            );
+                            continue;
+                        }
+                    }
                     if !self.consumed_cross_shard.insert(key) {
                         continue;
                     }
-                    let tx_hash = msg.tx.compute_tx_hash();
                     // Same-block ack+bounce for one transaction: the first in
                     // key order completes it; the second finds it completed.
                     if !self.completed_cross_shard.insert(tx_hash) {

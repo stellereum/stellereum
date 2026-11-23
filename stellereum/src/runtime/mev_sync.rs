@@ -1742,11 +1742,26 @@ impl ValidatorRuntime {
             // block, so no value is lost and the order is preserved.
             let mut dropped_senders: HashSet<[u8; 32]> = HashSet::new();
             let mut openings = 0usize;
+            // XSHARD bounce-escrow gate: when the gate is active and the §9
+            // 2PC is NOT the configured flow, an outbound legacy record can
+            // never validate (it must prove a same-block escrow anchored to
+            // the parent root, which a one-step producer cannot do). Including
+            // the transaction would only build a block every validator refuses,
+            // so it stays in the mempool until the 2PC is active. On the
+            // supported activation sequence (XPC from genesis) this branch is
+            // never taken.
+            let legacy_outbound_disabled =
+                crate::chain_spec::xshard_bounce_escrow_required_active_at(self.hc.height)
+                    && !xpc_active;
             for tx in txs {
                 if dropped_senders.contains(&tx.from) {
                     continue;
                 }
                 if crate::sharding::tx_is_outbound_cross_shard(&tx, my_shard) {
+                    if legacy_outbound_disabled {
+                        dropped_senders.insert(tx.from);
+                        continue;
+                    }
                     if openings >= opening_budget {
                         dropped_senders.insert(tx.from);
                         continue;
@@ -1995,6 +2010,29 @@ impl ValidatorRuntime {
                         if !self.control_linkage_ok(&msg, self.hc.height) {
                             continue;
                         }
+                        // XSHARD bounce-escrow gate: the proposer only admits
+                        // a bounce backed by a committed source escrow leaf,
+                        // and never for a transaction whose §9 2PC record is
+                        // this block's plan or already committed. This keeps
+                        // an honest proposer from building a block validation
+                        // and apply would refuse, while the apply gate still
+                        // refuses a forged one.
+                        if crate::chain_spec::xshard_bounce_escrow_required_active_at(
+                            self.hc.height,
+                        ) {
+                            if self.xpc_records.contains_key(&tx_hash)
+                                || xpc_plan.iter().any(|r| r.tx_hash == tx_hash)
+                                || cross_shard_out
+                                    .iter()
+                                    .any(|m| m.is_xpc() && m.tx.compute_tx_hash() == tx_hash)
+                            {
+                                continue;
+                            }
+                            if msg.is_bounce() && !self.state.has_legacy_escrow_leaf(&msg.tx).await
+                            {
+                                continue;
+                            }
+                        }
                     } else if msg.is_xpc() {
                         if !xpc_on {
                             continue;
@@ -2151,6 +2189,15 @@ impl ValidatorRuntime {
                 } else {
                     std::collections::HashSet::new()
                 };
+                // XSHARD bounce-escrow gate: derived bounces must be backed by
+                // the committed source escrow leaf, and a §9 2PC transfer never
+                // bounces through this legacy path. Above, the `xpc_owned`
+                // filter already covers the activation switch; this covers the
+                // case where a 2PC record exists while the legacy flow is the
+                // configured one (the S6-2 double-spend shape) AND a produced
+                // entry from below the gate that has no escrow leaf.
+                let bounce_escrow_gate =
+                    crate::chain_spec::xshard_bounce_escrow_required_active_at(self.hc.height);
                 let mut expired: Vec<([u8; 32], Transaction)> = self
                     .produced_cross_shard
                     .iter()
@@ -2162,6 +2209,23 @@ impl ValidatorRuntime {
                     .map(|(tx_hash, (tx, _))| (*tx_hash, tx.clone()))
                     .collect();
                 expired.sort_by_key(|(tx_hash, _)| *tx_hash);
+                if bounce_escrow_gate {
+                    let mut proven: Vec<([u8; 32], Transaction)> =
+                        Vec::with_capacity(expired.len());
+                    for (tx_hash, tx) in expired {
+                        if self.xpc_records.contains_key(&tx_hash)
+                            || cross_shard_out
+                                .iter()
+                                .any(|m| m.is_xpc() && m.tx.compute_tx_hash() == tx_hash)
+                        {
+                            continue;
+                        }
+                        if self.state.has_legacy_escrow_leaf(&tx).await {
+                            proven.push((tx_hash, tx));
+                        }
+                    }
+                    expired = proven;
+                }
                 for (tx_hash, tx) in expired {
                     if cross_shard_out
                         .iter()

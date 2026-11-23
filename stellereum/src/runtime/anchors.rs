@@ -2012,7 +2012,10 @@ impl ValidatorRuntime {
     ///    (`produced_cross_shard`, rebuilt from applied blocks);
     ///  * the transaction has not already completed (no ack/bounce committed);
     ///  * for a bounce, the height timeout has elapsed
-    ///    (`bounce_eligible(produce_height, at_height)` — heights, not seconds).
+    ///    (`bounce_eligible(produce_height, at_height)` — heights, not seconds);
+    ///  * at/above [`crate::chain_spec::XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT`],
+    ///    the transaction owns NO §9 2PC record (the async apply path also
+    ///    requires the committed source escrow leaf before it pays).
     ///
     /// Unknown kinds fail closed (false).
     pub(super) fn control_linkage_ok(&self, msg: &CrossShardMessage, at_height: u64) -> bool {
@@ -2024,6 +2027,16 @@ impl ValidatorRuntime {
         }
         let tx_hash = msg.tx.compute_tx_hash();
         if self.completed_cross_shard.contains(&tx_hash) {
+            return false;
+        }
+        // XSHARD bounce-escrow gate: a transaction that owns ANY §9 2PC record
+        // (PREPARE / COMMIT / ABORT) may never complete through the legacy
+        // control path. The 2PC is the transport that already moved (or will
+        // move) the value; a bounce here would refund the source while the
+        // target's COMMIT credits the recipient — the S6-2 double spend.
+        if crate::chain_spec::xshard_bounce_escrow_required_active_at(at_height)
+            && self.xpc_records.contains_key(&tx_hash)
+        {
             return false;
         }
         let Some((_, produce_height)) = self.produced_cross_shard.get(&tx_hash) else {

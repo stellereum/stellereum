@@ -209,6 +209,52 @@ impl InMemoryStateEngine {
         self.state_trie.read().await.generate_merkle_proof(&key)
     }
 
+    /// True when the SOURCE-side escrow/debit leaf of this exact legacy
+    /// cross-shard transfer is committed in this engine's state trie
+    /// (XSHARD-01).
+    ///
+    /// This is the LOCAL half of [`Self::verify_cross_shard_escrow_anchored`]:
+    /// a node that applied the source block can ask its own committed trie,
+    /// with no proof and no peer input, whether the sender was really debited.
+    /// The key is [`crate::sharding::xshard_escrow_state_key`] and the value
+    /// must equal [`crate::sharding::xshard_escrow_state_value`] for the
+    /// carried transaction, so a leaf written for a different transfer (or a
+    /// stale value) does not count.
+    ///
+    /// The bounce gate
+    /// ([`crate::chain_spec::xshard_bounce_escrow_required_active_at`]) uses
+    /// this both when it decides whether an outbound transfer may enter
+    /// `produced_cross_shard` and before paying a timeout refund. `false` is
+    /// the safe answer: no credit, no refund, no claimed replay key.
+    pub async fn has_legacy_escrow_leaf(&self, tx: &crate::sharding::Transaction) -> bool {
+        if !self.cross_shard_enabled() {
+            return false;
+        }
+        let key = crate::sharding::xshard_escrow_state_key(&tx.compute_tx_hash());
+        let expected = crate::sharding::xshard_escrow_state_value(tx);
+        self.state_trie
+            .read()
+            .await
+            .get(&key)
+            .is_some_and(|value| value == expected.as_slice())
+    }
+
+    /// Key-only form of [`Self::has_legacy_escrow_leaf`]: true when the
+    /// committed trie holds the escrow leaf for `tx_hash`, without re-deriving
+    /// the expected value from the transaction.
+    ///
+    /// Used by the gate's PRODUCED prune, which walks `cross_shard_produced`
+    /// (hash -> height only): the key commits the transaction hash, and the
+    /// leaf writer is the only path that writes it, so key presence is exactly
+    /// "the source debit is committed".
+    pub async fn legacy_escrow_leaf_committed(&self, tx_hash: &[u8; 32]) -> bool {
+        if !self.cross_shard_enabled() {
+            return false;
+        }
+        let key = crate::sharding::xshard_escrow_state_key(tx_hash);
+        self.state_trie.read().await.get(&key).is_some()
+    }
+
     /// Install persisted §9 two-phase-commit records (startup restore).
     ///
     /// Extends (never replaces) the live map, and RE-INSERTS the state-trie
@@ -414,6 +460,13 @@ impl InMemoryStateEngine {
         // a restart (the trie is rebuilt from the accounts alone) would lose
         // the escrow leaves and the restored node's root would stop matching
         // the chain that produced them.
+        //
+        // XSHARD bounce-escrow gate: from the gate height on, produced is
+        // PRUNED to entries with a committed escrow leaf (see
+        // `apply_cross_shard_consumptions`), so by the time a post-gate
+        // snapshot is taken every restored entry is a real debit and this
+        // re-derivation is exact. A pre-gate snapshot keeps the historical
+        // behaviour byte-for-byte.
         {
             let mut leaves: Vec<([u8; 32], Vec<u8>)> = snap
                 .produced
@@ -530,7 +583,12 @@ impl InMemoryStateEngine {
     /// * produced: every transfer that is outbound for this block's shard,
     ///   first height wins - the same predicate the runtime uses, recorded
     ///   BEFORE the inbound pass so same-block linkage reads it, exactly like
-    ///   the runtime's apply order;
+    ///   the runtime's apply order. At/above
+    ///   [`crate::chain_spec::XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT`] it is
+    ///   recorded instead by `record_legacy_escrow_receipts_with_index`, i.e.
+    ///   only for a transfer whose escrow transaction APPLIED and whose
+    ///   XSHARD-01 escrow leaf is committed (the runtime mirror gates on the
+    ///   same leaf, so the two cannot diverge across restart);
     /// * consumed (transfers): the replay key is CLAIMED (atomic insert) before
     ///   the credit and released only if the credit refuses, so exactly one
     ///   concurrent consumer credits and the key is present iff it was paid;
@@ -549,13 +607,60 @@ impl InMemoryStateEngine {
         // with no cross-shard records), so the retained set stays bounded when
         // the chain is otherwise idle and every node/pruner path agrees.
         self.prune_terminal_xpc_records(block.height).await;
+        // XSHARD bounce-escrow gate: at/above the gate the produced set is
+        // written by `record_legacy_escrow_receipts_with_index` instead, which
+        // is the only place that knows the apply `status` AND writes the
+        // XSHARD-01 escrow leaf. Recording a transfer whose transaction was
+        // refused would (a) let the timeout bounce mint an amount that was
+        // never debited and (b) diverge from the runtime mirror, which gates
+        // on the same leaf. Below the gate the historical unconditional record
+        // is kept byte-identical.
+        let bounce_escrow_gate =
+            crate::chain_spec::xshard_bounce_escrow_required_active_at(block.height);
+        // XSHARD bounce-escrow gate, HISTORY CLEANSE: entries inherited from
+        // below the gate were recorded unconditionally, so a failed apply may
+        // be in the map. At the first gated block (and every one after) drop
+        // every entry WITHOUT a committed escrow leaf. The verdict is a pure
+        // function of the committed trie (all nodes holding the same pre-state
+        // derive the same victims in the same block), so the digest moves
+        // identically everywhere it is gated. This is what makes the runtime
+        // mirror, the persisted snapshot and `cross_shard_replay_covers`
+        // agree across a restart: after this block the produced set contains
+        // only real debits, and the snapshot's leaf re-derivation is exact.
+        if bounce_escrow_gate {
+            let hashes: Vec<[u8; 32]> = self
+                .cross_shard_produced
+                .read()
+                .await
+                .keys()
+                .copied()
+                .collect();
+            let victims: Vec<[u8; 32]> = {
+                let trie = self.state_trie.read().await;
+                hashes
+                    .into_iter()
+                    .filter(|tx_hash| {
+                        let key = crate::sharding::xshard_escrow_state_key(tx_hash);
+                        trie.get(&key).is_none()
+                    })
+                    .collect()
+            };
+            if !victims.is_empty() {
+                let mut produced = self.cross_shard_produced.write().await;
+                for tx_hash in &victims {
+                    produced.remove(tx_hash);
+                }
+                drop(produced);
+                self.bump_domain_generation(crate::commitment::Domain::CrossShard);
+            }
+        }
         if block.cross_shard_out.is_empty() {
             return 0;
         }
         let mut mutated = false;
         // Produced first: same-block linkage reads the map including this
         // block's own outbounds, exactly like the runtime's apply order.
-        {
+        if !bounce_escrow_gate {
             let mut produced = self.cross_shard_produced.write().await;
             for msg in &block.cross_shard_out {
                 if msg.is_transfer() && msg.is_outbound_for(block.shard_id) {
@@ -655,6 +760,22 @@ impl InMemoryStateEngine {
                     continue;
                 }
                 let tx_hash = msg.tx.compute_tx_hash();
+                // XSHARD bounce-escrow gate: a bounce must be backed by a
+                // committed source escrow, and NO control record may complete a
+                // transaction that owns a §9 2PC record (in this block or
+                // already committed). Without this a hand-crafted bounce plus
+                // a legacy record for a 2PC transfer refunds the source while
+                // the target's COMMIT credits the recipient: a double spend.
+                if bounce_escrow_gate {
+                    if xpc_in_block.contains(&tx_hash)
+                        || self.cross_shard_xpc.read().await.contains_key(&tx_hash)
+                    {
+                        continue;
+                    }
+                    if msg.is_bounce() && !self.has_legacy_escrow_leaf(&msg.tx).await {
+                        continue;
+                    }
+                }
                 {
                     let produced = self.cross_shard_produced.read().await;
                     let Some(produce_height) = produced.get(&tx_hash) else {
@@ -851,6 +972,13 @@ impl InMemoryStateEngine {
         // critical section keeps the apply cheap and the order irrelevant
         // (each leaf has its own key).
         let mut leaves: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+        // XSHARD bounce-escrow gate: the produced set is written HERE (not by
+        // `apply_cross_shard_consumptions`) so its membership means exactly
+        // "the escrow transaction applied and its source debit is committed".
+        // Below the gate the earlier unconditional write is kept.
+        let bounce_escrow_gate =
+            crate::chain_spec::xshard_bounce_escrow_required_active_at(block.height);
+        let mut produced_hashes: Vec<[u8; 32]> = Vec::new();
         let mut msg_hasher = crate::sharding::Transaction::batch_hasher();
         for msg in &block.cross_shard_out {
             if !msg.is_transfer() || !msg.is_outbound_for(block.shard_id) {
@@ -866,10 +994,29 @@ impl InMemoryStateEngine {
             if !status.get(idx).copied().unwrap_or(false) {
                 continue;
             }
+            if bounce_escrow_gate {
+                produced_hashes.push(tx_hash);
+            }
             leaves.push((
                 crate::sharding::xshard_escrow_state_key(&tx_hash),
                 crate::sharding::xshard_escrow_state_value(tx),
             ));
+        }
+        if !produced_hashes.is_empty() {
+            let mut produced = self.cross_shard_produced.write().await;
+            let mut produced_moved = false;
+            for tx_hash in produced_hashes {
+                if let std::collections::hash_map::Entry::Vacant(e) = produced.entry(tx_hash) {
+                    e.insert(block.height);
+                    produced_moved = true;
+                }
+            }
+            drop(produced);
+            if produced_moved {
+                // The produced map is digest-covered: any mutation must move
+                // the CrossShard generation so the next root read sees it.
+                self.bump_domain_generation(crate::commitment::Domain::CrossShard);
+            }
         }
         if leaves.is_empty() {
             return 0;

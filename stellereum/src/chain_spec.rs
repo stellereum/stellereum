@@ -97,6 +97,58 @@ pub const WASM_XSHARD_CONTRACT_SEND_REFUSAL_HEIGHT: u64 = 0;
 /// change needs an explicit governance decision.
 pub const CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT: u64 = u64::MAX;
 
+/// Bridge withdrawal target-address length-cap activation height
+/// (`u64::MAX` = disabled, the compiled default).
+///
+/// `BRIDGE-TARGET-ADDRESS-UNBOUNDED` (S6-4): `TeleportWithdrawalRequest
+/// .target_address` was only checked non-empty and was committed into
+/// `pending_withdrawals`, while the bridge rate limit counted AMOUNT only —
+/// so an attacker could park arbitrarily large strings (a 1 MiB address costs
+/// no bridge value) and grow consensus state for free.
+///
+/// Activating this gate makes settlement refuse a withdrawal whose
+/// `target_address` is longer than
+/// [`crate::bridge::MAX_BRIDGE_TARGET_ADDRESS_BYTES`]. Below the gate every
+/// historical acceptance verdict is unchanged, which is why the default is
+/// `u64::MAX`: a chain (including the live `{0}` configuration) is
+/// byte-identical until an explicit activation.
+pub const BRIDGE_TARGET_ADDRESS_CAP_HEIGHT: u64 = u64::MAX;
+
+/// Cross-shard bounce escrow gate (`u64::MAX` = disabled, the default).
+///
+/// Below this gate the legacy cross-shard bounce path trusts three facts that
+/// are NOT proof of a source debit: the outbound transfer record exists in an
+/// applied block, the height timeout elapsed, and the transaction is not
+/// completed. `produced_cross_shard` was recorded for EVERY outbound legacy
+/// transfer regardless of the transaction's apply `status`, and the bounce
+/// refund used the uncapped `credit_native_transfer` (which mints from the
+/// state machine's point of view). Two exploits followed:
+///
+///  * (a) a validly signed transaction that FAILS at apply (for example a
+///    saturated nonce) debits nobody, yet its outbound record is recorded and
+///    the 64-height timeout bounce mints `tx.amount` back to the sender;
+///  * (b) a §9 2PC PREPARE for a transaction plus a legacy transfer record for
+///    the SAME tx hash plus a hand-crafted bounce credits the target's COMMIT
+///    and refunds the source, double spending the value.
+///
+/// At/above this gate:
+///  * `produced_cross_shard` is recorded ONLY for a transaction whose apply
+///    `status[i]` is true AND whose source debit is proven by the committed
+///    XSHARD-01 escrow leaf (`xshard_escrow_state_key` /
+///    `xshard_escrow_state_value`), in the runtime mirror AND the engine mirror;
+///  * an outbound legacy record is validated with the same anchored escrow
+///    proof an inbound legacy credit uses (the "tx is in the block" shortcut is
+///    gone);
+///  * a bounce requires the committed escrow leaf (or the gate-filtered
+///    applied-produced set) and is REFUSED for any tx hash that owns a §9 2PC
+///    record (PREPARE / COMMIT / ABORT).
+///
+/// The compiled value is `u64::MAX` (inert at every reachable height) so the
+/// live single-shard chain is byte-identical. A chain that activates the
+/// multi-shard `{0,1}` set MUST set a real height; see
+/// `docs/specs/XSHARD_BOUNCE_ESCROW.md` for the exact sequencing.
+pub const XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT: u64 = u64::MAX;
+
 #[cfg(any(test, debug_assertions))]
 thread_local! {
     static EXEC_HARDENING_V1_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
@@ -106,6 +158,10 @@ thread_local! {
     static WASM_XSHARD_CONTRACT_SEND_REFUSAL_OVERRIDE: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
     static CONTRACT_BLOCK_HASH_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    static BRIDGE_TARGET_ADDRESS_CAP_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    static XSHARD_BOUNCE_ESCROW_REQUIRED_OVERRIDE: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -207,6 +263,62 @@ pub fn contract_block_hash_activation_height() -> u64 {
 /// `u64::MAX` (the compiled default): contracts keep seeing zero.
 pub fn contract_block_hash_active_at(height: u64) -> bool {
     let gate = contract_block_hash_activation_height();
+    gate != u64::MAX && height >= gate
+}
+
+/// Set (or clear with `None`) the TEST/DEBUG-ONLY `BRIDGE_TARGET_ADDRESS_CAP`
+/// activation height override for the calling thread. Absent from release
+/// builds.
+#[cfg(any(test, debug_assertions))]
+pub fn set_bridge_target_address_cap_override(activation: Option<u64>) {
+    BRIDGE_TARGET_ADDRESS_CAP_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// Effective `BRIDGE_TARGET_ADDRESS_CAP_HEIGHT` for the calling thread.
+pub fn bridge_target_address_cap_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(h) = BRIDGE_TARGET_ADDRESS_CAP_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    BRIDGE_TARGET_ADDRESS_CAP_HEIGHT
+}
+
+/// True iff the bridge withdrawal target-address byte cap is active at
+/// `height`.
+///
+/// Strictly returns `false` for EVERY height (including `u64::MAX`) when the
+/// effective gate is `u64::MAX` (`GatedOff`, the compiled default), so a chain
+/// that has not opted in keeps the historical acceptance verdicts.
+pub fn bridge_target_address_cap_active_at(height: u64) -> bool {
+    let gate = bridge_target_address_cap_height();
+    gate != u64::MAX && height >= gate
+}
+
+/// Set (or clear with `None`) the TEST/DEBUG-ONLY `XSHARD_BOUNCE_ESCROW_REQUIRED`
+/// activation height override for the calling thread. Absent from release
+/// builds.
+#[cfg(any(test, debug_assertions))]
+pub fn set_xshard_bounce_escrow_override(activation: Option<u64>) {
+    XSHARD_BOUNCE_ESCROW_REQUIRED_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// Effective `XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT` for the calling thread.
+pub fn xshard_bounce_escrow_required_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(h) = XSHARD_BOUNCE_ESCROW_REQUIRED_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT
+}
+
+/// True iff a cross-shard bounce must prove the source escrow (and must not
+/// own a §9 2PC record) at `height`.
+///
+/// Strictly returns `false` for EVERY height (including `u64::MAX`) when the
+/// effective gate is `u64::MAX` (`GatedOff`, the compiled default), so the live
+/// single-shard chain keeps the historical bytes.
+pub fn xshard_bounce_escrow_required_active_at(height: u64) -> bool {
+    let gate = xshard_bounce_escrow_required_height();
     gate != u64::MAX && height >= gate
 }
 
@@ -511,6 +623,12 @@ pub fn current_activation_schedule() -> ChainActivationSchedule {
                 "Contract-visible host.block_hash returns the parent block hash (compiled default u64::MAX: contracts see zero)",
             ),
             ActivationGate::new(
+                "XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT",
+                "stellereum::chain_spec",
+                xshard_bounce_escrow_required_height(),
+                "Cross-shard bounce escrow: produced records and outbound legacy records require the XSHARD-01 source escrow proof, and a bounce is refused for any tx owning a §9 2PC record (compiled default u64::MAX: legacy bounce path unchanged)",
+            ),
+            ActivationGate::new(
                 "HEADER_COMMIT_ACTIVATION_HEIGHT",
                 "stellereum::sharding::block",
                 HEADER_COMMIT_ACTIVATION_HEIGHT,
@@ -693,6 +811,10 @@ mod tests {
             (
                 "CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT",
                 CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT,
+            ),
+            (
+                "XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT",
+                XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT,
             ),
             (
                 "HEADER_COMMIT_ACTIVATION_HEIGHT",

@@ -1,0 +1,4 @@
+# node_exporter textfile collector drop point.
+# Put stell_cluster_liveness.prom here (written by
+# scripts/cluster_liveness_watch.sh) and it is scraped with the host metrics.
+# The directory is mounted read-only into the node-exporter container.

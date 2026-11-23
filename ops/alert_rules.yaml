@@ -258,3 +258,30 @@ groups:
           summary: "Clock sync is failing on node {{ $labels.node }} (stell_clock_sync_ok={{ $value }}; check stell_clock_skew_ms)"
           description: "A node offset beyond 1000 ms (or NTP explicitly disabled/unknown) corrupts block-timestamp sampling, producing negative intervals and fake block-time gaps. Enable NTP and verify with timedatectl timesync-status."
           runbook: "ops/alerts.md#clockskew"
+
+# ==============================================================================
+# 4-VALIDATOR CLUSTER RULES LIVE IN ops/observability/alerts.yml
+#
+# THIS FILE IS THE REGISTRY-ONLY REFERENCE (lab Prometheus, one scrape target).
+# The canonical rules for the live A/B/C/D cluster — the set scraped through
+# scripts/observe-local.sh tunnels — are in ops/observability/alerts.yml, with
+# node-exporter host rules and the validator-participation families. Loading
+# both files into one Prometheus would double-page on overlapping signals, so
+# do not copy the cluster rules here.
+#
+# Name mapping (old name here -> canonical name there):
+#   FinalsStalled       -> BlockStall (60 s) + NodeOutOfSync (>50 blocks)
+#   RoundExplosion      -> no direct twin; round motion is on the dashboard
+#   NilRoundsStall      -> no direct twin; nil-rate panel + BlockStall
+#   ValidatorSetFragile -> ValidatorQuorumLow (also covers size < 4)
+#   ForkSpike           -> ForkDetected (any increase, 1 m)
+#   DivergenceSpike     -> DivergenceDetected (any increase, 1 m)
+#   PersistQueueDrops   -> PersistQueueBacklog (depth > 100, 5 m) for the
+#                          warning; dropped-jobs stays a critical here
+#   DiskAbove80Pct      -> DiskUsageHigh (node_exporter, bytes -> percent)
+#   DiskGrowthFast      -> DiskWillFillIn24h (predict_linear, 24 h)
+#
+# If you tune a threshold for the live cluster, edit
+# ops/observability/alerts.yml only. Runbooks for the new names are in
+# ops/observability/README.md; the entries above stay valid for this file.
+# ==============================================================================

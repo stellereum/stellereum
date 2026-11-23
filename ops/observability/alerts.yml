@@ -1,0 +1,349 @@
+# ==============================================================================
+# Prometheus alerting rules for the live 4-validator Stellereum cluster.
+#
+# THIS IS THE CANONICAL RULE FILE FOR THE CLUSTER. ops/alert_rules.yaml stays
+# the registry-only reference; it contains a pointer and a name mapping, not a
+# duplicate copy of these rules (two files with different thresholds would make
+# "which alert is real" unanswerable during an incident).
+#
+# Runbooks: ops/observability/README.md (anchors named in each description).
+# Metric names are the public constants in stellereum/src/metrics.rs, rendered
+# at GET /metrics. Nothing here invents a series: if a family is absent on a
+# node, its rule simply produces no series for that node.
+#
+# Severity vocabulary (TON-style):
+#   critical = finality, quorum, divergence, or data-loss risk. Page now.
+#   warning  = degradation with headroom. Ticket/next working hour.
+#   info     = context only; routed to the null receiver.
+# ==============================================================================
+
+groups:
+  - name: stellereum-observability-quorum
+    interval: 15s
+    rules:
+      # The set needs 4 validators for one outage to be survivable. `fragile`
+      # means quorum currently needs 100% of the set (STELL_GETVALIDATORS
+      # `fragile: true`), i.e. every validator is mandatory.
+      - alert: ValidatorQuorumLow
+        expr: |
+          (stell_validator_set_size < 4)
+            or
+          (stell_validator_set_fragile == 1)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Validator quorum low on node {{ $labels.node }} (set < 4 or fragile = 1)"
+          description: >-
+            stell_validator_set_size is below 4, or stell_validator_set_fragile
+            is 1, on {{ $labels.instance }}. A 3-validator set halts on one
+            outage and a fragile set has no spare vote. Check stell_getValidators
+            (size/quorum/fragile) on every node, then the last node that left
+            the set. Do not lower quorum values: they are frozen core.
+            Runbook: ops/observability/README.md#validatorquorumlow
+          runbook: "ops/observability/README.md#validatorquorumlow"
+
+  - name: stellereum-observability-participation
+    interval: 15s
+    rules:
+      # stell_validator_efficiency_ratio = produced / expected over the node's
+      # rolling window (1.0 when the node owned no slots). Directly exported;
+      # the equivalent counter form is
+      #   rate(stell_validator_proposals_produced_total[15m])
+      #     / rate(stell_validator_proposals_expected_total[15m])
+      # which is useful when the gauge is stale or you want a raw count.
+      - alert: ValidatorJailed
+        expr: max_over_time(stell_validator_efficiency_ratio[15m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node {{ $labels.node }} produced 0 of its expected proposals in 15m (jailed/absent)"
+          description: >-
+            stell_validator_efficiency_ratio has been exactly 0 for the whole
+            15m window on {{ $labels.instance }}, while the node still exposes
+            metrics. Either it is not in the active validator set (jailed /
+            removed) or it owns slots and can never use them. Compare
+            stell_validator_proposals_expected_total across nodes: expected > 0
+            with produced = 0 is the jailed signature.
+            Runbook: ops/observability/README.md#validatorjailed
+          runbook: "ops/observability/README.md#validatorjailed"
+
+      - alert: ValidatorNotVoting
+        expr: |
+          avg_over_time(stell_validator_efficiency_ratio[15m]) < 0.9
+            and
+          max_over_time(stell_validator_efficiency_ratio[15m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.node }} filled < 90% of its proposal slots over 15m ({{ $value }})"
+          description: >-
+            The 15m mean of stell_validator_efficiency_ratio on
+            {{ $labels.instance }} is below 0.9 but not zero: the node proposes
+            sometimes, so it is in the set and reachable, but misses slots
+            (apply in flight, slow validation, restart, or a proposer gate).
+            Cross-check stell_proposer_missed_total and
+            stell_propose_gate_blocked_total{reason} on the same node.
+            Runbook: ops/observability/README.md#validatornotvoting
+          runbook: "ops/observability/README.md#validatornotvoting"
+
+  - name: stellereum-observability-sync
+    interval: 15s
+    rules:
+      # Compare each node against the cluster max, not against a fixed height:
+      # a network-wide reorg-free catch-up must not page, a single laggard must.
+      - alert: NodeOutOfSync
+        expr: |
+          max_over_time(stell_consensus_height[2m])
+            <
+          (max(max_over_time(stell_consensus_height[2m])) - 50)
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.node }} is >50 blocks behind the cluster tip"
+          description: >-
+            max_over_time(stell_consensus_height[2m]) on {{ $labels.instance }}
+            has stayed more than 50 blocks below the highest node for 2m. Check
+            whether it is advancing (compare deltas, not one sample). Do not
+            wipe or restart into the same state; a lagging node that is
+            catching up is healthy. See also NodeMetricsUnreachable.
+            Runbook: ops/observability/README.md#nodeoutofsync
+          runbook: "ops/observability/README.md#nodeoutofsync"
+
+      - alert: BlockStall
+        expr: delta(stell_consensus_height[60s]) <= 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No height increase on {{ $labels.node }} for 60s (delta {{ $value }})"
+          description: >-
+            stell_consensus_height has not advanced on {{ $labels.instance }} for
+            at least 60s. With STELL_MIN_BLOCK_MS=400 this is a real stall, not
+            idle time. Rounds may still turn (motion without progress): read
+            stell_consensus_round and increase(stell_nil_rounds_total[10m])
+            before touching the node.
+            Runbook: ops/observability/README.md#blockstall
+          runbook: "ops/observability/README.md#blockstall"
+
+  - name: stellereum-observability-host
+    interval: 30s
+    rules:
+      - alert: DiskUsageHigh
+        expr: |
+          (1
+            - node_filesystem_avail_bytes{fstype!~"tmpfs|ramfs|overlay|squashfs|devtmpfs|autofs",mountpoint!~"/etc/hosts|/etc/hostname|/etc/resolv.conf"}
+            / node_filesystem_size_bytes{fstype!~"tmpfs|ramfs|overlay|squashfs|devtmpfs|autofs",mountpoint!~"/etc/hosts|/etc/hostname|/etc/resolv.conf"}
+          ) * 100 > 80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk usage {{ $value | printf \"%.1f\" }}% on {{ $labels.node }}:{{ $labels.mountpoint }}"
+          description: >-
+            node_filesystem_avail_bytes is below 20% of
+            node_filesystem_size_bytes on {{ $labels.instance }}
+            ({{ $labels.mountpoint }}). Check stell_data_dir_bytes and
+            stell_snapshot_count on the node, prune with the documented path,
+            and never delete live store data without a verified snapshot.
+            Runbook: ops/observability/README.md#diskusagehigh
+          runbook: "ops/observability/README.md#diskusagehigh"
+
+      - alert: DiskWillFillIn24h
+        expr: |
+          predict_linear(
+            node_filesystem_avail_bytes{fstype!~"tmpfs|ramfs|overlay|squashfs|devtmpfs|autofs",mountpoint!~"/etc/hosts|/etc/hostname|/etc/resolv.conf"}[6h],
+            24 * 3600
+          ) < 0
+            and
+          (1
+            - node_filesystem_avail_bytes{fstype!~"tmpfs|ramfs|overlay|squashfs|devtmpfs|autofs",mountpoint!~"/etc/hosts|/etc/hostname|/etc/resolv.conf"}
+            / node_filesystem_size_bytes{fstype!~"tmpfs|ramfs|overlay|squashfs|devtmpfs|autofs",mountpoint!~"/etc/hosts|/etc/hostname|/etc/resolv.conf"}
+          ) * 100 > 50
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.node }}:{{ $labels.mountpoint }} projected to fill within 24h"
+          description: >-
+            predict_linear(node_filesystem_avail_bytes[6h], 24h) is below zero
+            on {{ $labels.instance }} ({{ $labels.mountpoint }}), and the
+            filesystem is already over 50% used, so the projection is not noise.
+            Needs 6h of node_exporter history to be meaningful; after a fresh
+            start the rule is blind until then.
+            Runbook: ops/observability/README.md#diskwillfillin24h
+          runbook: "ops/observability/README.md#diskwillfillin24h"
+
+      - alert: InodesHigh
+        expr: |
+          (1
+            - node_filesystem_files_free{fstype!~"tmpfs|ramfs|overlay|squashfs|devtmpfs|autofs",mountpoint!~"/etc/hosts|/etc/hostname|/etc/resolv.conf"}
+            / node_filesystem_files{fstype!~"tmpfs|ramfs|overlay|squashfs|devtmpfs|autofs",mountpoint!~"/etc/hosts|/etc/hostname|/etc/resolv.conf"}
+          ) * 100 > 80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Inode usage {{ $value | printf \"%.1f\" }}% on {{ $labels.node }}:{{ $labels.mountpoint }}"
+          description: >-
+            More than 80% of inodes are used on {{ $labels.instance }}
+            ({{ $labels.mountpoint }}). A full inode table makes the filesystem
+            read-only and silently drops consensus writes (that is how Node C
+            fell out of consensus at 655360/655360). Run the documented orphan
+            sweeper, then re-check node_filesystem_files_free.
+            Runbook: ops/observability/README.md#inodeshigh
+          runbook: "ops/observability/README.md#inodeshigh"
+
+  - name: stellereum-observability-performance
+    interval: 30s
+    rules:
+      - alert: ApplySlow
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, node, instance) (rate(stell_apply_seconds_bucket[5m]))
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Apply p95 {{ $value | humanizeDuration }} on {{ $labels.node }} (>50ms for 10m)"
+          description: >-
+            The 5m p95 of stell_apply_seconds is above 50ms on
+            {{ $labels.instance }} and has stayed there for 10m. Apply runs
+            inside the consensus tick and the proposer gate refuses to build
+            while an apply is in flight, so slow apply widens block gaps. Check
+            host CPU/IO and stell_persist_queue_depth next.
+            Runbook: ops/observability/README.md#applyslow
+          runbook: "ops/observability/README.md#applyslow"
+
+      - alert: CpuPerBlockHigh
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, node, instance) (rate(stell_cpu_per_block_seconds_bucket[10m]))
+          ) > 0.4
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU per block p95 {{ $value | humanizeDuration }} on {{ $labels.node }} (>400ms for 15m)"
+          description: >-
+            Whole-process CPU per finalized block (utime+stime, background
+            threads included) has a 10m p95 above 400ms on
+            {{ $labels.instance }} for 15m. Signing dominates; compare
+            rate(stell_falcon_sign_total[5m]) against the 1h baseline to tell
+            redundant signing from host contention or a build on the box.
+            Runbook: ops/observability/README.md#cpuperblockhigh
+          runbook: "ops/observability/README.md#cpuperblockhigh"
+
+      - alert: PersistQueueBacklog
+        expr: stell_persist_queue_depth > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Persist queue depth {{ $value }} on {{ $labels.node }} (>100 for 5m)"
+          description: >-
+            The background persist queue on {{ $labels.instance }} has held more
+            than 100 jobs for 5m: writes are not keeping up with apply. Check
+            disk latency/free space and whether stell_persist_queue_dropped_total
+            is also moving (that counter is the hard failure; this gauge is the
+            warning before it).
+            Runbook: ops/observability/README.md#persistqueuebacklog
+          runbook: "ops/observability/README.md#persistqueuebacklog"
+
+  - name: stellereum-observability-integrity
+    interval: 15s
+    rules:
+      # Anything above zero here is evidence, not a rate to tolerate.
+      - alert: DivergenceDetected
+        expr: increase(stell_divergence_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Post-state-root divergence refusal on {{ $labels.node }} ({{ $value }} in 5m)"
+          description: >-
+            stell_divergence_total increased on {{ $labels.instance }}: a
+            proposal's post-state root disagreed with ours on the same finalized
+            hash. Stop transacting, preserve logs and the data dir, take a
+            verified snapshot, and compare stell_getStateRoot at a common height
+            across nodes before restarting anything.
+            Runbook: ops/observability/README.md#divergencedetected
+          runbook: "ops/observability/README.md#divergencedetected"
+
+      - alert: ForkDetected
+        expr: increase(stell_fork_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Conflicting block observed on {{ $labels.node }} ({{ $value }} in 5m)"
+          description: >-
+            stell_fork_total increased on {{ $labels.instance }}: this node saw
+            a block that conflicts with its finalized chain. Do not restart into
+            the same state blindly; capture the conflicting height/hash from the
+            journal and compare heights and state roots across all four nodes.
+            Runbook: ops/observability/README.md#forkdetected
+          runbook: "ops/observability/README.md#forkdetected"
+
+      - alert: NodeMetricsUnreachable
+        expr: up{job="stell-nodes"} == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Metrics scrape failing for node {{ $labels.node }} ({{ $labels.instance }})"
+          description: >-
+            Prometheus has failed to scrape {{ $labels.instance }} for 3m. This
+            is either the node process/gateway being down or a dead SSH tunnel
+            (A/C/D only). Run scripts/observe-local.sh --check to separate the
+            two; a tunnel-only failure is not a consensus incident.
+            Runbook: ops/observability/README.md#nodemetricsunreachable
+          runbook: "ops/observability/README.md#nodemetricsunreachable"
+
+  - name: stellereum-observability-informational
+    interval: 30s
+    rules:
+      # Recording rule for the dashboard: Falcon signatures per second, per
+      # node. Kept as a rule so the panel and any future ratio use the same
+      # aggregation.
+      - record: stell:falcon_sign_rate5m
+        expr: sum by (node) (rate(stell_falcon_sign_total[5m]))
+
+      # Counter-derived cross-check of stell_validator_efficiency_ratio (the
+      # gauge is the primary signal; this is the raw-count form used when the
+      # gauge looks stale, and the shape to use if the gauge is ever removed).
+      # It consumes, and never redefines, the two proposal counters.
+      - record: stell:validator_proposal_efficiency15m
+        expr: |
+          sum by (node) (rate(stell_validator_proposals_produced_total[15m]))
+            /
+          clamp_min(
+            sum by (node) (rate(stell_validator_proposals_expected_total[15m])),
+            1e-9
+          )
+
+      # Informational only (routed to the null receiver by default). A ready
+      # node that signs nothing for 10m is either not a validator yet or has
+      # stopped producing votes; the rate itself is on the dashboard panel.
+      - alert: FalconSignRate
+        expr: |
+          sum by (node) (rate(stell_falcon_sign_total[5m])) == 0
+            and on (node)
+          (stell_ready == 1)
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Falcon signing rate is 0 on {{ $labels.node }} while the node reports ready"
+          description: >-
+            rate(stell_falcon_sign_total[5m]) is exactly 0 on
+            {{ $labels.instance }} for 10m while stell_ready == 1. Signing
+            normally dominates CPU on a 1-vCPU validator, so zero means the node
+            is not voting/proposing (observer mode, wrong keys, or a stalled
+            consensus loop). Expected > 0 on a voting validator.
+            Runbook: ops/observability/README.md#falconsignrate
+          runbook: "ops/observability/README.md#falconsignrate"

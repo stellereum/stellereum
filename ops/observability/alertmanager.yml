@@ -1,0 +1,92 @@
+# ==============================================================================
+# Alertmanager — single instance on the build host.
+#
+# Default routing sends everything to the `null` receiver: alerts are ingested
+# and visible in the Alertmanager UI/API, but nothing leaves the host. That is
+# deliberate until the duty channel exists; it also means the wave-gate test
+# below can be run before Telegram is wired.
+#
+# TELEGRAM:
+#   1. Create the bot, add it to the duty group, get the chat id.
+#   2. Put TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in ops/observability/.env.
+#   3. Uncomment the telegram-duty receiver AND the route that points at it.
+#   4. docker compose up -d alertmanager   (compose runs with --config.expand-env)
+#
+# TEST ALERT (exact procedure, also in README "Wave gate"):
+#   docker compose exec alertmanager \
+#     amtool --alertmanager.url=http://127.0.0.1:9093 alert add \
+#       alertname=WaveGateTest severity=critical node=A \
+#       --annotation=summary="wave gate: alert delivery check" \
+#       --end="$(date -u -d '+2 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+#
+# Positional arguments are LABELS; text for the notification goes through
+# --annotation=key=value, otherwise .Annotations.summary is empty.
+#
+#   docker compose exec alertmanager \
+#     amtool --alertmanager.url=http://127.0.0.1:9093 alert query alertname=WaveGateTest
+#
+# With the null receiver, the gate is "query returns the alert". With Telegram
+# enabled, the gate is "the message appears in the duty group".
+#
+# Resolve early (optional):
+#   ... alert add alertname=WaveGateTest severity=critical node=A \
+#     --end="$(date -u -d '-1 minute' +%Y-%m-%dT%H:%M:%SZ)"
+# ==============================================================================
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: "null"
+  group_by: [alertname, cluster, node]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Informational alerts never page. They stay queryable in the API.
+    - matchers:
+        - 'severity="info"'
+      receiver: "null"
+      continue: false
+
+    # Uncomment after .env carries a bot token and chat id, and after the
+    # telegram-duty receiver below is uncommented.
+    # - matchers:
+    #     - 'severity=~"critical|warning"'
+    #   receiver: telegram-duty
+    #   continue: false
+
+receivers:
+  - name: "null"
+
+  # - name: telegram-duty
+  #   telegram_configs:
+  #     - bot_token: ${TELEGRAM_BOT_TOKEN}
+  #       chat_id: ${TELEGRAM_CHAT_ID}
+  #       parse_mode: HTML
+  #       send_resolved: true
+  #       message: |
+  #         <b>[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}</b>
+  #         severity: {{ .CommonLabels.severity }}
+  #         node: {{ .CommonLabels.node }}
+  #         {{ range .Alerts -}}
+  #         {{ .Annotations.summary }}
+  #         {{ .Annotations.description }}
+  #         {{ end }}
+  #         runbook: {{ .CommonAnnotations.runbook }}
+
+inhibit_rules:
+  # A critical on the same alertname+node silences its warning twin.
+  - source_matchers:
+      - 'severity="critical"'
+    target_matchers:
+      - 'severity="warning"'
+    equal: [alertname, node]
+
+  # If a node's metrics are unreachable, height/disk/apply alerts on that node
+  # are downstream noise (stale series or a dead tunnel), not new incidents.
+  - source_matchers:
+      - 'alertname="NodeMetricsUnreachable"'
+    target_matchers:
+      - 'severity=~"warning|critical"'
+    equal: [node]

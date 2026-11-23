@@ -1,0 +1,91 @@
+# Prometheus for the live 4-validator Stellereum cluster.
+#
+# Network model (see README "Why the nodes stay on localhost"):
+#   B  -> 127.0.0.1:8080          local process, scraped directly
+#   A  -> 127.0.0.1:9080          SSH tunnel  (scripts/observe-local.sh)
+#   C  -> 127.0.0.1:9081          SSH tunnel, non-default port 2222
+#   D  -> 127.0.0.1:9082          SSH tunnel
+#   9083 is reserved for a fifth endpoint (standby validator or observer).
+#
+# Prometheus runs with network_mode: host, so these 127.0.0.1 targets are the
+# HOST's loopback, not a container-local one.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: stellereum-testnet
+    site: build-host
+    monitor: prometheus-01
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - 127.0.0.1:9093
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  # The four validators. The `node` label is what every alert and dashboard
+  # groups on; keep it stable (A/B/C/D) and do not rename it.
+  - job_name: stell-nodes
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - 127.0.0.1:9080
+        labels:
+          node: A
+          role: validator
+          transport: ssh-tunnel
+      - targets:
+          - 127.0.0.1:8080
+        labels:
+          node: B
+          role: validator
+          transport: local
+      - targets:
+          - 127.0.0.1:9081
+        labels:
+          node: C
+          role: validator
+          transport: ssh-tunnel
+      - targets:
+          - 127.0.0.1:9082
+        labels:
+          node: D
+          role: validator
+          transport: ssh-tunnel
+      # Reserved for a fifth endpoint (observer / standby). Uncomment only
+      # after a tunnel or local process actually listens on 9083; an unused
+      # target would keep NodeMetricsUnreachable firing.
+      # - targets: ["127.0.0.1:9083"]
+      #   labels: {node: E, role: observer, transport: ssh-tunnel}
+
+  # Host that runs this stack: disks, inodes, CPU, load, network.
+  - job_name: node
+    static_configs:
+      - targets:
+          - 127.0.0.1:9100
+        labels:
+          node: build-host
+          role: monitor-host
+
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - 127.0.0.1:9090
+        labels:
+          node: build-host
+          role: monitor-host
+
+  - job_name: alertmanager
+    static_configs:
+      - targets:
+          - 127.0.0.1:9093
+        labels:
+          node: build-host
+          role: monitor-host

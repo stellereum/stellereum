@@ -1,0 +1,134 @@
+# ==============================================================================
+# Stellereum observability stack — Prometheus + Alertmanager + Grafana +
+# node_exporter, for the build host that runs the read-only collector.
+#
+# WHY HOST NETWORKING (and no `ports:`):
+#   Every node serves /metrics on 127.0.0.1 (STELL_EXPLORER_LISTEN), and A/C/D
+#   are only reachable through the SSH tunnels opened by
+#   scripts/observe-local.sh on this host. Host networking makes the
+#   container's 127.0.0.1 the host's 127.0.0.1, so the scrape targets are
+#   literally the tunnel ports (9080-9082) and B's 8080. Nothing is exposed on
+#   a public interface: each service is told to bind 127.0.0.1 explicitly.
+#
+# SECRETS: none live in this file. Copy .env.example to .env (mode 0600) and
+# fill it. `${GRAFANA_ADMIN_PASSWORD:?}` makes compose refuse to start instead
+# of booting Grafana with the default admin/admin.
+#
+# Bring up:  see ops/observability/README.md
+# ==============================================================================
+name: stell-observability
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    cpus: 1.0
+    mem_limit: 768m
+    container_name: stell-prometheus
+    restart: unless-stopped
+    network_mode: host
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}
+      - --storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-20GB}
+      - --web.listen-address=127.0.0.1:9090
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      alertmanager:
+        condition: service_started
+    logging: *default-logging
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    cpus: 0.5
+    mem_limit: 256m
+    container_name: stell-alertmanager
+    restart: unless-stopped
+    network_mode: host
+    # --config.expand-env substitutes ${TELEGRAM_*} from the container env, so
+    # the receiver block can stay in the file with no secret in it.
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=127.0.0.1:9093
+      - --config.expand-env
+      - --cluster.listen-address=
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    logging: *default-logging
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    cpus: 0.5
+    mem_limit: 512m
+    container_name: stell-grafana
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in ops/observability/.env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SERVER_HTTP_ADDR: 127.0.0.1
+      GF_SERVER_HTTP_PORT: ${GRAFANA_PORT:-3000}
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://127.0.0.1:3000}
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/stellereum-observability.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_started
+    logging: *default-logging
+
+  # Host metrics (disk, inodes, CPU, load, network). container filesystem is
+  # still a container: the host root is mounted read-only at /host and
+  # --path.rootfs makes the filesystem collector report HOST mountpoints.
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    cpus: 0.2
+    mem_limit: 128m
+    container_name: stell-node-exporter
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    command:
+      - --path.rootfs=/host
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --collector.textfile.directory=/var/lib/node_exporter/textfile_collector
+      - --web.listen-address=127.0.0.1:9100
+      - --no-collector.wifi
+      - --no-collector.hwmon
+    volumes:
+      - /:/host:ro,rslave
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      # Writable on the host, read-only to the collector. Drop
+      # stell_cluster_liveness.prom here to reuse the existing textfile watcher
+      # (scripts/cluster_liveness_watch.sh).
+      - ./textfile:/var/lib/node_exporter/textfile_collector:ro
+    logging: *default-logging
+
+volumes:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:

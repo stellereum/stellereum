@@ -282,3 +282,33 @@ never reset — alert on `increase(...) > 0`:
 `scripts/backup_verify.sh`), do not restart into the same state blindly.
 Persist/slow-validation = host resources first. Unbound-refused = check
 against the published activation height before concluding anything.
+
+## Live 4-validator cluster (ops/observability)
+
+The rules in this file are the **registry-only reference**. The canonical rules
+for the live A/B/C/D cluster are `ops/observability/alerts.yml` (Prometheus +
+Alertmanager + Grafana stack in `ops/observability/`). Thresholds differ on
+purpose (node_exporter percentages, 4-validator quorum, participation), so do
+not load both into the same Prometheus and do not copy thresholds between them.
+
+New alerts and their runbooks (anchors in `ops/observability/README.md`):
+
+| Alert | Signal | Severity |
+| --- | --- | --- |
+| `ValidatorQuorumLow` | `stell_validator_set_size < 4` or `stell_validator_set_fragile == 1` | critical |
+| `ValidatorJailed` | `stell_validator_efficiency_ratio[15m]` max = 0 | critical |
+| `ValidatorNotVoting` | 15m mean of `stell_validator_efficiency_ratio` < 0.9 | warning |
+| `NodeOutOfSync` | height > 50 below cluster max for 2m | warning |
+| `BlockStall` | `delta(stell_consensus_height[60s]) <= 0` | critical |
+| `DiskUsageHigh` / `DiskWillFillIn24h` | node_exporter filesystem > 80% / 24h projection | warning / critical |
+| `InodesHigh` | node_exporter inodes > 80% | warning |
+| `ApplySlow` / `CpuPerBlockHigh` | p95 apply > 50ms / CPU per block > 400ms | warning |
+| `PersistQueueBacklog` | `stell_persist_queue_depth > 100` for 5m | warning |
+| `DivergenceDetected` / `ForkDetected` | any `increase(...[5m]) > 0` | critical |
+| `FalconSignRate` | signing rate 0 while `stell_ready == 1` | info |
+
+`FinalsStalled` maps to `BlockStall` + `NodeOutOfSync`; `ForkSpike` /
+`DivergenceSpike` map to `ForkDetected` / `DivergenceDetected`. Nothing is
+contradictory: this file keeps its historical thresholds for a single-target
+lab, the cluster file owns the live 4-validator thresholds. Triage steps for
+the new names are in `ops/observability/README.md#alert-catalogue`.

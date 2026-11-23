@@ -1,0 +1,15 @@
+apiVersion: 1
+
+# Dashboard JSON lives next to this stack so it is reviewed like any other
+# config: ops/observability/grafana/dashboards/*.json
+providers:
+  - name: stellereum
+    orgId: 1
+    folder: Stellereum
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

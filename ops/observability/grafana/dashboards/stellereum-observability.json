@@ -1,0 +1,290 @@
+{
+  "uid": "stellereum-observability",
+  "title": "Stellereum — 4-validator cluster",
+  "description": "Height/lag, block interval, apply, CPU per block, participation, Falcon signing, persist queue, host disk/inodes, validator set. Prometheus job stell-nodes (nodes A/B/C/D) + node exporter.",
+  "tags": ["stellereum", "consensus", "validators"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "30s",
+  "graphTooltip": 1,
+  "time": {"from": "now-6h", "to": "now"},
+  "templating": {"list": []},
+  "annotations": {"list": []},
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Consensus height per node",
+      "description": "stell_consensus_height. A healthy cluster advances together; a flat line is BlockStall, a low line is NodeOutOfSync.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "stell_consensus_height", "legendFormat": "{{node}}"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 5, "showPoints": "never", "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Height lag (max − min)",
+      "description": "max(stell_consensus_height) - min(stell_consensus_height). NodeOutOfSync fires above 50 blocks.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "max(stell_consensus_height) - min(stell_consensus_height)", "legendFormat": "blocks", "instant": true}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 1}, {"color": "red", "value": 50}]}
+        },
+        "overrides": []
+      },
+      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "auto", "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "wideLayout": true}
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Block interval p50 / p95",
+      "description": "histogram_quantile over stell_block_interval_seconds_bucket (5m rate). Buckets top out at 60s; longer gaps land in +Inf.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.5, sum by (le, node) (rate(stell_block_interval_seconds_bucket[5m])))", "legendFormat": "p50 {{node}}"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le, node) (rate(stell_block_interval_seconds_bucket[5m])))", "legendFormat": "p95 {{node}}"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 5, "showPoints": "never", "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Apply p50 / p95 (ms)",
+      "description": "histogram_quantile over stell_apply_seconds_bucket ×1000. ApplySlow fires when p95 > 50ms for 10m.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.5, sum by (le, node) (rate(stell_apply_seconds_bucket[5m]))) * 1000", "legendFormat": "p50 {{node}}"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le, node) (rate(stell_apply_seconds_bucket[5m]))) * 1000", "legendFormat": "p95 {{node}}"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 50}]},
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 5, "showPoints": "never", "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "CPU per block p50 / p95 (ms)",
+      "description": "Whole-process CPU per finalized block, stell_cpu_per_block_seconds ×1000. CpuPerBlockHigh fires when p95 > 400ms for 15m.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.5, sum by (le, node) (rate(stell_cpu_per_block_seconds_bucket[10m]))) * 1000", "legendFormat": "p50 {{node}}"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le, node) (rate(stell_cpu_per_block_seconds_bucket[10m]))) * 1000", "legendFormat": "p95 {{node}}"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 400}]},
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 5, "showPoints": "never", "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Nil rounds / missed proposals (5m increase)",
+      "description": "increase(stell_nil_rounds_total[5m]) and increase(stell_proposer_missed_total[5m]). Motion without progress shows here first.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum by (node) (increase(stell_nil_rounds_total[5m]))", "legendFormat": "nil rounds {{node}}"},
+        {"refId": "B", "expr": "sum by (node) (increase(stell_proposer_missed_total[5m]))", "legendFormat": "missed proposals {{node}}"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "bars", "lineWidth": 1, "fillOpacity": 40, "showPoints": "never", "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Proposal efficiency ratio",
+      "description": "stell_validator_efficiency_ratio = produced/expected (1.0 when the node owned no slots). ValidatorJailed at 0; ValidatorNotVoting below 0.9.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "stell_validator_efficiency_ratio", "legendFormat": "{{node}}"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1.05,
+          "decimals": 3,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 0.9}]},
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 8, "showPoints": "never", "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Falcon signatures / s",
+      "description": "sum by (node) (rate(stell_falcon_sign_total[5m])). Signing dominates CPU on a 1-vCPU validator; zero while ready is FalconSignRate (info).",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum by (node) (rate(stell_falcon_sign_total[5m]))", "legendFormat": "{{node}}"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 5, "showPoints": "never", "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Persist queue depth",
+      "description": "stell_persist_queue_depth. PersistQueueBacklog fires above 100 for 5m; dropped jobs are the hard failure (stell_persist_queue_dropped_total).",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "stell_persist_queue_depth", "legendFormat": "{{node}}"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 100}]},
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 8, "showPoints": "never", "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Disk usage %",
+      "description": "1 − node_filesystem_avail_bytes / node_filesystem_size_bytes, tmpfs/overlay excluded. DiskUsageHigh > 80%; DiskWillFillIn24h uses predict_linear.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(1 - node_filesystem_avail_bytes{fstype!~\"tmpfs|ramfs|overlay|squashfs|devtmpfs|autofs\",mountpoint!~\"/etc/hosts|/etc/hostname|/etc/resolv.conf\"} / node_filesystem_size_bytes{fstype!~\"tmpfs|ramfs|overlay|squashfs|devtmpfs|autofs\",mountpoint!~\"/etc/hosts|/etc/hostname|/etc/resolv.conf\"}) * 100",
+          "legendFormat": "{{instance}} {{mountpoint}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 80}, {"color": "red", "value": 90}]},
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 5, "showPoints": "never", "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Inode usage %",
+      "description": "1 − node_filesystem_files_free / node_filesystem_files. A full inode table makes the filesystem read-only (Node C incident). InodesHigh > 80%.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 40},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(1 - node_filesystem_files_free{fstype!~\"tmpfs|ramfs|overlay|squashfs|devtmpfs|autofs\",mountpoint!~\"/etc/hosts|/etc/hostname|/etc/resolv.conf\"} / node_filesystem_files{fstype!~\"tmpfs|ramfs|overlay|squashfs|devtmpfs|autofs\",mountpoint!~\"/etc/hosts|/etc/hostname|/etc/resolv.conf\"}) * 100",
+          "legendFormat": "{{instance}} {{mountpoint}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 80}, {"color": "red", "value": 90}]},
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 5, "showPoints": "never", "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Validator set size / fragile",
+      "description": "stell_validator_set_size (left axis) and stell_validator_set_fragile (0/1). ValidatorQuorumLow fires when size < 4 or fragile = 1.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 40},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "stell_validator_set_size", "legendFormat": "size {{node}}"},
+        {"refId": "B", "expr": "stell_validator_set_fragile", "legendFormat": "fragile {{node}}"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 4}]},
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 5, "showPoints": "never", "spanNulls": false}
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byRegexp", "options": "fragile.*"},
+            "properties": [{"id": "custom.axisPlacement", "value": "right"}, {"id": "min", "value": 0}, {"id": "max", "value": 1}]
+          }
+        ]
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    }
+  ]
+}

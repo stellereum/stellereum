@@ -21,6 +21,42 @@ Snapshot: после пентеста-2 и кросс-кат свипа. Раб�
 
 ## P0 — блокеры безопасности/живучести
 
+P0-PEER-SNAPSHOT-ANCHOR (OPEN, 2026-11-23, liveness: catch-up blocked).
+Отставший узел не может догнать цепь через снапшот, полученный от пира. Живые
+наблюдения (`nodeB` на 155 243, `nodeC` на 171 697) дают два независимых отказа
+проверки `snapshot anchor (tail)` в `src/sync.rs`:
+
+1. `no header published at height <boundary-1>; cannot prove linkage` — заголовок
+   на границе обязан быть в DHT, но публикация заголовков ограничена по глубине,
+   поэтому «прогулка» от нашего anchor до границы снапшота недоказуема;
+2. `finality: header proposer at height <h> held no schedule slot in rounds 0..=r`
+   — исторический набор валидаторов, которым проверяется расписание пропозера,
+   не совпадает с набором, действовавшим на той высоте (набор менялся на каждом
+   джейле/разджейле `nodeC` в тот период).
+
+Оба отказа — fail-closed и это правильно; дефект в том, что штатного пути
+восстановления нет и узел висит до ручного вмешательства. Обход, применённый
+дважды: восстановление из ПУБЛИЧНОГО HTTP-снапшота
+(`https://rpc.stellereum.org/snapshot/latest.tar.zst` → `data/`) + `safety-reset`
++ `safety-init` (см. `ops/safety_recovery_runbook.md`). Требуется: (а) глубина
+публикации заголовков ≥ максимального span снапшота, либо снапшот, несущий
+собственный проверяемый префикс заголовков; (б) разрешение набора строго через
+`validator_set_history` с отказом при отсутствии записи (сейчас возможен
+«соседний» набор). Fail-before тесты: снапшот на границе, у которой заголовок
+не опубликован; и снапшот, чей anchor-пропозер не входит в исторический набор.
+
+P0-SAFETY-BOOT-ONE-BLOCK (OPEN, 2026-11-23, availability: restart -> Observer).
+После рестарта `safety_record_v1.finalized_height` может превышать сохранённый
+finalized/state ровно на 1 блок:
+`safety_record_v1 finalized_height (171696) exceeds restored finalized (171695) or
+state height (171695); refusing to vote with stale state`. Узел уходит в
+fail-closed Observer, хотя блок 171 696 есть в сторе и его QC проверяем. Обход:
+`safety-reset` + `safety-init` (потеря watermark'ов недопустима только при живом
+подписанте — процедура требует фенсинга). Требуется reconcile на boot: если
+`record.finalized_height == store.finalized + 1`, блок и его precommit QC на месте
+и проверяются, подтянуть finalized-указатель стора (и state) вместо карантина;
+иначе — карантин как сейчас.
+
 P0-LOCK-WATERMARK: локально реализован `SafetyAuthority` (`stellereum/src/safety.rs`)
 по `docs/specs/05_LOCK_SAFETY_P0.md` (Resolutions 1–3): сериализованное подписание
 голосов и предложений (`put_block + flush` → CAS `SafetyRecordStore::persist + db.flush()`

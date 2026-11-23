@@ -74,6 +74,43 @@ active set.
 below the legacy watermark, so a second invocation cannot silently destroy a
 healthy record.
 
+## Recovering a node that cannot catch up (stuck behind)
+
+Symptom: the node keeps logging `[sync] REFUSING snapshot at <h>: trailing header
+proof failed: ...` and `view change -> height <H> round <r>` without advancing.
+Two known refusals (`P0-PEER-SNAPSHOT-ANCHOR` in `docs/OPEN_DEFECTS.md`): the
+anchor header at the snapshot boundary is not published, or the historical
+validator set used for the proposer check does not match the set in force at
+that height. Both refusals are correct; the missing piece is a recovery path.
+
+Workaround — restore from the PUBLIC HTTP snapshot (this is a supported path,
+`scripts/join-testnet.sh` uses the same URL):
+
+```sh
+cd /root/nodeC
+systemctl stop stell-node-guard.timer
+systemctl mask --runtime stell-nodeC
+systemctl stop stell-nodeC
+for i in $(seq 1 45); do pgrep -f 'nodeC/steller[e]um run' >/dev/null || break; sleep 2; done
+pgrep -af 'nodeC/steller[e]um run' || echo "no process"
+
+mv data data.bak-stuck-$(date +%s)
+mkdir -p data
+curl -fsSL https://rpc.stellereum.org/snapshot/latest.tar.zst | tar -I 'zstd -d' -xf - -C data/
+
+# The snapshot carries the PRODUCER's safety record: clear it, initialise ours.
+set -a; . ./env.C; set +a
+./stellereum safety-reset --store-dir ./data/store --i-fenced-all-signers
+./stellereum safety-init --store-dir ./data/store --keys-dir ./keys --shard 0 --i-fenced-all-signers
+
+systemctl unmask stell-nodeC
+systemctl start stell-nodeC
+systemctl start stell-node-guard.timer
+```
+
+Keys and `env.*` are never touched. The old data directory can be deleted once
+the node is at tip; leaving it costs inodes (that is what put nodeC at 100 %).
+
 ## Rules that prevent a repeat
 
 0. **Pause the liveness guard** (`systemctl stop stell-node-guard.timer`) before

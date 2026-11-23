@@ -83,6 +83,11 @@ pub const PHASE_SECONDS: &str = "stell_phase_seconds";
 /// Whole-process CPU (utime+stime) consumed per finalized block. Cheap to take
 /// once per block and the only figure that includes background threads.
 pub const CPU_PER_BLOCK_SECONDS: &str = "stell_cpu_per_block_seconds";
+/// Falcon-512 signatures PRODUCED by this process (consensus votes, proposals,
+/// anything through `FalconKeypair::sign`). Signing dominates CPU on a 1-vCPU
+/// validator, so this counter tells redundant signing apart from the intrinsic
+/// cost of one signature per vote.
+pub const FALCON_SIGN_TOTAL: &str = "stell_falcon_sign_total";
 pub const APPLY_SECONDS: &str = "stell_apply_seconds";
 /// Rounds where this node owned the proposal slot and could not emit a block,
 /// by gate reason. `nil_rounds` says a round was lost; this says why.
@@ -510,6 +515,13 @@ impl Registry {
                 buckets: DEFAULT_APPLY_BUCKETS,
             },
             MetricDef {
+                name: FALCON_SIGN_TOTAL,
+                help: "Falcon-512 signatures produced by this process",
+                kind: MetricKind::Counter,
+                labels: &[],
+                buckets: &[],
+            },
+            MetricDef {
                 name: CPU_PER_BLOCK_SECONDS,
                 help: "Process CPU seconds consumed per finalized block",
                 kind: MetricKind::Histogram,
@@ -805,6 +817,7 @@ impl Registry {
         }
         reg.seed(APPLY_SECONDS, &[]);
         reg.seed(CPU_PER_BLOCK_SECONDS, &[]);
+        reg.seed(FALCON_SIGN_TOTAL, &[]);
         for phase in ["finalize_submit", "poll_apply", "propose"] {
             reg.seed(PHASE_SECONDS, &[(LABEL_PHASE, phase)]);
         }
@@ -1162,6 +1175,11 @@ impl Registry {
     /// One consensus-loop phase duration.
     pub fn observe_phase(&self, phase: &str, seconds: f64) {
         self.add(PHASE_SECONDS, &[(LABEL_PHASE, phase)], seconds);
+    }
+
+    /// One Falcon-512 signature produced.
+    pub fn inc_falcon_sign(&self) {
+        self.add(FALCON_SIGN_TOTAL, &[], 1.0);
     }
 
     /// Process CPU consumed for one finalized block.

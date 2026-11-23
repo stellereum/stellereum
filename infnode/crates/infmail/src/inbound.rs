@@ -113,6 +113,15 @@ pub(crate) const MAX_ATTACH_COUNT: usize = 50;
 const MAX_FILENAME_LEN: usize = 200;
 /// Лимит текстового тела письма (байт) — отдельный от вложений, защита от OOM.
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+/// Максимальная глубина вложенности `multipart/*` в одном письме.
+///
+/// MIME приходит от ВНЕШНЕГО отправителя (SMTP → MTA → IMAP), а разбор
+/// рекурсивный: раньше вложенность не ограничивалась, поэтому письмо с
+/// десятками тысяч вложенных `multipart` роняло процесс переполнением стека
+/// (плюс квадратичный ре-скан разделителей). 16 уровней — с большим запасом
+/// для любого реального клиента; глубже — часть игнорируется, письмо всё
+/// равно разбирается до безопасной глубины.
+const MAX_MIME_DEPTH: usize = 16;
 
 /// Поиск последовательности байт в срезе.
 fn find_seq(hay: &[u8], needle: &[u8], start: usize) -> Option<usize> {
@@ -333,7 +342,12 @@ struct PartCtx {
 }
 
 /// Разобрать одну MIME-часть (рекурсивно для multipart).
-fn parse_part(raw: &[u8], ctx: &mut PartCtx) {
+fn parse_part(raw: &[u8], ctx: &mut PartCtx, depth: usize) {
+    if depth > MAX_MIME_DEPTH {
+        // Hostile deep nesting: stop descending instead of overflowing the
+        // stack (the bounded outer part still contributes nothing).
+        return;
+    }
     let (headers, body) = split_headers_body(raw);
     let ct = header_val(headers, "Content-Type").unwrap_or_else(|| "text/plain".into());
     let (mime, params) = parse_params(&ct);
@@ -348,7 +362,7 @@ fn parse_part(raw: &[u8], ctx: &mut PartCtx) {
     let cte = header_val(headers, "Content-Transfer-Encoding").unwrap_or_default();
 
     if let Some(boundary) = param(&params, "boundary") {
-        parse_parts(body, &boundary, ctx);
+        parse_parts(body, &boundary, ctx, depth + 1);
         return;
     }
 
@@ -416,7 +430,10 @@ fn parse_part(raw: &[u8], ctx: &mut PartCtx) {
 }
 
 /// Пройти по multipart-частям по разделителям boundary.
-fn parse_parts(body: &[u8], boundary: &str, ctx: &mut PartCtx) {
+fn parse_parts(body: &[u8], boundary: &str, ctx: &mut PartCtx, depth: usize) {
+    if depth > MAX_MIME_DEPTH {
+        return;
+    }
     let delim = format!("--{boundary}");
     let delim_bytes = delim.as_bytes();
     let mut search = 0usize;
@@ -438,7 +455,7 @@ fn parse_parts(body: &[u8], boundary: &str, ctx: &mut PartCtx) {
             part_end -= 1;
         }
         if part_end > pos {
-            parse_part(&body[pos..part_end], ctx);
+            parse_part(&body[pos..part_end], ctx, depth);
         }
         if next.is_none() {
             break;
@@ -476,7 +493,7 @@ fn parse_inbound_limit(raw: &[u8], max_total: usize) -> ParsedMail {
     let ct = header_val(headers, "Content-Type").unwrap_or_else(|| "text/plain".into());
     let (_, params) = parse_params(&ct);
     if let Some(boundary) = param(&params, "boundary") {
-        parse_parts(body, &boundary, &mut ctx);
+        parse_parts(body, &boundary, &mut ctx, 0);
     } else {
         // однострочное (не multipart) письмо — тело целиком по CTE
         let cte = header_val(headers, "Content-Transfer-Encoding").unwrap_or_default();
@@ -933,5 +950,32 @@ mod tests {
         let m = parse_inbound_limit(raw.as_bytes(), 4);
         assert_eq!(m.body, "small body");
         assert!(m.attachments.is_empty());
+    }
+
+    /// SEC-S1: hostile MIME nesting must not overflow the stack.
+    ///
+    /// A remote sender can nest `multipart/*` arbitrarily deep; the recursive
+    /// parser used to descend without a bound, so a few megabytes of input
+    /// killed the process (stack overflow) before any size/quota check. The
+    /// parser now stops at `MAX_MIME_DEPTH` and still returns a bounded mail.
+    #[test]
+    fn deeply_nested_multipart_is_depth_bounded_not_a_stack_overflow() {
+        const DEPTH: usize = 25_000;
+        let mut raw = String::new();
+        for i in 0..DEPTH {
+            raw.push_str(&format!(
+                "Content-Type: multipart/mixed; boundary=bb{i}\r\n\r\n--bb{i}\r\n"
+            ));
+        }
+        raw.push_str("Content-Type: text/plain\r\n\r\nnested body\r\n");
+        for i in (0..DEPTH).rev() {
+            raw.push_str(&format!("--bb{i}--\r\n"));
+        }
+        let m = parse_inbound(raw.as_bytes());
+        assert!(
+            m.body.len() <= MAX_BODY_BYTES,
+            "body must stay bounded even for hostile nesting"
+        );
+        assert!(m.attachments.is_empty(), "no attachments in this fixture");
     }
 }

@@ -3317,13 +3317,27 @@ fn check_no_unexpected_chunks(
     Ok(())
 }
 
-fn group_units_by_tag(manifest: &SnapshotManifestV1) -> [Vec<&SnapshotUnitDesc>; TOTAL_UNIT_TAGS] {
+/// Group descriptors by `unit_tag` for the local (unanchored) assemble/apply
+/// paths, which receive a manifest straight from the store rather than from
+/// `validate_manifest_pre_fetch`.
+///
+/// The tag is attacker/corruption-controlled here: indexing the fixed-size
+/// array without a bound check used to panic (index out of bounds) on any
+/// descriptor with `unit_tag >= TOTAL_UNIT_TAGS`, so a malformed persisted
+/// manifest crashed restore instead of producing a typed error. Refuse the
+/// unknown tag instead.
+fn group_units_by_tag(
+    manifest: &SnapshotManifestV1,
+) -> Result<[Vec<&SnapshotUnitDesc>; TOTAL_UNIT_TAGS], SnapV4Error> {
     let mut grouped: [Vec<&SnapshotUnitDesc>; TOTAL_UNIT_TAGS] =
         std::array::from_fn(|_| Vec::new());
     for desc in &manifest.units {
-        grouped[desc.unit_tag as usize].push(desc);
+        let slot = grouped
+            .get_mut(desc.unit_tag as usize)
+            .ok_or(SnapV4Error::UnknownUnitTag(desc.unit_tag))?;
+        slot.push(desc);
     }
-    grouped
+    Ok(grouped)
 }
 
 /// Assemble and verify a `Base` `SnapV4` checkpoint from its manifest and chunks
@@ -3361,7 +3375,7 @@ async fn assemble_base_state_inner(
     chunks: &BTreeMap<(u16, u16), Vec<u8>>,
 ) -> Result<SnapStateV4, SnapV4Error> {
     check_no_unexpected_chunks(manifest, chunks)?;
-    let grouped = group_units_by_tag(manifest);
+    let grouped = group_units_by_tag(manifest)?;
 
     let mut state = SnapStateV4::default();
 
@@ -3586,7 +3600,7 @@ async fn apply_delta_state_inner(
     }
 
     check_no_unexpected_chunks(manifest, chunks)?;
-    let grouped = group_units_by_tag(manifest);
+    let grouped = group_units_by_tag(manifest)?;
     let mut next_state = base_state.clone();
     let limit = MAX_SNAP_CHUNK_BYTES as u64;
 

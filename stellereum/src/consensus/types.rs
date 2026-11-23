@@ -1279,6 +1279,25 @@ impl Vote {
     }
 
     pub fn verify(&self) -> bool {
+        // ANTI-DoS (memory amplification, sec_s3): the verdict cache below
+        // retains the vote's ENTIRE `signature` blob in its key, while
+        // `VERIFIED_VOTE_CACHE_CAP` bounds ENTRY COUNT — not BYTES. A vote
+        // signature is at most `VOTE_FALCON_PART_LEN` (the Falcon-512
+        // envelope) or the bare `FALCON512_SIG_LEN` half on the wire, and
+        // `verify_uncached_with_pq_key` already refuses every other shape
+        // (`falcon_signature()` returns `None`). Returning `false` here is
+        // therefore the SAME verdict, but it keeps a peer from parking up to
+        // one full consensus message (32 MiB, `consensus_net::MAX_CONSENSUS_MSG`)
+        // of its own bytes per cache entry: a few dozen messages with member
+        // ids (public) and oversized signatures used to retain hundreds of
+        // MiB (the cap is 65,536 entries) in the node's vote cache.
+        //
+        // Bounded invalid votes (<= `VOTE_FALCON_PART_LEN`) are still cached
+        // exactly as before, so the fail-closed verdict cache behavior and
+        // the forgery tests are unchanged.
+        if self.signature.len() > VOTE_FALCON_PART_LEN {
+            return false;
+        }
         // VERIFY-ONCE (vote-ingest hot path): a vote carries the same bytes
         // every time it is re-gossiped, re-driven through `on_prevote` /
         // `on_precommit` (which verify once in `VoteSet::add` AND once in

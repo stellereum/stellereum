@@ -442,15 +442,15 @@ impl KvStore {
         ttl_ms: i64,
         origin: [u8; NODEID_LEN],
         stored_at: i64,
-    ) {
+    ) -> bool {
         let now = now_ms();
         let sa = stored_at.clamp(now - ttl_ms, now);
         let expires = sa + ttl_ms;
         if expires <= now {
-            return;
+            return false;
         }
         if !self.ensure_remote_capacity(key, value.len(), now) {
-            return;
+            return false;
         }
         self.insert_entry(
             key.to_string(),
@@ -463,6 +463,7 @@ impl KvStore {
                 last_republished_ms: 0,
             },
         );
+        true
     }
 
     /// Репликация (LWW по stored_at): применить значение от пира ТОЛЬКО если оно новее

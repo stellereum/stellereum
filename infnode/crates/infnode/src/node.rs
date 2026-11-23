@@ -487,6 +487,41 @@ pub fn handshake_per_ip_per_sec() -> u32 {
         .unwrap_or(HANDSHAKE_PER_IP_PER_SEC_DEFAULT)
 }
 
+/// Hard cap on the per-IP handshake token-bucket map.
+///
+/// The map is keyed by SOURCE IP, which an unauthenticated peer can vary at
+/// will (an IPv6 /64 is free). Reaping only entries idle for five minutes is
+/// not a bound: a sustained handshake rain keeps the map growing until the
+/// five-minute horizon, which is millions of entries at any meaningful rate
+/// (a remote OOM). At the cap the least-recently-used bucket is evicted, so
+/// memory stays bounded and a new IP is still admitted (evicting its bucket
+/// only resets per-IP pacing; global concurrency is capped separately by
+/// `MAX_INCOMING`). Mirrors the fail-closed cap discipline of the other
+/// attacker-fed tables (`MAX_ROUTES_TOTAL`, `MAX_SCORED_PEERS`,
+/// `MAX_SEEN_IDS`).
+pub const MAX_HANDSHAKE_BUCKETS: usize = 4_096;
+
+/// Hard cap on the strike-ban map.
+///
+/// Bans are keyed by source IP and were only pruned for EXPIRED entries when
+/// the map already exceeded the soft threshold — once full of live bans the
+/// retain kept everything and every new ban grew it by one, and a ban whose
+/// IP was never re-queried stayed in memory forever after expiry. At the cap
+/// the soonest-expiring ban is evicted: memory is bounded and the longest
+/// bans (the worst offenders) survive.
+pub const MAX_AUTH_BANS: usize = 8_192;
+
+/// Hard cap on the per-peer protocol-negotiation verdict map.
+///
+/// `peer_protocol` is filled once per successful PQ handshake + HELLO and was
+/// never pruned, so an attacker rotating cheap PQ identities (each handshake
+/// adds one entry while the bounded peers table evicts the identity itself)
+/// could grow it without limit for the process lifetime. At the cap the
+/// oldest verdict is evicted; a long-lived peer re-negotiates on reconnect,
+/// and an absent verdict means the same legacy-v2 default as "never sent
+/// HELLO".
+pub const MAX_PEER_PROTOCOL_ENTRIES: usize = 4_096;
+
 /// F8 accept-path hardening: failed-auth strikes with cooldown.
 ///
 /// `STELL_INF_AUTH_FAIL_THRESHOLD` failed handshakes from one IP within
@@ -672,8 +707,10 @@ pub struct Node {
     /// A peer ABSENT from this map has not negotiated yet and is treated as a
     /// legacy v2 peer (full capabilities), which keeps the pre-negotiation
     /// wire behaviour byte-identical. Guard is `std` and never held across an
-    /// await (lookups are copy-out).
-    peer_protocol: std::sync::Mutex<HashMap<[u8; NODEID_LEN], proto::PeerProtocolState>>,
+    /// await (lookups are copy-out). Values carry the last-verdict `Instant`
+    /// so the map can be hard-bounded by [`MAX_PEER_PROTOCOL_ENTRIES`].
+    peer_protocol:
+        std::sync::Mutex<HashMap<[u8; NODEID_LEN], (proto::PeerProtocolState, std::time::Instant)>>,
 }
 
 /// R6: гейт на КАЖДЫЙ персистимый файл. Держится только на время
@@ -1099,9 +1136,23 @@ impl Node {
             return true;
         }
         let mut buckets = self.handshake_buckets.lock().await;
-        // Bound memory: reap buckets idle >5min when the map grows.
-        if buckets.len() > 4096 {
+        // Hard memory bound (see `MAX_HANDSHAKE_BUCKETS`): first drop buckets
+        // idle past the reap horizon, then — if the flood is recent enough
+        // that the reap freed nothing — evict the least-recently-used bucket.
+        // Without this the map is bounded only by the attack rate times the
+        // horizon, i.e. effectively unbounded against an IPv6 source range.
+        if buckets.len() >= MAX_HANDSHAKE_BUCKETS {
             buckets.retain(|_, b| b.idle() < Duration::from_secs(300));
+            while buckets.len() >= MAX_HANDSHAKE_BUCKETS {
+                let Some(oldest) = buckets
+                    .iter()
+                    .max_by_key(|(_, b)| b.idle())
+                    .map(|(ip, _)| *ip)
+                else {
+                    break;
+                };
+                buckets.remove(&oldest);
+            }
         }
         let allowed = buckets
             .entry(ip)
@@ -1139,6 +1190,30 @@ impl Node {
     /// F8: currently active (post-handshake) connections.
     pub fn conns_active_total(&self) -> u64 {
         self.metrics.conns_active.load(Ordering::Relaxed)
+    }
+
+    /// Test/monitor hook: live size of the per-IP handshake bucket map
+    /// (bounded by [`MAX_HANDSHAKE_BUCKETS`]).
+    #[doc(hidden)]
+    pub async fn handshake_bucket_count(&self) -> usize {
+        self.handshake_buckets.lock().await.len()
+    }
+
+    /// Test/monitor hook: live size of the strike-ban map (bounded by
+    /// [`MAX_AUTH_BANS`]).
+    #[doc(hidden)]
+    pub async fn auth_ban_count(&self) -> usize {
+        self.auth_bans.lock().await.len()
+    }
+
+    /// Test/monitor hook: live size of the per-peer protocol verdict map
+    /// (bounded by [`MAX_PEER_PROTOCOL_ENTRIES`]).
+    #[doc(hidden)]
+    pub fn peer_protocol_len(&self) -> usize {
+        self.peer_protocol
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// F8: record a failed pre-auth handshake from `ip`. When failures within
@@ -1184,9 +1259,20 @@ impl Node {
             entry.clear();
             drop(failures);
             let mut bans = self.auth_bans.lock().await;
-            if bans.len() > 8192 {
-                let t = std::time::Instant::now();
-                bans.retain(|_, until| *until > t);
+            // Hard memory bound. Expired bans do not need an eager sweep:
+            // `is_banned` ignores them on read, and the eviction below picks
+            // the SOONEST-EXPIRING entry first — expired entries are therefore
+            // reclaimed before any live ban, while the longest (worst-offender)
+            // bans survive. The map can never exceed MAX_AUTH_BANS.
+            while bans.len() >= MAX_AUTH_BANS {
+                let Some(victim) = bans
+                    .iter()
+                    .min_by_key(|(_, until)| **until)
+                    .map(|(ip, _)| *ip)
+                else {
+                    break;
+                };
+                bans.remove(&victim);
             }
             bans.insert(ip, now + cooldown);
             self.metrics.auth_bans_total.fetch_add(1, Ordering::Relaxed);
@@ -1217,6 +1303,21 @@ impl Node {
             map.retain(|_, e| e.banned_at(now) || e.score != 0);
             if map.len() >= SHARD_HARD_CAP {
                 map.retain(|_, e| e.banned_at(now));
+                // The hard cap must be HARD: if the shard is already full of
+                // live bans, inserting another identity would exceed it (an
+                // attacker rotating cheap PQ identities could grow the shard
+                // without bound). Evict the soonest-expiring ban so the
+                // worst-offender bans survive.
+                while map.len() >= SHARD_HARD_CAP {
+                    let Some(victim) = map
+                        .iter()
+                        .min_by_key(|(_, e)| e.ban_until.unwrap_or(now))
+                        .map(|(peer, _)| *peer)
+                    else {
+                        break;
+                    };
+                    map.remove(&victim);
+                }
             }
         }
         let e = map.entry(pid).or_insert_with(|| RepEntry::fresh(now));
@@ -3167,8 +3268,8 @@ impl Node {
     /// peer has not sent a `Hello` yet (legacy v2 behaviour).
     pub fn peer_protocol_state(&self, pid: &[u8; NODEID_LEN]) -> Option<proto::PeerProtocolState> {
         match self.peer_protocol.lock() {
-            Ok(m) => m.get(pid).copied(),
-            Err(e) => e.into_inner().get(pid).copied(),
+            Ok(m) => m.get(pid).map(|(state, _)| *state),
+            Err(e) => e.into_inner().get(pid).map(|(state, _)| *state),
         }
     }
 
@@ -3205,10 +3306,39 @@ impl Node {
         let local = proto::local_identity();
         let state = proto::classify_peer(local, hello);
         let previous = match self.peer_protocol.lock() {
-            Ok(mut m) => m.insert(pid, state),
-            Err(e) => e.into_inner().insert(pid, state),
+            Ok(mut m) => {
+                // Hard memory bound: an identity rotation adds one entry per
+                // HELLO while the bounded peers table evicts the identity, so
+                // an unpruned map grows for the process lifetime. Evict the
+                // oldest verdict when a NEW peer arrives at the cap; a
+                // long-lived peer re-negotiates on reconnect. The freshly
+                // inserted verdict is never evicted.
+                if !m.contains_key(&pid) && m.len() >= MAX_PEER_PROTOCOL_ENTRIES {
+                    if let Some(oldest) = m
+                        .iter()
+                        .min_by_key(|(_, (_, seen))| *seen)
+                        .map(|(peer, _)| *peer)
+                    {
+                        m.remove(&oldest);
+                    }
+                }
+                m.insert(pid, (state, std::time::Instant::now()))
+            }
+            Err(e) => {
+                let mut m = e.into_inner();
+                if !m.contains_key(&pid) && m.len() >= MAX_PEER_PROTOCOL_ENTRIES {
+                    if let Some(oldest) = m
+                        .iter()
+                        .min_by_key(|(_, (_, seen))| *seen)
+                        .map(|(peer, _)| *peer)
+                    {
+                        m.remove(&oldest);
+                    }
+                }
+                m.insert(pid, (state, std::time::Instant::now()))
+            }
         };
-        if previous == Some(state) {
+        if previous.map(|(p, _)| p) == Some(state) {
             return state;
         }
         match (state.refusal, state.agreement) {
@@ -5291,13 +5421,9 @@ impl Node {
                 match self.request_to(n.id, "dht.find_node", req).await {
                     Ok(resp) => {
                         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
-                            if let Some(nodes) = v["nodes"].as_array() {
-                                for nd in nodes {
-                                    if let Some(info) = parse_dht_node(nd) {
-                                        self.routing.write().await.insert(info.clone());
-                                        results.push(info);
-                                    }
-                                }
+                            for info in parse_dht_node_list(&v) {
+                                self.routing.write().await.insert(info.clone());
+                                results.push(info);
                             }
                         }
                     }
@@ -5625,11 +5751,33 @@ impl Node {
                     .into_bytes(),
             );
         }
-        kv.store(key, value.to_string(), ttl * 1000, self.id);
-        if let Some(owner) = sealed_owner_to_pin {
-            kv.store(&pin_key, owner, ttl * 1000, self.id);
+        // A remote peer that omits `stored_at` reaches this arm. `store` is
+        // the LOCAL-authoritative writer and deliberately skips
+        // `ensure_remote_capacity` (an operator-pinned manifest must always
+        // land), so using it here let any peer with `dht.store` bypass
+        // MAX_KV_ENTRIES / MAX_KV_BYTES and grow the KV map without limit (a
+        // remote OOM). Use the capacity-checked replica path with a
+        // receipt-time stamp: identical TTL semantics, bounded memory.
+        let stored = kv.store_replica(
+            key,
+            value.to_string(),
+            ttl * 1000,
+            self.id,
+            crate::dht::now_ms(),
+        );
+        if stored {
+            if let Some(owner) = sealed_owner_to_pin {
+                kv.store(&pin_key, owner, ttl * 1000, self.id);
+            }
         }
         drop(kv);
+        if !stored {
+            return Some(
+                json!({ "ok": false, "err": "kv storage capacity exceeded" })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
         self.mark_kv_dirty();
         Some(
             json!({ "ok": true, "stored": key })
@@ -10963,6 +11111,27 @@ pub fn pq_falcon_transcript_digest(t: &proto::PqTranscript) -> [u8; 32] {
     proto::pq_falcon_digest(t)
 }
 
+/// Parse the `nodes` array of a peer's `dht.find_node` answer, applying the
+/// per-response cap BEFORE validating any entry.
+///
+/// A single answer can be up to a 32 MiB frame; each valid `NodeInfo` carries
+/// a 1794-char `pq_pub`, so an uncapped walk made one hostile peer allocate
+/// (and then sort) tens of megabytes of `NodeInfo` values per lookup. The
+/// Kademlia answer never needs more than one routing-table fill; bound it to
+/// the same per-message route cap the gossip path uses.
+pub fn parse_dht_node_list(v: &serde_json::Value) -> Vec<crate::dht::NodeInfo> {
+    v["nodes"]
+        .as_array()
+        .map(|nodes| {
+            nodes
+                .iter()
+                .take(crate::proto::MAX_ROUTES_PER_UPDATE)
+                .filter_map(parse_dht_node)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn parse_dht_node(v: &serde_json::Value) -> Option<crate::dht::NodeInfo> {
     let id_hex = v["node_id"].as_str()?;
     let b = hex::decode(id_hex.strip_prefix("inf1:").unwrap_or(id_hex)).ok()?;
@@ -13242,5 +13411,107 @@ mod sealed_manifest_store_tests {
             "dynamic peer table must stay capped"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+/// SEC-S1: regression tests for remote-reachable resource caps.
+#[cfg(test)]
+mod sec_s1_cap_tests {
+    use super::*;
+
+    fn cfg(name: &str, listen: &str) -> NodeConfig {
+        NodeConfig {
+            name: name.to_string(),
+            listen: listen.to_string(),
+            client_listen: None,
+            advertise: None,
+            peers: Vec::new(),
+            allow_unknown: false,
+            unknown_allow: vec![],
+            metrics_listen: None,
+            log_level: Some(0),
+            roles: Default::default(),
+            outbox_ttl_secs: 3600,
+            storage_roles: vec![],
+            validators: vec![],
+            domain: None,
+            web_listen: None,
+            web_static: None,
+            wallet: None,
+        }
+    }
+
+    async fn test_node(tag: &str) -> (Arc<Node>, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("infnode-sec-s1-kvcap-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let node = Node::new(
+            cfg("SEC-S1-KV", "127.0.0.1:0"),
+            NodeKeys::generate(),
+            PqKeys::generate(),
+            dir.clone(),
+            PathBuf::new(),
+        )
+        .await
+        .expect("node");
+        (node, dir)
+    }
+
+    /// A peer that sends `dht.store` WITHOUT `stored_at` used to hit
+    /// `KvStore::store` (the local-authoritative writer that skips
+    /// `ensure_remote_capacity`), so it could grow the KV past
+    /// MAX_KV_ENTRIES without bound. The remote arm now uses the
+    /// capacity-checked `store_replica`; the map must stay capped.
+    #[tokio::test]
+    async fn remote_store_without_stored_at_cannot_bypass_the_kv_entry_cap() {
+        let (node, dir) = test_node("entry").await;
+        let from = [0x42u8; NODEID_LEN];
+        let total = crate::dht::MAX_KV_ENTRIES + 8;
+        for i in 0..total {
+            let key = format!("k{i:x}");
+            let resp = node
+                .handle_dht_store_typed(&key, "{}", None, 0, from)
+                .await
+                .expect("a response is always produced");
+            let v: serde_json::Value =
+                serde_json::from_slice(&resp).expect("response must be JSON");
+            assert!(v["ok"].as_bool().is_some(), "response must carry ok");
+        }
+        let len = node.kv.read().await.len();
+        assert!(
+            len <= crate::dht::MAX_KV_ENTRIES,
+            "remote store bypassed MAX_KV_ENTRIES: {len} > {}",
+            crate::dht::MAX_KV_ENTRIES
+        );
+        drop(node);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A rotated PQ identity supplies one `rep_*` protocol-violation event.
+    /// The per-shard hard cap used to only *retain banned* entries and then
+    /// insert anyway, so a shard already full of live bans kept growing.
+    #[tokio::test]
+    async fn identity_reputation_shards_stay_hard_bounded() {
+        let (node, dir) = test_node("repcap").await;
+        let hard_cap = crate::reputation::REP_MAP_HARD_CAP / 16;
+        let total = hard_cap + 64;
+        for i in 0..total {
+            let mut pid = [0u8; NODEID_LEN];
+            // Bytes 0 and 19 are pinned to 0, so `rep_shard` is always 0.
+            pid[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            assert_eq!((pid[0] ^ pid[19]) & 0x0f, 0);
+            node.rep_apply(pid, -1000).await;
+        }
+        let len = node.peer_rep[0]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        assert!(
+            len <= hard_cap,
+            "reputation shard grew to {len} > per-shard hard cap {hard_cap}"
+        );
+        drop(node);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

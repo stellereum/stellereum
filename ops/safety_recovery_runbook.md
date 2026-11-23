@@ -126,6 +126,25 @@ Two more space consumers seen on validators: `~/.rustup` + `~/.cargo` (about
 935 MB, only needed on a build host) and old `data.bak-*` directories (1.4 GB).
 Neither is needed on a running validator.
 
+### The inode arithmetic that keeps biting (chunk store)
+
+The DHT blob store writes **one file per chunk**: about **7 files per block** at
+the live block size, so ~1 300 files/minute at 176 blocks/min. The sweeper only
+deletes chunks older than its grace period, so the steady state is
+`grace_minutes × 1 300` files plus the referenced ones:
+
+| grace | steady-state chunk files | + referenced (~73 k) | of 655 360 inodes |
+|---|---|---|---|
+| 6 h (old default) | ~468 k | ~541 k | **83 %** — no headroom |
+| **2 h (current)** | ~156 k | ~229 k | **35 %** |
+
+`kv.json` is debounced at 30 min (`INFNODE_KV_DEBOUNCE_MS=1800000`), so a 2 h
+grace still leaves a 4× safety margin against deleting a chunk that is not yet
+referenced. The cron/timer passes `--grace-seconds 7200` on every node
+(`/etc/cron.d`-style cron on A/C/D, a systemd user timer on the B host).
+Watch `df -i`, not just `df -h`: nodeC reached 100 % inodes with 1.5 GB of disk
+still free, and that read-only state is what corrupted its safety record.
+
 To actually SHRINK a store that is already large, restore the public snapshot
 into a fresh `data/` (see the recovery section above) — that took nodeB from
 1.6 GB to 173 MB and nodeC from 1.5 GB to a fresh store.

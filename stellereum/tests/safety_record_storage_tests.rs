@@ -306,3 +306,40 @@ fn malformed_lengths_and_generations_are_rejected() {
         );
     }
 }
+
+/// Operator recovery (spec 05 §2.3/§2.4): a record that can no longer be
+/// decoded makes every handle fail closed, so there must be an offline way to
+/// delete it before `safety-init` writes generation 1 again. Live incident
+/// 2026-11-23: an unsupported concurrent open of the store left nodeC with an
+/// undecodable record and no recovery path.
+#[test]
+fn operator_recovery_clears_an_undecodable_record() {
+    let dir = TestDir::new();
+    seed_record(&dir, b"not-a-safety-record");
+    let storage = Storage::open(&dir.0).unwrap();
+    let store = storage.safety_record_store(identity()).unwrap();
+    // First read surfaces the decode error itself; the handle then latches the
+    // fail-closed "requires recovery" state for every later read/write.
+    assert!(store.load().is_err());
+    assert!(store
+        .load()
+        .unwrap_err()
+        .to_string()
+        .contains("requires recovery"));
+    drop(store);
+    drop(storage);
+
+    // The reset itself must work on the store that failed to decode, and report
+    // that it removed something.
+    let storage = Storage::open(&dir.0).unwrap();
+    assert!(storage.reset_safety_record_for_recovery().unwrap());
+    drop(storage);
+
+    // A fresh process now sees NO record (so `safety-init` may write generation
+    // 1), and a second reset is a clean no-op.
+    let storage = Storage::open(&dir.0).unwrap();
+    let store = storage.safety_record_store(identity()).unwrap();
+    assert!(store.load().unwrap().is_none());
+    drop(store);
+    assert!(!storage.reset_safety_record_for_recovery().unwrap());
+}

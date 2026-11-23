@@ -288,6 +288,22 @@ pub(crate) enum Commands {
         #[arg(long, default_value_t = false)]
         i_fenced_all_signers: bool,
     },
+    /// Delete a durable consensus safety record that can no longer be decoded
+    /// (store corruption, an unsupported concurrent open, a lost record), so
+    /// that `safety-init` can write generation 1 again.
+    ///
+    /// This is the §2.3/§2.4 operator recovery path: it DESTROYS the durable
+    /// vote watermarks, so it must only run with the node, every legacy
+    /// process and every remote signer for this key stopped and fenced.
+    SafetyReset {
+        /// Store directory containing the sled DB (default: ./data/store)
+        #[arg(long, default_value = "./data/store")]
+        store_dir: PathBuf,
+        /// Confirm the node, its legacy processes and every remote signer for
+        /// this key are stopped and fenced
+        #[arg(long, default_value_t = false)]
+        i_fenced_all_signers: bool,
+    },
     /// W3 PQ validator lifecycle and staking transactions
     Validator {
         #[command(subcommand)]
@@ -1470,6 +1486,28 @@ pub(crate) enum BridgeCommands {
 #[cfg(test)]
 mod cli_safety_init_tests {
     use super::*;
+
+    #[test]
+    fn cli_parses_safety_reset_subcommand() {
+        let cli = Cli::try_parse_from([
+            "stellereum",
+            "safety-reset",
+            "--store-dir",
+            "/tmp/store",
+            "--i-fenced-all-signers",
+        ])
+        .expect("parse safety-reset");
+        match cli.command {
+            Commands::SafetyReset {
+                store_dir,
+                i_fenced_all_signers,
+            } => {
+                assert_eq!(store_dir, PathBuf::from("/tmp/store"));
+                assert!(i_fenced_all_signers);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
 
     #[test]
     fn cli_parses_safety_init_subcommand() {

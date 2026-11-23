@@ -1956,6 +1956,31 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
             println!("  4. SPV Light Mode: Wallets verify state via Patricia-Merkle BoC proofs");
             println!("  5. Full Node Mode: Downloads block chunks via 'fetch_blob' and verifies\n");
         }
+        Commands::SafetyReset {
+            store_dir,
+            i_fenced_all_signers,
+        } => {
+            if !i_fenced_all_signers {
+                anyhow::bail!(
+                    "refusing safety-reset: pass --i-fenced-all-signers ONLY after stopping and \
+                     fencing the node, all legacy validator processes and every remote signer for \
+                     this key. This DESTROYS the durable vote watermarks; run `safety-init` next."
+                );
+            }
+            let storage = stellereum::storage::Storage::open(&store_dir)?;
+            let removed = storage.reset_safety_record_for_recovery()?;
+            println!(
+                "safety_record_v1 {} in {}; run `stellereum safety-init --store-dir {} \
+                 --keys-dir <keys> --i-fenced-all-signers` next",
+                if removed {
+                    "cleared"
+                } else {
+                    "was already absent"
+                },
+                store_dir.display(),
+                store_dir.display()
+            );
+        }
         Commands::SafetyInit {
             store_dir,
             keys_dir,

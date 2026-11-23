@@ -1329,6 +1329,24 @@ impl Storage {
     /// Open the isolated safety record for the expected validator/chain/shard.
     /// Fails closed immediately if any prior safety read/write/flush error
     /// poisoned this `Storage` instance.
+    /// Operator recovery for a safety record that can no longer be decoded
+    /// (`safety store requires recovery`): delete `safety_record_v1` so
+    /// [`Self::safety_record_store`] loads `None` and `stellereum safety-init`
+    /// can write generation 1 again.
+    ///
+    /// OFFLINE ONLY. The caller must have stopped and fenced the node, every
+    /// legacy process and every remote signer for the key: the record carries
+    /// the durable prevote/precommit watermarks, and losing them while a signer
+    /// is still live could allow a double vote. Returns whether a record was
+    /// present.
+    pub fn reset_safety_record_for_recovery(&self) -> Result<bool> {
+        let tree = self.db.open_tree(SAFETY_TREE)?;
+        let removed = tree.remove(SAFETY_KEY)?.is_some();
+        tree.flush()?;
+        self.db.flush()?;
+        Ok(removed)
+    }
+
     pub fn safety_record_store(&self, identity: SafetyRecordIdentity) -> Result<SafetyRecordStore> {
         let mut failed = self
             .safety_failed

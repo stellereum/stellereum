@@ -111,6 +111,25 @@ systemctl start stell-node-guard.timer
 Keys and `env.*` are never touched. The old data directory can be deleted once
 the node is at tip; leaving it costs inodes (that is what put nodeC at 100 %).
 
+## Disk full / disk pressure
+
+The 9.8 GB validator disks fill from three independent directions; check all
+three, because each has a different fix.
+
+| Source | Symptom | Fix |
+|---|---|---|
+| `safety`/store growth | `data/` grows every block | prune mode: `STELL_ARCHIVE=0` + `STELL_KEEP_BLOCKS=50000` (stops growth; sled does NOT return the freed file space to the OS, so it does not shrink an already-large store) |
+| `/var/log/syslog` duplication | one node had **2.4 GB** in `syslog`+`syslog.1` while another had 17 MB | `: > /var/log/syslog`, `: > /var/log/syslog.1`, plus `/etc/logrotate.d/stell-node` with `maxsize 200M / rotate 2 / compress` |
+| inodes | `df -i` at 100 %, writes fail, `safety_record_v1` corrupts | delete stale `data.bak-*` trees (one was 302 k files) and keep `scripts/node-prune-cron.sh` installed |
+
+Two more space consumers seen on validators: `~/.rustup` + `~/.cargo` (about
+935 MB, only needed on a build host) and old `data.bak-*` directories (1.4 GB).
+Neither is needed on a running validator.
+
+To actually SHRINK a store that is already large, restore the public snapshot
+into a fresh `data/` (see the recovery section above) — that took nodeB from
+1.6 GB to 173 MB and nodeC from 1.5 GB to a fresh store.
+
 ## Rules that prevent a repeat
 
 0. **Pause the liveness guard** (`systemctl stop stell-node-guard.timer`) before

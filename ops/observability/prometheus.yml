@@ -1,7 +1,7 @@
 # Prometheus for the live 4-validator Stellereum cluster.
 #
 # Network model (see README "Why the nodes stay on localhost"):
-#   B  -> 127.0.0.1:8080          local process, scraped directly
+#   B  -> 127.0.0.1:18081          local process, scraped directly
 #   A  -> 127.0.0.1:9080          SSH tunnel  (scripts/observe-local.sh)
 #   C  -> 127.0.0.1:9081          SSH tunnel, non-default port 2222
 #   D  -> 127.0.0.1:9082          SSH tunnel
@@ -42,7 +42,7 @@ scrape_configs:
           role: validator
           transport: ssh-tunnel
       - targets:
-          - 127.0.0.1:8080
+          - 127.0.0.1:18081
         labels:
           node: B
           role: validator

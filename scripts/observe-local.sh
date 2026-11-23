@@ -47,7 +47,7 @@ OBS_CHECK_TIMEOUT="${OBS_CHECK_TIMEOUT:-5}"
 OBS_PORT_A="${OBS_PORT_A:-9080}"
 OBS_PORT_C="${OBS_PORT_C:-9081}"
 OBS_PORT_D="${OBS_PORT_D:-9082}"
-OBS_PORT_B="${OBS_PORT_B:-8080}"
+OBS_PORT_B="${OBS_PORT_B:-18081}"
 
 die()  { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 64; }
 info() { printf '%s\n' "$*"; }
@@ -248,15 +248,12 @@ cmd_check() {
     url="$(metrics_url "$name")"
     total=$((total + 1))
     height="-"
-    ready="-"
     if body="$(curl -fsS --max-time "$OBS_CHECK_TIMEOUT" "$url" 2>/dev/null)"; then
       height="$(printf '%s\n' "$body" | awk '$1 == "stell_consensus_height" { print $2; exit }')"
-      ready="$(printf '%s\n' "$body" | awk '$1 == "stell_ready" { print $2; exit }')"
       [ -n "$height" ] || height="no-height-series"
-      [ -n "$ready" ] || ready="?"
       state="OK"
       ok=$((ok + 1))
-      printf '%-4s %-6s %-30s height=%s ready=%s\n' "$name" "$state" "$url" "$height" "$ready"
+      printf '%-4s %-6s %-30s height=%s\n' "$name" "$state" "$url" "$height"
     else
       state="DOWN"
       printf '%-4s %-6s %-30s curl failed (node or tunnel down)\n' "$name" "$state" "$url"

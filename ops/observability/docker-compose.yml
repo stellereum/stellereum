@@ -55,13 +55,14 @@ services:
     container_name: stell-alertmanager
     restart: unless-stopped
     network_mode: host
-    # --config.expand-env substitutes ${TELEGRAM_*} from the container env, so
-    # the receiver block can stay in the file with no secret in it.
+    # NOTE: alertmanager has no `--config.expand-env` (that is a Prometheus
+    # flag). The shipped config uses the null receiver; to enable Telegram,
+    # render alertmanager.yml from a template on the host and mount it, keeping
+    # the bot token out of git.
     command:
       - --config.file=/etc/alertmanager/alertmanager.yml
       - --storage.path=/alertmanager
       - --web.listen-address=127.0.0.1:9093
-      - --config.expand-env
       - --cluster.listen-address=
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}

@@ -333,7 +333,7 @@ groups:
         expr: |
           sum by (node) (rate(stell_falcon_sign_total[5m])) == 0
             and on (node)
-          (stell_ready == 1)
+          (changes(stell_consensus_height[5m]) > 0)
         for: 10m
         labels:
           severity: info
@@ -341,7 +341,7 @@ groups:
           summary: "Falcon signing rate is 0 on {{ $labels.node }} while the node reports ready"
           description: >-
             rate(stell_falcon_sign_total[5m]) is exactly 0 on
-            {{ $labels.instance }} for 10m while stell_ready == 1. Signing
+            {{ $labels.instance }} for 10m while the chain height is advancing. Signing
             normally dominates CPU on a 1-vCPU validator, so zero means the node
             is not voting/proposing (observer mode, wrong keys, or a stalled
             consensus loop). Expected > 0 on a voting validator.

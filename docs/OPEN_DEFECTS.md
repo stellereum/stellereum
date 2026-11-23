@@ -258,6 +258,29 @@ P0-LOCK-WATERMARK: локально реализован `SafetyAuthority` (`ste
 | SEC-DNS-LOOKUP-TIMEOUT | **LOW.** `resolve_peer_endpoints` без таймаута на хост; враждебная seed-зона может затянуть фоновый проход. | Report-only. |
 | PERF-S4-HOTPATH | 5 безопасных оптимизаций: один governance-снапшот, CLOB без клона `TokenRegistry` на консенсусных путях, без deep-clone `ClobEvent`, read-only mailbox fast path, `Linker` через `OnceLock`. | **FIXED (локально)**: counting-тесты `perf_s4_*`; wall-clock не измерялся. |
 
+## Вторая волна аудита (2026-11-23, bridge/EVM/oracle/xshard)
+
+| ID | Находка | Статус |
+|---|---|---|
+| BRIDGE-REFUND-WINDOW | **HIGH.** Refund заявки, запаркованной в ПРОШЛОМ часовом окне, безусловно вычитал сумму из `hourly_withdrawn` текущего окна → серией таких refund'ов можно было обнулить текущий лимит и вывести >2× `HOURLY_RATE_LIMIT_NANO`. | **FIXED (локально, не задеплоено)**: вычитание только если `requested_at >= last_rate_limit_reset`; инвариант восстановлен. Тесты `tests/x6_bridge_accounting_tests.rs` (fail-before). Меняет committed-счётчик для pre-window refund → нужен согласованный апгрейд. |
+| XSHARD-BOUNCE-MINT | **CRITICAL (multi-shard only).** Timeout-bounce возвращал `tx.amount` по outbound-записи, которая доказывает только связность, а не списание на источнике: (a) валидно подписанная tx с `nonce=u64::MAX` падает на apply (дебета нет), запись создаётся, через 64 высоты bounce минтит value; (b) 2PC-escrow + legacy-запись + bounce → target кредитует COMMIT, source возвращает refund (двойная трата). | **ACTIVATION-REQUIRED**: фикс в `runtime/**` (produced только при `status[i]==true`, inclusion/escrow proof для outbound, escrow-leaf перед bounce, отказ при наличии 2PC-записи; зеркала движка синхронно). В `{0}` недостижимо; обязателен до включения `{0,1}`. |
+| XPC-PREPARED-UNBOUNDED | **HIGH (multi-shard).** `Prepare` принимает affordability-proof и пишет `PREPARED`; `is_retired` не ретирит `PREPARED`, а один funded-ключ создаёт неограниченно разных tx-hash на одном nonce → target забивается ~16 записями/блок навсегда. | **ACTIVATION-REQUIRED**: escrow-backed PREPARE или bounded per-source admission. |
+| BRIDGE-TARGET-ADDRESS-UNBOUNDED | **HIGH.** `TeleportWithdrawalRequest.target_address: String` не ограничен по длине и коммитится в `pending_withdrawals`; лимит только по сумме, количество бесплатно → state под контролем атакующего. | **ACTIVATION-REQUIRED**: length cap в `validate`/`plan_at_height` (меняет acceptance). |
+| XSHARD-REEMIT-ROTATION | **LOW.** `height % plan.len()` при периоде 64 и `plan.len() % 64 == 0` даёт постоянный offset — часть набора ждёт дольше. Самоисправляется, value не теряется. | Documented (proposer-policy). |
+| XPC-DECIDED-ZERO | **LATENT.** `decided_height == 0` трактуется как «не решено»: COMMIT/ABORT-ACK применяется, но decision-leaf не пишется, а ошибка записи игнорируется. Недостижимо (target не может быть PREPARED до высоты 0). | Report-only (смена state-format sentinel). |
+
+## Liveness и производительность (вторая волна, 2026-11-23)
+
+| ID | Находка | Статус |
+|---|---|---|
+| LIVE-ROUND-TIMER | **HIGH.** Принятый peer-vote делает future-round chase внутри `on_prevote/on_precommit`; follow-up chase возвращал «already there» и **не перезапускал** `round_started` → следующий тик делал view-change мимо только что выровненного раунда. | **FIXED (локально)**: таймер перезапускается при любом наблюдённом движении раунда (vote и proposal alignment). |
+| LIVE-BLIND-LADDER | **HIGH.** В лестнице якоря не было ступеней ниже 64: разрыв 2–63 блока принимался по одному блоку за проход и не закрывался за бюджет даунтайма. | **FIXED**: `2/4/8/16/32/64/256/1024`; дальнейший quorum-verified якорь садится в `peer_hint`, следующий проход получает gap-scaled budget и latch re-arm. |
+| LIVE-SNAPSHOT-PROGRESS | **MED.** Snapshot-catch-up двигал finalized/hc/safety, но не штамповал progress → deadlock breaker на следующем тике делал ложный local re-phase. | **FIXED**: `advance_to_verified_snapshot()` + `record_progress`. |
+| LIVE-COMMIT-PARK | **MED.** Park-guard был инвертирован (`height == hc.height` вместо `H+1`): единственный adoptable commit отбрасывался, а избыточный занимал слот. | **FIXED**: паркуется только `H+1`; parked commit переигрывается через обычный drain (persistence/receipts/QC-sidecar/publication). |
+| LIVE-PARK-SLOT | **MED.** Слот парковки принимал любую высоту — одна junk-запись вытесняла реальный `H+1`. | **FIXED**: принимаются только replayable высоты. |
+| LIVE-QC-EVIDENCE | **MED.** Blind-QC sidecar влиял на бюджет/latch после простого decode+height. | **FIXED**: persistent evidence требует реальный Precommit-кворум под набором на этой высоте; непроверенный sidecar лишь ограничивает walk. |
+| PERF-S7-TRANSPORT | 12 безопасных оптимизаций: BLAKE3 один проход на chunk, dedup под read-lock, zero-copy fan-out/mail/blob, base64 прямо в буфер, precomputed XOR-сортировка, prealloc `closest`, Merkle leaf без Vec. | **FIXED (локально)**: counting/differential тесты `perf_s7_*`; byte-identity зафиксирована. |
+
 ## Правило закрытия
 
 Дефект считается закрытым только если: (1) есть тест, падающий на коде до фикса;

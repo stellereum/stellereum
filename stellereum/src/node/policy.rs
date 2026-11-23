@@ -73,6 +73,53 @@ pub(crate) const PEER_HINT_TTL_MS: u64 = 60_000;
 /// the 30 s backstop so it never becomes the primary poll.
 pub(crate) const AT_TIP_PROBE_INTERVAL_MS: u64 = 120_000;
 
+/// How long an at-tip node may receive NO consensus frame (proposal, vote or
+/// commit) before it runs ONE bounded head/QC probe, even though the regular
+/// [`AT_TIP_PROBE_INTERVAL_MS`] backstop is not due.
+///
+/// Why this exists (S5 finding #7): the backstop is 120 s, but the downtime
+/// budget at the live tempo is `42 × 800 ms = 33.6 s` — a validator that loses
+/// its inbound consensus stream is jailed long before the 120 s probe fires.
+/// Silence is the ONLY symptom of one-way push loss (the outbound path still
+/// works, peers still see us), so the at-tip predicate cannot detect it.
+///
+/// The trigger is deliberately cheap and bounded:
+///  * it only runs when the node is at the tip and normal catch-up is not due;
+///  * it reuses the existing blind head/QC probe with a
+///    [`RX_SILENCE_PROBE_BUDGET_MS`] budget (never the 120 s walk);
+///  * it is re-armed at most once per window, so a silent but genuinely
+///    in-sync node costs one cheap read per 10 s, not a hot loop;
+///  * it does NOT reset `last_catchup`, so the 120 s backstop keeps its exact
+///    schedule — this trigger only fills the gap before it.
+pub(crate) const RX_SILENCE_PROBE_MS: u64 = 10_000;
+
+/// Wall-time bound for the silence-triggered head/QC probe.
+///
+/// Bounded so the consensus tick can never be held hostage by a dead peer's
+/// DHT read: one WAN round trip for a head + one QC sidecar. A probe that
+/// finds nothing returns within this budget; a probe that finds a decided
+/// height hands off to the normal catch-up path unchanged.
+pub(crate) const RX_SILENCE_PROBE_BUDGET_MS: u64 = 500;
+
+/// Whether an at-tip node should run the silence-triggered probe.
+///
+/// Pure (fake-clock testable): due only when BOTH hold —
+///  * `now_ms - last_rx_ms >= RX_SILENCE_PROBE_MS`: no consensus frame has
+///    arrived inside the window (steady traffic never triggers);
+///  * `now_ms - last_probe_ms >= RX_SILENCE_PROBE_MS`: the previous silence
+///    probe is at least one full window old (at most one per window, and a
+///    probe that found nothing cannot re-fire on the next tick).
+///
+/// Saturating arithmetic: a clock jump backwards reads as "not due", the
+/// fail-safe direction (no probe storm). The caller additionally requires
+/// `at_tip`, `normal_probe_due == false` and no reactive ahead evidence; this
+/// helper deliberately stays arithmetic so the trigger can be pinned without
+/// a node. Node-local liveness policy — never consensus.
+pub fn at_tip_silence_due(now_ms: u64, last_rx_ms: u64, last_probe_ms: u64) -> bool {
+    now_ms.saturating_sub(last_rx_ms) >= RX_SILENCE_PROBE_MS
+        && now_ms.saturating_sub(last_probe_ms) >= RX_SILENCE_PROBE_MS
+}
+
 /// How far above our FINALIZED tip a peer-named height may be before it is
 /// treated as "not this chain" for cheap pre-checks.
 ///

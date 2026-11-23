@@ -761,9 +761,7 @@ pub(crate) async fn try_catch_up_with_lanes(
                     // alive across a set rotation it cannot verify yet, while
                     // a forged sidecar can never pin the node in repeated long
                     // catch-up ticks.
-                    let Some(raw_bh) = qc.block_hash else {
-                        return None;
-                    };
+                    let raw_bh = qc.block_hash?;
                     let verified = verified_qc_sidecar_hash(rt, &qc, probe_h);
                     // BLIND-ANCHOR-EXTEND (live 2026-11-23): adopting ONE
                     // height per pass capped a silent follower's catch-up at
@@ -2368,6 +2366,7 @@ mod recovery_walk_tests {
     /// scale the pass budget or re-arm the reactive latch (that would let any
     /// DHT peer pin a validator in repeated expensive catch-up ticks).
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // GATE: the PQ registry is process-global; this test must not race it.
     async fn blind_probe_evidence_requires_a_verified_precommit_quorum() {
         let _global = crate::node::policy::test_support::global_lock();
         let ks = vec![SigningKey::from_bytes(&[0x61; 32])];

@@ -47,6 +47,48 @@ pub const BRIDGE_MINT_CAP_NANO: u64 = 100_000_000 * 1_000_000_000; // 100M STELL
 /// Refund-after-expiry grace past unlock_at (audit follow-up F-G).
 pub const REFUND_GRACE_SECS: u64 = 24 * 3600;
 
+/// Maximum accepted byte length of a bridge withdrawal's `target_address`
+/// (`BRIDGE-TARGET-ADDRESS-UNBOUNDED`, S6-4).
+///
+/// The request is committed into `BridgeState::pending_withdrawals`, and the
+/// hourly rate limit counts AMOUNT only, so before this cap an attacker could
+/// park arbitrarily large strings (a 1 MiB address carries no bridge value)
+/// and grow consensus state for free. 128 bytes fits every supported target
+/// encoding (TON friendly address / EQ…, 0x-hex EVM, base58 Solana) with room
+/// to spare.
+///
+/// The check is activated by
+/// [`crate::chain_spec::BRIDGE_TARGET_ADDRESS_CAP_HEIGHT`] (`u64::MAX` =
+/// disabled by default), so below the gate every historical acceptance verdict
+/// is unchanged. Enforcement lives in [`BridgeIntent::validate_at_height`] and
+/// in [`BridgeState::plan_at_height`] (the settlement path that actually parks
+/// the request).
+pub const MAX_BRIDGE_TARGET_ADDRESS_BYTES: usize = 128;
+
+/// Refuse an over-long withdrawal target address when the cap is active at
+/// `block_height`, with an error that names the limit.
+///
+/// Pure and height-indexed on purpose: below
+/// [`crate::chain_spec::BRIDGE_TARGET_ADDRESS_CAP_HEIGHT`] it is a no-op, so
+/// replaying a pre-activation block yields exactly the verdict it did when it
+/// was produced. Above it, an over-long address is refused before any value
+/// moves or any state is parked.
+pub fn validate_bridge_target_address_len(
+    target_address: &str,
+    block_height: u64,
+) -> Result<(), String> {
+    if crate::chain_spec::bridge_target_address_cap_active_at(block_height)
+        && target_address.len() > MAX_BRIDGE_TARGET_ADDRESS_BYTES
+    {
+        return Err(format!(
+            "bridge withdrawal target address is {} bytes, exceeding \
+             MAX_BRIDGE_TARGET_ADDRESS_BYTES ({MAX_BRIDGE_TARGET_ADDRESS_BYTES})",
+            target_address.len(),
+        ));
+    }
+    Ok(())
+}
+
 /// Domain tag for the V2 payout-receipt signing preimage
 /// ([`release_receipt_signing_message_v2`]).
 ///
@@ -558,6 +600,20 @@ impl BridgeIntent {
     /// settlement, where the committed state and the block clock are both at
     /// hand - the VM has neither.
     pub fn validate(&self) -> Result<(), String> {
+        // Height-less entry point: the VM has no block height. Treated as
+        // height 0, so a gate active from genesis applies here and every other
+        // bounded rule keeps its historical verdict. The settlement path calls
+        // `validate_at_height` with the real height.
+        self.validate_at_height(0)
+    }
+
+    /// Height-indexed form of [`Self::validate`].
+    ///
+    /// Only activation-gated rules read `block_height` today: the bridge
+    /// withdrawal target-address byte cap
+    /// ([`crate::chain_spec::BRIDGE_TARGET_ADDRESS_CAP_HEIGHT`]). Below the
+    /// gate the verdict is byte-for-byte the historical one.
+    pub fn validate_at_height(&self, block_height: u64) -> Result<(), String> {
         match self {
             BridgeIntent::Deposit {
                 recipient, amount, ..
@@ -581,6 +637,10 @@ impl BridgeIntent {
                 if target_address.trim().is_empty() {
                     return Err("bridge withdrawal needs a target address".to_string());
                 }
+                // GATED (S6-4): the address is committed into the withdrawal
+                // queue and the rate limit counts amount only, so its length
+                // must be bounded. No-op below the activation height.
+                validate_bridge_target_address_len(target_address, block_height)?;
                 Ok(())
             }
             BridgeIntent::Attest { signatures, .. } => {
@@ -2006,6 +2066,12 @@ impl BridgeState {
                     target_address,
                     amount,
                 } => {
+                    // GATED (S6-4): bound the address that is about to be
+                    // committed into `pending_withdrawals`. Below the gate this
+                    // is a no-op; at/above it the withdrawal is refused before
+                    // the rate window or the queue is touched.
+                    validate_bridge_target_address_len(target_address, block_height)
+                        .map_err(|e| format!("bridge withdrawal rejected: {e}"))?;
                     // Rate window (block clock) then time-lock: a large
                     // withdrawal parks with unlock_at in the future.
                     engine

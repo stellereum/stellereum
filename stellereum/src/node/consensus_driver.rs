@@ -1880,6 +1880,19 @@ pub(crate) async fn run_consensus_node(
     // or refused — because receipt alone proves the transport delivers this
     // node's topic. Starts fresh like `last_inbound_msg` above.
     let mut last_consensus_rx_ms: u64 = liveness_alarm::now_ms();
+    // Consensus-FRAME RX clock for the at-tip silence trigger (S5 finding #7).
+    // Unlike `last_consensus_rx_ms` above (the liveness-alarm clock, which
+    // deliberately ignores `Committed`), this one is stamped by EVERY consumed
+    // Proposal / CompactProposal / Vote / Committed inner. A commit counts as
+    // traffic here because it proves the push path delivers catch-up evidence.
+    // Receipt-before-verification, exactly like the liveness clock: a refused
+    // frame still proves the transport is alive, and silence — not validity —
+    // is what the trigger detects.
+    let mut last_consensus_frame_ms: u64 = liveness_alarm::now_ms();
+    // Last silence-triggered head/QC probe. Kept SEPARATE from `last_catchup`
+    // so the 120 s at-tip backstop keeps its exact schedule; the trigger only
+    // fills the window before it and re-arms at most once per window.
+    let mut last_silence_probe_ms: u64 = liveness_alarm::now_ms();
     // Throttle for the liveness alarm line: at most one per
     // LIVENESS_ALARM_THROTTLE_MS (None = never emitted, always due).
     let mut last_liveness_emit_ms: Option<u64> = None;
@@ -2289,6 +2302,24 @@ pub(crate) async fn run_consensus_node(
             catchup_interval.as_millis() as u64,
             at_tip,
         );
+        // At-tip RX-silence trigger (S5 finding #7, `policy::RX_SILENCE_PROBE_MS`).
+        // The 120 s backstop is far longer than the `42 × 800 ms = 33.6 s`
+        // downtime budget: a node whose INBOUND stream is lost (outbound still
+        // works, so peers never name us behind) would be jailed long before
+        // the probe fires. When no consensus frame arrived for a full window
+        // and the normal probe is NOT due, run ONE bounded head/QC probe. It
+        // never runs with live traffic, never probes on reactive ahead
+        // evidence, and leaves `last_catchup` untouched so the 120 s backstop
+        // keeps its exact schedule.
+        let silence_probe_due = at_tip
+            && catchup_decision != CatchupAction::BlindProbe
+            && !reactive_catchup_due
+            && rx.is_empty()
+            && at_tip_silence_due(
+                liveness_alarm::now_ms(),
+                last_consensus_frame_ms,
+                last_silence_probe_ms,
+            );
         if catchup_decision == CatchupAction::SkipAtTip {
             // At the tip: skip the expensive DHT/body walk, but do NOT reset
             // `last_catchup` — the elapsed clock is what reaches the low-
@@ -2308,10 +2339,22 @@ pub(crate) async fn run_consensus_node(
         let catchup_due = matches!(
             catchup_decision,
             CatchupAction::Run | CatchupAction::BlindProbe
-        );
+        ) || silence_probe_due;
         if catchup_due && !rt.has_pending_apply() && !defer_for_live {
             catchup_ran = true;
-            last_catchup = std::time::Instant::now();
+            if silence_probe_due {
+                // Re-arm the silence window NOW, before the probe runs: a miss
+                // must not re-fire on the next tick. `last_catchup` is
+                // deliberately not moved, so the 120 s backstop keeps its
+                // schedule. The probe itself is bounded below.
+                last_silence_probe_ms = liveness_alarm::now_ms();
+                tracing::debug!(
+                    "[sync] at-tip RX silence >= {RX_SILENCE_PROBE_MS}ms at #{our_tip_now}; \
+                     running one bounded head/QC probe ({RX_SILENCE_PROBE_BUDGET_MS}ms budget)"
+                );
+            } else {
+                last_catchup = std::time::Instant::now();
+            }
             let split_catchup_t0 = std::time::Instant::now();
             // The pass must be able to clear a whole live-sized burst (or, far
             // behind, fetch/snapshot at all): the configured value is the
@@ -2323,11 +2366,19 @@ pub(crate) async fn run_consensus_node(
                 catchup_budget().as_millis() as u64,
                 budget_gap,
             ));
-            let catchup_budget = effective_catchup_pass_budget(
-                base_catchup_budget,
-                budget_gap,
-                last_live_adopt.elapsed(),
-            );
+            // A silence-triggered probe is the CHEAP head/QC read, never the
+            // gap-scaled walk (at tip the gap is 0 anyway; this also keeps a
+            // stale `last_live_adopt` from widening the tick). One WAN round
+            // trip, hard-bounded.
+            let catchup_budget = if silence_probe_due {
+                Duration::from_millis(RX_SILENCE_PROBE_BUDGET_MS)
+            } else {
+                effective_catchup_pass_budget(
+                    base_catchup_budget,
+                    budget_gap,
+                    last_live_adopt.elapsed(),
+                )
+            };
             let caught = tokio::time::timeout(
                 catchup_budget,
                 try_catch_up_with_lanes(
@@ -2439,7 +2490,7 @@ pub(crate) async fn run_consensus_node(
                     // heights — the exact jail-budget overrun this path exists
                     // to prevent.
                     if rearm_after_catchup_success(
-                        catchup_decision == CatchupAction::BlindProbe,
+                        silence_probe_due || catchup_decision == CatchupAction::BlindProbe,
                         still_behind,
                     ) {
                         catchup_pending = true;
@@ -2454,6 +2505,19 @@ pub(crate) async fn run_consensus_node(
             catchup_ms = split_catchup_t0.elapsed().as_millis() as u64;
             split_catchup_ms += catchup_ms;
             split_catchup_n += 1;
+            // A silence probe that did NOT fully adopt but DID plant verified
+            // ahead evidence (a QC sidecar) must arm the normal reactive path.
+            // Otherwise the next tick's at-tip predicate is now false and the
+            // full walk would wait out the 30 s backstop — the 500 ms probe
+            // budget is deliberately shorter than a body walk. Bounded: this
+            // only latches one ordinary catch-up attempt; it does not loop the
+            // silence trigger (`last_silence_probe_ms` is already re-armed).
+            if silence_probe_due {
+                let tip = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+                if catchup_still_behind(tip, rt.peer_hint, peer_named_height) {
+                    catchup_pending = true;
+                }
+            }
         } else if reactive_catchup_due {
             // A verified peer told us it is ahead, but the attempt could not
             // run this tick (apply in flight / live adopt deferral). KEEP the
@@ -3302,6 +3366,20 @@ pub(crate) async fn run_consensus_node(
                             | ConsensusMsg::Vote { .. }
                     ) {
                         last_consensus_rx_ms = liveness_alarm::now_ms();
+                    }
+                    // At-tip silence clock: every consensus frame counts,
+                    // including `Committed` (catch-up evidence also proves the
+                    // inbound stream delivers). Stamped on receipt, before any
+                    // verification/refusal, so only true transport silence
+                    // arms the bounded head/QC probe.
+                    if matches!(
+                        msg,
+                        ConsensusMsg::Proposal { .. }
+                            | ConsensusMsg::CompactProposal { .. }
+                            | ConsensusMsg::Vote { .. }
+                            | ConsensusMsg::Committed { .. }
+                    ) {
+                        last_consensus_frame_ms = liveness_alarm::now_ms();
                     }
                     // Event-driven catch-up: a message that NAMES a height above
                     // ours is potential "peer is ahead" evidence. It is acted on
@@ -5956,7 +6034,10 @@ mod parked_replay_tests {
         let raw = encode_committed_loopback(7, &block, &certificate, "local-replay")
             .expect("parked commit must encode");
         let (msg, src) = parse_incoming_with_peer_key(&raw).expect("loopback frame must parse");
-        assert_eq!(src, "local-replay");
+        // The parser's second value is the PEER KEY used for attribution, not
+        // the informational "src" label the loopback JSON also carries; a
+        // frame without a peer key is a local broadcast frame.
+        assert_eq!(src, "broadcast");
         match msg {
             ConsensusMsg::Committed {
                 height,

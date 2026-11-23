@@ -421,6 +421,16 @@ cold withdrawal key can clear. Pre-stage the binary and use the
 [live rolling deploy](/nodes/upgrades#live-rolling-deploy).
 :::
 
+Because that budget is far shorter than the 120 s at-tip backstop, a validator
+that is at the tip but loses only its **inbound** consensus stream now runs one
+cheap, bounded head/QC probe after 10 s of RX silence (`RX_SILENCE_PROBE_MS`),
+at most once per window and with a 500 ms budget; it never runs while votes,
+proposals or commits are arriving, never resets the 120 s backstop, and never
+changes consensus acceptance. If the probe finds a decided height, the ordinary
+catch-up path takes over. Separately, bridge withdrawals will be limited to
+128-byte target addresses once `BRIDGE_TARGET_ADDRESS_CAP_HEIGHT` is activated
+(compiled default `u64::MAX`, disabled, so today's chain is unchanged).
+
 ## Watchdog
 
 ```bash

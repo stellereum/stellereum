@@ -6,6 +6,30 @@ use stellereum::consensus_net::{ConsensusMsg, ConsensusNetwork};
 use stellereum::network::P2pNetworkAdapter;
 use stellereum::runtime::ValidatorRuntime;
 
+/// A blind-QC-probe sidecar is only usable as catch-up EVIDENCE (it can scale
+/// the pass budget and re-arm the reactive latch) when it is a GENUINE
+/// precommit quorum for exactly that height and block under the set in force
+/// there. Decoding plus a height match is not enough: a hostile DHT peer can
+/// publish a well-formed `QuorumCertificate` struct with no signatures, and
+/// trusting it would let a forged sidecar pin the node in an expensive
+/// catch-up pass (the old blind anchor paid a bounded one-shot cost; the
+/// hint/latch plumbing makes the evidence persistent, so it must be verified).
+fn verified_qc_sidecar_hash(
+    rt: &ValidatorRuntime,
+    qc: &stellereum::consensus::QuorumCertificate,
+    height: u64,
+) -> Option<[u8; 32]> {
+    if qc.kind != stellereum::consensus::VoteKind::Precommit || qc.height != height {
+        return None;
+    }
+    let bh = qc.block_hash?;
+    let validators = rt.validator_set_for_height(height);
+    if !qc.verify_with_schedule(&validators, rt.committee_schedule_at(height)) {
+        return None;
+    }
+    Some(bh)
+}
+
 /// PUSH-BASED BLOCK PROPAGATION (fast path): hand a finalized block's commit
 /// to every directly connected validator peer IMMEDIATELY.
 ///
@@ -466,27 +490,7 @@ pub(crate) async fn try_snapshot_sync(
         // resets `safety_record_v1`, `ConsensusCheckpoint`, or `VoteWatermark`;
         // `rt.safety.advance_height` only advances monotonically via CAS and
         // preserves quarantine on any mismatch.
-        rt.finalized.push((boundary, boundary_hash));
-        if let Some(b) = rt.blocks.get(&boundary_hash) {
-            let _ = b;
-        }
-        if let Err(e) = rt
-            .safety
-            .advance_height(boundary + 1, boundary, boundary_hash)
-        {
-            tracing::error!(
-                boundary,
-                error = %e,
-                "[safety] snapshot sync advance_height failed; quarantining"
-            );
-            rt.safety
-                .quarantine(format!("snapshot_sync advance_height({boundary}): {e}"));
-        }
-        rt.hc = stellereum::consensus::HeightConsensus::new(boundary + 1, rt.validators.clone());
-        // The sortition committee of this height is elected from the PARENT
-        // block hash — the finalized head we just restored. Every node must
-        // use the same parent, or they elect different committees.
-        rt.hc.set_parent_hash(boundary_hash);
+        rt.advance_to_verified_snapshot(boundary, boundary_hash);
         // The restored ledger may name a different validator set than our
         // config (bonds/slashes since genesis): converge now, not at the next
         // finalize, or proposer schedules disagree with the network.
@@ -749,48 +753,82 @@ pub(crate) async fn try_catch_up_with_lanes(
         _ => {
             let probe_h = our_height.saturating_add(1);
             match adapter.fetch_block_qc_probe(shard, probe_h).await {
-                Some(qc) if qc.height == probe_h => match qc.block_hash {
-                    Some(bh) => {
-                        // BLIND-ANCHOR-EXTEND (live 2026-11-23): adopting ONE
-                        // height per pass capped a silent follower's catch-up
-                        // at the pass cadence (~2 heights/s). At the live tempo
-                        // (2.5 blocks/s) a node that fell behind could never
-                        // close the gap — it stayed out of the quorum while its
-                        // CPU sat idle. Probe a small ladder ahead and anchor on
-                        // the FURTHEST height that already carries a decided
-                        // sidecar, so the normal snapshot-first/batched walk
-                        // handles a material gap. Liveness only: the walk still
-                        // verifies every block, QC, parent and state root.
-                        //
-                        // The ladder is ascending and stops at the first miss:
-                        // decided heights are contiguous, so a miss means the
-                        // chain is not that far ahead (and we avoid polluting a
-                        // future height's QC-miss backoff).
-                        let mut anchor = (probe_h, bh);
-                        for step in [64u64, 256, 1024] {
-                            let h = our_height.saturating_add(step);
-                            match adapter.fetch_block_qc_probe(shard, h).await {
-                                Some(q) if q.height == h => match q.block_hash {
-                                    Some(b) => anchor = (h, b),
-                                    None => break,
-                                },
-                                _ => break,
-                            }
+                Some(qc) if qc.height == probe_h => {
+                    // The WALK anchor may keep the structural (height + block
+                    // hash) binding exactly as before; only the EVIDENCE used
+                    // for budget scaling / latch re-arm requires a verified
+                    // quorum. That keeps a far-behind node's snapshot path
+                    // alive across a set rotation it cannot verify yet, while
+                    // a forged sidecar can never pin the node in repeated long
+                    // catch-up ticks.
+                    let Some(raw_bh) = qc.block_hash else {
+                        return None;
+                    };
+                    let verified = verified_qc_sidecar_hash(rt, &qc, probe_h);
+                    // BLIND-ANCHOR-EXTEND (live 2026-11-23): adopting ONE
+                    // height per pass capped a silent follower's catch-up at
+                    // the pass cadence (~2 heights/s). At the live tempo
+                    // (2.5 blocks/s) a node that fell behind could never close
+                    // the gap — it stayed out of the quorum while its CPU sat
+                    // idle. Probe a small ladder ahead and anchor on the
+                    // FURTHEST height that already carries a decided sidecar,
+                    // so the normal snapshot-first/batched walk handles a
+                    // material gap. Liveness only: the walk still verifies
+                    // every block, QC, parent and state root.
+                    //
+                    // The ladder is ascending and stops at the first miss:
+                    // decided heights are contiguous, so a miss means the
+                    // chain is not that far ahead (and we avoid polluting a
+                    // future height's QC-miss backoff).
+                    let mut anchor = (probe_h, raw_bh);
+                    // VERIFIED EVIDENCE FOR THE DRIVER (liveness): the ladder
+                    // proves decided heights ahead, so record the largest one
+                    // that fits `peer_hint`'s lookahead/TTL bounds. Without it
+                    // the driver had NO ahead evidence after a blind pass: the
+                    // end-of-tick latch could not re-arm, the follow-up pass
+                    // kept the 2 s blind budget (instead of the gap-scaled
+                    // one), and a timeout dropped it to the 120 s at-tip
+                    // cadence.
+                    let hint_cap = our_height.saturating_add(MAX_COMMITTED_LOOKAHEAD);
+                    let mut hint_anchor = verified.map(|bh| (probe_h, bh));
+                    for &step in BLIND_PROBE_LADDER {
+                        let h = our_height.saturating_add(step);
+                        match adapter.fetch_block_qc_probe(shard, h).await {
+                            Some(q) if q.height == h => match q.block_hash {
+                                Some(b) => {
+                                    // WALK anchor: the historical structural
+                                    // (height + hash) binding, so a set this
+                                    // node cannot verify yet still reaches the
+                                    // snapshot path.
+                                    anchor = (h, b);
+                                    // EVIDENCE: only a verified quorum may
+                                    // scale the next pass's budget / re-arm.
+                                    if h <= hint_cap {
+                                        if let Some(vb) = verified_qc_sidecar_hash(rt, &q, h) {
+                                            hint_anchor = Some((h, vb));
+                                        }
+                                    }
+                                }
+                                None => break,
+                            },
+                            _ => break,
                         }
-                        if anchor.0 == probe_h {
-                            eprintln!(
-                                "[sync] blind-QC-probe: tip+1 height {probe_h} carries a QC sidecar; walking one height to adopt it"
-                            );
-                        } else {
-                            eprintln!(
-                                "[sync] blind-QC-probe: tip+1 present; anchoring the walk at decided height {} so a material gap uses the batched/snapshot path",
-                                anchor.0
-                            );
-                        }
-                        anchor
                     }
-                    None => return None,
-                },
+                    if let Some((hh, hb)) = hint_anchor.filter(|(hh, _)| *hh > our_height) {
+                        rt.peer_hint = Some((hh, hb));
+                    }
+                    if anchor.0 == probe_h {
+                        eprintln!(
+                            "[sync] blind-QC-probe: tip+1 height {probe_h} carries a QC sidecar; walking one height to adopt it"
+                        );
+                    } else {
+                        eprintln!(
+                            "[sync] blind-QC-probe: tip+1 present; anchoring the walk at decided height {} so a material gap uses the batched/snapshot path",
+                            anchor.0
+                        );
+                    }
+                    anchor
+                }
                 _ => {
                     static BLIND_MISS_N: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(0);
@@ -2322,5 +2360,43 @@ mod recovery_walk_tests {
         assert_eq!(got, Some(N));
         assert_eq!(lagging.state.get_state_root().await, tip_root);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A blind-QC-probe sidecar is catch-up EVIDENCE only when it carries a
+    /// REAL precommit quorum for that exact height. A well-formed but
+    /// signature-less sidecar decoded from the DHT must never be able to
+    /// scale the pass budget or re-arm the reactive latch (that would let any
+    /// DHT peer pin a validator in repeated expensive catch-up ticks).
+    #[tokio::test]
+    async fn blind_probe_evidence_requires_a_verified_precommit_quorum() {
+        let _global = crate::node::policy::test_support::global_lock();
+        let ks = vec![SigningKey::from_bytes(&[0x61; 32])];
+        let fks = fks_for(&ks);
+        let vs = vset(&ks);
+        let (blocks, _root) = build_chain(&ks, &fks, 1).await;
+        let block = &blocks[0];
+        let qc = block.precommit_qc.clone().expect("genuine QC attached");
+        let rt = ValidatorRuntime::new(ks[0].clone(), vs, Arc::new(InMemoryStateEngine::new()), 1);
+
+        assert_eq!(
+            verified_qc_sidecar_hash(&rt, &qc, 1),
+            Some(block.compute_hash()),
+            "a genuine precommit quorum is usable evidence"
+        );
+
+        let mut unsigned = qc.clone();
+        unsigned.signatures.clear();
+        assert!(
+            verified_qc_sidecar_hash(&rt, &unsigned, 1).is_none(),
+            "a signature-less sidecar must never become catch-up evidence"
+        );
+
+        let mut prevote_kind = qc.clone();
+        prevote_kind.kind = VoteKind::Prevote;
+        assert!(verified_qc_sidecar_hash(&rt, &prevote_kind, 1).is_none());
+        assert!(
+            verified_qc_sidecar_hash(&rt, &qc, 2).is_none(),
+            "a sidecar is bound to its own height"
+        );
     }
 }

@@ -2966,3 +2966,46 @@ async fn validator_refuses_a_body_over_the_wire_cap() {
         "the refusal must name the wire cap, got: {err}"
     );
 }
+
+/// LIVENESS (S5): a verified snapshot jump IS finality progress.
+///
+/// The snapshot-sync path used to advance `finalized`, `hc` and the safety
+/// record but never stamp `last_progress_at`. A node that had been behind for
+/// longer than the deadlock-breaker timeout therefore read an hours-old "no
+/// finalization" on its very next tick and fired a spurious LOCAL RE-PHASE —
+/// advancing the round it had just rejoined and skipping its own scheduled
+/// proposal slot. `advance_to_verified_snapshot` (used by `try_snapshot_sync`)
+/// stamps the clock as part of the advance.
+#[tokio::test]
+async fn snapshot_catchup_jump_stamps_finality_progress() {
+    let key = SigningKey::generate(&mut OsRng);
+    let me = key.verifying_key().to_bytes();
+    let validators = ValidatorSet::from_list(vec![(me, 1)]);
+    let mut rt = ValidatorRuntime::new(key, validators, funded_state(me).await, 2);
+
+    // Precondition: a node that spent 400 s behind ALONE trips the local
+    // re-phase predicate (this is what the breaker read after a snapshot).
+    rt.last_progress_at = std::time::Instant::now() - std::time::Duration::from_secs(400);
+    assert!(
+        rt.hc.deadlock_local_reset_due(400, 300),
+        "precondition: the stale progress clock alone triggers a re-phase"
+    );
+
+    let hash = [0x5Au8; 32];
+    rt.advance_to_verified_snapshot(500, hash);
+    assert_eq!(rt.finalized.last().copied(), Some((500, hash)));
+    assert_eq!(rt.hc.height, 501, "the snapshot resumes at boundary + 1");
+    assert_eq!(rt.hc.parent_hash, hash);
+    assert!(
+        !rt.hc.deadlock_local_reset_due(
+            rt.last_progress_at.elapsed().as_secs(),
+            crate::consensus::HeightConsensus::deadlock_timeout_secs(),
+        ),
+        "a verified snapshot jump must count as progress (no re-phase)"
+    );
+    assert_eq!(
+        rt.check_deadlock_breaker(),
+        None,
+        "no breaker jump immediately after a successful catch-up"
+    );
+}

@@ -319,31 +319,63 @@ pub(crate) fn apply_peer_pq_keys_env_at(init_height: u64, peers_env: Option<&str
     }
 }
 
+/// Encode a parked commit back into the local loopback queue.
+///
+/// Re-entering the normal inbound drain (rather than calling
+/// `adopt_committed` from the tick tail) is deliberate: the drain's
+/// `Committed` arm is the ONE place that performs the full adopt side effects
+/// — persistence (`enqueue_block` / `enqueue_finalized`), the QC sidecar
+/// clear, explorer/receipt records and replication. Adopting from the tail
+/// would advance consensus while silently skipping all of them.
+fn encode_committed_loopback(
+    height: u64,
+    block: &stellereum::sharding::Block,
+    certificate: &stellereum::consensus::QuorumCertificate,
+    src: &str,
+) -> Option<String> {
+    let msg = ConsensusMsg::Committed {
+        height,
+        block: block.clone(),
+        certificate: certificate.clone(),
+    };
+    let bytes = msg.encode().ok()?;
+    Some(serde_json::json!({ "data": hex::encode(bytes), "src": src }).to_string())
+}
+
 /// Replay the bounded park slots once the apply worker has released post-H
 /// state (`apply_in_flight` Some -> None).
 ///
-/// The replay goes through the SAME public entry points as live traffic —
-/// [`ValidatorRuntime::on_proposal`] and
-/// [`ValidatorRuntime::adopt_committed`] — so every authenticity, height,
-/// round, root, actor-cap, proposer, parent, lock and precommit-quorum check
-/// runs again. Nothing is applied from the parked copy directly; a refusal is
-/// logged and dropped (the peer/gossip retry remains the backstop).
+/// The proposal goes through the same public entry point as live traffic
+/// ([`ValidatorRuntime::on_proposal`]) and the commit is re-injected into the
+/// local loopback queue so the next drain runs the normal `Committed` arm
+/// (which validates it through [`ValidatorRuntime::adopt_committed`] AND
+/// performs the persistence/publication/receipt side effects). Nothing is
+/// applied from the parked copy directly; a refusal is logged and dropped
+/// (the peer/gossip retry remains the backstop).
 ///
-/// Order: the commit first (it may address the height that just finished),
-/// then the proposal (which typically targets the newly installed H+1).
-async fn replay_parked_apply_window(rt: &mut ValidatorRuntime) {
+/// Order: the commit is queued first, then the proposal is replayed (it
+/// typically targets the newly installed H+1).
+async fn replay_parked_apply_window(
+    rt: &mut ValidatorRuntime,
+    loopback_queue: &mut std::collections::VecDeque<String>,
+    loopback_dropped: &mut u64,
+) {
     let (proposal, commit) = rt.take_parked();
     if let Some(c) = commit {
-        match rt.adopt_committed(c.height, c.block, c.certificate).await {
-            Ok(bh) => info!(
-                "[consensus] replayed parked commit #{} {} (adopted)",
-                c.height,
-                hex::encode(&bh[..6])
-            ),
-            Err(e) => tracing::debug!(
-                height = c.height,
-                error = %e,
-                "[consensus] parked commit refused on replay (fail-closed)"
+        let height = c.height;
+        match encode_committed_loopback(height, &c.block, &c.certificate, "local-replay") {
+            Some(raw) => {
+                if push_bounded_loopback(loopback_queue, raw, LOOPBACK_QUEUE_CAP) {
+                    *loopback_dropped += 1;
+                }
+                info!(
+                    "[consensus] parked commit #{} re-injected into the drain (full adopt path on the next tick)",
+                    height
+                );
+            }
+            None => tracing::warn!(
+                height,
+                "[consensus] parked commit could not be re-encoded for replay; dropped (peer retry remains the backstop)"
             ),
         }
     }
@@ -2399,7 +2431,17 @@ pub(crate) async fn run_consensus_node(
                 // the 500 ms floor instead of dropping to the 30 s backstop.
                 {
                     let tip = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
-                    if catchup_still_behind(tip, rt.peer_hint, peer_named_height) {
+                    let still_behind = catchup_still_behind(tip, rt.peer_hint, peer_named_height);
+                    // A BLIND probe that still advanced us proves there is
+                    // more to fetch even when no ahead evidence was recorded
+                    // (a silent follower). Dropping the latch here would wait
+                    // out the 120 s at-tip window while the chain moved ~300
+                    // heights — the exact jail-budget overrun this path exists
+                    // to prevent.
+                    if rearm_after_catchup_success(
+                        catchup_decision == CatchupAction::BlindProbe,
+                        still_behind,
+                    ) {
                         catchup_pending = true;
                     }
                 }
@@ -3669,6 +3711,7 @@ pub(crate) async fn run_consensus_node(
                             if height < rt.hc.height && proposal_admissible {
                                 last_behind_peer_seen = Some(std::time::Instant::now());
                             }
+                            let round_before_proposal = rt.hc.round;
                             match rt.on_proposal(proposer, block, round_of_block).await {
                                 Ok(_) => {
                                     // VEL-2 vote-fan-in pipeline: vote in the SAME
@@ -3739,6 +3782,18 @@ pub(crate) async fn run_consensus_node(
                                         e
                                     );
                                 }
+                            }
+                            // NEAR-FUTURE ALIGNMENT IS A ROUND CHANGE: a genuine
+                            // body signed at a later round carries us there
+                            // inside `on_proposal` (`sync_round_to`). Without
+                            // restarting the timer the next tick's elapsed-time
+                            // check can fire immediately and view-change past the
+                            // proposal we just voted. Same rule as the vote
+                            // chase above, accepted or refused (the round moved
+                            // either way).
+                            if round_timer_should_restart(round_before_proposal, rt.hc.round, false)
+                            {
+                                round_started = std::time::Instant::now();
                             }
                         }
                         ConsensusMsg::Vote { vote: v, locked } => {
@@ -3811,7 +3866,8 @@ pub(crate) async fn run_consensus_node(
                                     // not votable (stale round / too far ahead).
                                     votes_seen_voters.insert(vcopy.voter);
                                     peer_round_seen = Some((vh, vr, std::time::Instant::now()));
-                                    if rt.hc.round != round_before {
+                                    if round_timer_should_restart(round_before, rt.hc.round, false)
+                                    {
                                         round_started = std::time::Instant::now();
                                     }
                                 }
@@ -3906,13 +3962,20 @@ pub(crate) async fn run_consensus_node(
                                 // network is voting it in, and keeps the
                                 // proposal live there; other votes use the
                                 // conservative corroborated chase.
-                                if rt.note_peer_vote_round_for(vh, vr, vbh) {
-                                    // The round moved under us: restart the round
-                                    // timer. Without this the elapsed-time check
-                                    // already exceeded the timeout, so on the very
-                                    // next tick the node view-changed straight past
-                                    // the peer it had just aligned with -- measured
-                                    // live as a view change 269ms after syncing.
+                                let drain_moved = rt.note_peer_vote_round_for(vh, vr, vbh);
+                                // The round may ALSO have moved inside
+                                // `on_prevote`/`on_precommit` above (they run
+                                // the same future-round chase). Restart on ANY
+                                // observed movement: restarting only when this
+                                // follow-up reports a move left the timer at the
+                                // OLD round's origin, so the very next tick
+                                // view-changed straight past the peer it had
+                                // just aligned with (live: 269ms after syncing).
+                                if round_timer_should_restart(
+                                    round_before,
+                                    rt.hc.round,
+                                    drain_moved,
+                                ) {
                                     round_started = std::time::Instant::now();
                                 }
                             }
@@ -4013,7 +4076,15 @@ pub(crate) async fn run_consensus_node(
                                 // bounded one-slot buffer (returning the
                                 // "parked for replay" error). The replay hook
                                 // after `try_poll_apply` re-runs every check.
-                                if height == rt.hc.height {
+                                //
+                                // Only the NEXT height survives the replay: the
+                                // install advances us to `hc.height + 1`, so a
+                                // commit for H+1 is exactly the one the replay
+                                // can adopt. Parking the CURRENT (already
+                                // executing) height would instead sit in the
+                                // one-slot buffer and be dropped, evicting the
+                                // useful H+1 copy.
+                                if commit_parkable_during_apply(rt.hc.height, height) {
                                     let _ = rt
                                         .adopt_committed(height, block.clone(), certificate.clone())
                                         .await;
@@ -4404,12 +4475,14 @@ pub(crate) async fn run_consensus_node(
             // observed (`apply_in_flight` just transitioned Some -> None and
             // `install_apply_outcome` installed H). Anything that arrived
             // during the execute window was parked, not dropped; replay it
-            // NOW through the normal validating entry points. Placed before
-            // any publish/record work so the proposal is re-validated (and may
-            // be prevoted on the next step) without waiting another tick.
-            // `take_parked` clears both one-slot buffers, so replay is
-            // at-most-once and cannot grow the runtime.
-            replay_parked_apply_window(&mut rt).await;
+            // through the normal validating entry points. The replay is placed
+            // at the END of this block (just before the same-tick fast-forward
+            // propose) on purpose: a replayed H+1 commit enters the ordinary
+            // drain (which adopts it with ALL side effects), and the
+            // completed-height publish/record/persist work above must still
+            // see ITS height (`last_decision`, `applied_statuses`, the durable
+            // finalized pointer). `take_parked` clears both one-slot buffers,
+            // so replay is at-most-once and cannot grow the runtime.
             // The executed height: the tick-top `height` cannot have moved
             // past it (the height advance happens right here), but naming it
             // keeps every line below honest about what it publishes.
@@ -5255,6 +5328,12 @@ pub(crate) async fn run_consensus_node(
             last_block_at = std::time::Instant::now()
                 .checked_sub(elapsed_round.min(min_block_time))
                 .unwrap_or_else(std::time::Instant::now);
+            // PARK-AND-REPLAY (see the note at `try_poll_apply` above). Runs
+            // after this height's publish/record/persist work so the commit
+            // re-injection cannot rewrite the H bookkeeping, and before the
+            // same-tick fast-forward so a replayed H+1 proposal is live here.
+            // A parked commit enters the ordinary drain on the next tick.
+            replay_parked_apply_window(&mut rt, &mut loopback_queue, &mut loopback_dropped).await;
             // SPD proposal-fast-forward (empty-block fast path): the next
             // VEL-1 proposal-fast-forward (prebuild hit): the next proposer
             // pre-broadcasts its proposal IN THE SAME TICK as finalize
@@ -5846,6 +5925,51 @@ pub(crate) async fn run_consensus_node(
             split_join_n = 0;
         }
         tokio::time::sleep(Duration::from_millis(tick_ms)).await;
+    }
+}
+
+#[cfg(test)]
+mod parked_replay_tests {
+    use super::*;
+
+    /// A parked commit is re-injected as an ordinary `Committed` frame, so the
+    /// next drain runs the full adopt arm (validation + persistence +
+    /// publication/receipts). Pin the exact framing: encode -> parse must
+    /// yield the same height/body/certificate, attributed to the local replay
+    /// source.
+    #[test]
+    fn parked_commit_loopback_round_trips_through_the_drain_parser() {
+        let block = stellereum::sharding::Block {
+            height: 7,
+            round: 2,
+            ..Default::default()
+        };
+        let bh = block.compute_hash();
+        let certificate = stellereum::consensus::QuorumCertificate {
+            height: 7,
+            round: 2,
+            kind: VoteKind::Precommit,
+            block_hash: Some(bh),
+            signatures: vec![],
+            shard_id: block.shard_id,
+        };
+        let raw = encode_committed_loopback(7, &block, &certificate, "local-replay")
+            .expect("parked commit must encode");
+        let (msg, src) = parse_incoming_with_peer_key(&raw).expect("loopback frame must parse");
+        assert_eq!(src, "local-replay");
+        match msg {
+            ConsensusMsg::Committed {
+                height,
+                block: b,
+                certificate: c,
+            } => {
+                assert_eq!(height, 7);
+                assert_eq!(b.compute_hash(), bh);
+                assert_eq!(c.height, 7);
+                assert_eq!(c.block_hash, Some(bh));
+            }
+            _ => panic!("loopback frame must decode as Committed"),
+        }
     }
 }
 

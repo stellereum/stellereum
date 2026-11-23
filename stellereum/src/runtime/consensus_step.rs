@@ -51,7 +51,23 @@ pub struct ParkedCommit {
 impl ValidatorRuntime {
     /// Park the newest proposal for replay (bounded: overwrites any older
     /// parked proposal, so at most one is ever held).
+    ///
+    /// Only `hc.height + 1` is ever replayable: the install advances the
+    /// height by exactly one, and `take_parked` drops any other target. A
+    /// proposal for any other height is therefore junk in this slot — and
+    /// letting it overwrite the REAL H+1 proposal (park depth 1) means the
+    /// useful copy is lost and the peer must retransmit it. One unauthenticated
+    /// frame could evict it, so refuse to park non-replayable heights.
     pub(super) fn park_proposal(&mut self, proposer: ValidatorId, block: Block, round: Round) {
+        if block.height != self.hc.height.saturating_add(1) {
+            tracing::debug!(
+                height = block.height,
+                round,
+                local_height = self.hc.height,
+                "not parking a proposal that cannot be replayed after this apply"
+            );
+            return;
+        }
         if self.parked_proposal.is_some() {
             tracing::debug!(
                 height = block.height,
@@ -69,12 +85,24 @@ impl ValidatorRuntime {
 
     /// Park the newest peer commit for replay (bounded: overwrites any older
     /// parked commit, so at most one is ever held).
+    ///
+    /// Same replayable-target rule as [`Self::park_proposal`]: only
+    /// `hc.height + 1` can be adopted after the install, so a commit for any
+    /// other height must never evict the useful slot (park depth 1).
     pub(super) fn park_commit(
         &mut self,
         height: Height,
         block: Block,
         certificate: crate::consensus::QuorumCertificate,
     ) {
+        if height != self.hc.height.saturating_add(1) {
+            tracing::debug!(
+                height,
+                local_height = self.hc.height,
+                "not parking a commit that cannot be replayed after this apply"
+            );
+            return;
+        }
         if self.parked_commit.is_some() {
             tracing::debug!(
                 height,
@@ -2813,6 +2841,39 @@ impl ValidatorRuntime {
         changed
     }
 
+    /// Advance the finalized tip to a snapshot boundary the SYNC layer has
+    /// already verified (trusted state root, QC-anchored header proof and
+    /// validator-set binding all ran in `try_snapshot_sync`).
+    ///
+    /// A catch-up jump IS chain progress, so it must stamp the deadlock
+    /// breaker's clock (`record_progress`). Without that stamp a node that
+    /// spent longer than `deadlock_timeout()` behind read an hours-old "no
+    /// finalization" on its very next tick and fired a spurious LOCAL
+    /// RE-PHASE — advancing the round it had just rejoined (and skipping its
+    /// own scheduled proposal slot) — even though it had just made more
+    /// progress than any single finalize would.
+    pub fn advance_to_verified_snapshot(&mut self, boundary: u64, boundary_hash: [u8; 32]) {
+        self.finalized.push((boundary, boundary_hash));
+        if let Err(e) = self
+            .safety
+            .advance_height(boundary + 1, boundary, boundary_hash)
+        {
+            tracing::error!(
+                boundary,
+                error = %e,
+                "[safety] snapshot sync advance_height failed; quarantining"
+            );
+            self.safety
+                .quarantine(format!("snapshot_sync advance_height({boundary}): {e}"));
+        }
+        self.hc = crate::consensus::HeightConsensus::new(boundary + 1, self.validators.clone());
+        // The sortition committee of this height is elected from the PARENT
+        // block hash — the finalized head we just restored. Every node must
+        // use the same parent, or they elect different committees.
+        self.hc.set_parent_hash(boundary_hash);
+        self.record_progress();
+    }
+
     /// View change: move to the next round.
     pub fn next_round(&mut self) {
         // A parked slot must not survive an unbounded number of view changes;
@@ -3915,5 +3976,127 @@ mod consensus_step_tests {
         );
         assert!(parked_commit.is_none());
         assert!(!nodes[target_idx].has_parked());
+    }
+
+    /// PARK-DEPTH EVICTION (liveness): the slot holds ONE item, so a frame
+    /// that can never be replayed must not overwrite the real H+1 proposal.
+    /// Before the guard, any proposal arriving during the apply window was
+    /// parked, so one junk frame (wrong height) evicted the only useful copy
+    /// and the height lost its body until the peer retransmitted.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // GATE: process-global PQ registry; serialized with the other step tests.
+    async fn non_replayable_proposal_cannot_evict_the_parked_next_height_slot() {
+        let _global = step_lock();
+        let (mut nodes, validators) = make_4node_cluster(0x76).await;
+        let ts = 1_700_050_000u64;
+        let h2_idx = nodes
+            .iter()
+            .position(|n| validators.proposer_for(2, 0) == Some(n.id))
+            .expect("proposer for h=2 r=0");
+        let target_idx = (h2_idx + 1) % nodes.len();
+        decide_h1_and_leave_apply_in_flight(&mut nodes, &validators, target_idx, ts).await;
+
+        let block2 = nodes[h2_idx]
+            .propose(ts.saturating_add(30))
+            .await
+            .expect("propose h=2");
+        let bh2 = block2.compute_hash();
+        let pid2 = nodes[h2_idx].id;
+        nodes[target_idx]
+            .on_proposal(pid2, block2.clone(), 0)
+            .await
+            .expect_err("H+1 proposal during apply is parked");
+
+        // The CURRENT height is the one executing (already decided) and a far
+        // height cannot be replayed after a single advance: neither may take
+        // the slot.
+        let mut current = block2.clone();
+        current.height = 1;
+        current.prev_hash = [0u8; 32];
+        let _ = nodes[target_idx].on_proposal(pid2, current, 0).await;
+        let mut far = block2.clone();
+        far.height = 9;
+        let _ = nodes[target_idx].on_proposal(pid2, far, 0).await;
+
+        nodes[target_idx]
+            .await_apply_completion()
+            .await
+            .expect("apply completion");
+        assert_eq!(nodes[target_idx].hc.height, 2);
+
+        let (parked, commit) = nodes[target_idx].take_parked();
+        assert!(commit.is_none());
+        let p = parked.expect("the real H+1 proposal must survive junk parking attempts");
+        assert_eq!(p.block.compute_hash(), bh2);
+    }
+
+    /// Same guard on the commit slot: only the post-install height (H+1) is
+    /// adoptable, so a current/far-height commit must not evict it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // GATE: process-global PQ registry; serialized with the other step tests.
+    async fn non_replayable_commit_cannot_evict_the_parked_next_height_slot() {
+        let _global = step_lock();
+        let (mut nodes, validators) = make_4node_cluster(0x78).await;
+        let ts = 1_700_060_000u64;
+        let h2_idx = nodes
+            .iter()
+            .position(|n| validators.proposer_for(2, 0) == Some(n.id))
+            .expect("proposer for h=2 r=0");
+        let target_idx = (h2_idx + 1) % nodes.len();
+        decide_h1_and_leave_apply_in_flight(&mut nodes, &validators, target_idx, ts).await;
+
+        let block2 = nodes[h2_idx]
+            .propose(ts.saturating_add(30))
+            .await
+            .expect("propose h=2");
+        let empty = crate::consensus::QuorumCertificate {
+            height: 2,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: Some(block2.compute_hash()),
+            signatures: vec![],
+            shard_id: block2.shard_id,
+        };
+        // The useful H+1 commit (parking happens before certification).
+        let err = nodes[target_idx]
+            .adopt_committed(2, block2.clone(), empty)
+            .await
+            .expect_err("commit during apply is parked");
+        assert!(err.contains("parked"));
+        // Junk at the current and a far height: must not evict the H+1 slot.
+        let current_cert = crate::consensus::QuorumCertificate {
+            height: 1,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: None,
+            signatures: vec![],
+            shard_id: block2.shard_id,
+        };
+        let mut current = block2.clone();
+        current.height = 1;
+        let _ = nodes[target_idx]
+            .adopt_committed(1, current, current_cert)
+            .await;
+        let far_cert = crate::consensus::QuorumCertificate {
+            height: 9,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: None,
+            signatures: vec![],
+            shard_id: block2.shard_id,
+        };
+        let mut far = block2.clone();
+        far.height = 9;
+        let _ = nodes[target_idx].adopt_committed(9, far, far_cert).await;
+
+        nodes[target_idx]
+            .await_apply_completion()
+            .await
+            .expect("apply completion");
+        assert_eq!(nodes[target_idx].hc.height, 2);
+
+        let (_, parked) = nodes[target_idx].take_parked();
+        let c = parked.expect("the real H+1 commit must survive junk parking attempts");
+        assert_eq!(c.height, 2);
     }
 }

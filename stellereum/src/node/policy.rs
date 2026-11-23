@@ -225,6 +225,63 @@ pub fn catchup_still_behind(
     peer_hint.is_some_and(|(ph, _)| ph > our_tip) || peer_named_height > our_tip
 }
 
+/// Whether the per-round timer must be restarted after one verified peer vote.
+///
+/// The runtime's own `on_prevote`/`on_precommit` already apply the
+/// future-round rule (`note_peer_vote_round_for`) BEFORE the node loop sees the
+/// vote. When that call already carried us to the peer's round, the loop's
+/// follow-up chase returns `false` ("already there") even though `hc.round`
+/// moved during the message. Restarting the timer only on the follow-up's
+/// return left `round_started` at the OLD round's origin, so the very next
+/// view-change check (`elapsed > timeout`) fired immediately and abandoned the
+/// round we had just aligned with (live: view change 269ms after syncing).
+///
+/// Any OBSERVED round movement must restart the timer, whichever of the two
+/// chase sites performed it. Pure.
+pub fn round_timer_should_restart(round_before: u32, round_after: u32, drain_moved: bool) -> bool {
+    drain_moved || round_after != round_before
+}
+
+/// Whether a peer `Committed` for `height` should be handed to
+/// `adopt_committed` while the apply worker is still finishing `hc_height`.
+///
+/// Only the NEXT height survives the replay: the install advances
+/// `hc.height` to `hc_height + 1`, and `take_parked` returns a parked commit
+/// only when `height == hc.height`. A commit for the CURRENT (already
+/// executing) height is redundant, and parking it would EVICT the one useful
+/// H+1 slot (park depth is 1). Pure.
+pub fn commit_parkable_during_apply(hc_height: u64, height: u64) -> bool {
+    height == hc_height.saturating_add(1)
+}
+
+/// Whether a catch-up pass that returned `Some` must keep the reactive latch
+/// armed for the next tick.
+///
+/// A BLIND probe (no verified ahead evidence: a silent follower) that still
+/// ADVANCED us proves there is more to fetch — the next blind probe is
+/// otherwise `AT_TIP_PROBE_INTERVAL_MS` away (120 s), during which a 2.5
+/// blocks/s chain moves ~300 heights and the node burns its 33.6 s downtime
+/// budget. `still_behind` covers the evidence-backed case (a hint or a named
+/// peer height above our new tip). Pure; node-local pacing only.
+pub fn rearm_after_catchup_success(blind_probe: bool, still_behind: bool) -> bool {
+    blind_probe || still_behind
+}
+
+/// Ascending probe offsets for the blind-QC-probe anchor.
+///
+/// The caller probes these offsets above its FINALIZED tip in order and stops
+/// at the first miss (decided heights are contiguous), using the last hit as
+/// the furthest decided height it can prove. The small steps are load-bearing:
+/// with only `+64/+256/+1024`, a silent follower 2..=63 heights behind could
+/// prove only `tip+1`, adopt ONE height, and then wait out the 120 s blind
+/// window — far slower than the live tempo, so it fell further behind and
+/// burned the downtime budget before the `+64` rung ever existed. Each small
+/// step at most doubles the previous, so one pass halves a sub-64 gap.
+///
+/// The far rungs are unchanged (material gaps still leap to the
+/// snapshot/batched path). Pure; local sync policy, never consensus.
+pub const BLIND_PROBE_LADDER: &[u64] = &[2, 4, 8, 16, 32, 64, 256, 1024];
+
 /// Height a message NAMES that is above `our_height`, if any.
 ///
 /// One choke point for "a peer told us it is ahead", used by the drain for

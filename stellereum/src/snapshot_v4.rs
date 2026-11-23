@@ -789,21 +789,37 @@ pub fn canonical_vset_hash(vset: &ValidatorSet) -> [u8; 32] {
 // Units Merkle Tree & Proofs
 // ============================================================================
 
-fn canonical_unit_desc_bytes(desc: &SnapshotUnitDesc) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 + 2 + 1 + 32 + 32 + 4);
-    out.extend_from_slice(&desc.unit_tag.to_le_bytes());
-    out.extend_from_slice(&desc.sub_index.to_le_bytes());
-    out.push(desc.encoding);
-    out.extend_from_slice(&desc.unit_hash);
-    out.extend_from_slice(&desc.chunk_hash);
-    out.extend_from_slice(&desc.byte_len.to_le_bytes());
+/// Canonical 73-byte encoding of one unit descriptor.
+///
+/// This is the ONE layout definition: the Manifest body bytes, the units-Merkle
+/// leaf hash and the Merkle leaf all read it, so the three can never drift.
+/// Fixed-size (stack) so the per-leaf/per-signature paths allocate nothing.
+fn canonical_unit_desc_array(desc: &SnapshotUnitDesc) -> [u8; 73] {
+    let mut out = [0u8; 73];
+    out[0..2].copy_from_slice(&desc.unit_tag.to_le_bytes());
+    out[2..4].copy_from_slice(&desc.sub_index.to_le_bytes());
+    out[4] = desc.encoding;
+    out[5..37].copy_from_slice(&desc.unit_hash);
+    out[37..69].copy_from_slice(&desc.chunk_hash);
+    out[69..73].copy_from_slice(&desc.byte_len.to_le_bytes());
     out
 }
 
+/// Vec form of [`canonical_unit_desc_array`]. Test-only: production paths use
+/// the fixed-size array and allocate nothing.
+#[cfg(test)]
+fn canonical_unit_desc_bytes(desc: &SnapshotUnitDesc) -> Vec<u8> {
+    canonical_unit_desc_array(desc).to_vec()
+}
+
 fn hash_merkle_leaf(desc: &SnapshotUnitDesc) -> [u8; 32] {
+    // Same input stream as `SNAP_MERKLE_LEAF_DOMAIN || <73 canonical bytes>`
+    // without materialising a Vec for every leaf: a manifest carries up to
+    // MAX_SNAP_UNITS leaves and this root is recomputed on every decode /
+    // verify, so the old form allocated once per unit per verification.
     let mut hasher = blake3::Hasher::new();
     hasher.update(SNAP_MERKLE_LEAF_DOMAIN);
-    hasher.update(&canonical_unit_desc_bytes(desc));
+    hasher.update(&canonical_unit_desc_array(desc));
     *hasher.finalize().as_bytes()
 }
 
@@ -945,7 +961,7 @@ pub fn canonical_manifest_body_bytes(manifest: &SnapshotManifestV1) -> Vec<u8> {
     out.extend_from_slice(&manifest.units_merkle_root);
     out.extend_from_slice(&(manifest.units.len() as u64).to_le_bytes());
     for desc in &manifest.units {
-        out.extend_from_slice(&canonical_unit_desc_bytes(desc));
+        out.extend_from_slice(&canonical_unit_desc_array(desc));
     }
     out.extend_from_slice(&manifest.publisher_id);
     out
@@ -4166,4 +4182,73 @@ where
     }
 
     Ok(cur_state)
+}
+
+#[cfg(test)]
+mod perf_s7_merkle_leaf_tests {
+    //! PERF S7: the units-Merkle leaf hash now streams the canonical unit
+    //! descriptor straight into BLAKE3 instead of materialising a 73-byte Vec
+    //! per leaf (one allocation per unit per root computation). These tests
+    //! pin that the digest — and therefore every manifest's
+    //! `units_merkle_root` — is unchanged.
+
+    use super::*;
+
+    fn desc(i: u32) -> SnapshotUnitDesc {
+        SnapshotUnitDesc {
+            unit_tag: (i % 7) as u16,
+            sub_index: (i * 3 % 11) as u16,
+            encoding: 1,
+            unit_hash: *blake3::hash(&i.to_le_bytes()).as_bytes(),
+            chunk_hash: *blake3::hash(&(i as u64 + 1).to_le_bytes()).as_bytes(),
+            byte_len: i.wrapping_mul(65_537),
+        }
+    }
+
+    #[test]
+    fn perf_s7_merkle_leaf_matches_the_vec_concatenation() {
+        for i in 0..256u32 {
+            let d = desc(i);
+            // Reference: the old two-step form (domain || canonical_unit_desc_bytes).
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(SNAP_MERKLE_LEAF_DOMAIN);
+            hasher.update(&canonical_unit_desc_bytes(&d));
+            let reference = *hasher.finalize().as_bytes();
+            assert_eq!(hash_merkle_leaf(&d), reference, "leaf {i} digest changed");
+        }
+    }
+
+    #[test]
+    fn perf_s7_units_merkle_root_is_unchanged() {
+        let units: Vec<SnapshotUnitDesc> = (0..64u32).map(desc).collect();
+        // Independent reference fold over the (Vec-based) canonical encoding.
+        let mut level: Vec<[u8; 32]> = units
+            .iter()
+            .map(|d| {
+                let mut h = blake3::Hasher::new();
+                h.update(SNAP_MERKLE_LEAF_DOMAIN);
+                h.update(&canonical_unit_desc_bytes(d));
+                *h.finalize().as_bytes()
+            })
+            .collect();
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            for pair in level.chunks(2) {
+                let left = pair[0];
+                let right = if pair.len() == 2 { pair[1] } else { pair[0] };
+                let mut h = blake3::Hasher::new();
+                h.update(SNAP_MERKLE_NODE_DOMAIN);
+                h.update(&left);
+                h.update(&right);
+                next.push(*h.finalize().as_bytes());
+            }
+            level = next;
+        }
+        assert_eq!(compute_units_merkle_root(&units), level[0]);
+        // Empty manifest keeps its dedicated domain-separated root.
+        assert_eq!(
+            compute_units_merkle_root(&[]),
+            *blake3::hash(SNAP_MERKLE_EMPTY_DOMAIN).as_bytes()
+        );
+    }
 }

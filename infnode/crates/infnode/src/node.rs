@@ -4020,13 +4020,17 @@ impl Node {
                     .msgs_dropped_no_sub
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            for msg in &ordered {
-                for tx in &senders {
-                    if tx.send(msg.clone()).is_err() {
-                        self.metrics
-                            .msgs_dropped_dead_rx
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
+            // One clone per subscriber except the last (which takes ownership):
+            // for the common single-subscriber case the 1 MiB-max payload is
+            // never copied at all (see `fanout_owned`).
+            for msg in ordered {
+                let (_delivered, dropped) = fanout_owned(msg, senders.len(), |payload, i| {
+                    senders[i].send(payload).is_ok()
+                });
+                if dropped > 0 {
+                    self.metrics
+                        .msgs_dropped_dead_rx
+                        .fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             return Some(
@@ -4514,24 +4518,37 @@ impl Node {
         if ttl == 0 {
             return;
         }
+        // Resolve the eligible fan-out set BEFORE serializing: an empty set
+        // (single-node cluster, or every peer suspected) no longer pays for a
+        // payload JSON build it would immediately drop.
         let peers: Vec<[u8; NODEID_LEN]> = self.peers.read().await.keys().copied().collect();
+        let targets: Vec<[u8; NODEID_LEN]> = peers
+            .into_iter()
+            .filter(|pid| Some(*pid) != exclude)
+            // A suspected-dead peer must not receive overlay fan-out: the
+            // broadcast would pay its handshake timeout on every publish.
+            // It stays explicitly dialable (mesh heartbeat / direct calls).
+            .filter(|pid| self.routing_target_allowed(pid))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
         let payload = json!({
             "topic": topic, "data": data, "msg_id": msg_id, "seq": seq, "origin": origin, "ttl": ttl - 1
         })
         .to_string()
         .into_bytes();
-        for pid in peers {
-            if Some(pid) == exclude {
-                continue;
-            }
-            // A suspected-dead peer must not receive overlay fan-out: the
-            // broadcast would pay its handshake timeout on every publish.
-            // It stays explicitly dialable (mesh heartbeat / direct calls).
-            if !self.routing_target_allowed(&pid) {
-                continue;
-            }
+        let n = targets.len();
+        let mut payload = Some(payload);
+        for (i, pid) in targets.into_iter().enumerate() {
+            // Last target takes ownership: one fewer full-payload copy per
+            // relayed frame (payloads can be 1 MiB; fleet hosts have 1 vCPU).
+            let payload = if i + 1 == n {
+                payload.take().expect("fanout payload moved exactly once")
+            } else {
+                payload.as_ref().expect("fanout payload present").clone()
+            };
             let node = self.clone();
-            let payload = payload.clone();
             tokio::spawn(async move {
                 let _ = node.request_to(pid, "pubsub.relay", payload).await;
             });
@@ -6317,8 +6334,15 @@ impl Node {
     }
 
     /// Роль пира: хранит ли он этот бакет (неизвестный пир/TOFU = оба бакета).
+    ///
+    /// Reads the role straight out of the peers map under its READ guard: the
+    /// old form cloned the whole `PeerLink` (quinn `ClientConfig`, endpoints,
+    /// Falcon key, ...) on every chunk store/fetch/delete just to inspect
+    /// `storage_roles`. No await happens while the guard is held, so the hold
+    /// time is a single field check.
     pub async fn peer_allows(&self, pid: &[u8; NODEID_LEN], bucket: &str) -> bool {
-        let Some(peer) = self.peers.read().await.get(pid).cloned() else {
+        let peers = self.peers.read().await;
+        let Some(peer) = peers.get(pid) else {
             return true;
         };
         if peer.cfg.storage_roles.is_empty() {
@@ -6395,23 +6419,17 @@ impl Node {
         ) {
             return (false, false, 0);
         }
-        let content_hash = blake3::hash(data);
+        let content_hash = chunk_content_hash(data);
         let dedup_key = format!("dedup:{}", hex::encode(content_hash.as_bytes()));
+        let me_hex = hex::encode(self.id);
         let mut dedup_hit = false;
-        {
-            let mut kv = self.kv.write().await;
-            if let Some(v) = kv.get(&dedup_key) {
-                if let Ok(d) = serde_json::from_str::<serde_json::Value>(&v) {
-                    if let Some(nodes) = d["nodes"].as_array() {
-                        if nodes
-                            .iter()
-                            .any(|x| x.as_str() == Some(&hex::encode(self.id)))
-                        {
-                            dedup_hit = true;
-                        }
-                    }
-                }
-            }
+        // Read-only probe (see `handle_storage_store_typed`): a READ lock keeps
+        // concurrent chunk writes from serializing on the KV writer; an expired
+        // dedup record answers "absent" exactly like the old `get`.
+        if let Some((v, _expires)) = self.kv.read().await.peek(&dedup_key) {
+            // `me_hex` is hoisted: the old form re-encoded our own id inside
+            // the `any` predicate, i.e. once per recorded node.
+            dedup_hit = dedup_record_holders(&v, &me_hex).1;
         }
         if dedup_hit {
             let d = dir.clone();
@@ -6438,32 +6456,14 @@ impl Node {
             }
         }
         {
-            let mut nodes: Vec<String> = {
-                let mut kv = self.kv.write().await;
-                kv.get(&dedup_key)
-                    .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
-                    .and_then(|d| d["nodes"].as_array().cloned())
-                    .map(|arr| {
-                        arr.into_iter()
-                            .filter_map(|x| x.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
-            let me = hex::encode(self.id);
-            if !nodes.iter().any(|x| x == &me) {
-                nodes.push(me);
-            }
-            let entry = serde_json::json!({
-                "size": nbytes,
-                "ts": crate::dht::now_ms(),
-                "nodes": nodes,
-            });
-            let payload = serde_json::to_string(&entry).unwrap_or("{}".into());
-            self.kv
-                .write()
-                .await
-                .store(&dedup_key, payload, crate::dht::DEDUP_TTL_MS, self.id);
+            // ONE write guard for the read-modify-write of the dedup record:
+            // two acquisitions used to serialize the path twice and allowed a
+            // concurrent store's node list to be lost in between.
+            let mut kv = self.kv.write().await;
+            let prev = kv.peek(&dedup_key).map(|(v, _)| v);
+            let payload =
+                dedup_record_payload(prev.as_deref(), &me_hex, nbytes, crate::dht::now_ms());
+            kv.store(&dedup_key, payload, crate::dht::DEDUP_TTL_MS, self.id);
         }
         (true, false, nbytes)
     }
@@ -6530,17 +6530,21 @@ impl Node {
                     .into_bytes(),
             );
         }
+        // ONE BLAKE3 pass over the chunk body for the whole store: the digest is
+        // used both for the manifest-hash gate and for the content-addressed
+        // dedup key. The hex form is built lazily — only when a live manifest
+        // actually pins this chunk id (the common case has no entry, and hex
+        // formatting a hash is still an allocation).
+        let content_hash = chunk_content_hash(&data);
         // O(1) expected-hash verification against the KvStore secondary index.
-        {
-            let got = hex::encode(blake3::hash(&data).as_bytes());
-            if let Some(expected) = self.kv.read().await.expected_chunk_hash(id) {
-                if !expected.eq_ignore_ascii_case(&got) {
-                    return Some(
-                        json!({ "ok": false, "err": "chunk hash mismatch with known manifest" })
-                            .to_string()
-                            .into_bytes(),
-                    );
-                }
+        if let Some(expected) = self.kv.read().await.expected_chunk_hash(id) {
+            let got = hex::encode(content_hash.as_bytes());
+            if !expected.eq_ignore_ascii_case(&got) {
+                return Some(
+                    json!({ "ok": false, "err": "chunk hash mismatch with known manifest" })
+                        .to_string()
+                        .into_bytes(),
+                );
             }
         }
         let dir = self.chunks_dir(bucket);
@@ -6552,23 +6556,18 @@ impl Node {
                 return Some(json!({ "ok": false, "err": "io" }).to_string().into_bytes());
             }
         }
-        let content_hash = blake3::hash(&data);
         let dedup_key = format!("dedup:{}", hex::encode(content_hash.as_bytes()));
+        let me_hex = hex::encode(self.id);
         let want_replicas = 2usize;
         let mut dedup_hit = false;
-        {
-            let mut kv = self.kv.write().await;
-            if let Some(v) = kv.get(&dedup_key) {
-                if let Ok(d) = serde_json::from_str::<serde_json::Value>(&v) {
-                    if let Some(nodes) = d["nodes"].as_array() {
-                        let have = nodes.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>();
-                        if have.len() >= want_replicas
-                            && have.iter().any(|h| *h == hex::encode(self.id))
-                        {
-                            dedup_hit = true;
-                        }
-                    }
-                }
+        // Read-only probe: `peek` never mutates (no eager expiry sweep), so it
+        // takes a READ lock instead of serializing every concurrent chunk store
+        // behind one writer. An expired record answers "absent" exactly like
+        // `get` did; the periodic sweep is what reclaims it.
+        if let Some((v, _expires)) = self.kv.read().await.peek(&dedup_key) {
+            let (holders, lists_me) = dedup_record_holders(&v, &me_hex);
+            if holders >= want_replicas && lists_me {
+                dedup_hit = true;
             }
         }
         if dedup_hit {
@@ -6603,32 +6602,14 @@ impl Node {
         }
         {
             let now = crate::dht::now_ms();
-            let mut entry = serde_json::Map::new();
-            entry.insert("size".into(), serde_json::json!(nbytes));
-            entry.insert("ts".into(), serde_json::json!(now));
-            let mut nodes: Vec<String> = {
-                let mut kv = self.kv.write().await;
-                kv.get(&dedup_key)
-                    .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
-                    .and_then(|d| d["nodes"].as_array().cloned())
-                    .map(|arr| {
-                        arr.into_iter()
-                            .filter_map(|x| x.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
-            let me = hex::encode(self.id);
-            if !nodes.iter().any(|x| x == &me) {
-                nodes.push(me);
-            }
-            entry.insert("nodes".into(), serde_json::json!(nodes));
-            let payload =
-                serde_json::to_string(&serde_json::Value::Object(entry)).unwrap_or("{}".into());
-            self.kv
-                .write()
-                .await
-                .store(&dedup_key, payload, crate::dht::DEDUP_TTL_MS, self.id);
+            // Read-modify-write under ONE write guard: the previous shape took
+            // the lock twice (read nodes, drop, re-take to store), which both
+            // doubled the lock churn on the hot chunk path and let a concurrent
+            // store's node list be overwritten between the two acquisitions.
+            let mut kv = self.kv.write().await;
+            let prev = kv.peek(&dedup_key).map(|(v, _)| v);
+            let payload = dedup_record_payload(prev.as_deref(), &me_hex, nbytes, now);
+            kv.store(&dedup_key, payload, crate::dht::DEDUP_TTL_MS, self.id);
         }
         Some(
             json!({
@@ -6694,15 +6675,7 @@ impl Node {
             .ok()
             .and_then(|r| r.ok());
         match data {
-            Some(data) => Some(
-                json!({
-                    "ok": true,
-                    "chunk_id": id,
-                    "data": base64::engine::general_purpose::STANDARD.encode(&data),
-                })
-                .to_string()
-                .into_bytes(),
-            ),
+            Some(data) => Some(storage_fetch_hit_response(id, &data)),
             None => Some(
                 json!({ "ok": false, "err": "not found" })
                     .to_string()
@@ -7308,20 +7281,28 @@ impl Node {
         };
         let ct = e2e_encrypt_det(&data_key, &nonce, blob);
         let shards = Self::ec_encode(&ct, k, n).ok_or(StoreMailError::ErasureEncodingFailed)?;
+        // Captured before the loop consumes `shards` for the manifest's
+        // `shard_len` field.
+        let ec_shard_len = shards.first().map(|s| s.len()).unwrap_or(0);
         let have_mail_role = self.role_allows("mail");
         let mut chunks: Vec<serde_json::Value> = Vec::with_capacity(n);
         let mut stored = 0usize;
         // шарды для фоновой репликации (нода с mail-ролью пишет локально —
         // без этого все шарды оставались только на ней и EC давал 0 отказоустойчивости)
         let mut to_replicate: Vec<(String, Vec<u8>)> = Vec::new();
-        for (i, sh) in shards.iter().enumerate() {
+        // `into_iter` so the shard is MOVED into the replication queue instead
+        // of cloned: to_replicate held a full second copy of every shard
+        // (i.e. the whole ciphertext) for the duration of the write.
+        for (i, sh) in shards.into_iter().enumerate() {
             let chunk_id = ec_chunk_id_for("mail", name, i, &content_hash);
+            let sh_len = sh.len();
+            let sh_hash = hex::encode(blake3::hash(&sh).as_bytes());
             let ok = if have_mail_role {
-                let (_a, _dedup, _b) = self.write_chunk_with_dedup("mail", &chunk_id, sh).await;
-                to_replicate.push((chunk_id.clone(), sh.clone()));
+                let (_a, _dedup, _b) = self.write_chunk_with_dedup("mail", &chunk_id, &sh).await;
+                to_replicate.push((chunk_id.clone(), sh));
                 true
             } else {
-                self.store_chunk_replicated("mail", &chunk_id, sh).await > 0
+                self.store_chunk_replicated("mail", &chunk_id, &sh).await > 0
             };
             if ok {
                 stored += 1;
@@ -7329,8 +7310,8 @@ impl Node {
             chunks.push(json!({
                 "id": chunk_id,
                 "shard": i,
-                "len": sh.len(),
-                "hash": hex::encode(blake3::hash(sh).as_bytes()),
+                "len": sh_len,
+                "hash": sh_hash,
             }));
         }
         let mut manifest = json!({
@@ -7338,7 +7319,7 @@ impl Node {
             "name": name,
             "size": blob.len(),
             "nonce": hex::encode(nonce),
-            "ec": { "k": k, "n": n, "ct_len": ct.len(), "shard_len": shards.first().map(|s| s.len()).unwrap_or(0) },
+            "ec": { "k": k, "n": n, "ct_len": ct.len(), "shard_len": ec_shard_len },
             "chunks": chunks,
         });
         if let Some(kb) = key_box {
@@ -7347,17 +7328,17 @@ impl Node {
             manifest["key"] = json!(hex::encode(data_key));
         }
         let mkey = format!("m:{name}");
-        self.kv_store_local(&mkey, &manifest.to_string()).await;
+        let manifest_str = manifest.to_string();
+        self.kv_store_local(&mkey, &manifest_str).await;
         // фоновая репликация манифеста + EC-шардов (replicate_mail перекладывает
         // только обычные чанки chunk_id_for("mail",..), EC-шарды — отдельно)
         let node = self.clone();
         let name_s = name.to_string();
         let mkey_s = mkey.clone();
-        let manifest_s = manifest.to_string();
         tokio::spawn(async move {
             let _ = timeout(
                 Duration::from_secs(20),
-                node.replicate_mail(&name_s, &[], &manifest_s, &mkey_s, &content_hash),
+                node.replicate_mail(&name_s, &[], &manifest_str, &mkey_s, &content_hash),
             )
             .await;
             for (cid, data) in to_replicate {
@@ -7457,12 +7438,15 @@ impl Node {
             manifest["key"] = json!(hex::encode(data_key));
         }
         let mkey = format!("m:{name}");
-        self.kv_store_local(&mkey, &manifest.to_string()).await;
-        // фоновая репликация на другие ноды (не блокирует отправителя)
+        // Serialize once (local KV copy + replication payload share the string).
+        let manifest_str = manifest.to_string();
+        self.kv_store_local(&mkey, &manifest_str).await;
+        // фоновая репликация на другие ноды (не блокирует отправителя).
+        // `ct` is dead after the chunk loop, so the task TAKES the ciphertext:
+        // the old `ct.clone()` copied the whole (up to a megabyte-per-chunk)
+        // mail body again on every store.
         let node = self.clone();
         let name = name.to_string();
-        let ct = ct.clone();
-        let manifest_str = manifest.to_string();
         let mkey2 = mkey.clone();
         tokio::spawn(async move {
             let _ = tokio::time::timeout(
@@ -8105,13 +8089,17 @@ impl Node {
             manifest["key"] = json!(hex::encode(data_key));
         }
         let mkey = Self::blob_manifest_key(bucket, name);
-        self.kv_store_local_with_ttl(&mkey, &manifest.to_string(), ttl_ms)
+        // Serialize the manifest ONCE: it feeds the local KV copy and the
+        // replication payload. A snapshot manifest can carry up to
+        // MAX_BLOB_CHUNKS (4096) entries, so the old double `to_string()` built
+        // (and threw away) a multi-hundred-KB string on every publish.
+        let manifest_str = manifest.to_string();
+        self.kv_store_local_with_ttl(&mkey, &manifest_str, ttl_ms)
             .await;
         // Replication is awaited: a one-shot CLI must not print "put ok"
         // before the manifest/chunks actually left the machine, and the
         // caller needs a real replica count. The 20 s bound matches the old
         // background timeout.
-        let manifest_str = manifest.to_string();
         let mut peer_replicas = if await_replication {
             tokio::time::timeout(
                 std::time::Duration::from_secs(20),
@@ -8130,11 +8118,13 @@ impl Node {
         } else {
             // High-volume chain path: replicate in the background exactly as
             // before (the caller reports chunk count, not a replica promise).
+            // `ct` is dead after this point, so the task TAKES the ciphertext
+            // instead of cloning it: a snapshot blob can be hundreds of MB and
+            // the old `ct.clone()` copied all of it on every publish.
             let node = self.clone();
             let bucket_owned = bucket.to_string();
             let name_owned = name.to_string();
-            let ct_owned = ct.clone();
-            let manifest_owned = manifest_str.clone();
+            let manifest_owned = manifest_str;
             let mkey_owned = mkey.clone();
             tokio::spawn(async move {
                 let _ = tokio::time::timeout(
@@ -8142,7 +8132,7 @@ impl Node {
                     node.replicate_blob(
                         &bucket_owned,
                         &name_owned,
-                        &ct_owned,
+                        &ct,
                         &manifest_owned,
                         &mkey_owned,
                         &content_hash,
@@ -8401,7 +8391,18 @@ impl Node {
             );
             return None;
         }
-        let mut buf: Vec<u8> = Vec::new();
+        // Assemble the ciphertext with ONE capacity decision instead of
+        // growing from zero: chain blobs arrive in ~1 MiB chunks, so the old
+        // `Vec::new()` reallocated and re-copied the assembled body
+        // ~log2(chunks) times (a 16-chunk blob copied ~15 MiB of extra data).
+        // The reservation is BOUNDED to 8 MiB because `size`/per-chunk `len`
+        // come from an UNTRUSTED manifest — at most MAX_BLOB_CHUNKS (4096)
+        // 1 MiB chunks are nameable, so an unconditional reservation would be
+        // a 4 GiB allocation an attacker could request with a tiny manifest.
+        // Anything larger still grows geometrically, and every chunk is
+        // hash-verified before it is appended (no cap above is relaxed).
+        const ASSEMBLY_RESERVE_CAP: usize = 8 * 1024 * 1024;
+        let mut buf: Vec<u8> = Vec::with_capacity(expected_off.min(ASSEMBLY_RESERVE_CAP));
         for c in chunks {
             let cid = c["id"].as_str().unwrap_or("");
             let mut got = self.local_chunk_get_async(bucket, cid).await;
@@ -9175,6 +9176,46 @@ async fn frame_loop(
     if crate::log::enabled(2) {
         crate::log::emit_empty(2, "info", &node.cfg.name, 0, "conn_closed");
     }
+}
+
+/// Fan one already-serialized message out to `n` local subscribers, cloning it
+/// at most `n - 1` times: the LAST receiver takes ownership of the original.
+///
+/// Hot path: each inbound `pubsub.msg` carries one JSON string that can be as
+/// large as `MAX_PUBSUB_DATA_LEN` (1 MiB); the old loop cloned that whole
+/// string once per subscriber even when there was exactly one (the common
+/// case: one local websocket/aggregator per node). Bytes handed to every
+/// subscriber are identical — only the ownership of the final copy differs.
+///
+/// `send` returns whether the receiver was still alive (its `mpsc::send`
+/// result), so the caller keeps its exact drop counter.
+pub(crate) fn fanout_owned<T, F>(msg: T, n: usize, mut send: F) -> (usize, usize)
+where
+    T: Clone,
+    F: FnMut(T, usize) -> bool,
+{
+    let mut owned = Some(msg);
+    let mut delivered = 0usize;
+    let mut dropped = 0usize;
+    for i in 0..n {
+        let is_last = i + 1 == n;
+        let payload = if is_last {
+            owned
+                .take()
+                .expect("fanout_owned: last receiver takes the original message")
+        } else {
+            owned
+                .as_ref()
+                .expect("fanout_owned: original message outlives all clones")
+                .clone()
+        };
+        if send(payload, i) {
+            delivered += 1;
+        } else {
+            dropped += 1;
+        }
+    }
+    (delivered, dropped)
 }
 
 #[allow(clippy::too_many_arguments)] // GATE: per-conn replay/hello state stays bound to frame_loop
@@ -10357,6 +10398,136 @@ pub fn ec_chunk_id_for(bucket: &str, name: &str, index: usize, content_hash: &[u
         )
         .as_bytes(),
     )
+}
+
+/// Build the `storage.fetch` HIT response body.
+///
+/// Byte-identical to
+/// `json!({"ok":true,"chunk_id":id,"data":<base64>}).to_string().into_bytes()`:
+/// `serde_json`'s map is a `BTreeMap` (no `preserve_order` feature), so the
+/// keys are emitted in `chunk_id`, `data`, `ok` order with compact separators.
+///
+/// Why not the `Value` route: a fetched chunk can be 2 MiB, i.e. ~2.7 MiB of
+/// base64 text, which the old shape copied twice (base64 `String` → `Value`
+/// `String` → serialized output). Here the base64 text is encoded STRAIGHT
+/// into the response buffer, so the body is written exactly once. `chunk_id`
+/// is already gated by `valid_chunk_id` (ASCII hex), and the base64 alphabet
+/// contains no JSON metacharacters, so nothing needs escaping. On the
+/// (unreachable, buffer is sized exactly) slice error this falls back to the
+/// old `json!` construction, so the bytes can never diverge.
+fn storage_fetch_hit_response(chunk_id: &str, data: &[u8]) -> Vec<u8> {
+    let engine = base64::engine::general_purpose::STANDARD;
+    let b64_len = data.len().div_ceil(3) * 4;
+    let mut out = Vec::with_capacity(32 + chunk_id.len() + b64_len);
+    out.extend_from_slice(b"{\"chunk_id\":\"");
+    out.extend_from_slice(chunk_id.as_bytes());
+    out.extend_from_slice(b"\",\"data\":\"");
+    let b64_start = out.len();
+    out.resize(b64_start + b64_len, 0);
+    match engine.encode_slice(data, &mut out[b64_start..]) {
+        Ok(written) => {
+            out.truncate(b64_start + written);
+            out.extend_from_slice(b"\",\"ok\":true}");
+            out
+        }
+        Err(_) => json!({
+            "ok": true,
+            "chunk_id": chunk_id,
+            "data": engine.encode(data),
+        })
+        .to_string()
+        .into_bytes(),
+    }
+}
+
+/// Content digest of one stored chunk body.
+///
+/// The store path needs this digest TWICE (manifest-hash gate + content-
+/// addressed dedup key); it used to run `blake3::hash` separately for each, i.e.
+/// two full passes over a body that can be `MAX_STORAGE_CHUNK_LEN` (2 MiB) on
+/// every `storage.store`. Keeping both consumers on one digest is the fix; the
+/// test-only thread-local counter lets `perf_s7_*` pin "exactly one pass".
+fn chunk_content_hash(data: &[u8]) -> blake3::Hash {
+    #[cfg(test)]
+    perf_s7_hash_calls::note_chunk_hash();
+    blake3::hash(data)
+}
+
+#[cfg(test)]
+mod perf_s7_hash_calls {
+    //! Test-only instrumentation (compiled out of release builds).
+    use std::cell::Cell;
+
+    thread_local! {
+        static CHUNK_HASHES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn note_chunk_hash() {
+        CHUNK_HASHES.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(super) fn chunk_hashes() -> usize {
+        CHUNK_HASHES.with(|c| c.get())
+    }
+
+    pub(super) fn reset() {
+        CHUNK_HASHES.with(|c| c.set(0));
+    }
+}
+
+/// Parse one dedup registry record (`{"size":u64,"ts":i64,"nodes":[hex,..]}`).
+///
+/// Returns the number of recorded holder identities and whether `me_hex` is
+/// one of them. A malformed record (or a missing/wrong-typed `nodes`) reads as
+/// `(0, false)` — byte-for-byte the same answers the inline `serde_json`
+/// probes gave, but without re-encoding `me_hex` inside the holder predicate
+/// (the old `any(|h| h == &hex::encode(self.id))` allocated once per node).
+fn dedup_record_holders(raw: &str, me_hex: &str) -> (usize, bool) {
+    let Ok(d) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return (0, false);
+    };
+    let Some(nodes) = d["nodes"].as_array() else {
+        return (0, false);
+    };
+    let mut holders = 0usize;
+    let mut lists_me = false;
+    for n in nodes {
+        if let Some(h) = n.as_str() {
+            holders += 1;
+            if h == me_hex {
+                lists_me = true;
+            }
+        }
+    }
+    (holders, lists_me)
+}
+
+/// Merge `me_hex` into a dedup registry record and serialize the result.
+///
+/// Same payload shape as the previous inline construction
+/// (`serde_json`'s map is ordered, so keys stay `nodes`/`size`/`ts` in both
+/// forms). `raw` is the previously stored record; a missing, malformed, or
+/// non-string holder list starts fresh. `me_hex` is appended only when it is
+/// not already listed, so re-storing the same chunk is idempotent.
+fn dedup_record_payload(raw: Option<&str>, me_hex: &str, size: usize, now: i64) -> String {
+    let mut nodes: Vec<String> = raw
+        .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
+        .and_then(|d| d["nodes"].as_array().cloned())
+        .map(|arr| {
+            arr.into_iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !nodes.iter().any(|x| x == me_hex) {
+        nodes.push(me_hex.to_string());
+    }
+    let entry = serde_json::json!({
+        "size": size,
+        "ts": now,
+        "nodes": nodes,
+    });
+    serde_json::to_string(&entry).unwrap_or("{}".into())
 }
 
 /// Атомарная запись чанка: tmp-файл в том же каталоге + rename.
@@ -13511,6 +13682,283 @@ mod sec_s1_cap_tests {
             len <= hard_cap,
             "reputation shard grew to {len} > per-shard hard cap {hard_cap}"
         );
+        drop(node);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod perf_s7_hot_path_tests {
+    //! PERF S7: counting/equivalence tests for the transport–storage hot-path
+    //! edits in this crate. Each test pins the property the optimization
+    //! claims (copy count, hash-once identity, byte-identical JSON), so a
+    //! regression shows up as a failing count instead of a silent slowdown.
+
+    use super::*;
+    use base64::Engine as _;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A payload that counts its clones: fan-out must not copy the message for
+    /// the LAST receiver (it takes ownership), so `n` subscribers cost `n-1`
+    /// clones — zero for the common single-subscriber case.
+    #[derive(Debug)]
+    struct CloneCounted {
+        bytes: Arc<Vec<u8>>,
+        clones: Arc<AtomicUsize>,
+    }
+
+    impl Clone for CloneCounted {
+        fn clone(&self) -> Self {
+            self.clones.fetch_add(1, Ordering::Relaxed);
+            Self {
+                bytes: Arc::clone(&self.bytes),
+                clones: Arc::clone(&self.clones),
+            }
+        }
+    }
+
+    fn counted(bytes: usize, clones: &Arc<AtomicUsize>) -> CloneCounted {
+        CloneCounted {
+            bytes: Arc::new(vec![0xABu8; bytes]),
+            clones: Arc::clone(clones),
+        }
+    }
+
+    #[test]
+    fn perf_s7_pubsub_fanout_single_subscriber_copies_nothing() {
+        let clones = Arc::new(AtomicUsize::new(0));
+        let mut seen: Vec<usize> = Vec::new();
+        let (delivered, dropped) = fanout_owned(counted(1024 * 1024, &clones), 1, |payload, i| {
+            assert_eq!(i, 0);
+            seen.push(payload.bytes.len());
+            true
+        });
+        assert_eq!((delivered, dropped), (1, 0));
+        assert_eq!(seen, vec![1024 * 1024], "payload bytes are unchanged");
+        assert_eq!(
+            clones.load(Ordering::Relaxed),
+            0,
+            "one subscriber must take ownership: zero 1 MiB copies per message"
+        );
+    }
+
+    #[test]
+    fn perf_s7_pubsub_fanout_clones_at_most_n_minus_one() {
+        let clones = Arc::new(AtomicUsize::new(0));
+        let mut seen = 0usize;
+        let (delivered, dropped) = fanout_owned(counted(4096, &clones), 3, |payload, _i| {
+            assert_eq!(payload.bytes.len(), 4096);
+            seen += 1;
+            true
+        });
+        assert_eq!((delivered, dropped), (3, 0));
+        assert_eq!(seen, 3, "every subscriber receives the message");
+        assert_eq!(
+            clones.load(Ordering::Relaxed),
+            2,
+            "exactly n-1 clones for n=3 subscribers"
+        );
+    }
+
+    #[test]
+    fn perf_s7_pubsub_fanout_zero_subscribers_copies_nothing() {
+        let clones = Arc::new(AtomicUsize::new(0));
+        let (delivered, dropped) = fanout_owned(counted(1024, &clones), 0, |_p, _i| true);
+        assert_eq!((delivered, dropped), (0, 0));
+        assert_eq!(clones.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn perf_s7_pubsub_fanout_counts_dead_receivers() {
+        let clones = Arc::new(AtomicUsize::new(0));
+        let (delivered, dropped) = fanout_owned(counted(8, &clones), 4, |_p, i| i != 1);
+        assert_eq!((delivered, dropped), (3, 1), "one dead rx is counted once");
+        assert_eq!(clones.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn perf_s7_storage_fetch_response_is_byte_identical_to_the_json_form() {
+        for data in [
+            Vec::new(),
+            vec![0u8],
+            vec![0xFFu8, 0x00, 0x7F, 0x80, 0x01],
+            (0..=255u8).cycle().take(1024 * 1024 + 7).collect(),
+        ] {
+            let id = "0123456789abcdef0123456789abcdef";
+            let fast = storage_fetch_hit_response(id, &data);
+            let reference = json!({
+                "ok": true,
+                "chunk_id": id,
+                "data": base64::engine::general_purpose::STANDARD.encode(&data),
+            })
+            .to_string()
+            .into_bytes();
+            assert_eq!(
+                fast,
+                reference,
+                "direct-encode response must stay byte-identical (len {})",
+                data.len()
+            );
+            // Round-trip: the peer's decoder still gets the same chunk back.
+            let parsed: serde_json::Value = serde_json::from_slice(&fast).expect("valid JSON");
+            assert_eq!(parsed["ok"], json!(true));
+            assert_eq!(parsed["chunk_id"], json!(id));
+            let decoded = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                parsed["data"].as_str().expect("data is a string"),
+            )
+            .expect("base64 decodes");
+            assert_eq!(decoded, data);
+        }
+    }
+
+    #[test]
+    fn perf_s7_dedup_records_parse_and_merge_identically() {
+        let me = "aa".repeat(NODEID_LEN);
+        // Absent record: a single holder, our id.
+        let fresh = dedup_record_payload(None, &me, 1234, 99);
+        let (holders, lists_me) = dedup_record_holders(&fresh, &me);
+        assert_eq!(holders, 1);
+        assert!(lists_me);
+        let v: serde_json::Value = serde_json::from_str(&fresh).expect("valid JSON");
+        assert_eq!(v["size"], json!(1234usize));
+        assert_eq!(v["ts"], json!(99));
+        assert_eq!(v["nodes"], json!(vec![me.clone()]));
+        // Byte-identical to the previous inline `serde_json::Map` construction
+        // (BTreeMap key order, compact separators).
+        let mut legacy = serde_json::Map::new();
+        legacy.insert("size".into(), json!(1234usize));
+        legacy.insert("ts".into(), json!(99i64));
+        legacy.insert("nodes".into(), json!(vec![me.clone()]));
+        let legacy_str =
+            serde_json::to_string(&serde_json::Value::Object(legacy)).expect("serialize");
+        assert_eq!(fresh, legacy_str, "dedup record bytes must not change");
+
+        // Re-merging is idempotent (no duplicate holder) and keeps the others.
+        let other = "bb".repeat(NODEID_LEN);
+        let with_other = dedup_record_payload(None, &other, 10, 5);
+        let merged = dedup_record_payload(Some(&with_other), &me, 10, 6);
+        let (holders, lists_me) = dedup_record_holders(&merged, &me);
+        assert_eq!(holders, 2);
+        assert!(lists_me);
+        let merged_again = dedup_record_payload(Some(&merged), &me, 10, 7);
+        assert_eq!(
+            dedup_record_holders(&merged_again, &me).0,
+            2,
+            "re-storing the same chunk must not duplicate the holder entry"
+        );
+
+        // Malformed / absent / non-string holder lists read as "no holders".
+        assert_eq!(dedup_record_holders("not json", &me), (0, false));
+        assert_eq!(dedup_record_holders("{}", &me), (0, false));
+        assert_eq!(dedup_record_holders(r#"{"nodes":[1,2]}"#, &me), (0, false));
+        // A malformed previous record starts a fresh list (same as the inline
+        // parser: the bad record yields zero holders, then our id is pushed).
+        let recovered = dedup_record_payload(Some("not json"), &me, 4, 8);
+        assert_eq!(dedup_record_holders(&recovered, &me), (1, true));
+    }
+
+    #[test]
+    fn perf_s7_chunk_store_identity_hashes_once() {
+        // The store path derives BOTH the manifest-hash gate and the dedup key
+        // from a single BLAKE3 digest. Pin that identity: one digest, two
+        // consumers, and the digest equals the hex the manifest carries.
+        perf_s7_hash_calls::reset();
+        let data: Vec<u8> = (0..=255u8).cycle().take(512 * 1024).collect();
+        let digest = chunk_content_hash(&data);
+        // The two consumers of the store path, with no further hashing:
+        let manifest_hash = hex::encode(digest.as_bytes());
+        let dedup_key = format!("dedup:{}", hex::encode(digest.as_bytes()));
+        assert_eq!(dedup_key, format!("dedup:{manifest_hash}"));
+        assert_eq!(
+            perf_s7_hash_calls::chunk_hashes(),
+            1,
+            "both consumers share one digest"
+        );
+        // A chunk whose body differs never matches the pinned hash.
+        let mut tampered = data;
+        tampered[0] ^= 1;
+        assert_ne!(chunk_content_hash(&tampered), digest);
+    }
+
+    fn perf_cfg(name: &str) -> NodeConfig {
+        NodeConfig {
+            name: name.to_string(),
+            listen: "127.0.0.1:0".to_string(),
+            client_listen: None,
+            advertise: None,
+            peers: Vec::new(),
+            allow_unknown: false,
+            unknown_allow: vec![],
+            metrics_listen: None,
+            log_level: Some(0),
+            roles: Default::default(),
+            outbox_ttl_secs: 3600,
+            storage_roles: vec![],
+            validators: vec![],
+            domain: None,
+            web_listen: None,
+            web_static: None,
+            wallet: None,
+        }
+    }
+
+    async fn perf_node(tag: &str) -> (Arc<Node>, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("infnode-perf-s7-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let node = Node::new(
+            perf_cfg("PERF-S7"),
+            NodeKeys::generate(),
+            PqKeys::generate(),
+            dir.clone(),
+            PathBuf::new(),
+        )
+        .await
+        .expect("node");
+        (node, dir)
+    }
+
+    /// End-to-end count on the real `storage.store` handler: exactly ONE BLAKE3
+    /// pass over the chunk body, and the chunk lands under its id with a dedup
+    /// record naming this node.
+    #[tokio::test]
+    async fn perf_s7_storage_store_hashes_the_chunk_exactly_once() {
+        let (node, dir) = perf_node("store").await;
+        perf_s7_hash_calls::reset();
+        let data: Vec<u8> = (0..=255u8).cycle().take(512 * 1024).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        let chunk_id = hex::encode(blake3::hash(&data).as_bytes());
+        let resp = node
+            .handle_storage_store_typed(&chunk_id, "files", &b64, None)
+            .await
+            .expect("storage.store always answers");
+        let v: serde_json::Value = serde_json::from_slice(&resp).expect("JSON response");
+        assert_eq!(v["ok"], json!(true), "store must succeed");
+        assert_eq!(v["bytes"], json!(data.len()));
+        assert_eq!(
+            perf_s7_hash_calls::chunk_hashes(),
+            1,
+            "one BLAKE3 pass per stored chunk (the manifest gate and the dedup \
+             key share the digest; the old path hashed the body twice)"
+        );
+        // The chunk really landed under its id ...
+        let read = node
+            .local_chunk_get("files", &chunk_id)
+            .expect("chunk on disk");
+        assert_eq!(read, data);
+        // ... and the dedup registry names this node exactly once.
+        let dedup_key = format!("dedup:{}", hex::encode(blake3::hash(&data).as_bytes()));
+        let me = hex::encode(node.id);
+        let raw = node
+            .kv
+            .read()
+            .await
+            .peek(&dedup_key)
+            .map(|(v, _)| v)
+            .expect("dedup record");
+        assert_eq!(dedup_record_holders(&raw, &me), (1, true));
         drop(node);
         let _ = std::fs::remove_dir_all(dir);
     }

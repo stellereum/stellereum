@@ -114,11 +114,42 @@ pub fn lookup_fanout(
     from: &[u8; NODEID_LEN],
     fanout: usize,
 ) -> Vec<[u8; NODEID_LEN]> {
-    let mut candidates: Vec<[u8; NODEID_LEN]> = peers.into_iter().filter(|p| p != from).collect();
-    candidates.sort_by_key(|a| xor_distance(a, target));
-    candidates.dedup();
+    let mut distances = 0usize;
+    lookup_fanout_counted(peers, target, from, fanout, &mut distances)
+}
+
+/// [`lookup_fanout`] with an operation counter (`distances` is incremented once
+/// per XOR-distance evaluation) so a test can pin the cost model.
+///
+/// Every candidate's distance is computed EXACTLY ONCE and the (stable) sort
+/// runs over the precomputed key. The previous `sort_by_key` recomputed
+/// `xor_distance` for BOTH operands of every comparison — an O(n·log2 n) run
+/// of full 20-byte XORs per forwarded lookup instead of O(n). Ordering is
+/// identical: `sort_by_key` was stable, so equal distances keep their
+/// candidate order here too, and `dedup` is now `dedup_by` on the same key.
+pub fn lookup_fanout_counted(
+    peers: impl IntoIterator<Item = [u8; NODEID_LEN]>,
+    target: &[u8; NODEID_LEN],
+    from: &[u8; NODEID_LEN],
+    fanout: usize,
+    distances: &mut usize,
+) -> Vec<[u8; NODEID_LEN]> {
+    let peers = peers.into_iter();
+    // Pre-size from the iterator's lower bound (a `Vec` iterator reports its
+    // exact length): one allocation instead of ~log2(n) growth re-copies.
+    let mut candidates: Vec<([u8; NODEID_LEN], [u8; NODEID_LEN])> =
+        Vec::with_capacity(peers.size_hint().0);
+    for p in peers {
+        if p == *from {
+            continue;
+        }
+        *distances += 1;
+        candidates.push((p, xor_distance(&p, target)));
+    }
+    candidates.sort_by(|a, b| a.1.cmp(&b.1));
+    candidates.dedup_by(|a, b| a.0 == b.0);
     candidates.truncate(fanout);
-    candidates
+    candidates.into_iter().map(|(p, _)| p).collect()
 }
 
 /// Kademlia routing table: 160 бакетов по XOR-расстоянию от нашего ID.
@@ -208,7 +239,10 @@ impl RoutingTable {
         if n == 0 {
             return Vec::new();
         }
-        let mut refs: Vec<(&NodeInfo, [u8; NODEID_LEN])> = Vec::new();
+        // One reservation for the whole table scan: `Vec::new()` grew (and
+        // re-copied) the refs vector through ~log2(len) reallocations on every
+        // lookup, and this runs per find_node/republish/replication pick.
+        let mut refs: Vec<(&NodeInfo, [u8; NODEID_LEN])> = Vec::with_capacity(self.len());
         for b in &self.buckets {
             for node in b {
                 refs.push((node, xor_distance(&node.id, target)));

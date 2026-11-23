@@ -76,6 +76,13 @@ pub const BLOCK_INTERVAL_SECONDS: &str = "stell_block_interval_seconds";
 /// the consensus driver (`has_pending_apply` true -> false). The proposer gate
 /// refuses to build a block while an apply is in flight, so this is the direct
 /// measure of how much of each block's budget is spent there.
+/// Time spent inside one named consensus-loop phase. The block path is the
+/// only thing that matters at 4 validators, and "apply" is 8 ms of ~200 ms, so
+/// this is how the rest gets attributed instead of guessed.
+pub const PHASE_SECONDS: &str = "stell_phase_seconds";
+/// Whole-process CPU (utime+stime) consumed per finalized block. Cheap to take
+/// once per block and the only figure that includes background threads.
+pub const CPU_PER_BLOCK_SECONDS: &str = "stell_cpu_per_block_seconds";
 pub const APPLY_SECONDS: &str = "stell_apply_seconds";
 /// Rounds where this node owned the proposal slot and could not emit a block,
 /// by gate reason. `nil_rounds` says a round was lost; this says why.
@@ -165,6 +172,8 @@ pub const LABEL_KIND: &str = "kind";
 pub const LABEL_PEER: &str = "peer";
 /// Reason a proposal gate refused to fire (propose-gate diagnostics).
 pub const LABEL_REASON: &str = "reason";
+/// Which consensus-loop phase a duration belongs to.
+pub const LABEL_PHASE: &str = "phase";
 /// Label carrying the binary's semantic version.
 pub const LABEL_VERSION: &str = "version";
 /// Label carrying the build's git hash.
@@ -494,6 +503,20 @@ impl Registry {
                 buckets: DEFAULT_BLOCK_INTERVAL_BUCKETS,
             },
             MetricDef {
+                name: PHASE_SECONDS,
+                help: "Wall time spent in a named consensus-loop phase",
+                kind: MetricKind::Histogram,
+                labels: &[LABEL_PHASE],
+                buckets: DEFAULT_APPLY_BUCKETS,
+            },
+            MetricDef {
+                name: CPU_PER_BLOCK_SECONDS,
+                help: "Process CPU seconds consumed per finalized block",
+                kind: MetricKind::Histogram,
+                labels: &[],
+                buckets: DEFAULT_APPLY_BUCKETS,
+            },
+            MetricDef {
                 name: APPLY_SECONDS,
                 help: "Time a block apply was in flight as seen by the consensus driver",
                 kind: MetricKind::Histogram,
@@ -781,6 +804,10 @@ impl Registry {
             reg.seed(CONSENSUS_VOTES_TOTAL, &[(LABEL_KIND, kind.as_str())]);
         }
         reg.seed(APPLY_SECONDS, &[]);
+        reg.seed(CPU_PER_BLOCK_SECONDS, &[]);
+        for phase in ["finalize_submit", "poll_apply", "propose"] {
+            reg.seed(PHASE_SECONDS, &[(LABEL_PHASE, phase)]);
+        }
         for reason in [
             "pending_apply",
             "parent_not_finalized",
@@ -1130,6 +1157,16 @@ impl Registry {
     /// One completed in-flight block apply, as observed by the driver.
     pub fn observe_apply(&self, seconds: f64) {
         self.add(APPLY_SECONDS, &[], seconds);
+    }
+
+    /// One consensus-loop phase duration.
+    pub fn observe_phase(&self, phase: &str, seconds: f64) {
+        self.add(PHASE_SECONDS, &[(LABEL_PHASE, phase)], seconds);
+    }
+
+    /// Process CPU consumed for one finalized block.
+    pub fn observe_cpu_per_block(&self, seconds: f64) {
+        self.add(CPU_PER_BLOCK_SECONDS, &[], seconds);
     }
 
     /// One proposal slot this node owned and could not use, by gate reason.
@@ -1931,8 +1968,18 @@ mod tests {
         m.observe_apply(0.250);
         m.inc_propose_gate_blocked("pending_apply");
         m.inc_propose_gate_blocked("min_block_time");
+        m.observe_phase("poll_apply", 0.008);
+        m.observe_cpu_per_block(0.182);
         let text = m.render();
         assert!(text.contains(APPLY_SECONDS), "apply histogram missing");
+        assert!(
+            text.contains(PHASE_SECONDS) && text.contains("phase=\"poll_apply\""),
+            "phase histogram missing\n{text}"
+        );
+        assert!(
+            text.contains(CPU_PER_BLOCK_SECONDS),
+            "cpu-per-block histogram missing"
+        );
         assert!(
             text.contains(&format!(
                 "{PROPOSE_GATE_BLOCKED_TOTAL}{{reason=\"pending_apply\"}} 1"

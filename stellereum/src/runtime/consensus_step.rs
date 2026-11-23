@@ -48,6 +48,20 @@ pub struct ParkedCommit {
     pub parked_at: (Height, Round),
 }
 
+/// Measures one consensus entry point and reports it on EVERY return path
+/// (`Drop` runs for early returns too). Timing only; no behaviour change.
+struct PhaseTimer(&'static str, std::time::Instant);
+
+impl Drop for PhaseTimer {
+    fn drop(&mut self) {
+        stellereum::metrics::global().observe_phase(self.0, self.1.elapsed().as_secs_f64());
+    }
+}
+
+fn phase_timer(name: &'static str) -> PhaseTimer {
+    PhaseTimer(name, std::time::Instant::now())
+}
+
 impl ValidatorRuntime {
     /// Park the newest proposal for replay (bounded: overwrites any older
     /// parked proposal, so at most one is ever held).
@@ -1692,6 +1706,7 @@ impl ValidatorRuntime {
         block: Block,
         envelope_round: Round,
     ) -> Result<BlockHash, String> {
+        let _phase = phase_timer("on_proposal");
         // §7 Phase 2 gate: the header's root check below reads OUR root, which
         // is PRE-H while a decided block is still executing. Checking now
         // would compare the proposal against the wrong parent state (a valid
@@ -2003,6 +2018,7 @@ impl ValidatorRuntime {
     }
 
     pub fn on_prevote(&mut self, v: Vote) -> Result<(), String> {
+        let _phase = phase_timer("on_prevote");
         // SHARD SCOPE (Finding A). This runtime is one shard's consensus
         // instance; a vote signed for another shard is a different statement
         // (V3 preimage) and must not be admitted. The signature verifies
@@ -2204,6 +2220,7 @@ impl ValidatorRuntime {
     }
 
     pub fn on_precommit(&mut self, v: Vote) -> Result<(), String> {
+        let _phase = phase_timer("on_precommit");
         // SHARD SCOPE — same rule as `on_prevote`.
         if v.shard_id != self.shard_id {
             return Err(format!(

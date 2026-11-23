@@ -136,6 +136,20 @@ fn log_local_validator_self_check(
 const SMALL_GAP_LIVE_CATCHUP_WINDOW_MS: u64 = 1_500;
 const SMALL_GAP_LIVE_CATCHUP_BUDGET_MS: u64 = 120;
 
+/// Process CPU seconds (utime + stime) from `/proc/self/stat`.
+///
+/// Linux `USER_HZ` is 100 on every mainstream build; a different value would
+/// scale every reading by a constant, never distort a comparison. `None` off
+/// Linux or when the file cannot be parsed, so the metric simply stays absent.
+fn process_cpu_seconds() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let close = stat.rfind(')')?;
+    let fields: Vec<&str> = stat.get(close + 1..)?.split_whitespace().collect();
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    Some((utime + stime) as f64 / 100.0)
+}
+
 /// Cap the per-tick `try_catch_up` budget ONLY for `budget_gap == 0` blind probes
 /// while the chain is actively finalizing (`since_last_finalized < 1500ms`).
 /// Whenever `budget_gap >= 1` (verified ahead evidence), return `base_budget`
@@ -1807,6 +1821,10 @@ pub(crate) async fn run_consensus_node(
     // Observability: the propose gate refuses to build a block while an apply is
     // in flight, so the driver measures that window itself (`stell_apply_seconds`).
     let mut apply_in_flight_since: Option<std::time::Instant> = None;
+    // Per-block CPU attribution (Linux): process utime+stime delta at each
+    // finalized block. Cheap (one /proc read per block) and the only figure
+    // that includes the background lanes, not just the tick loop.
+    let mut cpu_at_last_block: Option<f64> = None;
     let mut last_join = std::time::Instant::now() - Duration::from_secs(60);
     // Highest round at which a peer has been seen voting at OUR height, and when.
     //
@@ -3074,7 +3092,10 @@ pub(crate) async fn run_consensus_node(
             // Off-tick CN-VRF v3 VDF completion (cheap `try_recv`; the lane
             // itself runs on a blocking worker, never on this tick).
             rt.poll_vdf_lane();
-            if let Some(block) = rt.propose(now_secs()).await {
+            let phase_t = std::time::Instant::now();
+            let proposed = rt.propose(now_secs()).await;
+            stellereum::metrics::global().observe_phase("propose", phase_t.elapsed().as_secs_f64());
+            if let Some(block) = proposed {
                 let bh = block.compute_hash();
                 let ntx = block.transactions.len();
                 // P3-H4: enqueue; proposals carry bodies so they flush at once.
@@ -4595,7 +4616,11 @@ pub(crate) async fn run_consensus_node(
         // inline apply. `propose` for the next height, the proposal root
         // check and the commit broadcast all wait for it (stage-1 gate,
         // `apply_in_flight` checks in the runtime).
-        if let Some(decided) = rt.try_finalize_submit().await {
+        let phase_t = std::time::Instant::now();
+        let decided_out = rt.try_finalize_submit().await;
+        stellereum::metrics::global()
+            .observe_phase("finalize_submit", phase_t.elapsed().as_secs_f64());
+        if let Some(decided) = decided_out {
             let decided_height = rt.hc.height;
             info!(
                 "[consensus] DECIDED block #{} {} (execution queued on the sequenced worker)",
@@ -4634,7 +4659,18 @@ pub(crate) async fn run_consensus_node(
                 }
             }
         }
-        if let Some(completed) = rt.try_poll_apply().await {
+        let phase_t = std::time::Instant::now();
+        let polled = rt.try_poll_apply().await;
+        stellereum::metrics::global().observe_phase("poll_apply", phase_t.elapsed().as_secs_f64());
+        if let Some(completed) = polled {
+            if let Some(now_cpu) = process_cpu_seconds() {
+                if let Some(prev_cpu) = cpu_at_last_block {
+                    if now_cpu >= prev_cpu {
+                        stellereum::metrics::global().observe_cpu_per_block(now_cpu - prev_cpu);
+                    }
+                }
+                cpu_at_last_block = Some(now_cpu);
+            }
             // PARK-AND-REPLAY HOOK (liveness, incident #21508): this is the
             // exact point where the sequenced apply worker's completion is
             // observed (`apply_in_flight` just transitioned Some -> None and
@@ -5535,7 +5571,11 @@ pub(crate) async fn run_consensus_node(
                 && rt.has_prebuild_for(rt.hc.height)
             {
                 rt.poll_vdf_lane();
-                if let Some(block) = rt.propose(now_secs()).await {
+                let phase_t = std::time::Instant::now();
+                let proposed = rt.propose(now_secs()).await;
+                stellereum::metrics::global()
+                    .observe_phase("propose", phase_t.elapsed().as_secs_f64());
+                if let Some(block) = proposed {
                     let height = rt.hc.height;
                     let round = rt.hc.round;
                     let bh = block.compute_hash();

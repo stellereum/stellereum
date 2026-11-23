@@ -176,6 +176,39 @@ sysctl_for() {
     fi
 }
 
+# Run a command that legitimately BLOCKS longer than a probe: `systemctl
+# restart` waits for the stop half, and a busy node drains for up to
+# TimeoutStopSec (90 s on the live fleet). The 30 s probe cap would kill such a
+# command while systemd kept going, and the script then reported a false
+# "swap/restart failed" (observed on nodeC: the node came up on the new binary
+# with no operator action). Probes keep the short cap; lifecycle commands get
+# the long one.
+nrun_long() {
+    local node="$1" cmd="$2" host opts
+    host="$(node_attr "$node" SSH)"
+    opts="$(node_attr "$node" SSH_OPTS)"
+    if [ -n "$host" ]; then
+        local -a ssh_opts=()
+        if [ -n "$opts" ]; then
+            read -r -a ssh_opts <<<"$opts"
+        fi
+        timeout 200 ssh -o BatchMode=yes -o ConnectTimeout=10 \
+            -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+            "${ssh_opts[@]+"${ssh_opts[@]}"}" "$host" "$cmd"
+    else
+        timeout 200 bash -c "$cmd"
+    fi
+}
+
+# The per-node liveness guard restarts a stopped unit within 60 s. A rolling
+# activate that stops the guard unit first and restarts it afterwards is the
+# only way a restart stays a SINGLE instance: with the guard live, a stop/start
+# can race and leave two processes on one sled store, which corrupts the safety
+# record (live incident 2026-11-23, nodeC).
+guard_unit() {
+    printf '%s' "${STELL_ROLL_GUARD_UNIT:-stell-node-guard.timer}"
+}
+
 rpc_cmd() {
     local url="$1" method="$2" params="$3"
     printf "curl -sS -m 8 -X POST '%s' -H 'content-type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"%s\",\"params\":%s}'" \
@@ -316,7 +349,8 @@ show_plan() {
         fi
         if [ -z "$COMMAND" ] || [ "$COMMAND" = "activate" ]; then
             note "  activate: sha256 preflight -> cp -f stellereum stellereum.prev -> mv .new.next stellereum"
-            note "            $([ "$scope" = user ] && printf 'systemctl --user' || printf 'systemctl') restart $unit"
+            note "            pause $(guard_unit), then $([ "$scope" = user ] && printf 'systemctl --user' || printf 'systemctl') restart $unit, then resume the guard"
+            note "            (a live guard can start a SECOND instance on the same store)"
             note "            wait is-active <=120 s, then local height within 5 of $PUBLIC_RPC"
             note "            warn if downtime >15 s; abort if <3 validators or fragile=true"
         fi
@@ -513,9 +547,15 @@ activate_one() {
     # --- 2. T0, swap, restart ------------------------------------------------
     t0="$(now_ms)"
     note "[$node] T0: swapping binary and restarting $unit"
-    if ! nrun "$node" "cd '$dir' && cp -f stellereum stellereum.prev && mv -f stellereum.new.next stellereum && $sysctl restart '$unit'"; then
+    # Pause the liveness guard so it cannot start a SECOND instance while the
+    # unit is coming down (see guard_unit()).
+    guard="$(guard_unit)"
+    nrun_long "$node" "$sysctl stop '$guard' >/dev/null 2>&1 || true"
+    if ! nrun_long "$node" "cd '$dir' && cp -f stellereum stellereum.prev && mv -f stellereum.new.next stellereum && $sysctl restart '$unit'"; then
+        nrun_long "$node" "$sysctl start '$guard' >/dev/null 2>&1 || true"
         die "[$node] swap/restart failed; $dir/stellereum.prev holds the previous binary"
     fi
+    nrun_long "$node" "$sysctl start '$guard' >/dev/null 2>&1 || true"
 
     deadline=$(( $(date +%s) + 120 ))
     t_active=""

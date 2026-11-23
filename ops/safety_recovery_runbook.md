@@ -25,11 +25,14 @@ double vote. This behaviour is intended; only the recovery path was missing.
 
 ## Known causes
 
-1. **Two processes on one data directory** (the incident). sled's lock is not
-   used by the node to refuse startup: the second instance opens the same DB,
-   corrupts the read, and the first record read fails. `systemd` with
-   `Restart=always` makes this easy to trigger: a `systemctl start` issued while
-   the previous process is still draining produces two instances.
+1. **Two processes on one data directory** (the incident). The
+   `stell-node-guard.timer` restarts a stopped unit within 60 s, so any
+   stop/start that is not guarded can overlap: `systemctl restart` brings the
+   node down, the guard sees it down and starts a second instance, and both
+   hold the same sled store. sled's lock is not used by the node to refuse
+   startup, so the second instance corrupts the first record read.
+   `scripts/rolling-deploy.sh` now pauses the guard around the restart for this
+   reason; do the same by hand.
 2. Genuine store corruption (power loss, full disk, inode exhaustion).
 3. Identity change (validator key replaced) — decode checks
    `(validator, chain, shard)`.
@@ -73,6 +76,9 @@ healthy record.
 
 ## Rules that prevent a repeat
 
+0. **Pause the liveness guard** (`systemctl stop stell-node-guard.timer`) before
+   any stop/start, and resume it afterwards. It fires within 60 s and will
+   happily create the second instance that corrupts the store.
 1. **Never start a second instance** on the same data directory. Before
    `systemctl start`, confirm `pgrep -f '<node>/steller[e]um run'` is empty.
 2. `pkill -f '<pattern>'` matches the invoking shell's own command line when the

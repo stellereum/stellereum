@@ -40,3 +40,11 @@ routes.json
 .env.*
 *.secret
 *.token
+
+# Build output and third-party reference dumps (never sources)
+dist/
+dist-*/
+*.min.js
+*.min.css
+explorer-site/docs/references/
+infnode/nft/

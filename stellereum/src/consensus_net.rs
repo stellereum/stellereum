@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
@@ -91,6 +91,15 @@ pub const MAX_BATCH_ITEMS: usize = 32;
 /// [`MAX_CONSENSUS_MSG`] so a single peer cannot force a 32 MiB
 /// deserialize/verify from one envelope.
 pub const MAX_BATCH_BYTES: usize = 512 * 1024;
+
+/// bincode discriminant of [`ConsensusMsg::Batch`] under the fixint encoding
+/// (variant index 3, little-endian u32). Used by the hand-rolled batch decoder
+/// and its cheap pre-deserialize size guard (C1-F2).
+const BATCH_VARIANT_TAG: [u8; 4] = [3, 0, 0, 0];
+
+/// bincode discriminant of [`ConsensusMsg::Committed`] (variant index 2).
+/// The critical pre-decode budget only charges this shape (C1-F4).
+const COMMITTED_VARIANT_TAG: [u8; 4] = [2, 0, 0, 0];
 
 /// A broadcast sub-stage slower than this is logged at WARN (rate-limited);
 /// anything faster is logged at DEBUG. The point is to name the slow stage
@@ -558,6 +567,41 @@ impl BroadcastEncodeError {
     }
 }
 
+/// Encode a borrowed chunk as ONE [`ConsensusMsg::Batch`] WITHOUT cloning its
+/// members (O7).
+///
+/// bincode's fixint encoding of `Batch(items)` is exactly
+/// `variant tag (u32)` + `Vec length (u64)` + each item's own encoding, so the
+/// same bytes can be assembled in a single buffer straight from the borrowed
+/// messages. The validation (non-empty, count cap, never nested, byte caps) and
+/// the resulting byte string are identical to
+/// [`ConsensusMsg::batch_encode_owned`]; only the deep clone of every member
+/// (a full block body per proposal) disappears.
+fn batch_encode_borrowed(msgs: &[std::borrow::Cow<'_, ConsensusMsg>]) -> Result<Vec<u8>, String> {
+    if msgs.is_empty() {
+        return Err("empty consensus batch".to_string());
+    }
+    if msgs.len() > MAX_BATCH_ITEMS {
+        return Err(format!("consensus batch too many items: {}", msgs.len()));
+    }
+    if msgs.iter().any(|m| matches!(&**m, ConsensusMsg::Batch(_))) {
+        return Err("nested consensus batch".to_string());
+    }
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&BATCH_VARIANT_TAG);
+    bytes.extend_from_slice(&(msgs.len() as u64).to_le_bytes());
+    for m in msgs {
+        bytes.extend_from_slice(&m.encode()?);
+    }
+    if bytes.len() > MAX_BATCH_BYTES {
+        return Err(format!("consensus batch too large: {} bytes", bytes.len()));
+    }
+    if bytes.len() > MAX_CONSENSUS_MSG {
+        return Err("consensus message too large".to_string());
+    }
+    Ok(bytes)
+}
+
 /// Build the pubsub frame for a live chunk: bincode encode (single message or
 /// one `Batch`), hex, JSON `{"topic", "data"}` — byte-for-byte the framing
 /// [`ConsensusNetwork::broadcast_batch`] has always put on the wire.
@@ -569,8 +613,7 @@ pub fn encode_broadcast_payload(
         let bytes = msgs[0].encode().map_err(BroadcastEncodeError::Single)?;
         (bytes, false)
     } else {
-        let owned: Vec<ConsensusMsg> = msgs.iter().map(|m| m.clone().into_owned()).collect();
-        let bytes = ConsensusMsg::batch_encode_owned(owned).map_err(BroadcastEncodeError::Batch)?;
+        let bytes = batch_encode_borrowed(msgs).map_err(BroadcastEncodeError::Batch)?;
         (bytes, true)
     };
     let encoded_len = bytes.len();
@@ -584,6 +627,34 @@ pub fn encode_broadcast_payload(
         encoded_len,
         is_batch,
     })
+}
+
+/// Exact bincode (fixint) length of a `ConsensusMsg::Vote`.
+///
+/// `bincode::serialize` of the enum writes, in order:
+///
+/// | field                     | bytes                    |
+/// |---------------------------|--------------------------|
+/// | variant tag (`u32`)       | 4                        |
+/// | `Vote.height` (`u64`)     | 8                        |
+/// | `Vote.round` (`u32`)      | 4                        |
+/// | `Vote.kind` (enum tag)    | 4                        |
+/// | `Vote.block_hash` Option  | 1 (+32 when `Some`)      |
+/// | `Vote.voter` (`[u8;32]`)  | 32                       |
+/// | `Vote.signature` (`Vec`)  | 8 + `len`                |
+/// | `Vote.shard_id` (`u32`)   | 4                        |
+/// | `locked` Option           | 1 (+32 when `Some`)      |
+///
+/// `Vote` carries no maps/strings, so this is the whole encoding; the O8
+/// differential test pins it to `encode().len()` for every shape.
+fn vote_encoded_len(vote: &Vote, locked: &Option<[u8; 32]>) -> usize {
+    const FIXED: usize = 4 + 8 + 4 + 4 + 32 + 8 + 4;
+    let block_hash = if vote.block_hash.is_some() { 33 } else { 1 };
+    let locked = if locked.is_some() { 33 } else { 1 };
+    FIXED
+        .saturating_add(vote.signature.len())
+        .saturating_add(block_hash)
+        .saturating_add(locked)
 }
 
 impl ConsensusMsg {
@@ -679,9 +750,13 @@ impl ConsensusMsg {
             | ConsensusMsg::BodyPull { .. }
             | ConsensusMsg::Body { .. } => true,
             ConsensusMsg::Batch(..) => true,
-            ConsensusMsg::Vote { .. } => {
-                self.encode().map(|b| b.len() >= 64 * 1024).unwrap_or(false)
-            }
+            // O8: a Vote's bincode length is fully determined by its scalar
+            // header plus the two variable parts (signature bytes and the two
+            // Option fields). Decide the 64 KiB flush threshold from that
+            // arithmetic instead of materialising the whole encoding just to
+            // measure it. `vote_encoded_len` is pinned to `serialize().len()`
+            // by the differential test, so the classification is identical.
+            ConsensusMsg::Vote { vote, locked } => vote_encoded_len(vote, locked) >= 64 * 1024,
         }
     }
 
@@ -715,6 +790,28 @@ impl ConsensusMsg {
         Ok(bytes)
     }
 
+    /// Decode exactly ONE message from the front of `bytes` (used for batch
+    /// elements). Rejects an element whose tag is `Batch` at ANY position, so
+    /// nesting can never reach bincode's recursive deserializer.
+    fn decode_single_from(bytes: &[u8]) -> Result<(Self, usize), String> {
+        if bytes.starts_with(&BATCH_VARIANT_TAG) {
+            return Err("nested batch".to_string());
+        }
+        use bincode::Options;
+        let limit = (bytes.len() as u64).min(MAX_CONSENSUS_MSG as u64);
+        let mut cursor = std::io::Cursor::new(bytes);
+        let msg: Self = bincode::DefaultOptions::new()
+            .with_limit(limit)
+            .with_fixint_encoding()
+            .deserialize_from(&mut cursor)
+            .map_err(|e| format!("consensus msg decode: {e}"))?;
+        let consumed = cursor.position() as usize;
+        if consumed == 0 || consumed > bytes.len() {
+            return Err("consensus msg decode: no progress".to_string());
+        }
+        Ok((msg, consumed))
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         if bytes.is_empty() {
             return Err("empty consensus message".to_string());
@@ -722,9 +819,50 @@ impl ConsensusMsg {
         if bytes.len() > MAX_CONSENSUS_MSG {
             return Err("consensus message too large".to_string());
         }
-        // Anti-recursion DoS: if top-level is a Batch (variant 3), reject nested batch before deserializing
-        if bytes.starts_with(&[3, 0, 0, 0]) && bytes.len() >= 16 && bytes[12..16] == [3, 0, 0, 0] {
-            return Err("nested batch".to_string());
+        // C1-F2: BATCHES ARE DECODED BY HAND, ELEMENT BY ELEMENT. The old
+        // pre-check only inspected element 0, so `Batch([Vote, Batch([..])])`
+        // reached bincode's recursive `Vec<ConsensusMsg>` deserializer and a
+        // deep enough nest aborted the process on stack exhaustion. We parse
+        // the fixed header (tag + u64 count), refuse an out-of-cap count
+        // BEFORE allocating, and run every element through the SINGLE-message
+        // path, which rejects a Batch tag at any position. There is therefore
+        // no recursive deserialization left on the peer path.
+        if bytes.starts_with(&BATCH_VARIANT_TAG) {
+            // Cheap pre-deserialize guard: a Batch can never honestly exceed
+            // MAX_BATCH_BYTES, so refuse it before touching bincode.
+            if bytes.len() > MAX_BATCH_BYTES {
+                return Err(format!("consensus batch too large: {} bytes", bytes.len()));
+            }
+            const BATCH_HEADER_LEN: usize = 4 + 8; // tag + Vec<u64> length
+            if bytes.len() < BATCH_HEADER_LEN {
+                return Err("consensus msg decode: truncated batch header".to_string());
+            }
+            let count = u64::from_le_bytes(
+                bytes[4..12]
+                    .try_into()
+                    .expect("header length checked above"),
+            );
+            if count == 0 {
+                return Err("empty consensus batch".to_string());
+            }
+            if count > MAX_BATCH_ITEMS as u64 {
+                return Err(format!("consensus batch too many items: {count}"));
+            }
+            let mut items = Vec::with_capacity(count as usize);
+            let mut offset = BATCH_HEADER_LEN;
+            for _ in 0..count {
+                if offset >= bytes.len() {
+                    return Err("consensus msg decode: truncated batch".to_string());
+                }
+                let (item, consumed) = Self::decode_single_from(&bytes[offset..])?;
+                offset += consumed;
+                items.push(item);
+            }
+            if offset != bytes.len() {
+                return Err("consensus msg decode: trailing bytes after batch".to_string());
+            }
+            Self::check_batch(&items, bytes.len())?;
+            return Ok(Self::Batch(items));
         }
         use bincode::Options;
         let msg: Self = bincode::DefaultOptions::new()
@@ -733,9 +871,6 @@ impl ConsensusMsg {
             .reject_trailing_bytes()
             .deserialize(bytes)
             .map_err(|e| format!("consensus msg decode: {e}"))?;
-        if let Self::Batch(items) = &msg {
-            Self::check_batch(items, bytes.len())?;
-        }
         Self::check_compact_gate(&msg)?;
         Ok(msg)
     }
@@ -2683,10 +2818,34 @@ pub fn parse_incoming(raw: &str) -> Option<ConsensusMsg> {
 pub fn parse_incoming_with_peer_key(raw: &str) -> Option<(ConsensusMsg, String)> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     let data = v["data"].as_str()?;
+    let peer_key = peer_key_from_json(&v);
+    // C1-F4: charge the CRITICAL class against its own large per-peer budget
+    // BEFORE any hex/bincode decode. `Committed` frames are exactly the class
+    // that bypasses the bulk limiter, so without this a peer could make us
+    // deserialize unbounded 32 MiB frames per tick. Reading the 4-byte tag from
+    // the hex prefix identifies the class without decoding the body; past the
+    // budget the frame is DROPPED here (never deferred, never decoded).
+    if frame_tag_from_hex(data) == Some(COMMITTED_VARIANT_TAG) {
+        let frame_bytes = (data.len() as u64).div_ceil(2);
+        if !admit_critical_predecode(peer_key.as_str(), frame_bytes) {
+            return None;
+        }
+    }
     let bytes = hex::decode(data).ok()?;
     let msg = ConsensusMsg::decode(&bytes).ok()?;
-    let peer_key = peer_key_from_json(&v);
-    Some((msg, peer_key))
+    // O10: keep the historical public signature (an owned `String` bucket
+    // key) at this boundary; the validated identity itself is now produced
+    // allocation-free, and a rejected frame never materialises the String.
+    Some((msg, peer_key.as_str().to_string()))
+}
+
+/// Read the 4-byte bincode variant tag from a hex `data` field without decoding
+/// the body. `None` for a short/non-hex prefix (the full decode will fail).
+fn frame_tag_from_hex(data: &str) -> Option<[u8; 4]> {
+    // Byte slice, not a `&str` slice: `data` is peer-controlled JSON and may
+    // contain multi-byte UTF-8, so slicing at byte 8 could split a char.
+    let prefix = data.as_bytes().get(..8)?;
+    hex::decode(prefix).ok()?.try_into().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -4873,21 +5032,24 @@ mod tests {
         // in `src`; `from` is the legacy spelling. `src` wins when both are
         // present.
         let raw = r#"{"topic":"t","data":"00","msg_id":7,"src":"aa","from":"bb"}"#;
-        assert_eq!(inbound_peer_key(raw), "aa");
+        assert_eq!(inbound_peer_key(raw).as_str(), "aa");
         let legacy = r#"{"topic":"t","data":"00","msg_id":7,"from":"bb"}"#;
-        assert_eq!(inbound_peer_key(legacy), "bb");
+        assert_eq!(inbound_peer_key(legacy).as_str(), "bb");
         // `inf1:` is infnode's canonical node-id prefix: the same peer must
         // key identically no matter which form the sender used.
         let prefixed = r#"{"topic":"t","data":"00","msg_id":7,"src":"inf1:cc"}"#;
-        assert_eq!(inbound_peer_key(prefixed), "cc");
+        assert_eq!(inbound_peer_key(prefixed).as_str(), "cc");
         // No sender at all: the shared fallback bucket (and only that one).
         let bare = r#"{"topic":"t","data":"00","msg_id":7}"#;
-        assert_eq!(inbound_peer_key(bare), INBOUND_BROADCAST_PEER_KEY);
+        assert_eq!(inbound_peer_key(bare).as_str(), INBOUND_BROADCAST_PEER_KEY);
         // Garbage is not a crash and not a distinct peer.
-        assert_eq!(inbound_peer_key("not json"), INBOUND_BROADCAST_PEER_KEY);
+        assert_eq!(
+            inbound_peer_key("not json").as_str(),
+            INBOUND_BROADCAST_PEER_KEY
+        );
         // An empty sender is not a peer either.
         let empty = r#"{"topic":"t","data":"00","msg_id":7,"src":""}"#;
-        assert_eq!(inbound_peer_key(empty), INBOUND_BROADCAST_PEER_KEY);
+        assert_eq!(inbound_peer_key(empty).as_str(), INBOUND_BROADCAST_PEER_KEY);
     }
 
     #[test]
@@ -4902,28 +5064,28 @@ mod tests {
         let key_a = inbound_peer_key(&raw_a);
         let key_b = inbound_peer_key(&raw_b);
         assert_ne!(key_a, key_b, "two peers must key differently");
-        assert_eq!(key_a, peer_a);
-        assert_eq!(key_b, peer_b);
+        assert_eq!(key_a.as_str(), peer_a);
+        assert_eq!(key_b.as_str(), peer_b);
 
         // A limiter with a 1 KiB/s rate and a 1 KiB burst: peer A spends its
         // whole burst, peer B still has its own bucket.
         let mut limiter = InboundBulkLimiter::new(1024, 1024);
         let now = 1_000u64;
         assert_eq!(
-            limiter.admit(&key_a, 1024, false, now),
+            limiter.admit(key_a.as_str(), 1024, false, now),
             InboundDecision::Allow
         );
         // A is now over budget -> deferred.
         assert!(
             matches!(
-                limiter.admit(&key_a, 1024, false, now),
+                limiter.admit(key_a.as_str(), 1024, false, now),
                 InboundDecision::Defer { .. }
             ),
             "the noisy peer must be deferred once it is over budget"
         );
         // B is untouched: its own bucket still has the full burst.
         assert_eq!(
-            limiter.admit(&key_b, 1024, false, now),
+            limiter.admit(key_b.as_str(), 1024, false, now),
             InboundDecision::Allow,
             "one peer exhausting its budget must not defer another peer's traffic"
         );
@@ -5563,25 +5725,25 @@ mod tests {
         let huge = "ab".repeat(1024);
         let raw = format!(r#"{{"topic":"t","data":"00","msg_id":1,"src":"{huge}"}}"#);
         assert_eq!(
-            inbound_peer_key(&raw),
+            inbound_peer_key(&raw).as_str(),
             INBOUND_BROADCAST_PEER_KEY,
             "an oversized src must not become a distinct bucket"
         );
         // Non-hex sender: shared bucket.
         let raw = r#"{"topic":"t","data":"00","msg_id":2,"src":"../../evil"}"#;
         assert_eq!(
-            inbound_peer_key(raw),
+            inbound_peer_key(raw).as_str(),
             INBOUND_BROADCAST_PEER_KEY,
             "a non-hex src must not become a bucket key"
         );
         // Honest forms keep working: short hex, full node id, inf1: prefix.
         assert_eq!(
-            inbound_peer_key(r#"{"topic":"t","data":"00","src":"aa"}"#),
+            inbound_peer_key(r#"{"topic":"t","data":"00","src":"aa"}"#).as_str(),
             "aa"
         );
         let full = "ab".repeat(20);
         let raw = format!(r#"{{"topic":"t","data":"00","src":"inf1:{full}"}}"#);
-        assert_eq!(inbound_peer_key(&raw), full);
+        assert_eq!(inbound_peer_key(&raw).as_str(), full);
         // Distinct honest peers still key distinctly (per-peer isolation kept).
         let ka = inbound_peer_key(r#"{"topic":"t","data":"00","src":"aa"}"#);
         let kb = inbound_peer_key(r#"{"topic":"t","data":"00","src":"bb"}"#);
@@ -5708,6 +5870,102 @@ mod tests {
         );
     }
 
+    /// C1-F2: a nested Batch at ANY position is refused by the hand-rolled
+    /// element decoder, without ever entering bincode's recursive
+    /// `Vec<ConsensusMsg>` deserializer (which aborted the process on a deep
+    /// enough nest).
+    #[test]
+    fn f1x_nested_batch_at_any_position_is_refused_without_recursion() {
+        // Depth 2: Batch([Vote, Batch([Vote])]).
+        let inner = ConsensusMsg::Batch(vec![tagged_vote(1)]);
+        let depth_two = ConsensusMsg::Batch(vec![tagged_vote(2), inner]);
+        let raw = bincode::serialize(&depth_two).expect("nested fixture serializes");
+        let err = ConsensusMsg::decode(&raw).expect_err("nested batch must be refused");
+        assert!(err.contains("nested"), "got: {err}");
+
+        // Depth 5: every level inserts the nest after a harmless Vote, so the
+        // old element-0 pre-check never saw it.
+        let mut deep = ConsensusMsg::Batch(vec![tagged_vote(3)]);
+        for _ in 0..4 {
+            deep = ConsensusMsg::Batch(vec![tagged_vote(4), deep]);
+        }
+        let raw = bincode::serialize(&deep).expect("deep fixture serializes");
+        let err = ConsensusMsg::decode(&raw).expect_err("deep nest must be refused");
+        assert!(err.contains("nested"), "got: {err}");
+
+        // The tag must be rejected BEFORE the inner element is deserialized.
+        // Hand-build `Batch([Vote, <Batch tag + count 2 with no elements>])`:
+        // the old full-deserialize path tried to read the inner batch and
+        // failed with a generic EOF decode error; the hand-rolled path refuses
+        // the nested tag itself.
+        let mut sneaky = ConsensusMsg::batch_encode(&[tagged_vote(5)]).expect("valid batch");
+        sneaky[4..12].copy_from_slice(&2u64.to_le_bytes());
+        sneaky.extend_from_slice(&BATCH_VARIANT_TAG);
+        sneaky.extend_from_slice(&2u64.to_le_bytes());
+        let err = ConsensusMsg::decode(&sneaky).expect_err("nested tag must be refused");
+        assert!(
+            err.contains("nested"),
+            "nested tag must be rejected before inner deserialization, got: {err}"
+        );
+
+        // Header-level cap: a count above MAX_BATCH_ITEMS is refused BEFORE
+        // any element is deserialized (no allocation, no loop).
+        let mut header = Vec::new();
+        header.extend_from_slice(&[3, 0, 0, 0]);
+        header.extend_from_slice(&((MAX_BATCH_ITEMS as u64) + 1).to_le_bytes());
+        let err = ConsensusMsg::decode(&header).expect_err("over-cap count must be refused");
+        assert!(err.contains("too many items"), "got: {err}");
+    }
+
+    /// C1-F4: the critical (Committed) class has its own LARGE per-peer byte
+    /// budget, charged before decode and DROPPED (never deferred) past it. A
+    /// flood of maximal frames in one tick is capped; one honest maximal frame
+    /// still fits; other peers keep their own bucket.
+    #[test]
+    fn f1x_critical_predecode_budget_caps_a_committed_flood() {
+        let mut budget = InboundCriticalBudget::new(
+            INBOUND_CRITICAL_BYTES_PER_SEC_DEFAULT,
+            INBOUND_CRITICAL_BURST_BYTES_DEFAULT,
+        );
+        let frame = MAX_CONSENSUS_MSG as u64;
+        let now = 1_000u64;
+        assert!(
+            budget.admit_predecode("peer-a", frame, now),
+            "one maximal Committed proof must always be admitted"
+        );
+        assert!(
+            !budget.admit_predecode("peer-a", frame, now),
+            "a second maximal frame in the same tick is flood tail: DROP, never defer"
+        );
+        assert!(
+            budget.admit_predecode("peer-b", frame, now),
+            "per-peer budget: a flooder cannot starve an honest peer"
+        );
+
+        // Tag recognition happens on the hex prefix, before decode.
+        let commit = ConsensusMsg::Committed {
+            height: 9,
+            block: sample_block(),
+            certificate: crate::consensus::QuorumCertificate {
+                shard_id: 0,
+                height: 9,
+                round: 0,
+                kind: VoteKind::Precommit,
+                block_hash: None,
+                signatures: vec![],
+            },
+        };
+        assert_eq!(
+            frame_tag_from_hex(&hex::encode(commit.encode().expect("commit encodes"))),
+            Some(COMMITTED_VARIANT_TAG)
+        );
+        assert_ne!(
+            frame_tag_from_hex(&hex::encode(tagged_vote(1).encode().expect("vote encodes"))),
+            Some(COMMITTED_VARIANT_TAG),
+            "votes must not spend the critical budget"
+        );
+    }
+
     /// VERIFICATION F2-hardening: a singleton-vote flood from ONE peer must
     /// not touch an honest peer's budget, sustained across ticks.
     ///
@@ -5816,7 +6074,7 @@ mod tests {
         // Unicode lookalike: full-width/cyrillic hex lookalikes are not ASCII hex.
         let uni = "ab".repeat(10) + "аа"; // trailing chars are Cyrillic 'a'
         assert_eq!(
-            inbound_peer_key(&format!(r#"{{"topic":"t","data":"00","src":"{uni}"}}"#)),
+            inbound_peer_key(&format!(r#"{{"topic":"t","data":"00","src":"{uni}"}}"#)).as_str(),
             shared,
             "unicode sender must not become a bucket"
         );
@@ -5824,13 +6082,13 @@ mod tests {
         let k128 = "ab".repeat(64);
         assert_eq!(k128.len(), 128);
         assert_eq!(
-            inbound_peer_key(&format!(r#"{{"topic":"t","data":"00","src":"{k128}"}}"#)),
+            inbound_peer_key(&format!(r#"{{"topic":"t","data":"00","src":"{k128}"}}"#)).as_str(),
             k128
         );
         // ...129 chars collapses to shared.
         let k129 = format!("{k128}ab");
         assert_eq!(
-            inbound_peer_key(&format!(r#"{{"topic":"t","data":"00","src":"{k129}"}}"#)),
+            inbound_peer_key(&format!(r#"{{"topic":"t","data":"00","src":"{k129}"}}"#)).as_str(),
             shared,
             "a 129-char src must not mint a bucket"
         );
@@ -5844,11 +6102,11 @@ mod tests {
             r#"{"topic":"t","data":"00","src":"   "}"#.to_string(),
             r#"{"topic":"t","data":"00","from":"zz-top"}"#.to_string(),
         ] {
-            assert_eq!(inbound_peer_key(&raw), shared, "raw={raw}");
+            assert_eq!(inbound_peer_key(&raw).as_str(), shared, "raw={raw}");
         }
         // `from` fallback is gated identically (non-hex -> shared, hex distinct).
         assert_eq!(
-            inbound_peer_key(r#"{"topic":"t","data":"00","from":"cc"}"#),
+            inbound_peer_key(r#"{"topic":"t","data":"00","from":"cc"}"#).as_str(),
             "cc"
         );
         // Two distinct malicious senders share ONE bucket: no minting, and the
@@ -5856,13 +6114,16 @@ mod tests {
         // bucket, not an exemption).
         let m1 = inbound_peer_key(r#"{"topic":"t","data":"00","src":"../../evil"}"#);
         let m2 = inbound_peer_key(&format!(r#"{{"topic":"t","data":"00","src":"{k129}"}}"#));
-        assert_eq!(m1, shared);
-        assert_eq!(m2, shared);
+        assert_eq!(m1.as_str(), shared);
+        assert_eq!(m2.as_str(), shared);
         let mut lim = InboundBulkLimiter::new(1024, 1024);
-        assert_eq!(lim.admit(&m1, 1024, false, 1_000), InboundDecision::Allow);
+        assert_eq!(
+            lim.admit(m1.as_str(), 1024, false, 1_000),
+            InboundDecision::Allow
+        );
         assert!(
             matches!(
-                lim.admit(&m2, 1024, false, 1_000),
+                lim.admit(m2.as_str(), 1024, false, 1_000),
                 InboundDecision::Defer { .. }
             ),
             "malicious senders share one budget: the second must defer"
@@ -7056,6 +7317,46 @@ pub fn inbound_bulk_burst_bytes() -> u64 {
     })
 }
 
+/// Sustained per-peer budget for CRITICAL inbound bytes, charged BEFORE
+/// decode (C1-F4). Default 4 MiB/s.
+///
+/// `Committed` is the one message class that bypasses the bulk limiter (it is
+/// the live catch-up proof and must never wait behind gossip). That exemption
+/// was unbounded: a peer could emit any number of 32 MiB `Committed` frames per
+/// tick and every one was deserialized before admission. This budget is
+/// deliberately LARGE (one honest proof is never blocked) but finite, and it
+/// is charged on the RAW frame length before hex/bincode decoding.
+pub const INBOUND_CRITICAL_BYTES_PER_SEC_DEFAULT: u64 = 4 * 1024 * 1024;
+/// Burst allowance per peer for critical inbound bytes (default 40 MiB):
+/// one maximal 32 MiB frame plus headroom for a normal block or two. A second
+/// maximal frame in the same burst window is flood tail and is DROPPED (never
+/// deferred) before decode.
+pub const INBOUND_CRITICAL_BURST_BYTES_DEFAULT: u64 = 40 * 1024 * 1024;
+
+/// Effective critical inbound rate (`STELL_INBOUND_CRITICAL_BYTES_PER_SEC`).
+pub fn inbound_critical_bytes_per_sec() -> u64 {
+    static CACHED: OnceLock<u64> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("STELL_INBOUND_CRITICAL_BYTES_PER_SEC")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&n| n >= 1024)
+            .unwrap_or(INBOUND_CRITICAL_BYTES_PER_SEC_DEFAULT)
+    })
+}
+
+/// Effective critical inbound burst (`STELL_INBOUND_CRITICAL_BURST_BYTES`).
+pub fn inbound_critical_burst_bytes() -> u64 {
+    static CACHED: OnceLock<u64> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("STELL_INBOUND_CRITICAL_BURST_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&n| n >= 1024)
+            .unwrap_or(INBOUND_CRITICAL_BURST_BYTES_DEFAULT)
+    })
+}
+
 /// Pure pacing decision: due when never sent (`None`) or the floor elapsed.
 /// Shared by the broadcast floor and the probe floor (both are "at most one per
 /// interval per peer"). Time-injected for deterministic tests.
@@ -7167,6 +7468,79 @@ pub const INBOUND_BROADCAST_PEER_KEY: &str = "broadcast";
 /// headroom for future id forms without letting one envelope bloat the map.
 pub const INBOUND_PEER_KEY_MAX_LEN: usize = 128;
 
+/// Fixed-size validated inbound limiter key (O10).
+///
+/// The validated sender id is at most [`INBOUND_PEER_KEY_MAX_LEN`] ASCII hex
+/// bytes, so it fits inline. Deriving the key no longer allocates a `String`
+/// per frame; [`Self::as_str`] borrows the same bytes, so the limiter sees the
+/// EXACT same key string as before (same validation, same case, same
+/// `broadcast` fallback).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PeerKey {
+    /// A validated sender id, stored without its `inf1:` prefix.
+    Peer {
+        bytes: [u8; INBOUND_PEER_KEY_MAX_LEN],
+        len: u8,
+    },
+    /// No usable sender: the shared bucket.
+    Broadcast,
+}
+
+impl PeerKey {
+    fn from_validated_hex(bare: &str) -> Self {
+        debug_assert!(!bare.is_empty() && bare.len() <= INBOUND_PEER_KEY_MAX_LEN);
+        let mut bytes = [0u8; INBOUND_PEER_KEY_MAX_LEN];
+        bytes[..bare.len()].copy_from_slice(bare.as_bytes());
+        Self::Peer {
+            bytes,
+            len: bare.len() as u8,
+        }
+    }
+
+    /// The bucket key string (borrowed; never allocates).
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Peer { bytes, len } => std::str::from_utf8(&bytes[..*len as usize])
+                .expect("peer key bytes are validated ASCII hex"),
+            Self::Broadcast => INBOUND_BROADCAST_PEER_KEY,
+        }
+    }
+
+    pub fn is_broadcast(&self) -> bool {
+        matches!(self, Self::Broadcast)
+    }
+}
+
+impl std::fmt::Display for PeerKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl PartialEq<str> for PeerKey {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for PeerKey {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<PeerKey> for str {
+    fn eq(&self, other: &PeerKey) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl PartialEq<PeerKey> for &str {
+    fn eq(&self, other: &PeerKey) -> bool {
+        *self == other.as_str()
+    }
+}
+
 /// Derive the inbound limiter bucket key from a raw pubsub envelope.
 ///
 /// The envelope delivered by infnode's `pubsub.msg` handler is
@@ -7186,7 +7560,7 @@ pub const INBOUND_PEER_KEY_MAX_LEN: usize = 128;
 /// instead of becoming a distinct attacker-minted map key.
 ///
 /// Pure so the contract is testable without a live peer.
-fn peer_key_from_json(v: &serde_json::Value) -> String {
+fn peer_key_from_json(v: &serde_json::Value) -> PeerKey {
     let sender = v
         .get("src")
         .or_else(|| v.get("from"))
@@ -7202,19 +7576,19 @@ fn peer_key_from_json(v: &serde_json::Value) -> String {
                 && bare.len() <= INBOUND_PEER_KEY_MAX_LEN
                 && bare.bytes().all(|b| b.is_ascii_hexdigit());
             if ok {
-                bare.to_string()
+                PeerKey::from_validated_hex(bare)
             } else {
-                INBOUND_BROADCAST_PEER_KEY.to_string()
+                PeerKey::Broadcast
             }
         }
-        None => INBOUND_BROADCAST_PEER_KEY.to_string(),
+        None => PeerKey::Broadcast,
     }
 }
 
-pub fn inbound_peer_key(raw: &str) -> String {
+pub fn inbound_peer_key(raw: &str) -> PeerKey {
     let v: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,
-        Err(_) => return INBOUND_BROADCAST_PEER_KEY.to_string(),
+        Err(_) => return PeerKey::Broadcast,
     };
     peer_key_from_json(&v)
 }
@@ -7222,10 +7596,12 @@ pub fn inbound_peer_key(raw: &str) -> String {
 /// Per-peer byte-rate limiter for inbound bulk traffic.
 ///
 /// Token bucket per peer: `burst` tokens capacity, refilled at `rate_bps`.
-/// Only [`ConsensusMsg::Committed`] bypasses (see [`inbound_is_critical`])
-/// without consuming budget, so the live catch-up proof never waits behind
-/// bulk gossip. Every other message that fits is admitted; the rest defer
-/// with a rate-derived wait hint. Bounded to [`INBOUND_MAX_TRACKED_PEERS`] keys.
+/// Only [`ConsensusMsg::Committed`] bypasses THIS limiter (see
+/// [`inbound_is_critical`]) so the live catch-up proof never waits behind
+/// bulk gossip; it is still charged against the separate, larger critical
+/// pre-decode budget ([`InboundCriticalBudget`], C1-F4). Every other message
+/// that fits is admitted; the rest defer with a rate-derived wait hint.
+/// Bounded to [`INBOUND_MAX_TRACKED_PEERS`] keys.
 #[derive(Debug)]
 pub struct InboundBulkLimiter {
     rate_bps: f64,
@@ -7279,15 +7655,30 @@ impl InboundBulkLimiter {
         if critical {
             return InboundDecision::Allow;
         }
-        if !self.peers.contains_key(peer) && self.peers.len() >= self.max_peers {
-            if let Some(k) = self.peers.keys().next().cloned() {
-                self.peers.remove(&k);
+        if !self.peers.contains_key(peer) {
+            if self.peers.len() >= self.max_peers {
+                if let Some(k) = self.peers.keys().next().cloned() {
+                    self.peers.remove(&k);
+                }
             }
+            // O9: allocate the bucket key ONLY on the first sighting of a
+            // peer. The old `entry(peer.to_string())` allocated a String on
+            // every message of an already-tracked peer just to hand it to
+            // `entry` (which then freed it). The eviction decision above is
+            // unchanged: it happens exactly when the key is absent and the
+            // map is full.
+            self.peers.insert(
+                peer.to_string(),
+                InboundBucket {
+                    tokens: self.burst,
+                    last_ms: now_ms,
+                },
+            );
         }
-        let bucket = self.peers.entry(peer.to_string()).or_insert(InboundBucket {
-            tokens: self.burst,
-            last_ms: now_ms,
-        });
+        let bucket = self
+            .peers
+            .get_mut(peer)
+            .expect("bucket present: inserted above when absent");
         let elapsed = now_ms.saturating_sub(bucket.last_ms);
         if elapsed > 0 {
             bucket.tokens =
@@ -7306,6 +7697,86 @@ impl InboundBulkLimiter {
             }
         }
     }
+}
+
+/// Separate, LARGE per-peer byte budget for critical traffic, charged BEFORE
+/// decode (C1-F4).
+///
+/// Semantics are intentionally different from [`InboundBulkLimiter`]:
+///
+/// * it is consulted on the RAW frame (tag + length) before hex/bincode work;
+/// * over-budget frames are DROPPED (`false`), never deferred — a flood tail
+///   must not be parked and replayed later;
+/// * it never applies to non-critical messages, so bulk gossip keeps its own
+///   (much smaller) bucket.
+///
+/// Implemented over the same token-bucket primitive; the decision is collapsed
+/// to allow/drop because deferral is explicitly not wanted here.
+#[derive(Debug)]
+pub struct InboundCriticalBudget {
+    bucket: InboundBulkLimiter,
+}
+
+impl InboundCriticalBudget {
+    pub fn new(rate_bps: u64, burst_bytes: u64) -> Self {
+        Self {
+            bucket: InboundBulkLimiter::new(rate_bps, burst_bytes),
+        }
+    }
+
+    pub fn with_defaults() -> Self {
+        Self::from_env()
+    }
+
+    pub fn from_env() -> Self {
+        Self::new(
+            inbound_critical_bytes_per_sec(),
+            inbound_critical_burst_bytes(),
+        )
+    }
+
+    /// Charge `frame_bytes` for `peer`. `true` = may decode; `false` = drop.
+    pub fn admit_predecode(&mut self, peer: &str, frame_bytes: u64, now_ms: u64) -> bool {
+        matches!(
+            self.bucket.admit(peer, frame_bytes, false, now_ms),
+            InboundDecision::Allow
+        )
+    }
+
+    pub fn peer_count(&self) -> usize {
+        self.bucket.peer_count()
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::with_defaults();
+    }
+}
+
+/// Process-wide critical pre-decode budget used by the live parse entry point.
+///
+/// The receiver loop calls [`parse_incoming_with_peer_key`] BEFORE any
+/// admission accounting (the old limiter was charged only after the message had
+/// already been decoded), so the budget is enforced here, where the peer id and
+/// the raw frame length are both available and no decoding has happened yet.
+static INBOUND_CRITICAL_PREDECODE: LazyLock<Mutex<InboundCriticalBudget>> =
+    LazyLock::new(|| Mutex::new(InboundCriticalBudget::with_defaults()));
+
+/// Test hook: clear the process-wide critical budget (no effect on policy).
+pub fn reset_inbound_critical_budget_for_tests() {
+    INBOUND_CRITICAL_PREDECODE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .reset();
+}
+
+/// Charge one inbound frame against the critical pre-decode budget.
+/// `frame_bytes` is the DECODED (pre-hex) size estimate; the caller charges
+/// before doing the hex decode.
+pub fn admit_critical_predecode(peer: &str, frame_bytes: u64) -> bool {
+    INBOUND_CRITICAL_PREDECODE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .admit_predecode(peer, frame_bytes, epoch_ms())
 }
 
 impl ConsensusNetwork {
@@ -7655,5 +8126,303 @@ impl InboundShed {
     /// Shed refusals so far (over-const observations + refused new attempts).
     pub fn refused_total(&self) -> u64 {
         self.refused_total
+    }
+}
+
+/// O1x optimisations (O8 `is_large`, O9 limiter key allocation, O10
+/// fixed-size peer key). Each test is a differential pin against a test-local
+/// copy of the pre-optimisation algorithm.
+#[cfg(test)]
+mod o1x_tests {
+    use super::*;
+    use crate::consensus::{Vote, VoteKind};
+    use std::collections::HashMap;
+
+    /// O8: for every vote shape, the arithmetic classification equals the old
+    /// `serialize().len() >= 64 KiB` classification, and the formula is the
+    /// exact encoded length.
+    #[test]
+    fn o8_vote_is_large_matches_serialized_length() {
+        let voter = [0x77u8; 32];
+        let mut lengths: Vec<usize> = (0..=150).collect();
+        lengths.extend([666, 1024, 4096, 32_768, 6 * 1024 * 1024]);
+
+        for &hash in &[None, Some([0x31u8; 32])] {
+            for &locked in &[None, Some([0x99u8; 32])] {
+                // Exact threshold boundary for this option shape.
+                let probe = Vote::signed_with_in_shard(
+                    voter,
+                    0,
+                    11,
+                    4,
+                    VoteKind::Precommit,
+                    hash,
+                    Vec::new(),
+                );
+                let header = vote_encoded_len(&probe, &locked) - probe.signature.len();
+                for delta in 0..3usize {
+                    lengths.push(64usize * 1024 - (header + delta));
+                    lengths.push((64 * 1024) + delta);
+                }
+                for &len in &lengths {
+                    let vote = Vote::signed_with_in_shard(
+                        voter,
+                        1,
+                        11,
+                        4,
+                        VoteKind::Prevote,
+                        hash,
+                        vec![0xAB; len],
+                    );
+                    let msg = ConsensusMsg::Vote {
+                        vote: vote.clone(),
+                        locked,
+                    };
+                    assert_eq!(
+                        vote_encoded_len(&vote, &locked),
+                        msg.encode().expect("vote encodes").len(),
+                        "formula must equal bincode length (len={len})"
+                    );
+                    let old = msg.encode().expect("vote encodes").len() >= 64 * 1024;
+                    assert_eq!(msg.is_large(), old, "classification changed (len={len})");
+                    assert_eq!(is_large(&msg), old);
+                }
+            }
+        }
+    }
+
+    /// O10: fixed-size `PeerKey` validates and stringifies exactly like the
+    /// original allocating implementation, and two equal senders share one
+    /// bucket / two distinct senders do not.
+    #[test]
+    fn o10_peer_key_matches_string_reference() {
+        fn old_peer_key_from_json(v: &serde_json::Value) -> String {
+            let sender = v
+                .get("src")
+                .or_else(|| v.get("from"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            match sender {
+                Some(s) => {
+                    let bare = s.strip_prefix("inf1:").unwrap_or(s);
+                    let ok = !bare.is_empty()
+                        && bare.len() <= INBOUND_PEER_KEY_MAX_LEN
+                        && bare.bytes().all(|b| b.is_ascii_hexdigit());
+                    if ok {
+                        bare.to_string()
+                    } else {
+                        INBOUND_BROADCAST_PEER_KEY.to_string()
+                    }
+                }
+                None => INBOUND_BROADCAST_PEER_KEY.to_string(),
+            }
+        }
+        fn old_peer_key(raw: &str) -> String {
+            match serde_json::from_str::<serde_json::Value>(raw) {
+                Ok(v) => old_peer_key_from_json(&v),
+                Err(_) => INBOUND_BROADCAST_PEER_KEY.to_string(),
+            }
+        }
+
+        let k128 = "aB".repeat(64);
+        let k129 = format!("{k128}f");
+        let mut corpus = vec![
+            "not json".to_string(),
+            "{}".to_string(),
+            r#"{"topic":"t","data":"00"}"#.to_string(),
+            r#"{"topic":"t","data":"00","src":""}"#.to_string(),
+            r#"{"topic":"t","data":"00","src":"   "}"#.to_string(),
+            r#"{"topic":"t","data":"00","src":"aa"}"#.to_string(),
+            r#"{"topic":"t","data":"00","src":"AA"}"#.to_string(),
+            r#"{"topic":"t","data":"00","src":"inf1:cc"}"#.to_string(),
+            r#"{"topic":"t","data":"00","src":"inf1:"}"#.to_string(),
+            r#"{"topic":"t","data":"00","src":"  inf1:dd  "}"#.to_string(),
+            r#"{"topic":"t","data":"00","src":"../../evil"}"#.to_string(),
+            r#"{"topic":"t","data":"00","src":"аа"}"#.to_string(),
+            r#"{"topic":"t","data":"00","from":"bb"}"#.to_string(),
+            r#"{"topic":"t","data":"00","from":"zz-top"}"#.to_string(),
+            r#"{"topic":"t","data":"00","src":123}"#.to_string(),
+            r#"{"topic":"t","data":"00","src":null}"#.to_string(),
+            r#"{"topic":"t","data":"00","src":{"x":1}}"#.to_string(),
+            format!(r#"{{"topic":"t","data":"00","src":"{k128}"}}"#),
+            format!(r#"{{"topic":"t","data":"00","src":"{k129}"}}"#),
+        ];
+        let mut seed: u64 = 0xC0FF_EE00_1234_5678;
+        for _ in 0..200 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let len = (seed % 140) as usize;
+            let mut s = String::with_capacity(len);
+            for i in 0..len {
+                let c = match (seed >> (i % 32)) % 4 {
+                    0 => 'a',
+                    1 => '0',
+                    2 => 'F',
+                    _ => '.',
+                };
+                s.push(c);
+            }
+            corpus.push(format!(r#"{{"topic":"t","data":"00","src":"{s}"}}"#));
+        }
+
+        let mut limiters = (
+            InboundBulkLimiter::new(4096, 4096),
+            InboundBulkLimiter::new(4096, 4096),
+        );
+        let mut now = 1_000u64;
+        for (i, raw) in corpus.iter().enumerate() {
+            let key = inbound_peer_key(raw);
+            let reference = old_peer_key(raw);
+            assert_eq!(key.as_str(), reference, "key mismatch for {raw}");
+            assert_eq!(key.to_string(), reference);
+
+            // Bucket identity is the STRING identity: driving two limiters,
+            // one with the typed key and one with the reference string, must
+            // give the same decision pattern.
+            let bytes = 100 + (i as u64 % 17) * 100;
+            now += 5;
+            assert_eq!(
+                limiters.0.admit(key.as_str(), bytes, false, now),
+                limiters.1.admit(&reference, bytes, false, now),
+                "bucket accounting diverged for {raw}"
+            );
+            if key.is_broadcast() {
+                assert_eq!(reference, INBOUND_BROADCAST_PEER_KEY);
+            } else {
+                assert_ne!(key, PeerKey::Broadcast);
+                assert_eq!(inbound_peer_key(raw), key, "same raw frame, same key");
+            }
+        }
+    }
+
+    /// O9: the allocation-free bucket lookup keeps the EXACT accounting of the
+    /// old `entry(peer.to_string()).or_insert(...)` implementation.
+    #[test]
+    fn o9_limiter_accounting_matches_old_entry_implementation() {
+        #[derive(Debug)]
+        struct OldBucket {
+            tokens: f64,
+            last_ms: u64,
+        }
+        struct OldLimiter {
+            rate_bps: f64,
+            burst: f64,
+            peers: HashMap<String, OldBucket>,
+            max_peers: usize,
+        }
+        impl OldLimiter {
+            fn new(rate_bps: u64, burst_bytes: u64, max_peers: usize) -> Self {
+                Self {
+                    rate_bps: rate_bps.max(1) as f64,
+                    burst: burst_bytes.max(1) as f64,
+                    peers: HashMap::new(),
+                    max_peers,
+                }
+            }
+            fn admit(
+                &mut self,
+                peer: &str,
+                bytes: u64,
+                critical: bool,
+                now_ms: u64,
+            ) -> InboundDecision {
+                if critical {
+                    return InboundDecision::Allow;
+                }
+                if !self.peers.contains_key(peer) && self.peers.len() >= self.max_peers {
+                    if let Some(k) = self.peers.keys().next().cloned() {
+                        self.peers.remove(&k);
+                    }
+                }
+                let bucket = self.peers.entry(peer.to_string()).or_insert(OldBucket {
+                    tokens: self.burst,
+                    last_ms: now_ms,
+                });
+                let elapsed = now_ms.saturating_sub(bucket.last_ms);
+                if elapsed > 0 {
+                    bucket.tokens =
+                        (bucket.tokens + elapsed as f64 / 1000.0 * self.rate_bps).min(self.burst);
+                    bucket.last_ms = now_ms;
+                }
+                let need = bytes as f64;
+                if bucket.tokens >= need {
+                    bucket.tokens -= need;
+                    InboundDecision::Allow
+                } else {
+                    let shortfall = need - bucket.tokens;
+                    let wait = (shortfall / self.rate_bps * 1000.0).ceil() as u64;
+                    InboundDecision::Defer {
+                        wait_ms: wait.clamp(1, INBOUND_MAX_DEFER_WAIT_MS),
+                    }
+                }
+            }
+        }
+
+        let peers = ["aa", "bb", "cc", "dd", "ee", "ff", "broadcast"];
+        let mut new_limiter = InboundBulkLimiter::new(32_000, 96_000);
+        let mut old_limiter = OldLimiter::new(32_000, 96_000, INBOUND_MAX_TRACKED_PEERS);
+        let mut seed: u64 = 0xDEAD_BEEF_0BAD_F00D;
+        let mut now = 1_000u64;
+        for _ in 0..5_000 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let peer = peers[(seed >> 3) as usize % peers.len()];
+            let bytes = (seed >> 17) % 40_000;
+            let critical = (seed >> 41).is_multiple_of(23);
+            now += (seed >> 29) % 60;
+            assert_eq!(
+                new_limiter.admit(peer, bytes, critical, now),
+                old_limiter.admit(peer, bytes, critical, now),
+                "decision divergence at peer={peer} bytes={bytes} now={now}"
+            );
+        }
+        assert_eq!(new_limiter.peer_count(), old_limiter.peers.len());
+        for (peer, old) in &old_limiter.peers {
+            let new = new_limiter
+                .peers
+                .get(peer)
+                .expect("every old bucket must still exist");
+            assert_eq!(
+                new.tokens, old.tokens,
+                "token accounting changed for {peer}"
+            );
+            assert_eq!(new.last_ms, old.last_ms, "stamp changed for {peer}");
+        }
+    }
+
+    /// O9: the memory bound (evict one bucket at the cap) is unchanged, and
+    /// the just-inserted peer always gets a full fresh bucket.
+    #[test]
+    fn o9_limiter_eviction_bound_and_fresh_bucket() {
+        let mut limiter = InboundBulkLimiter {
+            rate_bps: 1_000.0,
+            burst: 1_000.0,
+            peers: HashMap::new(),
+            max_peers: 3,
+        };
+        for (i, peer) in ["aa", "bb", "cc"].iter().enumerate() {
+            assert_eq!(
+                limiter.admit(peer, 1_000, false, 1_000 + i as u64),
+                InboundDecision::Allow
+            );
+        }
+        assert_eq!(limiter.peer_count(), 3);
+        // A fourth peer evicts exactly one, and keeps its own fresh burst.
+        assert_eq!(
+            limiter.admit("dd", 1_000, false, 2_000),
+            InboundDecision::Allow
+        );
+        assert_eq!(limiter.peer_count(), 3);
+        assert_eq!(limiter.peers["dd"].tokens, 0.0);
+        assert_eq!(limiter.peers["dd"].last_ms, 2_000);
+        // Re-admitting an EXISTING peer never evicts another one.
+        let before: Vec<String> = limiter.peers.keys().cloned().collect();
+        let _ = limiter.admit("dd", 10, false, 2_001);
+        let mut after: Vec<String> = limiter.peers.keys().cloned().collect();
+        let mut before_sorted = before;
+        before_sorted.sort();
+        after.sort();
+        assert_eq!(before_sorted, after);
     }
 }

@@ -203,6 +203,25 @@ pub fn verify_transaction_envelope_at_height_with_activation(
 /// light clients -- inherits it without each remembering to check first.
 pub const MAX_COMMIT_CERT_SIGNERS: usize = 4_096;
 
+/// Maximum entries a block may carry in its proposer-signature evidence list
+/// (C1-F5).
+///
+/// `validator_signatures` is excluded from the block hash, so an unauthenticated
+/// peer can re-serve a genuine block with an arbitrary number of extra entries.
+/// Only the proposer's own slot is ever consulted, so a handful of entries is
+/// the honest shape (the live producer writes the Ed25519 half and the
+/// Falcon-512 half = 2). Anything past this cap is refused at admission before
+/// a single signature is examined.
+pub const MAX_PROPOSER_SIG_ENTRIES: usize = 8;
+
+/// Maximum total signature bytes a block may carry in
+/// `validator_signatures` (C1-F5).
+///
+/// Four KiB covers six Falcon-512 signatures (666 bytes each) plus envelope
+/// overhead, far above the honest two-entry shape and far below the 32 MiB
+/// wire cap, so the whole list can be copied/hashed without amplification.
+pub const MAX_PROPOSER_SIG_BYTES: usize = 4 * 1024;
+
 /// The Ed25519 half of a vote/certificate signature entry: strips the live
 /// Falcon envelope when present. Plain 64-byte signatures pass through untouched.
 // GATE: single live envelope (Falcon v2) keeps the straight-line strip auditable.
@@ -305,6 +324,13 @@ pub fn verify_proposer_signature_with_hash(
     block: &crate::sharding::Block,
     hash: &[u8; 32],
 ) -> bool {
+    // C1-F5: cap the attacker-supplied evidence list FIRST — before a registry
+    // read or a signature. The block hash does not commit
+    // `validator_signatures`, so this list arrives unauthenticated with every
+    // re-served block.
+    if !proposer_signature_list_within_cap(block) {
+        return false;
+    }
     // Height-indexed committed read (rotation-aware): fail-closed when the
     // proposer has no key at this height (unknown validator, pre-activation,
     // or pruned history).
@@ -318,6 +344,7 @@ pub fn verify_proposer_signature_with_hash(
     // under the derived address, not under the Ed proposer id).
     let expected_addr =
         crate::post_quantum::derive_pq_address(scheme, &pk, &crate::post_quantum::DEFAULT_SALT);
+    let mut slot_candidates = 0usize;
     for (signer_id, sig_bytes) in &block.validator_signatures {
         // Same registered-key source as votes: only the proposer's slot (by
         // Ed id or by derived Falcon address) counts; a neighbor's valid
@@ -330,14 +357,41 @@ pub fn verify_proposer_signature_with_hash(
         if sig_bytes.len() != scheme.signature_size() {
             continue;
         }
+        // C1-F1 (availability): SCAN every slot-matching entry and accept iff
+        // ANY of them verifies. The block hash does not commit
+        // `validator_signatures`, so a peer can re-serve a genuine block with a
+        // `(proposer, [0u8; sig_len])` entry inserted ahead of the real Falcon
+        // entry. Refusing on the first bad entry let that copy shadow the valid
+        // one on every receiver that saw it first (proposal, adoption, sync).
+        // Acceptance does not widen: a valid signature under the registered key
+        // is still required.
+        slot_candidates += 1;
+        if slot_candidates > MAX_PROPOSER_SIG_ENTRIES {
+            return false;
+        }
         if crate::post_quantum::verify_pq_signature(scheme, &pk, hash, sig_bytes) {
             return true;
         }
-        // A matching slot with a bad signature refuses at once: the Ed
-        // fallback is gone, so there is no second chance for this block.
-        return false;
+        // A bad signature in ONE slot entry never vetoes the others: keep
+        // scanning the remaining candidates.
     }
     false
+}
+
+/// True when the block's proposer-signature evidence list is small enough to
+/// examine at all (C1-F5).
+///
+/// Callers that admit a block from the network may use this directly; the
+/// verifier applies it unconditionally, so every path inherits the bound.
+pub fn proposer_signature_list_within_cap(block: &crate::sharding::Block) -> bool {
+    if block.validator_signatures.len() > MAX_PROPOSER_SIG_ENTRIES {
+        return false;
+    }
+    let total = block
+        .validator_signatures
+        .iter()
+        .fold(0usize, |acc, (_, sig)| acc.saturating_add(sig.len()));
+    total <= MAX_PROPOSER_SIG_BYTES
 }
 
 pub trait BlockProposerExt {
@@ -727,12 +781,27 @@ pub fn decode_pq_epoch_envelope(payload: &[u8]) -> Option<PqMicroCertificate> {
 pub struct ValidatorSet {
     /// validator pubkey -> voting power
     pub validators: BTreeMap<ValidatorId, u64>,
+    /// Lazily computed structural fingerprint (C1-F6).
+    ///
+    /// Never serialized (so no wire/state byte changes) and invalidated by
+    /// [`Self::add`]. The vote-verdict cache consults it on the ingest hot
+    /// path: comparing one cached 32-byte digest is O(1), whereas the old
+    /// exact `(voter, power)` snapshot zip walked the whole set on EVERY vote
+    /// (at n = 2000, ~80 KB of pointer chasing per admission).
+    ///
+    /// INVARIANT: mutate the set through [`Self::add`] (or replace it) so a
+    /// cached digest is never stale. Direct field edits remain possible for
+    /// fixtures, but production install paths all go through `add` /
+    /// `from_list` / deserialization, which leave the cache empty.
+    #[serde(skip)]
+    fingerprint: std::sync::OnceLock<[u8; 32]>,
 }
 
 impl ValidatorSet {
     pub fn new() -> Self {
         Self {
             validators: BTreeMap::new(),
+            fingerprint: std::sync::OnceLock::new(),
         }
     }
 
@@ -747,7 +816,34 @@ impl ValidatorSet {
     pub fn add(&mut self, id: ValidatorId, power: u64) {
         if power > 0 {
             self.validators.insert(id, power);
+            // A set edit invalidates the cached structural digest. O(1).
+            self.fingerprint = std::sync::OnceLock::new();
         }
+    }
+
+    /// O(1) structural fingerprint of this set (after the first call).
+    ///
+    /// Domain-separated BLAKE3 over the canonical sorted `(id, power)` pairs.
+    /// `validators` is a `BTreeMap`, so every node iterates the same order.
+    /// Two sets with the same content share the digest; any added/removed
+    /// validator or power edit yields a different one (collision resistance is
+    /// BLAKE3's, not a weakened equality check — the verdict cache elsewhere
+    /// still compares vote bytes EXACTLY).
+    ///
+    /// The digest is computed once and cached until [`Self::add`] invalidates
+    /// it, so the per-vote invalidation check is O(1) instead of the old O(N)
+    /// snapshot zip.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        *self.fingerprint.get_or_init(|| {
+            let mut h = blake3::Hasher::new();
+            h.update(b"STELL-CONSENSUS-VOTE-CACHE-SET-V1");
+            h.update(&(self.validators.len() as u64).to_le_bytes());
+            for (id, power) in &self.validators {
+                h.update(id);
+                h.update(&power.to_le_bytes());
+            }
+            *h.finalize().as_bytes()
+        })
     }
 
     /// Sum of the set's voting power, computed EXACTLY in `u128`.
@@ -1303,11 +1399,16 @@ impl Vote {
         // `on_precommit` (which verify once in `VoteSet::add` AND once in
         // `observe_peer_vote`), or re-scanned, so the second and later
         // verifications of identical bytes under an identical key context
-        // are pure CPU with no new information. Resolve the PQ key and build
-        // `VerifiedVoteCacheKey` ONCE so a cache miss never rebuilds the key
-        // or re-queries the PQ registry.
+        // are pure CPU with no new information.
+        //
+        // C1-F6: probe the cache with BORROWED fields. A hit no longer clones
+        // the ~1.6 KB signature + PQ key into an owned key just to look itself
+        // up. The owned key is materialized only on a miss, where it is the
+        // thing actually stored.
         let pq_entry = pq_key_at_height(&self.voter, self.height);
-        let key = VerifiedVoteCacheKey {
+        let pure_pq = crate::post_quantum::is_pure_pq_enforced();
+        let chain_id = consensus_chain_id();
+        let probe = VerifiedVoteCacheProbe {
             voter: self.voter,
             height: self.height,
             round: self.round,
@@ -1317,33 +1418,41 @@ impl Vote {
             },
             block_hash: self.block_hash,
             shard_id: self.shard_id,
-            signature: self.signature.clone(),
+            signature: &self.signature,
             pq_key: pq_entry
                 .as_ref()
-                .map(|(scheme, pk)| (*scheme as u8, pk.clone())),
-            pure_pq: crate::post_quantum::is_pure_pq_enforced(),
-            chain_id: consensus_chain_id(),
+                .map(|(scheme, pk)| (*scheme as u8, pk.as_slice())),
+            pure_pq,
+            chain_id,
         };
         if let Some(hit) = VERIFIED_VOTE_CACHE
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .copied()
+            .get(&probe)
         {
             VERIFIED_VOTE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             return hit;
         }
         VERIFIED_VOTE_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
         let verdict = self.verify_uncached_with_pq_key(pq_entry.as_ref());
-        let mut lock = VERIFIED_VOTE_CACHE
+        let key = VerifiedVoteCacheKey {
+            voter: self.voter,
+            height: self.height,
+            round: self.round,
+            kind: probe.kind,
+            block_hash: self.block_hash,
+            shard_id: self.shard_id,
+            signature: self.signature.clone(),
+            pq_key: pq_entry
+                .as_ref()
+                .map(|(scheme, pk)| (*scheme as u8, pk.clone())),
+            pure_pq,
+            chain_id,
+        };
+        VERIFIED_VOTE_CACHE
             .write()
-            .unwrap_or_else(|e| e.into_inner());
-        if lock.len() >= VERIFIED_VOTE_CACHE_CAP {
-            // Fail-safe bound: drop everything and re-record (miss = full
-            // verify). Verdicts are recomputed, never approximated.
-            lock.clear();
-        }
-        lock.insert(key, verdict);
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, verdict);
         verdict
     }
 
@@ -1550,9 +1659,9 @@ impl Vote {
 // EXACT INVALIDATION — every trigger enumerated (found by grep over the
 // tree; see call sites):
 //  1. VALIDATOR-SET CHANGE. `VoteSet::add` / `add_batch` receive the set in
-//     force and call `note_validator_set_for_vote_cache` first: an exact
-//     sorted `(voter, power)` snapshot is compared against the last-seen
-//     snapshot, and ANY change clears the cache (miss = full verify). Set
+//     force and call `note_validator_set_for_vote_cache` first: the set's
+//     O(1) content fingerprint is compared against the last-seen one, and ANY
+//     change clears the cache (miss = full verify). Set
 //     producers (all outside this file, read-only from here):
 //     `runtime.rs` `refresh_validator_set_from_ledger`,
 //     `refresh_validator_set_from_master_ledger`,
@@ -1628,69 +1737,144 @@ struct VerifiedVoteCacheKey {
     chain_id: u64,
 }
 
-static VERIFIED_VOTE_CACHE: std::sync::LazyLock<
-    std::sync::RwLock<HashMap<VerifiedVoteCacheKey, bool>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+/// Borrowed probe with the SAME hash shape as [`VerifiedVoteCacheKey`].
+///
+/// C1-F6: the hit path used to CLONE the whole owned key (~1.6 KB: signature
+/// envelope + Falcon public key) just to run `HashMap::get`. The cache is now
+/// keyed by a hash bucket and probed with borrowed fields, then compared
+/// BYTE-EXACTLY against the stored owned key — no weakening, no allocation on
+/// a hit. Borrowed `&[u8]` hashes exactly like the owned `Vec<u8>` it came
+/// from, so a probe hashes to the same bucket as its owned twin.
+#[derive(Hash)]
+struct VerifiedVoteCacheProbe<'a> {
+    voter: ValidatorId,
+    height: Height,
+    round: Round,
+    kind: u8,
+    block_hash: Option<BlockHash>,
+    shard_id: ShardId,
+    signature: &'a [u8],
+    pq_key: Option<(u8, &'a [u8])>,
+    pure_pq: bool,
+    chain_id: u64,
+}
+
+impl VerifiedVoteCacheKey {
+    /// Exact field-by-field comparison with a borrowed probe.
+    fn matches_probe(&self, probe: &VerifiedVoteCacheProbe<'_>) -> bool {
+        self.voter == probe.voter
+            && self.height == probe.height
+            && self.round == probe.round
+            && self.kind == probe.kind
+            && self.block_hash == probe.block_hash
+            && self.shard_id == probe.shard_id
+            && self.signature.as_slice() == probe.signature
+            && self
+                .pq_key
+                .as_ref()
+                .map(|(scheme, key)| (*scheme, key.as_slice()))
+                == probe.pq_key
+            && self.pure_pq == probe.pure_pq
+            && self.chain_id == probe.chain_id
+    }
+}
+
+/// Hash-bucketed verdict store. Hash collisions are resolved by the exact
+/// byte comparison in [`VerifiedVoteCacheKey::matches_probe`], so the cached
+/// verdict is a pure function of the exact key — same guarantee as the plain
+/// `HashMap<Key, bool>` this replaces.
+///
+/// The bucket hasher is a per-cache [`RandomState`](std::collections::hash_map::RandomState),
+/// exactly like `HashMap`'s: a peer cannot precompute bucket collisions from a
+/// fixed hash key.
+struct VerifiedVoteCache {
+    buckets: HashMap<u64, Vec<(VerifiedVoteCacheKey, bool)>>,
+    hasher: std::collections::hash_map::RandomState,
+    len: usize,
+}
+
+impl Default for VerifiedVoteCache {
+    fn default() -> Self {
+        Self {
+            buckets: HashMap::new(),
+            hasher: std::collections::hash_map::RandomState::new(),
+            len: 0,
+        }
+    }
+}
+
+impl VerifiedVoteCache {
+    fn bucket_of<H: std::hash::Hash + ?Sized>(&self, key: &H) -> u64 {
+        use std::hash::BuildHasher;
+        self.hasher.hash_one(key)
+    }
+
+    fn get(&self, probe: &VerifiedVoteCacheProbe<'_>) -> Option<bool> {
+        let bucket = self.bucket_of(probe);
+        self.buckets
+            .get(&bucket)?
+            .iter()
+            .find_map(|(key, verdict)| key.matches_probe(probe).then_some(*verdict))
+    }
+
+    fn insert(&mut self, key: VerifiedVoteCacheKey, verdict: bool) {
+        if self.len >= VERIFIED_VOTE_CACHE_CAP {
+            // Fail-safe bound: drop everything and re-record (miss = full
+            // verify). Verdicts are recomputed, never approximated.
+            self.clear();
+        }
+        let bucket = self.bucket_of(&key);
+        self.buckets.entry(bucket).or_default().push((key, verdict));
+        self.len += 1;
+    }
+
+    fn clear(&mut self) {
+        self.buckets.clear();
+        self.len = 0;
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+static VERIFIED_VOTE_CACHE: std::sync::LazyLock<std::sync::RwLock<VerifiedVoteCache>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(VerifiedVoteCache::default()));
 static VERIFIED_VOTE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static VERIFIED_VOTE_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
-/// Canonical `(validator, power)` view of the in-force set.
-type ValidatorSetSnapshot = Vec<(ValidatorId, u64)>;
 
-/// Exact snapshot `(validator, power)` of the set the cache was last
-/// validated against (trigger 1). `None` forces a re-record on the next
-/// ingest.
+/// Structural fingerprint of the set the cache was last validated against
+/// (trigger 1). `None` forces a re-record on the next ingest.
 ///
-/// A snapshot comparison is used instead of a per-call BLAKE3 digest: the
-/// digest was recomputed over the WHOLE set on every vote, so at `n = 2000`
-/// every `VoteSet::add` hashed ~80 KB before it could even consult the
-/// verdict cache. Comparing the stored pairs detects exactly the same
-/// changes (any added/removed validator or power edit makes the pair lists
-/// differ) without hashing or allocating on the no-change path.
-static VERIFIED_VOTE_CACHE_SET_SNAPSHOT: std::sync::LazyLock<
-    std::sync::RwLock<Option<ValidatorSetSnapshot>>,
+/// C1-F6: the old representation was an exact `(validator, power)` snapshot,
+/// which had to be ZIPPED against the live `BTreeMap` on EVERY vote — O(N) per
+/// admission (at n = 2000, ~80 KB of pointer chasing before the verdict cache
+/// was even consulted). [`ValidatorSet::fingerprint`] is cached on the set and
+/// invalidated only when the set is installed/edited, so the hot-path compare
+/// is one 32-byte load. Invalidation semantics are unchanged: any content edit
+/// changes the digest and clears every cached verdict (miss = full verify).
+static VERIFIED_VOTE_CACHE_SET_FINGERPRINT: std::sync::LazyLock<
+    std::sync::RwLock<Option<[u8; 32]>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
-
-/// Exact equality between the stored snapshot and `validators`.
-///
-/// `ValidatorSet.validators` is a `BTreeMap`, so both pair lists are in the
-/// same canonical (sorted) order. Equal lists ⇔ equal sets.
-fn validator_set_matches_snapshot(
-    snapshot: &[(ValidatorId, u64)],
-    validators: &ValidatorSet,
-) -> bool {
-    if snapshot.len() != validators.validators.len() {
-        return false;
-    }
-    snapshot
-        .iter()
-        .zip(validators.validators.iter())
-        .all(|((sid, spower), (vid, vpower))| sid == vid && spower == vpower)
-}
 
 /// Trigger-1 enforcement: call at the top of every vote-ingest entry point
 /// that observes the in-force set. A changed set clears the cache before any
 /// verdict is consulted (miss = full verify).
 pub(super) fn note_validator_set_for_vote_cache(validators: &ValidatorSet) {
+    // O(1) after the set's first fingerprint computation (C1-F6).
+    let fingerprint = validators.fingerprint();
     let changed = {
-        let lock = VERIFIED_VOTE_CACHE_SET_SNAPSHOT
+        let lock = VERIFIED_VOTE_CACHE_SET_FINGERPRINT
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        match lock.as_deref() {
-            None => true,
-            Some(snapshot) => !validator_set_matches_snapshot(snapshot, validators),
-        }
+        lock.as_ref() != Some(&fingerprint)
     };
     if changed {
         clear_verified_vote_cache();
-        let snapshot: ValidatorSetSnapshot = validators
-            .validators
-            .iter()
-            .map(|(id, power)| (*id, *power))
-            .collect();
-        let mut lock = VERIFIED_VOTE_CACHE_SET_SNAPSHOT
+        let mut lock = VERIFIED_VOTE_CACHE_SET_FINGERPRINT
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        *lock = Some(snapshot);
+        *lock = Some(fingerprint);
     }
 }
 
@@ -1711,7 +1895,7 @@ pub fn clear_verified_vote_cache() {
 /// it. Safe to call redundantly: clearing only costs CPU.
 pub fn invalidate_verified_vote_cache() {
     clear_verified_vote_cache();
-    let mut lock = VERIFIED_VOTE_CACHE_SET_SNAPSHOT
+    let mut lock = VERIFIED_VOTE_CACHE_SET_FINGERPRINT
         .write()
         .unwrap_or_else(|e| e.into_inner());
     *lock = None;
@@ -1850,8 +2034,16 @@ impl QuorumCertificate {
     /// * a marker that cannot be decoded / has no PQ key / fails a signature
     ///   or structural check contributes neither verdict nor signers;
     /// * `true` iff at least one marker clears its quorum rule;
-    /// * the returned power is summed over the UNION of verified signer ids
-    ///   (exactly what `signers_set` + `qc_signed_power` compute).
+    /// * when `true`, the returned power is summed over the UNION of verified
+    ///   signer ids; for a MULTI-MARKER certificate it is the FIRST
+    ///   quorum-bearing marker's power (C1-F3), matching `signers_set`;
+    /// * when `false` and the certificate carries SEVERAL markers, the
+    ///   returned power is `0` (C1-F3) — no single marker carried quorum, so
+    ///   attribution must not report the split union;
+    /// * when `false` and the certificate carries ONE marker, the returned
+    ///   power is that marker's genuine-signer power (historical shortfall
+    ///   observability; it is below the marker's own quorum, so it can never
+    ///   be mistaken for a verified certificate).
     pub fn verify_and_signed_power(&self, validators: &ValidatorSet) -> (bool, u64) {
         self.verify_and_signed_power_inner(validators, None, CommitteeSchedule::ParentHash)
     }
@@ -2047,11 +2239,43 @@ impl QuorumCertificate {
         schedule: CommitteeSchedule,
     ) -> (bool, u64) {
         let (verified, signers) = self.verify_and_signers_inner(validators, pq_keys, schedule);
-        let power = signers
+        let multi_marker = self.recognized_marker_count() > 1;
+        if !verified && multi_marker {
+            // C1-F3: a MULTI-MARKER certificate in which no single marker
+            // reached quorum is refused, so attribution carries ZERO power —
+            // exactly what `(verify, qc_signed_power)` returns. Reporting the
+            // union of the split halves here would let a caller that reads the
+            // power number (without the verdict) see a quorum the verifier
+            // denied. A SINGLE marker keeps its historical attribution (its
+            // genuine signers, used by shortfall logging/slashing), which can
+            // never manufacture quorum because it is that marker's own power.
+            return (false, 0);
+        }
+        // A verified MULTI-MARKER certificate is attributed by the first
+        // quorum-bearing marker (C1-F3), so re-use the exact attribution path
+        // (`signers_set`) rather than the union. Production certificates carry
+        // one marker; this second pass only runs on the rare multi-marker
+        // shape and keeps `(verify, qc_signed_power)` exact.
+        let attributed: HashSet<ValidatorId> = if verified && multi_marker {
+            self.signers_set_with_schedule(validators, schedule)
+        } else {
+            signers
+        };
+        let power = attributed
             .iter()
             .map(|v| validators.power_of(v))
             .fold(0u64, |a, p| a.saturating_add(p));
         (verified, power)
+    }
+
+    /// Number of µQC/epoch marker entries carried by this certificate
+    /// (decodability is irrelevant: a marker entry is a marker entry for the
+    /// "one marker vs several markers" attribution rule of C1-F3).
+    fn recognized_marker_count(&self) -> usize {
+        self.signatures
+            .iter()
+            .filter(|(voter, _)| *voter == PQ_UQC_MARKER_ID || *voter == PQ_QC_MARKER_ID)
+            .count()
     }
 
     fn verify_and_signers_inner(
@@ -2299,20 +2523,6 @@ impl QuorumCertificate {
         staged
             .par_iter()
             .all(|(_, scheme, pubkey, sig)| one(*scheme, pubkey, msg, sig))
-    }
-
-    fn micro_cert_valid_signers_with_beacon(
-        &self,
-        cert: &PqMicroCertificate,
-        validators: &ValidatorSet,
-        msg: &[u8],
-        pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
-        schedule: CommitteeSchedule,
-    ) -> Option<Vec<ValidatorId>> {
-        self.micro_cert_valid_signers_and_committee_with_beacon(
-            cert, validators, msg, pq_keys, schedule,
-        )
-        .map(|(signers, _)| signers)
     }
 
     fn micro_cert_valid_signers_and_committee_with_beacon(
@@ -2777,6 +2987,18 @@ impl QuorumCertificate {
     /// "signers", and even a fully-rejected QC attributed every named voter,
     /// silently forgiving downtime slash for validators that actually
     /// missed). Anything unverifiable contributes nothing.
+    ///
+    /// C1-F3: attribution is PER MARKER and never exceeds verification.
+    /// `verify` accepts a certificate iff at least ONE marker clears ITS
+    /// quorum; the old union across markers let a split certificate (two
+    /// markers, disjoint halves, same parent) attribute a full quorum while
+    /// `verify` refused it. This function now returns exactly the verified
+    /// signers of the FIRST quorum-bearing marker. A certificate whose markers
+    /// ALL fall short of their own quorum attributes NOBODY (so
+    /// `qc_signed_power` / `qc_meets_quorum` can never promote it), while a
+    /// SINGLE marker below quorum keeps its historical genuine-signer
+    /// attribution (shortfall logging / slashing; it cannot reach quorum on its
+    /// own power).
     pub fn signers_set(&self, validators: &ValidatorSet) -> HashSet<ValidatorId> {
         self.signers_set_with_schedule(validators, CommitteeSchedule::ParentHash)
     }
@@ -2832,7 +3054,6 @@ impl QuorumCertificate {
         if self.resolve_micro_certificate().is_err() {
             return HashSet::new();
         }
-        let mut signers = HashSet::new();
         let msg = vote_sign_bytes_for_shard(
             self.shard_id,
             self.height,
@@ -2840,27 +3061,41 @@ impl QuorumCertificate {
             self.kind,
             &self.block_hash,
         );
+        // C1-F3: with SEVERAL marker entries, attribution is all-or-nothing:
+        // exactly the first marker that clears its own quorum is named, and a
+        // certificate no single marker can carry names nobody. A SINGLE marker
+        // keeps the historical attribution of its genuine signers even below
+        // quorum: it cannot manufacture quorum (its own power is below the
+        // marker's own bar), and shortfall logging / slashing rely on it.
+        let multi_marker = self.recognized_marker_count() > 1;
+        let mut single_marker_signers: HashSet<ValidatorId> = HashSet::new();
         for (voter, payload) in &self.signatures {
             if *voter == PQ_UQC_MARKER_ID {
-                // Verify-grade: exactly what `verify_micro_cert_with_beacon` accepts
-                // (sans the quorum-power gate — a genuinely-signed member is named
-                // even in a sub-quorum certificate, so nobody is slashed for
-                // signing). A schemaless bincode parse of a non-envelope
-                // payload used to land on garbage bitmask bytes and attribute
-                // the wrong validators; a forged envelope now attributes none.
+                // Verify-grade: exactly what `verify_micro_cert_with_beacon`
+                // accepts, INCLUDING that marker's own quorum gate (C1-F3).
+                // A schemaless bincode parse of a non-envelope payload used to
+                // land on garbage bitmask bytes and attribute the wrong
+                // validators; a forged envelope now attributes none.
                 if let Some(cert) = decode_pq_micro_envelope(payload) {
                     if !cert.scheme.is_post_quantum() {
                         continue;
                     }
-                    if let Some(ids) = self.micro_cert_valid_signers_with_beacon(
-                        &cert, validators, &msg, None, schedule,
-                    ) {
-                        signers.extend(ids);
+                    if let Some((ids, committee)) = self
+                        .micro_cert_valid_signers_and_committee_with_beacon(
+                            &cert, validators, &msg, None, schedule,
+                        )
+                    {
+                        if Self::micro_cert_meets_quorum(&ids, &committee, validators) {
+                            return ids.into_iter().collect();
+                        }
+                        if !multi_marker {
+                            single_marker_signers = ids.into_iter().collect();
+                        }
                     }
                 }
             } else if *voter == PQ_QC_MARKER_ID {
-                // Verify-grade: exactly what `verify_epoch_cert` accepts (sans
-                // the quorum gate, same reasoning as above).
+                // Verify-grade: exactly what `verify_epoch_cert` accepts,
+                // INCLUDING that marker's own quorum gate (C1-F3).
                 if let Some(cert) =
                     decode_pq_epoch_envelope(payload).or_else(|| decode_pq_micro_envelope(payload))
                 {
@@ -2869,7 +3104,12 @@ impl QuorumCertificate {
                     }
                     if let Some(ids) = self.epoch_cert_valid_signers(&cert, validators, &msg, None)
                     {
-                        signers.extend(ids);
+                        if Self::epoch_cert_meets_quorum(&ids, validators) {
+                            return ids.into_iter().collect();
+                        }
+                        if !multi_marker {
+                            single_marker_signers = ids.into_iter().collect();
+                        }
                     }
                 }
             } else {
@@ -2879,7 +3119,13 @@ impl QuorumCertificate {
                 continue;
             }
         }
-        signers
+        if multi_marker {
+            // No single marker reached quorum: `verify` refuses this
+            // certificate, so attribution names nobody (C1-F3).
+            HashSet::new()
+        } else {
+            single_marker_signers
+        }
     }
 }
 

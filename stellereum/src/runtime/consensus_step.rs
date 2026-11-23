@@ -596,13 +596,24 @@ impl ValidatorRuntime {
         parent_hash: Option<[u8; 32]>,
         schedule: CommitteeSchedule,
     ) {
+        // O6: index the certificate's Ed25519 half ONCE. The old lookup ran
+        // `signatures.iter().find(...)` for every Falcon signer (O(signers *
+        // entries)); this is the same "first 64-byte entry for this id wins"
+        // result without the quadratic scan. Insertion order is preserved by
+        // `or_insert_with`, so a duplicate Ed entry still resolves exactly as
+        // `find` did.
+        let mut ed_by_signer: std::collections::HashMap<ValidatorId, &[u8]> =
+            std::collections::HashMap::with_capacity(qc.signatures.len());
+        for (id, s) in &qc.signatures {
+            if s.len() == 64 {
+                ed_by_signer.entry(*id).or_insert_with(|| s.as_slice());
+            }
+        }
         let mut votes = VoteSet::new();
         for (voter, fsig) in qc.pq_signer_signatures_with_schedule(&validators, schedule) {
-            let mut sig = qc
-                .signatures
-                .iter()
-                .find(|(id, s)| *id == voter && s.len() == 64)
-                .map(|(_, s)| s.clone())
+            let mut sig = ed_by_signer
+                .get(&voter)
+                .map(|s| s.to_vec())
                 .unwrap_or_else(|| vec![0u8; 64]);
             crate::consensus::attach_vote_falcon_sig(&fsig, &mut sig);
             let vote = Vote::signed_with_in_shard(
@@ -4133,5 +4144,152 @@ mod consensus_step_tests {
         let (_, parked) = nodes[target_idx].take_parked();
         let c = parked.expect("the real H+1 commit must survive junk parking attempts");
         assert_eq!(c.height, 2);
+    }
+
+    /// O6 DIFFERENTIAL: the single-pass Ed-half index seeds the SAME votes as
+    /// the old per-signer `signatures.iter().find(...)` scan, for a randomly
+    /// populated certificate (duplicates, wrong-length entries, junk ids,
+    /// signers with no Ed entry at all).
+    #[test]
+    fn o6_seed_ed_lookup_matches_linear_scan() {
+        use crate::consensus::{
+            attach_vote_falcon_sig, derive_sortition_committee, encode_pq_micro_envelope,
+            micro_committee_size, CommitteeSchedule, PqMicroCertificate, QuorumCertificate,
+            VoteSet, PQ_UQC_MARKER_ID,
+        };
+
+        const H: crate::consensus::Height = 42;
+        const R: crate::consensus::Round = 3;
+        let parent = [0x5Au8; 32];
+        let block_hash = [0x6Bu8; 32];
+
+        // 11 validators, distinct powers; all ids have power > 0.
+        let mut vs = crate::consensus::ValidatorSet::new();
+        for i in 1..=11u8 {
+            let mut id = [0u8; 32];
+            id[0] = i;
+            id[7] = 0xA5;
+            vs.add(id, 100 + i as u64);
+        }
+        let csize = micro_committee_size(vs.len());
+        assert!(csize > 0);
+        let committee = derive_sortition_committee(&vs, H, R, csize, &parent);
+        assert_eq!(committee.len(), csize as usize);
+
+        // Full-committee µQC: one Falcon half per member (bytes are opaque to
+        // the seeding path, which never verifies them).
+        let mut bitmask = vec![0u8; (csize as usize).div_ceil(8)];
+        for i in 0..committee.len() {
+            bitmask[i / 8] |= 1 << (i % 8);
+        }
+        let falcon_halves: Vec<Vec<u8>> = (0..committee.len())
+            .map(|i| vec![(0x90 + i % 16) as u8; 64 + i])
+            .collect();
+        let cert = PqMicroCertificate::new(
+            crate::post_quantum::PqScheme::Falcon512,
+            H,
+            R,
+            csize,
+            bitmask,
+            falcon_halves,
+            parent,
+        );
+
+        // Deterministic LCG so the fixture is "random" but reproducible.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+
+        let mut signatures: Vec<(crate::consensus::ValidatorId, Vec<u8>)> =
+            vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&cert))];
+        // Random filler: 0..=3 entries per committee member, random length in
+        // 0..=80 (so some are 64, some are not, some duplicate the id) plus a
+        // few junk ids that are not validators.
+        for &member in &committee {
+            let n = (next() % 4) as usize;
+            for _ in 0..n {
+                let len = (next() % 81) as usize;
+                let fill = (next() % 251) as u8;
+                signatures.push((member, vec![fill; len]));
+            }
+        }
+        for _ in 0..7 {
+            let mut junk = [0u8; 32];
+            junk[0] = 0xF0;
+            junk[1] = (next() % 16) as u8;
+            let len = (next() % 81) as usize;
+            signatures.push((junk, vec![0xEE; len]));
+        }
+
+        let qc = QuorumCertificate {
+            shard_id: 0,
+            height: H,
+            round: R,
+            kind: crate::consensus::VoteKind::Precommit,
+            block_hash: Some(block_hash),
+            signatures: signatures.clone(),
+        };
+
+        // ---- test-local copy of the OLD algorithm ----
+        fn old_seed(
+            qc: &QuorumCertificate,
+            validators: &crate::consensus::ValidatorSet,
+            schedule: CommitteeSchedule,
+        ) -> Vec<(crate::consensus::ValidatorId, Vec<u8>)> {
+            let mut out = Vec::new();
+            for (voter, fsig) in qc.pq_signer_signatures_with_schedule(validators, schedule) {
+                let mut sig = qc
+                    .signatures
+                    .iter()
+                    .find(|(id, s)| *id == voter && s.len() == 64)
+                    .map(|(_, s)| s.clone())
+                    .unwrap_or_else(|| vec![0u8; 64]);
+                attach_vote_falcon_sig(&fsig, &mut sig);
+                out.push((voter, sig));
+            }
+            out
+        }
+        let mut expected = old_seed(&qc, &vs, CommitteeSchedule::ParentHash);
+        assert!(!expected.is_empty(), "fixture must seed signers");
+        expected.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        // ---- actual ----
+        let key = SigningKey::from_bytes(&[0x42; 32]);
+        let mut rt =
+            ValidatorRuntime::new(key, vs.clone(), Arc::new(InMemoryStateEngine::new()), H);
+        rt.seed_decided_parent_votes_from_qc(
+            H,
+            block_hash,
+            &qc,
+            vs.clone(),
+            Some(parent),
+            CommitteeSchedule::ParentHash,
+        );
+        let dpv = rt.decided_parent_votes.expect("seeded votes recorded");
+        let seeded: &VoteSet = &dpv.votes;
+        assert_eq!(seeded.len(), expected.len(), "same seeded vote count");
+
+        let mut actual: Vec<(crate::consensus::ValidatorId, Vec<u8>)> = expected
+            .iter()
+            .map(|(voter, _)| {
+                let vote = seeded.vote_by(voter).expect("expected voter seeded");
+                (*voter, vote.signature.clone())
+            })
+            .collect();
+        actual.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(actual, expected, "seeded signatures must be byte-identical");
+        // No unexpected voters.
+        for member in vs.validators.keys() {
+            if seeded.vote_by(member).is_some() {
+                assert!(
+                    expected.iter().any(|(v, _)| v == member),
+                    "unexpected seeded voter {member:?}"
+                );
+            }
+        }
     }
 }

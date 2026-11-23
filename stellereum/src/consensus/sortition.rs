@@ -417,6 +417,63 @@ pub fn mixed_quorum_pair_safe(t_micro: u64, t_full: u64, total_power: u64) -> bo
 /// (ungrindable) selection would remove the grinding surface entirely; that
 /// is the structural fix and is out of scope here.
 ///
+/// Fixed-capacity prefix-sum over STABLE positions (O2).
+///
+/// Supports [`Self::first_prefix_gt`]: the first position whose inclusive
+/// prefix sum is strictly greater than a ticket, with removed positions
+/// contributing zero. Sums are exact (`u128`), which keeps the answer
+/// identical to the old linear scan even when the `u64` running total
+/// saturates: a saturated linear accumulator exceeds any legal ticket exactly
+/// when the exact sum does.
+struct StableWeightIndex {
+    tree: Vec<u128>,
+    n: usize,
+}
+
+impl StableWeightIndex {
+    fn new(weights: &[u64]) -> Self {
+        let n = weights.len();
+        let mut tree = vec![0u128; n + 1];
+        for (i, &w) in weights.iter().enumerate() {
+            let mut j = i + 1;
+            while j <= n {
+                tree[j] += w as u128;
+                j += j & j.wrapping_neg();
+            }
+        }
+        Self { tree, n }
+    }
+
+    fn remove(&mut self, index: usize, weight: u64) {
+        let mut j = index + 1;
+        while j <= self.n {
+            self.tree[j] -= weight as u128;
+            j += j & j.wrapping_neg();
+        }
+    }
+
+    /// First 0-based position whose inclusive prefix sum exceeds `ticket`
+    /// (`n` when none does, which cannot happen for `ticket < total`).
+    fn first_prefix_gt(&self, ticket: u128) -> usize {
+        let mut pos = 0usize;
+        let mut acc: u128 = 0;
+        let mut step = 1usize;
+        while step <= self.n {
+            step <<= 1;
+        }
+        step >>= 1;
+        while step > 0 {
+            let next = pos + step;
+            if next <= self.n && acc + self.tree[next] <= ticket {
+                pos = next;
+                acc += self.tree[next];
+            }
+            step >>= 1;
+        }
+        pos
+    }
+}
+
 /// Canonical stake-weighted without-replacement committee draw from a
 /// pre-derived 32-byte seed and domain separator.
 ///
@@ -434,7 +491,7 @@ fn select_committee_from_seed(
     }
 
     // Filter positive-power validators in canonical sorted order (BTreeMap order)
-    let mut pool: Vec<(ValidatorId, u64)> = validators
+    let pool: Vec<(ValidatorId, u64)> = validators
         .validators
         .iter()
         .filter(|(_, &p)| p > 0)
@@ -457,8 +514,16 @@ fn select_committee_from_seed(
     // deterministic under saturation and the certificate gate fails closed.
     let mut total_power: u64 = pool.iter().fold(0u64, |acc, (_, p)| acc.saturating_add(*p));
 
+    // O2: stable positions + a prefix-sum index replace `pool.remove` and the
+    // per-step linear scan. `ids`/`weights` never move, so the ticket's
+    // "first position whose cumulative weight exceeds it" is IDENTICAL to the
+    // old draw; a removed winner only contributes zero from then on.
+    let ids: Vec<ValidatorId> = pool.iter().map(|(id, _)| *id).collect();
+    let mut weights: Vec<u64> = pool.iter().map(|(_, p)| *p).collect();
+    let mut index = StableWeightIndex::new(&weights);
+
     for step in 0..target_k {
-        if total_power == 0 || pool.is_empty() {
+        if total_power == 0 {
             break;
         }
 
@@ -470,17 +535,21 @@ fn select_committee_from_seed(
         let rand_val = u64::from_le_bytes(hash.as_bytes()[0..8].try_into().unwrap());
         let ticket = rand_val % total_power;
 
-        let mut acc = 0u64;
-        let mut chosen_idx = 0;
-        for (idx, (_id, power)) in pool.iter().enumerate() {
-            acc = acc.saturating_add(*power);
-            if ticket < acc {
-                chosen_idx = idx;
-                break;
+        let chosen_idx = {
+            let idx = index.first_prefix_gt(ticket as u128);
+            // `ticket < total_power <= exact sum`, so a crossing always
+            // exists; keep the old `chosen_idx = 0` default otherwise.
+            if idx < ids.len() {
+                idx
+            } else {
+                0
             }
-        }
+        };
 
-        let (winner_id, winner_power) = pool.remove(chosen_idx);
+        let winner_id = ids[chosen_idx];
+        let winner_power = weights[chosen_idx];
+        weights[chosen_idx] = 0;
+        index.remove(chosen_idx, winner_power);
         total_power = total_power.saturating_sub(winner_power);
         selected.push(winner_id);
     }
@@ -965,4 +1034,136 @@ pub fn deterministic_round_timeout_ms(
     // replaces ONLY `base_ms` upstream — this ladder is already multiplicative
     // in the base and needs no further change.
     backoff_capped.saturating_add(adaptive)
+}
+
+#[cfg(test)]
+mod o1x_sortition_tests {
+    use super::*;
+
+    /// Test-local copy of the ORIGINAL `select_committee_from_seed` draw
+    /// (`pool.remove` + linear cumulative scan), used as the differential
+    /// oracle for O2.
+    fn old_select_from_seed(
+        validators: &ValidatorSet,
+        committee_size: u32,
+        domain: &str,
+        seed: &[u8; 32],
+    ) -> Vec<ValidatorId> {
+        if committee_size == 0 || validators.is_empty() || validators.total_power() == 0 {
+            return Vec::new();
+        }
+        let mut pool: Vec<(ValidatorId, u64)> = validators
+            .validators
+            .iter()
+            .filter(|(_, &p)| p > 0)
+            .map(|(&id, &p)| (id, p))
+            .collect();
+        let target_k = (committee_size as usize).min(pool.len());
+        if target_k == 0 {
+            return Vec::new();
+        }
+        if target_k == pool.len() {
+            let mut ids: Vec<ValidatorId> = pool.into_iter().map(|(id, _)| id).collect();
+            ids.sort_unstable();
+            return ids;
+        }
+        let mut selected = Vec::with_capacity(target_k);
+        let mut total_power: u64 = pool.iter().fold(0u64, |acc, (_, p)| acc.saturating_add(*p));
+        for step in 0..target_k {
+            if total_power == 0 || pool.is_empty() {
+                break;
+            }
+            let mut hasher = blake3::Hasher::new_derive_key(domain);
+            hasher.update(seed);
+            hasher.update(&(step as u32).to_le_bytes());
+            let hash = hasher.finalize();
+            let rand_val = u64::from_le_bytes(hash.as_bytes()[0..8].try_into().unwrap());
+            let ticket = rand_val % total_power;
+            let mut acc = 0u64;
+            let mut chosen_idx = 0;
+            for (idx, (_id, power)) in pool.iter().enumerate() {
+                acc = acc.saturating_add(*power);
+                if ticket < acc {
+                    chosen_idx = idx;
+                    break;
+                }
+            }
+            let (winner_id, winner_power) = pool.remove(chosen_idx);
+            total_power = total_power.saturating_sub(winner_power);
+            selected.push(winner_id);
+        }
+        selected.sort_unstable();
+        selected
+    }
+
+    #[test]
+    fn o2_fenwick_draw_matches_linear_removal_for_500_random_sets() {
+        let mut s: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            s ^ (s >> 29)
+        };
+
+        for iter in 0..500u32 {
+            let n = 1 + (next() % 250) as usize;
+            let mut vs = ValidatorSet::new();
+            for i in 0..n {
+                let mut id = [0u8; 32];
+                id[..4].copy_from_slice(&(i as u32).to_le_bytes());
+                id[4..8].copy_from_slice(&iter.to_le_bytes());
+                id[8] = 0x5A;
+                let power = match next() % 8 {
+                    0 => 0, // zero-power peers are filtered, but pin it
+                    1 => 1,
+                    2 => 2,
+                    3 => 1_000_000_000_000,
+                    4 => u64::MAX / (n as u64 + 1),
+                    5 => u64::MAX, // drives the saturating-total path
+                    _ => next() % 1_000_000,
+                };
+                vs.add(id, power);
+            }
+            let committee_size = (next() % (n as u64 + 6)) as u32;
+            let mut seed = [0u8; 32];
+            for chunk in seed.chunks_mut(8) {
+                chunk.copy_from_slice(&next().to_le_bytes());
+            }
+            let old = old_select_from_seed(&vs, committee_size, SORTITION_DRAW_DOMAIN, &seed);
+            let new = select_committee_from_seed(&vs, committee_size, SORTITION_DRAW_DOMAIN, &seed);
+            assert_eq!(
+                old, new,
+                "iteration {iter}: n={n} k={committee_size} powers/seed diverged"
+            );
+        }
+    }
+
+    #[test]
+    fn o2_edge_cases_match() {
+        let empty = ValidatorSet::new();
+        assert_eq!(
+            select_committee_from_seed(&empty, 5, SORTITION_DRAW_DOMAIN, &[7; 32]),
+            old_select_from_seed(&empty, 5, SORTITION_DRAW_DOMAIN, &[7; 32])
+        );
+
+        let mut zero = ValidatorSet::new();
+        zero.add([1u8; 32], 0);
+        zero.add([2u8; 32], 0);
+        for k in [0u32, 1, 2, 9] {
+            assert_eq!(
+                select_committee_from_seed(&zero, k, SORTITION_DRAW_DOMAIN, &[9; 32]),
+                old_select_from_seed(&zero, k, SORTITION_DRAW_DOMAIN, &[9; 32])
+            );
+        }
+
+        let mut one = ValidatorSet::new();
+        one.add([3u8; 32], 42);
+        for k in [0u32, 1, 2] {
+            assert_eq!(
+                select_committee_from_seed(&one, k, SORTITION_DRAW_DOMAIN, &[3; 32]),
+                old_select_from_seed(&one, k, SORTITION_DRAW_DOMAIN, &[3; 32])
+            );
+        }
+    }
 }

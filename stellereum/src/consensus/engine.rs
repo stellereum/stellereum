@@ -641,6 +641,20 @@ pub fn canonicalize_proposal_equivocation_evidence(
 // Vote set (per height+round+kind): aggregation, quorum, equivocation
 // ============================================================================
 
+// TEST-ONLY: number of votes that entered the batch signature screen on THIS
+// thread. C1-F6 pins "a non-member vote is refused WITHOUT a Falcon verify"
+// by asserting this counter does not move. Thread-local so parallel lib tests
+// cannot perturb one another.
+#[cfg(test)]
+thread_local! {
+    static BATCH_SIGNATURE_SCREENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn batch_signature_screens_for_tests() -> u64 {
+    BATCH_SIGNATURE_SCREENS.with(|c| c.get())
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct VoteSet {
     /// voter -> vote (at most one accepted per voter)
@@ -816,29 +830,45 @@ impl VoteSet {
                 .cmp(&vb.voter)
                 .then_with(|| va.block_hash.cmp(&vb.block_hash))
         });
-        // One signature screen over the in-scope votes in admission order.
-        // Out-of-scope votes skip the screen; the scope check in the admit
-        // loop below reports their error exactly as `add` would.
+        // One signature screen over the IN-SCOPE, MEMBER votes in admission
+        // order (C1-F6). Membership used to be checked only in `add_verified`,
+        // i.e. AFTER the Falcon screen, so a non-member's junk vote burned a
+        // full Falcon verification AND parked a negative entry in the global
+        // verdict cache on every delivery. It is a cheap `BTreeMap` lookup, so
+        // it now runs BEFORE crypto. Out-of-scope votes skip the screen too;
+        // the admit loop below reports their error exactly as `add` would
+        // (scope wins over membership, matching `add`'s check order).
         let mut screen_indices: Vec<usize> = Vec::new();
+        let mut out: Vec<Option<Result<(), String>>> = (0..len).map(|_| None).collect();
         for &i in &order {
             let v = slots[i]
                 .as_ref()
                 .expect("slot present while screening the batch");
-            if v.height == height && v.round == round && v.kind == kind {
-                screen_indices.push(i);
+            if v.height != height || v.round != round || v.kind != kind {
+                continue;
             }
+            if validators.power_of(&v.voter) == 0 {
+                out[i] = Some(Err("vote from non-validator".to_string()));
+                continue;
+            }
+            screen_indices.push(i);
         }
+        #[cfg(test)]
+        BATCH_SIGNATURE_SCREENS.with(|c| c.set(c.get() + screen_indices.len() as u64));
         let screen_flags = Vote::partition_valid_slots(&slots, &screen_indices);
         let mut sig_ok = vec![true; len];
         for (pos, &i) in screen_indices.iter().enumerate() {
             sig_ok[i] = screen_flags[pos];
         }
         // Admit in canonical order; results stored per INPUT index.
-        let mut out: Vec<Option<Result<(), String>>> = (0..len).map(|_| None).collect();
         for &i in &order {
             let v = slots[i]
                 .take()
                 .expect("every slot is admitted exactly once");
+            if out[i].is_some() {
+                // Non-member refused before the signature screen (C1-F6).
+                continue;
+            }
             if v.height != height || v.round != round || v.kind != kind {
                 out[i] = Some(Err("vote out of scope".to_string()));
                 continue;
@@ -1100,6 +1130,29 @@ impl VoteSet {
                 // No seal ever travels with the certificate: verifiers resolve
                 // the same legacy committee, so embedding anything would only
                 // risk divergence.
+                //
+                // O5: precompute `derived address -> Falcon half` ONCE for
+                // this certificate. The old tail re-derived a PQ address for
+                // every (committee member x signer) pair — O(k*n) registry
+                // reads — to find the first signer whose derived address is
+                // the member id. `or_insert` keeps the old "first in
+                // `falcon_sigs` iteration order wins" rule, and the two cheap
+                // exact-id lookups above it are kept verbatim so their
+                // priority is untouched.
+                let mut derived_addr_to_sig: HashMap<ValidatorId, Vec<u8>> =
+                    HashMap::with_capacity(falcon_sigs.len());
+                for (voter, sig) in &falcon_sigs {
+                    if let Some((scheme, pk)) = pq_key_at_height(voter, qc.height) {
+                        let addr = crate::post_quantum::derive_pq_address(
+                            scheme,
+                            &pk,
+                            &crate::post_quantum::DEFAULT_SALT,
+                        );
+                        derived_addr_to_sig
+                            .entry(addr)
+                            .or_insert_with(|| sig.clone());
+                    }
+                }
                 let get_sig_for_committee_member = |val_id: &ValidatorId| -> Option<Vec<u8>> {
                     if let Some(sig) = falcon_sigs.get(val_id) {
                         return Some(sig.clone());
@@ -1114,19 +1167,7 @@ impl VoteSet {
                             return Some(sig.clone());
                         }
                     }
-                    for (voter, sig) in &falcon_sigs {
-                        if let Some((scheme, pk)) = pq_key_at_height(voter, qc.height) {
-                            let addr = crate::post_quantum::derive_pq_address(
-                                scheme,
-                                &pk,
-                                &crate::post_quantum::DEFAULT_SALT,
-                            );
-                            if addr == *val_id {
-                                return Some(sig.clone());
-                            }
-                        }
-                    }
-                    None
+                    derived_addr_to_sig.get(val_id).cloned()
                 };
 
                 let bitmask_len = (committee_size as usize).div_ceil(8);
@@ -1215,6 +1256,23 @@ pub enum Action {
 // Per-height consensus state machine
 // ============================================================================
 
+/// Memoised answer of [`HeightConsensus::proposer`] (O14).
+///
+/// Keyed on EVERY input of the proposer draw — `(height, round)`, the
+/// committee schedule (which carries the epoch beacon), and the validator
+/// set's structural fingerprint (a BLAKE3 digest over all `(id, power)`
+/// entries, invalidated by [`ValidatorSet::add`]). A cache hit therefore
+/// proves the draw would return the same value, and any replacement of the
+/// schedule/beacon or the validator set is a MISS, never a stale answer.
+#[derive(Clone, Debug)]
+struct ProposerCache {
+    height: Height,
+    round: Round,
+    schedule: CommitteeSchedule,
+    validators_fingerprint: [u8; 32],
+    proposer: Option<ValidatorId>,
+}
+
 #[derive(Clone, Debug)]
 pub struct HeightConsensus {
     pub height: Height,
@@ -1262,6 +1320,12 @@ pub struct HeightConsensus {
     /// certificates this height produces are then drawn from the SAME epoch
     /// beacon its own verifier attributes them with.
     pub committee_schedule: CommitteeSchedule,
+    /// O14: one-entry memo for [`Self::proposer`]. Interior mutability is
+    /// required (`proposer` takes `&self`); the mutex is uncontended on the
+    /// single-threaded consensus state machine, and the guard is never held
+    /// across a call into outside code. `Arc` keeps `HeightConsensus: Clone`
+    /// (a clone shares the key-validated memo, never a wrong answer).
+    proposer_cache: std::sync::Arc<std::sync::Mutex<Option<ProposerCache>>>,
     /// (proposer, block_hash) proposed this round
     pub proposal: Option<(ValidatorId, BlockHash)>,
     /// The LOCAL round `proposal` was accepted in. A vote must name the
@@ -1567,6 +1631,7 @@ impl HeightConsensus {
             parent_hash: [0u8; 32],
             parent_hash_known: height <= 1,
             committee_schedule: CommitteeSchedule::ParentHash,
+            proposer_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
             proposal: None,
             proposal_round: None,
             proposal_signed_round: None,
@@ -1603,10 +1668,28 @@ impl HeightConsensus {
     /// elects a different committee than the rest of the network.
     pub fn set_parent_hash(&mut self, parent_hash: [u8; 32]) {
         if !self.parent_hash_known || self.parent_hash != parent_hash {
-            self.prevote_qc.clear();
+            // C1-F7: the parent hash is the sortition entropy of this height,
+            // so every certificate/derived fact elected with the OLD parent is
+            // stale. Clearing `prevote_qc` alone left `precommit_qc` and
+            // `observed_polka` (both committee/parent-derived) pointing at a
+            // committee that no longer exists. Reset all of it together.
+            self.clear_schedule_derived_state();
         }
         self.parent_hash = parent_hash;
         self.parent_hash_known = true;
+    }
+
+    /// Drop every cached fact whose truth depended on the sortition parent or
+    /// committee schedule (C1-F7). Locks, votes, the accepted proposal and
+    /// `decided` are NOT derived from either and must survive (clearing a lock
+    /// or a decision would weaken safety).
+    fn clear_schedule_derived_state(&mut self) {
+        self.prevote_qc.clear();
+        self.precommit_qc = None;
+        self.observed_polka = None;
+        debug_assert!(self.prevote_qc.is_empty());
+        debug_assert!(self.precommit_qc.is_none());
+        debug_assert!(self.observed_polka.is_none());
     }
 
     /// True when the sortition parent of this height is known.
@@ -1623,7 +1706,18 @@ impl HeightConsensus {
     /// (`QuorumCertificate::verify_with_schedule`) attributes them with.
     pub fn set_committee_schedule(&mut self, schedule: CommitteeSchedule) {
         if self.committee_schedule != schedule {
-            self.prevote_qc.clear();
+            // C1-F7: same rule as `set_parent_hash` — the schedule decides who
+            // may sign, so a QC or polka cached under the old schedule proves
+            // nothing under the new one.
+            self.clear_schedule_derived_state();
+            // O14: the memoised proposer was drawn under the OLD schedule (and
+            // its beacon). Drop it explicitly; the cache key would also miss,
+            // but a stale entry must be impossible by construction, not by
+            // careful reading.
+            *self
+                .proposer_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
         }
         self.committee_schedule = schedule;
     }
@@ -1645,8 +1739,45 @@ impl HeightConsensus {
         // CN-VRF v3 activation, epoch beacon at/after it. The runtime installs
         // it via `set_committee_schedule`; a bare `HeightConsensus` keeps the
         // byte-identical parent-hash default.
-        self.validators
-            .proposer_for_with_schedule(self.height, self.round, self.committee_schedule)
+        //
+        // O14: the draw is a pure function of (height, round, schedule,
+        // validator set) and is re-read several times per round, so memoise
+        // it. A hit requires the fingerprint of the CURRENT set to match, so a
+        // replaced set (the runtime installs a new one on rotation/adoption)
+        // can never be answered from the old one.
+        let fingerprint = self.validators.fingerprint();
+        {
+            let cache = self
+                .proposer_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = cache.as_ref() {
+                if cached.height == self.height
+                    && cached.round == self.round
+                    && cached.schedule == self.committee_schedule
+                    && cached.validators_fingerprint == fingerprint
+                {
+                    return cached.proposer;
+                }
+            }
+        }
+        let proposer = self.validators.proposer_for_with_schedule(
+            self.height,
+            self.round,
+            self.committee_schedule,
+        );
+        let mut cache = self
+            .proposer_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *cache = Some(ProposerCache {
+            height: self.height,
+            round: self.round,
+            schedule: self.committee_schedule,
+            validators_fingerprint: fingerprint,
+            proposer,
+        });
+        proposer
     }
 
     /// Accept a proposal for the current round from the correct proposer.
@@ -2870,14 +3001,6 @@ impl HeightConsensus {
             .sum::<u128>()
     }
 
-    /// True when `round` is reported by validators holding MORE than one third
-    /// of the network's total power (strictly more, so the BFT floor
-    /// `B_w < W/3` guarantees at least one honest reporter).
-    fn corroborated_round(&self, round: Round) -> bool {
-        let total = self.validators.total_power_exact();
-        total > 0 && self.supporting_peer_power(round).saturating_mul(3) > total
-    }
-
     /// The highest peer round that is CORROBORATED by more than one third of
     /// the network's voting power, if any.
     ///
@@ -2891,10 +3014,39 @@ impl HeightConsensus {
     /// it clears the one-third floor on its own (a 2-member set is 50%
     /// Byzantine by construction).
     pub fn corroborated_peer_round(&self) -> Option<Round> {
-        let mut rounds: Vec<Round> = self.peer_rounds.values().copied().collect();
-        rounds.sort_unstable_by(|a, b| b.cmp(a));
-        rounds.dedup();
-        rounds.into_iter().find(|r| self.corroborated_round(*r))
+        // O11: ONE descending pass over the reporters instead of re-summing
+        // every peer's power for every distinct round (O(N^2)). Sorting the
+        // (round, power) pairs once and accumulating power as the round
+        // descends yields exactly `supporting_peer_power(r)` for each
+        // candidate `r`; the first (highest) round above the one-third floor
+        // wins, which is the old `find` over descending distinct rounds. Ties
+        // are consumed as a group BEFORE the check, so a round is only
+        // reported after every peer at that round has been counted (including
+        // zero-power peers, which contribute nothing to the sum but must not
+        // split the group).
+        let total = self.validators.total_power_exact();
+        if total == 0 || self.peer_rounds.is_empty() {
+            return None;
+        }
+        let mut reports: Vec<(Round, u128)> = self
+            .peer_rounds
+            .iter()
+            .map(|(voter, &round)| (round, self.validators.power_of(voter) as u128))
+            .collect();
+        reports.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let mut accumulated: u128 = 0;
+        let mut i = 0usize;
+        while i < reports.len() {
+            let round = reports[i].0;
+            while i < reports.len() && reports[i].0 == round {
+                accumulated = accumulated.saturating_add(reports[i].1);
+                i += 1;
+            }
+            if accumulated.saturating_mul(3) > total {
+                return Some(round);
+            }
+        }
+        None
     }
 
     /// Highest verified peer round seen at this height, if any. Drives the
@@ -3147,5 +3299,120 @@ impl ConsensusDriver {
 
     pub fn is_final(&self, height: Height, block: BlockHash) -> bool {
         self.finalized.get(&height) == Some(&block)
+    }
+}
+
+#[cfg(test)]
+mod f1x_review_tests {
+    use super::*;
+
+    fn dummy_qc() -> QuorumCertificate {
+        QuorumCertificate {
+            shard_id: MASTERCHAIN_SHARD,
+            height: 1,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: Some([0x11u8; 32]),
+            signatures: Vec::new(),
+        }
+    }
+
+    /// C1-F6: a non-member vote is refused BEFORE the signature screen, so it
+    /// cannot burn a Falcon verification or fill the negative cache.
+    #[test]
+    fn f1x_non_member_batch_vote_skips_the_signature_screen() {
+        let member = ed25519_dalek::SigningKey::from_bytes(&[0x31; 32]);
+        let member_fk = crate::post_quantum::FalconKeypair::generate_from_seed(0x34);
+        let member_id = member.verifying_key().to_bytes();
+        crate::consensus::register_validator_pq_key(
+            member_id,
+            crate::post_quantum::PqScheme::Falcon512,
+            member_fk.public_key.clone(),
+        );
+        let outsider = ed25519_dalek::SigningKey::from_bytes(&[0x32; 32]);
+        let outsider_fk = crate::post_quantum::FalconKeypair::generate_from_seed(0x33);
+        let vs = ValidatorSet::from_list(vec![(member_id, 1)]);
+        let non_member_vote = Vote::sign_with_falcon(
+            &outsider,
+            &outsider_fk,
+            1,
+            0,
+            VoteKind::Prevote,
+            Some([0x44u8; 32]),
+        );
+        let member_vote = Vote::sign_with_falcon(
+            &member,
+            &member_fk,
+            1,
+            0,
+            VoteKind::Prevote,
+            Some([0x44u8; 32]),
+        );
+
+        let before = batch_signature_screens_for_tests();
+        let mut set = VoteSet::new();
+        let results = set.add_batch(
+            vec![non_member_vote, member_vote],
+            &vs,
+            1,
+            0,
+            VoteKind::Prevote,
+        );
+        let after = batch_signature_screens_for_tests();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], Err("vote from non-validator".to_string()));
+        assert_eq!(results[1], Ok(()));
+        assert_eq!(
+            after - before,
+            1,
+            "only the member vote may enter the Falcon signature screen"
+        );
+        assert_eq!(set.len(), 1);
+    }
+
+    /// C1-F7: both re-anchoring setters reset every certificate/polka fact
+    /// derived from the old parent/schedule, not just `prevote_qc`.
+    #[test]
+    fn f1x_parent_and_schedule_setters_reset_all_derived_state() {
+        let mut hc = HeightConsensus::new(5, ValidatorSet::from_list(vec![([0x55u8; 32], 1)]));
+        // Height 5 starts with an UNKNOWN parent (height > 1).
+        assert!(!hc.parent_hash_known());
+
+        hc.prevote_qc.insert(0, dummy_qc());
+        hc.precommit_qc = Some(dummy_qc());
+        hc.observed_polka = Some((0, [0x11u8; 32]));
+
+        hc.set_parent_hash([0x77u8; 32]);
+        assert!(hc.parent_hash_known());
+        assert!(hc.prevote_qc.is_empty(), "stale prevote QC must be dropped");
+        assert!(
+            hc.precommit_qc.is_none(),
+            "stale precommit QC must be dropped"
+        );
+        assert!(
+            hc.observed_polka.is_none(),
+            "polka observed under the old parent must be dropped"
+        );
+
+        hc.prevote_qc.insert(0, dummy_qc());
+        hc.precommit_qc = Some(dummy_qc());
+        hc.observed_polka = Some((0, [0x11u8; 32]));
+
+        hc.set_committee_schedule(CommitteeSchedule::Beacon(None));
+        assert!(hc.prevote_qc.is_empty());
+        assert!(hc.precommit_qc.is_none());
+        assert!(hc.observed_polka.is_none());
+
+        // A no-op set must NOT throw away valid state.
+        let mut same = HeightConsensus::new(5, ValidatorSet::from_list(vec![([0x55u8; 32], 1)]));
+        same.set_parent_hash([0x01u8; 32]);
+        same.prevote_qc.insert(0, dummy_qc());
+        same.set_parent_hash([0x01u8; 32]);
+        assert_eq!(
+            same.prevote_qc.len(),
+            1,
+            "re-setting the same parent must keep derived state"
+        );
     }
 }

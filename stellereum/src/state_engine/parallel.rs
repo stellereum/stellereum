@@ -51,6 +51,40 @@ fn parallel_plan_chunk() -> usize {
         .unwrap_or(PARALLEL_PLAN_CHUNK)
 }
 
+/// Wave planning for one block (O13).
+///
+/// The `DisjointScheduler` partition is a pure function of the transactions,
+/// but it is only CONSUMED when parallel execution is enabled. Planning it
+/// behind the flag keeps the scheduler out of the sequential path entirely;
+/// when the flag is on the plan is identical, so `use_parallel` and every
+/// resulting state write are unchanged.
+fn planned_waves(parallel_enabled: bool, txs: &[crate::sharding::Transaction]) -> Vec<Vec<usize>> {
+    if !parallel_enabled {
+        return Vec::new();
+    }
+    #[cfg(test)]
+    o13_schedule_probe_note_call();
+    crate::parallel_exec::DisjointScheduler::schedule(txs)
+}
+
+// TEST-ONLY probe (O13): counts how many times the wave scheduler was
+// consulted on THIS thread. Thread-local so parallel lib tests cannot
+// perturb one another.
+#[cfg(test)]
+thread_local! {
+    static O13_SCHEDULE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn o13_schedule_probe_note_call() {
+    O13_SCHEDULE_CALLS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(test)]
+fn o13_schedule_probe_calls() -> u64 {
+    O13_SCHEDULE_CALLS.with(|c| c.get())
+}
+
 /// The plan of ONE plain (payload-free) transaction, computed from a
 /// CONSISTENT snapshot of the accounts map.
 ///
@@ -1175,14 +1209,18 @@ impl InMemoryStateEngine {
             }};
         }
 
-        let waves = crate::parallel_exec::DisjointScheduler::schedule(txs);
+        // O13: plan the waves ONLY when parallel execution is enabled. The
+        // scheduler result was previously computed unconditionally and then
+        // discarded by the `&&` short-circuit on the flag, paying a full
+        // access-key partition for every block on a sequential node.
+        let waves = planned_waves(self.is_parallel_exec_enabled(), txs);
         // The wave path is used for EVERY block when parallel execution is
         // on - including a single-wave block, which is the most parallel
         // shape there is (all of its transactions are disjoint, so the wave
         // is planned on the rayon pool and merged conflict-free). A wave is
         // applied in wave order, and the scheduler keeps the relative order
         // of every CONFLICTING pair, so the result is the sequential one.
-        let use_parallel = self.is_parallel_exec_enabled() && !waves.is_empty();
+        let use_parallel = !waves.is_empty();
 
         if use_parallel {
             for wave in waves {
@@ -1863,5 +1901,63 @@ impl InMemoryStateEngine {
         }
 
         (applied, failed, fees_collected, status, fees, events)
+    }
+}
+
+#[cfg(test)]
+mod o13_tests {
+    use super::*;
+
+    fn plain_tx(from: u8, to: u8, nonce: u64) -> crate::sharding::Transaction {
+        crate::sharding::Transaction {
+            from: [from; 32],
+            to: [to; 32],
+            amount: 1,
+            gas_limit: 21_000,
+            nonce,
+            source_shard: 0,
+            target_shard: 0,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        }
+    }
+
+    /// O13: with the flag OFF the scheduler is never consulted (thread-local
+    /// probe), and the wave plan handed to the parallel branch is EXACTLY what
+    /// the unconditional computation produced when the flag is ON.
+    #[test]
+    fn o13_scheduler_only_runs_when_parallel_enabled() {
+        let txs = vec![
+            plain_tx(1, 2, 0),
+            plain_tx(3, 4, 0),
+            plain_tx(1, 4, 1), // conflicts with both earlier txs
+            plain_tx(5, 6, 0),
+        ];
+
+        let before = o13_schedule_probe_calls();
+        let disabled = planned_waves(false, &txs);
+        assert!(disabled.is_empty(), "sequential path has no waves");
+        assert_eq!(
+            o13_schedule_probe_calls(),
+            before,
+            "the scheduler must not be consulted when parallel exec is off"
+        );
+
+        let enabled = planned_waves(true, &txs);
+        assert_eq!(
+            o13_schedule_probe_calls(),
+            before + 1,
+            "the scheduler runs exactly once when parallel exec is on"
+        );
+        let reference = crate::parallel_exec::DisjointScheduler::schedule(&txs);
+        assert_eq!(enabled, reference);
+        // The old branch condition `enabled && !waves.is_empty()` is unchanged.
+        for flag in [false, true] {
+            let old_waves = crate::parallel_exec::DisjointScheduler::schedule(&txs);
+            let old = flag && !old_waves.is_empty();
+            let new = !planned_waves(flag, &txs).is_empty();
+            assert_eq!(new, old, "use_parallel decision changed for flag={flag}");
+        }
     }
 }

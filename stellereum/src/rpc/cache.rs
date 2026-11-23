@@ -307,6 +307,30 @@ pub fn estimate_fee_budget() -> &'static crate::explorer::RateLimiter {
 /// bucket. Normal clients (`Some(ip)`) take the exact same path as before.
 pub const LOCAL_BUCKET_IP: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
 
+/// The key every PER-IP budget uses for `ip`.
+///
+/// IPv4 and IPv4-mapped addresses are exact (after canonicalization). A native
+/// IPv6 client is bucketed by its **/64 network**, because one host is routinely
+/// delegated a whole /64: keying per exact address let a single machine reset
+/// every rate limit, faucet hourly budget and expensive-read budget simply by
+/// rotating the low 64 bits (2^64 free buckets per allocation, and the bearer
+/// of that allocation is one actor). Grouping by /64 is the standard
+/// anti-rotation unit and keeps independent allocations in separate buckets.
+///
+/// This is a BUDGET key only. It must never be used for ownership/identity
+/// decisions (subscription ownership, `ClientIp` provenance, auth): there the
+/// exact address is what identifies the peer.
+pub fn budget_bucket_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match crate::client_ip::canonical_ip(ip) {
+        std::net::IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            octets[8..].fill(0);
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets))
+        }
+        v4 => v4,
+    }
+}
+
 /// Static client identity for unattributed subscription creators (see
 /// [`LOCAL_BUCKET_IP`]): in-process `stell_subscribe` calls share one
 /// per-client budget (`MAX_SUBSCRIPTIONS_PER_CLIENT`) instead of bypassing it.

@@ -1611,6 +1611,17 @@ pub(super) fn parse_token_transfers_filter(filter: &Value) -> Result<Subscriptio
 /// and matches `MAX_PROOF_STORAGE_KEYS`.
 pub const MAX_SUBSCRIPTION_TOPICS: usize = 32;
 
+/// Maximum BYTE length of one event-topic filter string.
+///
+/// [`MAX_SUBSCRIPTION_TOPICS`] bounds the LIST; without a per-entry byte cap a
+/// single 1 MiB request can still lodge a ~1 MiB topic string, and
+/// `MAX_SUBSCRIPTIONS_PER_CLIENT` (64) subscriptions turn that into ~64 MiB of
+/// retained heap for ONE client — the exact amplification the topic-COUNT cap
+/// exists to prevent (an IPv6 client can repeat it per /64). Event topics on
+/// this chain are `i64`s (decimal or hex), so 128 bytes is already far above
+/// any legitimate filter; anything longer can never match a real event.
+pub const MAX_SUBSCRIPTION_TOPIC_BYTES: usize = 128;
+
 pub(super) fn parse_events_filter(filter: &Value) -> Result<SubscriptionTopic, String> {
     let mut contract = None;
     let mut topics: Vec<String> = Vec::new();
@@ -1643,6 +1654,12 @@ pub(super) fn parse_events_filter(filter: &Value) -> Result<SubscriptionTopic, S
                             )
                         }
                     };
+                    if t.len() > MAX_SUBSCRIPTION_TOPIC_BYTES {
+                        return Err(format!(
+                            "event topic too long: {} bytes (max {MAX_SUBSCRIPTION_TOPIC_BYTES})",
+                            t.len()
+                        ));
+                    }
                     if !t.is_empty() {
                         topics.push(t);
                     }
@@ -1651,6 +1668,12 @@ pub(super) fn parse_events_filter(filter: &Value) -> Result<SubscriptionTopic, S
             Value::String(s) => {
                 for t in s.split(',') {
                     let t = t.trim();
+                    if t.len() > MAX_SUBSCRIPTION_TOPIC_BYTES {
+                        return Err(format!(
+                            "event topic too long: {} bytes (max {MAX_SUBSCRIPTION_TOPIC_BYTES})",
+                            t.len()
+                        ));
+                    }
                     if !t.is_empty() {
                         topics.push(t.to_string());
                     }
@@ -2004,6 +2027,21 @@ pub fn is_ws_expensive_method(method: &str) -> bool {
             | "stell_getBalanceSpv"
             | "stell_tokenBalanceSpv"
             | "stell_runGetMethod"
+            // Event history: the legacy (non-cursor) form walks receipts
+            // looking for matching events. That scan is now hard-capped (see
+            // the `stell_getEvents` legacy branch in `rpc/reads.rs`), and the
+            // method still gets the dedicated expensive-read budget because a
+            // broad query is the heaviest unauthenticated read after the
+            // estimate/proof family.
+            | "stell_getEvents"
+            // EVM twin of `stell_getProof`: one trie walk + proof build +
+            // self-verification per call, previously outside every dedicated
+            // proof budget (it was not even in `rpc_rate_buckets`).
+            | "eth_getProof"
+            // `eth_getLogs` converts every receipt in the 50 000-entry index
+            // on a broad query; it was transport-only like the other cheap EVM
+            // reads.
+            | "eth_getLogs"
             // W4/E3 history & bounded program-account scans: a cursor walk over
             // the secondary indexes (or a bounded scan of up to
             // `MAX_PROGRAM_ACCOUNTS_SCAN` accounts) is a heavy read.
@@ -2163,7 +2201,7 @@ pub(super) fn ws_idle_timeout() -> std::time::Duration {
 //
 // Method -> buckets (mirrored by `rpc_rate_buckets` below; the coverage test
 // `rate_bucket_table_covers_every_public_method` asserts every row):
-//   transport only (EVM, 36): eth_chainId, net_version, web3_clientVersion,
+//   transport only (EVM, 35): eth_chainId, net_version, web3_clientVersion,
 //     net_listening, net_peerCount, eth_syncing, eth_gasPrice,
 //     eth_maxPriorityFeePerGas, eth_estimateGas, eth_feeHistory, eth_getCode,
 //     eth_getBalance, eth_getTransactionCount, eth_blockNumber,
@@ -2175,9 +2213,9 @@ pub(super) fn ws_idle_timeout() -> std::time::Duration {
 //     eth_getUncleCountByBlockNumber, eth_getUncleByBlockHashAndIndex,
 //     eth_getUncleByBlockNumberAndIndex, eth_call, eth_newBlockFilter,
 //     eth_newPendingTransactionFilter, eth_newFilter, eth_getFilterChanges,
-//     eth_getFilterLogs, eth_uninstallFilter, eth_getLogs, eth_getStorageAt,
+//     eth_getFilterLogs, eth_uninstallFilter, eth_getStorageAt,
 //     eth_sendRawTransaction.
-//   transport only (stell, 53): stell_chainId, stell_nodeId, stell_blockNumber,
+//   transport only (stell, 52): stell_chainId, stell_nodeId, stell_blockNumber,
 //     stell_syncing, stell_getStateRoot, stell_latestBlocks, stell_getShards,
 //     stell_getShardTopology, stell_getBlock, stell_getBlockTransactions,
 //     stell_epochKey, stell_sendSealedTransaction, stell_mevStats,
@@ -2186,7 +2224,7 @@ pub(super) fn ws_idle_timeout() -> std::time::Duration {
 //     stell_bridgeDispute, stell_tokenBalance, stell_tokenSupply,
 //     stell_tokenResolve, stell_listTokens, stell_getTransactionReceipt,
 //     stell_getTransactionByHash,
-//     stell_getEvents, stell_getTransactionStatus, stell_stakeOf,
+//     stell_getTransactionStatus, stell_stakeOf,
 //     stell_getValidatorStatus, stell_zkmlCapabilities, stell_getValidators,
 //     stell_getPqKey, stell_getPqRegistryStatus, stell_proposal,
 //     stell_listProposals, stell_governanceParams, stell_mempoolSize,
@@ -2197,10 +2235,11 @@ pub(super) fn ws_idle_timeout() -> std::time::Duration {
 //     stell_getContractReceipt, stell_getInvalidations, stell_invalidationFeed,
 //     stell_unsubscribe, stell_getSubscriptions.
 //   transport + expensive + expensive-ws (1): stell_estimateFee.
-//   transport + expensive-ws (8): stell_getProof, stell_getArchiveProof,
+//   transport + expensive-ws (11): stell_getProof, stell_getArchiveProof,
 //     stell_getBalanceSpv, stell_tokenBalanceSpv, stell_runGetMethod,
 //     stell_getAddressHistory, stell_getProgramAccounts,
-//     stell_getTokenAccountsByOwner.
+//     stell_getTokenAccountsByOwner, stell_getEvents, eth_getProof,
+//     eth_getLogs.
 //   transport + expensive-ws + subscription (1): stell_subscribe.
 //   transport + faucet (1): stell_faucet.
 //   transport + auth (11): stell_mempoolDump, stell_submitProposal, stell_vote,
@@ -2243,7 +2282,10 @@ pub fn rpc_rate_buckets(method: &str) -> &'static [&'static str] {
         | "stell_runGetMethod"
         | "stell_getAddressHistory"
         | "stell_getProgramAccounts"
-        | "stell_getTokenAccountsByOwner" => &["transport", "expensive-ws"],
+        | "stell_getTokenAccountsByOwner"
+        | "stell_getEvents"
+        | "eth_getProof"
+        | "eth_getLogs" => &["transport", "expensive-ws"],
         "stell_faucet" => &["transport", "faucet"],
         "stell_mempoolDump"
         | "stell_submitProposal"
@@ -2291,7 +2333,6 @@ pub fn rpc_rate_buckets(method: &str) -> &'static [&'static str] {
         | "eth_getFilterChanges"
         | "eth_getFilterLogs"
         | "eth_uninstallFilter"
-        | "eth_getLogs"
         | "eth_getStorageAt"
         | "eth_sendRawTransaction"
         | "stell_chainId"
@@ -2320,7 +2361,6 @@ pub fn rpc_rate_buckets(method: &str) -> &'static [&'static str] {
         | "stell_listTokens"
         | "stell_getTransactionReceipt"
         | "stell_getTransactionByHash"
-        | "stell_getEvents"
         | "stell_getTransactionStatus"
         | "stell_stakeOf"
         | "stell_getValidatorStatus"

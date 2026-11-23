@@ -1731,10 +1731,30 @@ pub(super) async fn dispatch_eth(
             }
         }
 
-        "eth_getProof" => match crate::evm_adapter::eth_get_proof_rpc(st, params).await {
-            Ok(v) => ok(id, v),
-            Err(e) => rpc_error(id, e),
-        },
+        "eth_getProof" => {
+            // Same foreign-shard rule as `stell_getProof`: an EVM-shape proof
+            // is still generated from THIS process's one trie, so a
+            // foreign-shard account would get a verifiable exclusion proof for
+            // state this node does not hold. Refuse before paying for it.
+            let addr_raw = match params {
+                Value::Array(arr) => arr.first().and_then(|v| v.as_str()),
+                Value::Object(obj) => obj.get("address").and_then(|v| v.as_str()),
+                _ => None,
+            };
+            let denied = match addr_raw
+                .and_then(|raw| crate::evm_adapter::parse_evm_or_stell_address(raw).ok())
+            {
+                Some(addr) => super::reads::foreign_shard_refusal(st, &id, addr, None).await,
+                None => None,
+            };
+            if let Some(denied) = denied {
+                return Some(denied);
+            }
+            match crate::evm_adapter::eth_get_proof_rpc(st, params).await {
+                Ok(v) => ok(id, v),
+                Err(e) => rpc_error(id, e),
+            }
+        }
         // REFUSED honestly: the WebSocket plumbing frames only
         // `stell_subscribe` notifications and has no EIP-1193
         // `eth_subscription` envelope / EVM header payload. Issuing an id

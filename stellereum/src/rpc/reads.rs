@@ -862,10 +862,17 @@ pub(super) async fn handle_get_proof(
         Some(a) => a,
         None => return err(id, -32602, "missing address"),
     };
-    let address = match crate::address::parse_address(addr_raw) {
+    let (shard_hint, addr_body) = crate::sharding::split_shard_prefix(addr_raw);
+    let address = match parse_addr_or_hash(addr_body) {
         Ok(a) => a,
         Err(e) => return err(id, -32602, format!("bad address: {e}")),
     };
+    // A proof from THIS shard's trie cannot authenticate another shard's
+    // state: an exclusion proof would tell a light client (verifiably!) that a
+    // foreign-shard account does not exist. Refuse, never fabricate.
+    if let Some(denied) = foreign_shard_refusal(st, &id, address, shard_hint).await {
+        return denied;
+    }
 
     // Optional height. This node keeps no historical state, so the only
     // height it can answer for is the one it is currently serving — saying
@@ -1097,10 +1104,16 @@ pub(super) async fn handle_get_archive_proof(
         Some(a) => a,
         None => return err(id, -32602, "missing address"),
     };
-    let address = match crate::address::parse_address(addr_raw) {
+    let (shard_hint, addr_body) = crate::sharding::split_shard_prefix(addr_raw);
+    let address = match parse_addr_or_hash(addr_body) {
         Ok(a) => a,
         Err(e) => return err(id, -32602, format!("bad address: {e}")),
     };
+    // Historical proofs come from THIS shard's snapshots; a foreign-shard
+    // address is not provable here (see `foreign_shard_refusal`).
+    if let Some(denied) = foreign_shard_refusal(st, &id, address, shard_hint).await {
+        return denied;
+    }
     let key: [u8; 32] = match p.get("key") {
         None | Some(Value::Null) => address,
         Some(Value::String(s)) => match parse_hash(s) {
@@ -1346,6 +1359,42 @@ pub async fn collect_shard_heads(st: &RpcState) -> Vec<ShardHead> {
 // operation (see the `stellereum wallet sign` CLI); the VERIFY arms accept all
 // three live schemes.
 // ============================================================================
+
+/// Refuse a state read whose address routes to a shard this node does NOT run.
+///
+/// A process holds exactly one shard's engine/trie. Answering a
+/// foreign-shard address from it is not "an empty account": for a balance it
+/// is a fabricated `0`, and for `stell_getProof` it is a verifiable
+/// EXCLUSION proof that the account does not exist — a false claim about
+/// another shard's state that a light client would accept. The honest answer
+/// is a refusal naming both shards (the same rule the faucet and the archive
+/// proofs apply).
+///
+/// Single-shard nodes (`ShardRegistry::is_sharded() == false`) are unchanged:
+/// they serve every address from their one state, as before.
+pub(crate) async fn foreign_shard_refusal(
+    st: &RpcState,
+    id: &Value,
+    address: [u8; 32],
+    hint: Option<u32>,
+) -> Option<Json<RpcResponse>> {
+    if !st.shard_registry.is_sharded() {
+        return None;
+    }
+    let target = resolve_shard_for_address(st, address, hint).await;
+    let local = st.engine.shard_id();
+    if target == local {
+        return None;
+    }
+    Some(err(
+        id.clone(),
+        -32004,
+        format!(
+            "address belongs to shard {target}, but this node serves shard {local}: \
+             the local state does not hold it (query the RPC endpoint of shard {target})"
+        ),
+    ))
+}
 
 pub(super) async fn dispatch_reads(
     st: &RpcState,
@@ -1720,10 +1769,17 @@ pub(super) async fn dispatch_reads(
                 Some(a) => a,
                 None => return err(id, -32602, "missing address"),
             };
-            let a = match parse_addr_or_hash(addr) {
+            // Accept the shard-aware forms (`-1:` / `N:`) like every other
+            // address-taking read, and REFUSE a foreign-shard address rather
+            // than serving the local trie's zero as that shard's balance.
+            let (hint, addr_body) = crate::sharding::split_shard_prefix(addr);
+            let a = match parse_addr_or_hash(addr_body) {
                 Ok(a) => a,
                 Err(e) => return err(id, -32602, e),
             };
+            if let Some(denied) = foreign_shard_refusal(st, &id, a, hint).await {
+                return denied;
+            }
             let acc = st.engine.get_account(&a).await;
             let (bal, nonce) = acc.map(|x| (x.balance, x.nonce)).unwrap_or((0, 0));
             ok(id, json!({ "balance": bal.to_string(), "nonce": nonce }))
@@ -1734,10 +1790,16 @@ pub(super) async fn dispatch_reads(
                 Some(a) => a,
                 None => return err(id, -32602, "missing address"),
             };
-            let a = match parse_addr_or_hash(addr) {
+            let (hint, addr_body) = crate::sharding::split_shard_prefix(addr);
+            let a = match parse_addr_or_hash(addr_body) {
                 Ok(a) => a,
                 Err(e) => return err(id, -32602, e),
             };
+            // A proof built from another shard's trie is a false claim; the
+            // client must ask the shard that owns the account.
+            if let Some(denied) = foreign_shard_refusal(st, &id, a, hint).await {
+                return denied;
+            }
             let acc = st.engine.get_account(&a).await;
             let (balance, nonce) = acc.as_ref().map(|x| (x.balance, x.nonce)).unwrap_or((0, 0));
             let root = st.engine.get_state_root().await;
@@ -2593,16 +2655,36 @@ pub(super) async fn dispatch_reads(
                     idx.for_contract_events(&contract_addr, from_block, to_block, false);
 
                 let mut matched_events: Vec<Value> = Vec::new();
+                // SCAN BUDGET (audit SEC-S2): the paginated branch has always
+                // been capped at `STORAGE_SCAN_HARD_CAP` inspected events; the
+                // legacy ARRAY branch was not, so a filter that matches nothing
+                // (`topic` that no receipt emits) walked every event of every
+                // receipt for the contract — up to `MAX_RECEIPTS` (50 000)
+                // receipts x `MAX_CONTRACT_EVENTS` (256) events on an
+                // unauthenticated read. Refuse an over-budget scan explicitly
+                // instead of silently returning a partial/wrong answer.
+                let mut inspected = 0usize;
                 'scan: for r in matched_receipts {
                     for e in &r.events {
+                        if matched_events.len() >= limit {
+                            break 'scan;
+                        }
+                        if inspected >= STORAGE_SCAN_HARD_CAP {
+                            return err(
+                                id,
+                                -32000,
+                                format!(
+                                    "event scan budget exceeded ({STORAGE_SCAN_HARD_CAP} events inspected); \
+                                     narrow from_block/to_block or use cursor pagination"
+                                ),
+                            );
+                        }
+                        inspected += 1;
                         if e.contract != contract_addr {
                             continue;
                         }
                         if topic_filter.map(|t| t != e.topic).unwrap_or(false) {
                             continue;
-                        }
-                        if matched_events.len() >= limit {
-                            break 'scan;
                         }
                         matched_events.push(json!({
                             "contract": hex::encode(e.contract),
@@ -3569,7 +3651,7 @@ pub(super) async fn dispatch_reads(
         // configured), like the signed-payload arms. (The send paths stay OPEN
         // — see the module docs.)
         "stell_mempoolDump" => {
-            let Some(expected) = &st.auth_token else {
+            let Some(expected) = configured_secret(st.auth_token.as_deref()) else {
                 return err(
                     id,
                     -32001,

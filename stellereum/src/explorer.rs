@@ -9,7 +9,7 @@
 //! is a static string that calls the JSON API with `fetch`. That keeps the
 //! attack surface small and the build reproducible.
 
-use crate::rpc::{constant_time_eq, extract_header_token, RpcState};
+use crate::rpc::{configured_secret, constant_time_eq, extract_header_token, RpcState};
 use axum::{
     extract::{ConnectInfo, Path as AxumPath, Query, Request, State},
     http::{HeaderMap, StatusCode},
@@ -85,7 +85,9 @@ impl RateLimiter {
     /// Deterministic core (audit follow-up: the old test flaked on second
     /// boundaries under load — time is injected here so tests pin behavior).
     pub fn check_at(&self, ip: IpAddr, now: u64) -> bool {
-        let ip = crate::client_ip::canonical_ip(ip);
+        // IPv6 is bucketed by /64 (see `rpc::budget_bucket_ip`), so rotating
+        // the low 64 bits cannot mint a fresh per-second budget.
+        let ip = crate::rpc::budget_bucket_ip(ip);
         let idx = rate_limiter_shard_index(ip);
         let mut m = self.shards[idx].lock().unwrap_or_else(|e| e.into_inner());
         // Bound memory: with many distinct source IPs the map could grow without
@@ -1193,6 +1195,36 @@ pub fn parse_addr(s: &str) -> Option<[u8; 32]> {
     hex::decode(s).ok()?.try_into().ok()
 }
 
+/// Explorer-facing counterpart of `rpc::reads::foreign_shard_refusal`.
+///
+/// The gateway serves this process's ONE engine/trie. A balance, SPV proof or
+/// account view for an address that routes to another shard must be refused,
+/// not answered with a locally-verifiable zero/exclusion answer. Single-shard
+/// nodes (the default) are unchanged.
+async fn foreign_shard_response(st: &GatewayState, address: [u8; 32]) -> Option<Response> {
+    if !st.rpc.shard_registry.is_sharded() {
+        return None;
+    }
+    let target = {
+        let topology = st.rpc.engine.shard_topology().await;
+        crate::sharding::route_shard(
+            &topology,
+            &crate::sharding::ShardAddress::Workchain(address),
+        )
+    };
+    let local = st.rpc.engine.shard_id();
+    if target == local {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::NOT_FOUND,
+            format!("address belongs to shard {target}, but this node serves shard {local}"),
+        )
+            .into_response(),
+    )
+}
+
 /// GET hint for the POST-only faucet (see the route above).
 async fn faucet_get_hint() -> Response {
     (
@@ -1257,7 +1289,7 @@ async fn api_faucet(
     // degrade into "anyone who can reach this gateway may mint". This mirrors
     // the `stell_faucet` JSON-RPC gate exactly and accepts the token either as
     // `?token=`/`?apiKey=` or via the conventional auth headers.
-    let Some(expected) = st.rpc.faucet_token.as_deref() else {
+    let Some(expected) = configured_secret(st.rpc.faucet_token.as_deref()) else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "faucet is enabled but STELL_FAUCET_TOKEN is not set; refusing to dispense",
@@ -1639,6 +1671,9 @@ async fn api_balance(
     let Some(a) = parse_addr(&addr) else {
         return (StatusCode::BAD_REQUEST, "bad address").into_response();
     };
+    if let Some(denied) = foreign_shard_response(&st, a).await {
+        return denied;
+    }
     let acc = st.rpc.engine.get_account(&a).await;
     let (balance, nonce) = acc.map(|x| (x.balance, x.nonce)).unwrap_or((0, 0));
     Json(json!({ "address": hex::encode(a), "balance": balance.to_string(), "nonce": nonce }))
@@ -1652,6 +1687,9 @@ async fn api_spv(
     let Some(a) = parse_addr(&addr) else {
         return (StatusCode::BAD_REQUEST, "bad address").into_response();
     };
+    if let Some(denied) = foreign_shard_response(&st, a).await {
+        return denied;
+    }
     let acc = st.rpc.engine.get_account(&a).await;
     let (balance, nonce) = acc.map(|x| (x.balance, x.nonce)).unwrap_or((0, 0));
     let root = st.rpc.engine.get_state_root().await;
@@ -1893,6 +1931,9 @@ async fn api_account(
     let Some(a) = parse_addr(&addr) else {
         return (StatusCode::BAD_REQUEST, "bad address").into_response();
     };
+    if let Some(denied) = foreign_shard_response(&st, a).await {
+        return denied;
+    }
     let hex_addr = hex::encode(a);
     let (balance, nonce) = st
         .rpc
@@ -2050,7 +2091,7 @@ async fn api_tx(
             // Pending bodies are non-public, same as `stell_mempoolDump`:
             // unauthenticated callers get hash/nonce/status only, never the
             // full pre-finalization payload (front-running aid).
-            let authed = match &st.rpc.auth_token {
+            let authed = match configured_secret(st.rpc.auth_token.as_deref()) {
                 None => false,
                 Some(expected) => {
                     if query.contains_key("token") || query.contains_key("apiKey") {
@@ -2503,7 +2544,7 @@ async fn api_tx_detail(
     // Body present: finalized receipts are public; pending bodies keep the
     // `/api/tx/:hash` redaction (same token check, same fail-closed default
     // when no auth token is configured).
-    let authed = match &st.rpc.auth_token {
+    let authed = match configured_secret(st.rpc.auth_token.as_deref()) {
         None => receipt.is_some(),
         Some(expected) => {
             if receipt.is_some() {

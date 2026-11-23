@@ -92,6 +92,8 @@ pub struct RpcState {
     /// `stell_vote`, `stell_executeProposal`) and the contract previews
     /// (`stell_deployContract`, `stell_callContract`), which require a valid
     /// token on EVERY bind (N-02/N-03; see `require_gov_write_auth`).
+    /// An EMPTY value is treated exactly like `None` (`configured_secret`):
+    /// it is a misconfiguration, never a matchable empty password.
     pub auth_token: Option<String>,
 
     /// Optional channel to forward validated raw transactions into P2P gossip
@@ -102,7 +104,8 @@ pub struct RpcState {
     /// Token that must be presented to use the faucet. Unlike `auth_token`
     /// this one is **fail-closed**: an enabled faucet with no token refuses to
     /// dispense, because "no token configured" must never mean "anyone who can
-    /// reach the port may mint".
+    /// reach the port may mint". An EMPTY value is treated as not configured
+    /// (`configured_secret`), for the same reason.
     pub faucet_token: Option<String>,
     /// Ed25519 seed the `stell_signMessage` / `stell_signTypedData` arms sign
     /// with: a SEPARATE ephemeral dev-only key (see

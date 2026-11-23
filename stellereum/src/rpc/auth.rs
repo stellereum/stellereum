@@ -19,6 +19,25 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// The EFFECTIVE value of an optional configured secret.
+///
+/// An empty or whitespace-only `STELL_RPC_AUTH_TOKEN` / `STELL_FAUCET_TOKEN`
+/// is a misconfiguration (the common `TOKEN=$UNSET_VAR` compose expansion),
+/// not a credential. Treating it as configured would make the empty string a
+/// matchable password: every gate's `constant_time_eq("", "")` succeeds, so a
+/// fail-closed gate (governance writes, wallet signing, faucet, mempool dump)
+/// would open to any caller that sends `"token": ""`. Every consumer must
+/// therefore go through this helper:
+///
+/// * `require_gov_write_auth` / `require_wallet_sign_auth` / faucet /
+///   `mempoolDump` treat `None` as "not configured" and REFUSE (fail closed);
+/// * the locally-open arms (`admit_signed_payload_tx` when no token is
+///   configured) treat it exactly like an unset variable — no stronger than
+///   the documented local/dev default, never a secret of "".
+pub fn configured_secret(value: Option<&str>) -> Option<&str> {
+    value.filter(|s| !s.trim().is_empty())
+}
+
 // GATE: H-02 — SIGN arms are fail-closed without a configured `auth_token`
 // (unlike the mempool/payload arms which stay open in local/dev mode). A
 // dev signing key must never be anonymously reachable.
@@ -28,7 +47,7 @@ pub(super) fn require_wallet_sign_auth(
     params: &Value,
     header_token: Option<&str>,
 ) -> Option<Json<RpcResponse>> {
-    let Some(expected) = &st.auth_token else {
+    let Some(expected) = configured_secret(st.auth_token.as_deref()) else {
         return Some(err(
             id.clone(),
             -32001,
@@ -41,7 +60,7 @@ pub(super) fn require_wallet_sign_auth(
         .or_else(|| params["apiKey"].as_str())
         .or(header_token);
     if !provided
-        .map(|p| constant_time_eq(p, expected.as_str()))
+        .map(|p| constant_time_eq(p, expected))
         .unwrap_or(false)
     {
         return Some(err(
@@ -184,7 +203,7 @@ pub(super) fn require_gov_write_auth(
     params: &Value,
     header_token: Option<&str>,
 ) -> Option<Json<RpcResponse>> {
-    let Some(expected) = &st.auth_token else {
+    let Some(expected) = configured_secret(st.auth_token.as_deref()) else {
         return Some(err(
             id.clone(),
             -32001,
@@ -196,7 +215,7 @@ pub(super) fn require_gov_write_auth(
         .or_else(|| params["apiKey"].as_str())
         .or(header_token);
     if !provided
-        .map(|p| constant_time_eq(p, expected.as_str()))
+        .map(|p| constant_time_eq(p, expected))
         .unwrap_or(false)
     {
         return Some(err(

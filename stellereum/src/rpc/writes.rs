@@ -54,13 +54,13 @@ pub(super) async fn admit_signed_payload_tx(
     // `eth_sendRawTransaction`) are OPEN submission by design (self-
     // authenticating signed txs); only these introspection/payload arms plus
     // `stell_mempoolDump` take the token.
-    if let Some(expected) = &st.auth_token {
+    if let Some(expected) = configured_secret(st.auth_token.as_deref()) {
         let provided = params["token"]
             .as_str()
             .or_else(|| params["apiKey"].as_str())
             .or(header_token);
         if !provided
-            .map(|p| constant_time_eq(p, expected.as_str()))
+            .map(|p| constant_time_eq(p, expected))
             .unwrap_or(false)
         {
             return err(id, -32001, "unauthorized: missing or invalid API token");
@@ -284,7 +284,7 @@ async fn dispatch_writes_inner(
             // The faucet token is separate from the general write token so that
             // a public testnet can offer read-only queries freely while still
             // rationing who may draw from the treasury.
-            let Some(expected) = st.faucet_token.as_deref() else {
+            let Some(expected) = configured_secret(st.faucet_token.as_deref()) else {
                 return err(
                     id,
                     -32001,

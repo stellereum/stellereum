@@ -9400,7 +9400,6 @@ fn rate_bucket_table_covers_every_public_method() {
         "eth_getFilterChanges",
         "eth_getFilterLogs",
         "eth_uninstallFilter",
-        "eth_getLogs",
         "eth_getStorageAt",
         "eth_sendRawTransaction",
         // stell reads/writes under the transport limiter only.
@@ -9429,7 +9428,6 @@ fn rate_bucket_table_covers_every_public_method() {
         "stell_tokenResolve",
         "stell_listTokens",
         "stell_getTransactionReceipt",
-        "stell_getEvents",
         "stell_getTransactionStatus",
         "stell_stakeOf",
         "stell_getValidatorStatus",
@@ -9465,6 +9463,13 @@ fn rate_bucket_table_covers_every_public_method() {
         "stell_getBalanceSpv",
         "stell_tokenBalanceSpv",
         "stell_runGetMethod",
+        "stell_getEvents",
+        // The EVM twin of `stell_getProof` (trie walk + proof build); it had
+        // NO bucket row at all before the SEC-S2 fix.
+        "eth_getProof",
+        // Broad log queries convert the whole receipt index; moved off the
+        // transport-only row for the same reason as `stell_getEvents`.
+        "eth_getLogs",
     ];
     const SUBSCRIPTION_CAPPED: &[&str] = &["stell_subscribe"];
     const FAUCET_CAPPED: &[&str] = &["stell_faucet"];
@@ -9543,12 +9548,13 @@ fn rate_bucket_table_covers_every_public_method() {
     for m in &all {
         assert!(seen.insert(*m), "method `{m}` listed in two audit rows");
     }
-    // The table covers 141 public methods (143 minus the 3 removed
-    // shielded methods, plus `stell_submitPqPriceFeed`); a dispatch arm
-    // added without updating the table keeps this count stale on purpose
+    // The table covers 142 public methods (143 minus the 3 removed
+    // shielded methods, plus `stell_submitPqPriceFeed` and the EVM proof
+    // method `eth_getProof` that had no bucket row before SEC-S2); a dispatch
+    // arm added without updating the table keeps this count stale on purpose
     // — bump it.
     // GATE (Ristretto excision): shieldedTransfer/shieldedBalance/unshield gone.
-    assert_eq!(all.len(), 141, "audit list size drifted: recount dispatch");
+    assert_eq!(all.len(), 142, "audit list size drifted: recount dispatch");
     for m in &all {
         let buckets = rpc_rate_buckets(m);
         assert!(
@@ -9578,6 +9584,14 @@ fn rate_bucket_table_covers_every_public_method() {
     assert!(rpc_rate_buckets("stell_estimateFee").contains(&"expensive"));
     assert!(rpc_rate_buckets("stell_getProof").contains(&"expensive-ws"));
     assert!(!rpc_rate_buckets("stell_getProof").contains(&"expensive"));
+    assert!(
+        rpc_rate_buckets("eth_getProof").contains(&"expensive-ws"),
+        "the EVM proof read must share the dedicated proof budget"
+    );
+    assert!(
+        rpc_rate_buckets("eth_getLogs").contains(&"expensive-ws"),
+        "the broad EVM log read must draw from the expensive budget"
+    );
     assert!(rpc_rate_buckets("stell_subscribe").contains(&"subscription"));
     assert!(rpc_rate_buckets("stell_faucet").contains(&"faucet"));
     assert!(rpc_rate_buckets("stell_mempoolDump").contains(&"auth"));

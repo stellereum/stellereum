@@ -1175,6 +1175,7 @@ impl Faucet {
     ) -> Result<FaucetGrant, FaucetDripError> {
         let ip_key = req
             .ip
+            .map(crate::rpc::budget_bucket_ip)
             .map(|a| a.to_string())
             .unwrap_or_else(|| "unknown".to_string());
         let charged_hour = req.now_secs / 3600;
@@ -1532,6 +1533,7 @@ impl Faucet {
     /// grant and rolls the bucket back.
     pub async fn check_ip_throttle(&self, ip: Option<std::net::IpAddr>, now_secs: u64) -> bool {
         let key = ip
+            .map(crate::rpc::budget_bucket_ip)
             .map(|a| a.to_string())
             .unwrap_or_else(|| "unknown".to_string());
         let mut st = self.state.lock().await;

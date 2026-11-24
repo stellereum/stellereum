@@ -52,6 +52,8 @@ pub struct Faucet {
     /// write/flush failures: a drip whose durable write fails is rolled back
     /// and refused, never granted in RAM only.
     persist: Option<std::sync::Arc<dyn Fn(&[u8]) -> Result<(), String> + Send + Sync>>,
+    /// Source-IP hashing key; installed once at restore, process-lifetime.
+    ip_salt: std::sync::OnceLock<[u8; 32]>,
     // NOTE: there is deliberately NO process-local rate-limit map here. The
     // per-source hourly budgets live in FaucetState (persisted): the token +
     // per-address lifetime cap do not stop a token holder from draining the
@@ -350,6 +352,15 @@ pub const FAUCET_STATE_META_KEY: &str = "faucet_state_v1";
 /// presence without a state blob means the state was LOST (never "fresh"):
 /// the startup machine quarantines instead of re-opening every lifetime cap.
 pub const FAUCET_INITIALIZED_META_KEY: &str = "faucet_initialized_v1";
+/// Durable per-node salt for the source-IP rate-limit key.
+///
+/// WHY: `ip_buckets` used to be keyed by the literal client address, so the
+/// node's memory and its persisted state carried a log of who requested funds.
+/// Buckets only need EQUALITY within an hour, so the key is now
+/// `BLAKE3_KEYED(salt, bucket_string)` truncated — the same limit, no address.
+/// The salt is created once and persisted here, so a restart does not reopen
+/// the hourly budget (a per-process salt would have reset the limits).
+pub const FAUCET_IP_SALT_META_KEY: &str = "faucet_ip_salt_v1";
 
 /// Compact rollback point for one drip mutation. Restored under the same lock
 /// when the durable write/flush fails, so RAM and disk never disagree in the
@@ -786,6 +797,7 @@ impl Faucet {
             chain_id: None,
             state: tokio::sync::Mutex::new(FaucetState::default()),
             persist: None,
+            ip_salt: std::sync::OnceLock::new(),
         }
     }
 
@@ -964,6 +976,57 @@ impl Faucet {
         }
     }
 
+    /// Load the durable IP salt, creating it on first use.
+    fn ensure_ip_salt(&self, store: &dyn FaucetMetaStore) -> Result<(), String> {
+        if self.ip_salt.get().is_some() {
+            return Ok(());
+        }
+        match store
+            .get_meta(FAUCET_IP_SALT_META_KEY)
+            .map_err(|e| format!("failed to read {FAUCET_IP_SALT_META_KEY}: {e}"))?
+        {
+            Some(bytes) => {
+                let salt: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                    format!(
+                        "{FAUCET_IP_SALT_META_KEY} has invalid length {} (expected 32)",
+                        bytes.len()
+                    )
+                })?;
+                let _ = self.ip_salt.set(salt);
+                Ok(())
+            }
+            None => {
+                let mut salt = [0u8; 32];
+                rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut salt);
+                store
+                    .set_meta_durable(FAUCET_IP_SALT_META_KEY, &salt)
+                    .map_err(|e| format!("failed to persist {FAUCET_IP_SALT_META_KEY}: {e}"))?;
+                let _ = self.ip_salt.set(salt);
+                Ok(())
+            }
+        }
+    }
+
+    /// Rate-limit key for a source address: a salted, truncated digest of the
+    /// already-normalized bucket (IPv4 host, IPv6 /64). Equality is all the
+    /// limiter needs, and the stored key cannot be walked back to an address.
+    fn ip_key_for(&self, ip: std::net::IpAddr) -> String {
+        let bucket = crate::rpc::budget_bucket_ip(ip).to_string();
+        match self.ip_salt.get() {
+            Some(salt) => {
+                let h = blake3::keyed_hash(salt, bucket.as_bytes());
+                hex::encode(&h.as_bytes()[..16])
+            }
+            None => {
+                // No salt means restore has not run, and the faucet refuses to
+                // serve before it does. Keep the invariant anyway rather than
+                // ever writing a raw address into the state.
+                let h = blake3::hash(bucket.as_bytes());
+                hex::encode(&h.as_bytes()[..16])
+            }
+        }
+    }
+
     async fn try_restore(
         &self,
         store: &dyn FaucetMetaStore,
@@ -983,6 +1046,7 @@ impl Faucet {
                             format!("failed to persist {FAUCET_INITIALIZED_META_KEY}: {e}")
                         })?;
                 }
+                self.ensure_ip_salt(store)?;
                 self.clamp_nonce_down(onchain_nonce).await
             }
             Ok(None) => {
@@ -1010,6 +1074,7 @@ impl Faucet {
                 store
                     .set_meta_durable(FAUCET_STATE_META_KEY, &bytes)
                     .map_err(|e| format!("failed to persist {FAUCET_STATE_META_KEY}: {e}"))?;
+                self.ensure_ip_salt(store)?;
                 Ok(())
             }
         }
@@ -1175,8 +1240,7 @@ impl Faucet {
     ) -> Result<FaucetGrant, FaucetDripError> {
         let ip_key = req
             .ip
-            .map(crate::rpc::budget_bucket_ip)
-            .map(|a| a.to_string())
+            .map(|ip| self.ip_key_for(ip))
             .unwrap_or_else(|| "unknown".to_string());
         let charged_hour = req.now_secs / 3600;
         let (nonce, amount) = {
@@ -1683,6 +1747,57 @@ pub(super) fn parse_addr_from_val(val: Option<&Value>) -> Result<[u8; 32], Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct MemStore(std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>);
+    impl FaucetMetaStore for MemStore {
+        fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+            Ok(self.0.lock().unwrap().get(key).cloned())
+        }
+        fn set_meta_durable(&self, key: &str, value: &[u8]) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_vec());
+            Ok(())
+        }
+    }
+
+    /// Privacy (Wave 3): the rate-limit key must be a salted digest, never the
+    /// address, must be stable for the same address+salt, and must differ for a
+    /// different salt (so a leaked store cannot be reversed by brute force).
+    #[test]
+    fn source_ip_is_stored_only_as_a_salted_digest() {
+        let store = MemStore(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let faucet = Faucet::new([7u8; 32], 0, 2, 1_000);
+        faucet.ensure_ip_salt(&store).unwrap();
+        let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let key = faucet.ip_key_for(ip);
+        assert_eq!(key.len(), 32, "16-byte digest in hex");
+        assert!(
+            !key.contains("203"),
+            "key must not carry the address: {key}"
+        );
+        assert!(!key.contains('.') && !key.contains(':'));
+        assert_eq!(
+            key,
+            faucet.ip_key_for(ip),
+            "same address, same salt, same key"
+        );
+        let other: std::net::IpAddr = "203.0.113.8".parse().unwrap();
+        assert_ne!(key, faucet.ip_key_for(other));
+
+        // The salt is durable: a second faucet over the same store hashes the
+        // same address to the same key (hourly limits survive a restart).
+        let faucet2 = Faucet::new([7u8; 32], 0, 2, 1_000);
+        faucet2.ensure_ip_salt(&store).unwrap();
+        assert_eq!(key, faucet2.ip_key_for(ip));
+
+        // A different salt gives a different key.
+        let store3 = MemStore(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let faucet3 = Faucet::new([9u8; 32], 0, 2, 1_000);
+        faucet3.ensure_ip_salt(&store3).unwrap();
+        assert_ne!(key, faucet3.ip_key_for(ip));
+    }
 
     #[test]
     fn faucet_ip_buckets_and_public_drip_stay_bounded_within_window() {

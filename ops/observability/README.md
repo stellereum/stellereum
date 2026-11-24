@@ -28,7 +28,7 @@ options are read from `scripts/cluster-nodes.conf`; nothing is duplicated here.
 
 ```
 ops/observability/
-  docker-compose.yml        prometheus, alertmanager, grafana, node-exporter
+  docker-compose.yml        prometheus, alertmanager, grafana, node-exporter (9101)
   prometheus.yml            scrape jobs (stell-nodes, node, prometheus, alertmanager)
   alerts.yml                canonical Prometheus rules for the cluster
   alertmanager.yml          null receiver by default + commented Telegram shape
@@ -73,6 +73,51 @@ explicitly. That is what makes `localhost:9080-9082` (the tunnels) and
 `localhost:8080` (B) reachable from inside the containers. Do not "fix" it by
 adding `ports:` or by switching Prometheus to a bridge network — the targets
 would then point at the container's own loopback.
+
+### Why the exporter listens on 9101, not 9100
+
+`127.0.0.1:9100` is already taken on this host by a **different** compose
+project, `grafana-monitoring-stack`
+(`/home/imm/grafana-monitoring-stack/docker-compose.yml`). Its
+`node-exporter` container binds `0.0.0.0:9100` and carries no textfile
+collector. A second exporter on 9100 cannot coexist — the container
+crash-loops with `bind: address already in use`.
+
+It is not a distro package either: `systemctl cat node_exporter` finds no
+unit, and `/proc/<pid>/cgroup` for the listening process names the Docker
+scope of that other project. The "preferred" fix (drop our container and add
+a systemd drop-in with `--collector.textfile.directory=…`) is therefore not
+available without editing a project outside this repository; the stack keeps
+its own exporter on `127.0.0.1:9101` instead.
+
+What this means operationally:
+
+- `prometheus.yml` job `node` scrapes **only** `127.0.0.1:9101`. The 9100
+  exporter is deliberately not scraped: ingesting the same host metric
+  families from two exporters would double-count them in every alert and
+  dashboard panel.
+- `./textfile/` is mounted read-only into the 9101 container at
+  `/var/lib/node_exporter/textfile_collector`; that is how
+  `scripts/cluster_liveness_watch.sh` publishes
+  `stell_cluster_liveness.prom` (see `ops/alerts.md`).
+- `scripts/observe-local.sh` only manages SSH tunnels; it never starts or
+  stops containers, so removing/renaming a compose service needs no change
+  there.
+
+Verify the binding and the textfile collector after `docker compose up -d`:
+
+```bash
+ss -ltnp | grep -E '9100|9101'          # 9100 = other project, 9101 = ours
+curl -s 127.0.0.1:9101/metrics | grep -c '^node_'   # host families present
+curl -s 127.0.0.1:9101/metrics | grep stell_cluster_liveness_ok || true
+```
+
+If the other project is ever retired, move this service back to `9100`, point
+the `node` job at `9100`, and delete the duplicate-metrics note in
+`docker-compose.yml` in the same change. The drop-in equivalent for a future
+distro `node_exporter` would be
+`--collector.textfile.directory=/home/imm/stellereum-project/ops/observability/textfile`
+with the same port (`9100`).
 
 ### Why no root password in the file
 

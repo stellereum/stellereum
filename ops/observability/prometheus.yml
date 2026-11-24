@@ -66,10 +66,19 @@ scrape_configs:
       #   labels: {node: E, role: observer, transport: ssh-tunnel}
 
   # Host that runs this stack: disks, inodes, CPU, load, network.
+  #
+  # 9101 = the stack's OWN node-exporter (docker-compose.yml `node-exporter`),
+  # the one with the textfile collector that publishes
+  # `stell_cluster_liveness.prom`. Port 9100 on this host belongs to the
+  # separate `grafana-monitoring-stack` compose project; it is intentionally
+  # NOT scraped here so the same host metric families are never ingested
+  # twice (that would double-count every node_* series in alerts/dashboards).
+  # Historical note: this job used to point at 9100 and the stack's exporter
+  # could not bind it (`bind: address already in use`) - see README.
   - job_name: node
     static_configs:
       - targets:
-          - 127.0.0.1:9100
+          - 127.0.0.1:9101
         labels:
           node: build-host
           role: monitor-host

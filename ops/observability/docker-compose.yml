@@ -103,6 +103,27 @@ services:
   # Host metrics (disk, inodes, CPU, load, network). container filesystem is
   # still a container: the host root is mounted read-only at /host and
   # --path.rootfs makes the filesystem collector report HOST mountpoints.
+  #
+  # PORT 9101, NOT 9100 (2026-11-25). 9100 on this host is already bound by
+  # ANOTHER compose project: `grafana-monitoring-stack`
+  # (/home/imm/grafana-monitoring-stack/docker-compose.yml) runs its own
+  # `node-exporter` on 0.0.0.0:9100. A second exporter on 9100 crash-loops with
+  # `bind: address already in use`, which is what this service did until now.
+  #
+  # WHY NOT REUSE THE 9100 EXPORTER: it is not a distro/systemd service
+  # (`systemctl cat node_exporter` -> no unit; the process lives in a Docker
+  # cgroup of that other project), it has no --collector.textfile.directory,
+  # and reconfiguring it means editing a project outside this repository.
+  # This container therefore stays, on its own loopback port, and is the ONLY
+  # exporter Prometheus scrapes (job `node`): it carries the textfile
+  # collector that publishes `stell_cluster_liveness.prom`.
+  #
+  # DUPLICATE-METRICS NOTE: both exporters do expose the same host metric
+  # families. That is deliberate and bounded: Prometheus scrapes ONLY 9101
+  # (see prometheus.yml), so the 9100 series are never ingested and cannot
+  # double-count in alerts/dashboards. Do not add a second `node` job for
+  # 9100; if the other project is ever retired, move this service back to
+  # 9100 and update prometheus.yml in the same change.
   node-exporter:
     image: prom/node-exporter:v1.8.2
     cpus: 0.2
@@ -116,7 +137,7 @@ services:
       - --path.procfs=/host/proc
       - --path.sysfs=/host/sys
       - --collector.textfile.directory=/var/lib/node_exporter/textfile_collector
-      - --web.listen-address=127.0.0.1:9100
+      - --web.listen-address=127.0.0.1:9101
       - --no-collector.wifi
       - --no-collector.hwmon
     volumes:

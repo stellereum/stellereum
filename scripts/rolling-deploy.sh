@@ -198,11 +198,11 @@ nrun_long() {
         if [ -n "$opts" ]; then
             read -r -a ssh_opts <<<"$opts"
         fi
-        timeout 200 ssh -o BatchMode=yes -o ConnectTimeout=10 \
+        timeout 330 ssh -o BatchMode=yes -o ConnectTimeout=10 \
             -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
             "${ssh_opts[@]+"${ssh_opts[@]}"}" "$host" "$cmd"
     else
-        timeout 200 bash -c "$cmd"
+        timeout 330 bash -c "$cmd"
     fi
 }
 

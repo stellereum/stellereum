@@ -65,6 +65,11 @@ impl crate::safety::VoteSigner for RuntimeVoteSigner<'_> {
             let req = self.pq_req.as_ref()?;
             match ps.sign_consensus_checked(req, msg) {
                 Ok(sig) => {
+                    // One real Falcon signature for consensus. Counted HERE (not
+                    // in post_quantum.rs) because the load-test harness embeds
+                    // post_quantum.rs verbatim into its own crate, where
+                    // `crate::metrics` does not exist; anchors.rs is node-only.
+                    stellereum::metrics::global().inc_falcon_sign();
                     *self.cached_pq_sig.borrow_mut() = Some((ps.validator_id(), sig.to_vec()));
                 }
                 Err(e) => {
@@ -111,7 +116,10 @@ impl crate::safety::VoteSigner for RuntimeVoteSigner<'_> {
             }
             let req = self.pq_req.as_ref()?;
             return match ps.sign_consensus_checked(req, msg) {
-                Ok(sig) => Some((ps.validator_id(), sig.to_vec())),
+                Ok(sig) => {
+                    stellereum::metrics::global().inc_falcon_sign();
+                    Some((ps.validator_id(), sig.to_vec()))
+                }
                 Err(e) => {
                     tracing::error!(
                         error = %e,

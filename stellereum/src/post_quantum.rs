@@ -1961,7 +1961,6 @@ impl FalconKeypair {
     /// parallelepiped of the private basis and leaked the private key
     /// (Nguyen-Regev parallelepiped attack).
     pub fn sign(&self, message: &[u8]) -> Vec<u8> {
-        crate::metrics::global().inc_falcon_sign();
         let mut seed = Zeroizing::new([0u8; 32]);
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut *seed);
         let sig = self.sign_with_seed(message, &seed);

@@ -3642,7 +3642,42 @@ pub fn router(gateway: Arc<GatewayState>) -> Router {
 }
 
 /// Serve the gateway with per-IP connect info for the rate limiter.
+/// Process-wide readiness handle.
+///
+/// WHY A GLOBAL: the consensus driver is spawned BEFORE the explorer gateway
+/// exists (bootstrap order), and threading an `Arc` through `run_consensus_node`
+/// would touch every call site and test for no behavioural gain. The exporter is
+/// process-wide already (`metrics::global`), so the readiness handle follows the
+/// same shape. Unset until `serve()` installs it; the setters then become no-ops,
+/// which is exactly the behaviour a process without an explorer wants.
+static READINESS: std::sync::OnceLock<Arc<ReadinessState>> = std::sync::OnceLock::new();
+
+/// Install the handle the consensus loop reports into (called by `serve`).
+pub fn register_readiness(readiness: Arc<ReadinessState>) {
+    let _ = READINESS.set(readiness);
+}
+
+/// Record a finalized block for `/readyz` and the `stell_ready` gauge.
+///
+/// No-op when no gateway is serving this process. P0-READINESS-DEAD: before
+/// this existed, nothing produced the readiness state at all, so `/readyz`
+/// reported 0 forever and any consumer (a load balancer) would drop a healthy
+/// node.
+pub fn note_readiness_finalized(height: u64) {
+    if let Some(r) = READINESS.get() {
+        r.note_finalized(height);
+    }
+}
+
+/// Report the current connected-peer count for `/readyz`.
+pub fn set_readiness_peers(peers: usize) {
+    if let Some(r) = READINESS.get() {
+        r.set_peers(peers);
+    }
+}
+
 pub async fn serve(addr: &str, gateway: Arc<GatewayState>) -> anyhow::Result<()> {
+    register_readiness(gateway.readiness.clone());
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(
         listener,

@@ -830,6 +830,10 @@ impl SafetyAuthority {
         matches!(self.mode(), AuthorityMode::Active)
     }
 
+    pub fn is_quarantined(&self) -> bool {
+        matches!(self.mode(), AuthorityMode::Quarantined(_))
+    }
+
     pub fn is_durable(&self) -> bool {
         self.inner
             .lock()
@@ -1422,4 +1426,188 @@ pub fn operator_safety_init(
     payload.highest_precommit_round = precommit_round_floor;
     let bytes = payload.encode_canonical()?;
     store.persist(None, bytes)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BootReconcileOutcome {
+    /// No `safety_record_v1` lag behind `storage.finalized()` was detected.
+    NoGap,
+    /// `safety_record_v1.finalized_height` exceeded `storage.finalized()`, all
+    /// intervening durable blocks existed locally and passed hash-chain and
+    /// precommit-QC verification (and historical state replay where engine state
+    /// lagged), and `storage.finalized()` was durably advanced to match.
+    Reconciled {
+        from_height: Height,
+        to_height: Height,
+        finalized_hash: BlockHash,
+        replayed_to_height: Height,
+    },
+}
+
+/// Fail-closed, proof-carrying boot reconciliation for the hard-`SIGKILL` gap
+/// where `safety_record_v1.finalized_height` advanced ahead of `storage.finalized()`
+/// (and/or the persisted state snapshot).
+///
+/// Invariants:
+/// * NEVER lowers `safety_record_v1.finalized_height`, `height`, or vote/proposal floors.
+/// * ONLY reads from durable local `storage` (never fetches unverified peer blocks).
+/// * Verifies the entire chain `restored_fh + 1 ..= payload.finalized_height`:
+///   - contiguous `height` and `shard_id == identity.shard`,
+///   - hash chain linking from `restored_fhash` to `payload.finalized_hash`,
+///   - embedded `precommit_qc` metadata, parent binding, and quorum signature
+///     verification under the active validator set + committee schedule,
+///   - historical state replay via `rt.replay_historical_block` for heights above
+///     `current_state_height` (which also enforces `block.state_root` continuity).
+/// * If ANY block is missing, hash-mismatched, or fails QC/state verification,
+///   returns `Err` WITHOUT advancing `storage.finalized()`, so `SafetyAuthority::open_from_storage`
+///   quarantines fail-closed.
+pub async fn reconcile_boot_sigkill_gap(
+    storage: &Arc<Storage>,
+    identity: SafetyRecordIdentity,
+    rt: &mut crate::runtime::ValidatorRuntime,
+    current_state_height: Height,
+) -> Result<BootReconcileOutcome> {
+    let store = storage.safety_record_store(identity.clone())?;
+    let Some(record) = store.load()? else {
+        return Ok(BootReconcileOutcome::NoGap);
+    };
+    let payload = SafetyRecordPayload::decode_canonical(&record.payload)?;
+    let (restored_fh, restored_fhash) = storage.finalized()?.unwrap_or((0, [0u8; 32]));
+    if payload.finalized_height <= restored_fh {
+        return Ok(BootReconcileOutcome::NoGap);
+    }
+    if current_state_height < restored_fh {
+        return Err(anyhow!(
+            "cannot reconcile safety_record_v1 gap ({restored_fh} -> {}): \
+             engine state height {current_state_height} is behind stored finalized height {restored_fh}",
+            payload.finalized_height
+        ));
+    }
+
+    const MAX_BOOT_RECONCILE_GAP: u64 = 1_000_000;
+    let gap = payload.finalized_height - restored_fh;
+    if gap > MAX_BOOT_RECONCILE_GAP {
+        return Err(anyhow!(
+            "safety_record_v1 finalized_height gap ({gap}) exceeds max boot reconcile cap"
+        ));
+    }
+
+    let mut chain: Vec<Block> = Vec::with_capacity(gap as usize);
+    let mut expected_hash = payload.finalized_hash;
+    let mut expected_height = payload.finalized_height;
+    while expected_height > restored_fh {
+        let blk = storage.get_block(&expected_hash)?.ok_or_else(|| {
+            anyhow!(
+                "missing durable block at height {expected_height} ({}) for safety_record_v1 reconciliation",
+                hex::encode(expected_hash)
+            )
+        })?;
+        if blk.height != expected_height {
+            return Err(anyhow!(
+                "durable block height mismatch: expected {expected_height}, got {}",
+                blk.height
+            ));
+        }
+        if blk.shard_id != identity.shard {
+            return Err(anyhow!(
+                "durable block shard mismatch at height {expected_height}: expected {}, got {}",
+                identity.shard,
+                blk.shard_id
+            ));
+        }
+        let computed = blk.compute_hash();
+        if computed != expected_hash {
+            return Err(anyhow!(
+                "durable block hash mismatch at height {expected_height}: expected {}, got {}",
+                hex::encode(expected_hash),
+                hex::encode(computed)
+            ));
+        }
+        let qc = blk.precommit_qc.as_ref().ok_or_else(|| {
+            anyhow!("durable block at height {expected_height} lacks embedded precommit QC")
+        })?;
+        if qc.kind != VoteKind::Precommit
+            || qc.height != expected_height
+            || qc.shard_id != identity.shard
+            || qc.block_hash != Some(expected_hash)
+            || !qc.binds_to_parent(&blk.prev_hash)
+        {
+            return Err(anyhow!(
+                "durable block at height {expected_height} carries invalid precommit QC metadata/binding"
+            ));
+        }
+        expected_hash = blk.prev_hash;
+        chain.push(blk);
+        expected_height -= 1;
+    }
+    if expected_hash != restored_fhash {
+        return Err(anyhow!(
+            "durable chain prev_hash at height {} ({}) does not link to restored finalized hash ({})",
+            restored_fh + 1,
+            hex::encode(expected_hash),
+            hex::encode(restored_fhash)
+        ));
+    }
+    chain.reverse();
+
+    let mut replayed_to_height = current_state_height;
+    for blk in &chain {
+        let bh = blk.compute_hash();
+        if blk.height > replayed_to_height {
+            rt.replay_historical_block(blk).await.map_err(|e| {
+                anyhow!("boot reconcile replay failed at height {}: {e}", blk.height)
+            })?;
+            replayed_to_height = blk.height;
+        } else {
+            let qc = blk.precommit_qc.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "durable block at height {} lacks embedded precommit QC",
+                    blk.height
+                )
+            })?;
+            let verify_set = rt.validator_set_for_height(blk.height);
+            let schedule = rt.committee_schedule_at(blk.height);
+            if !qc.verify_with_schedule(&verify_set, schedule) {
+                return Err(anyhow!(
+                    "durable block at height {} failed precommit QC verification",
+                    blk.height
+                ));
+            }
+            rt.blocks.insert(bh, blk.clone());
+        }
+    }
+
+    if let Some(tip_blk) = chain.last() {
+        if storage.header_at(payload.finalized_height)?.is_none() {
+            storage.put_block(tip_blk)?;
+        }
+    }
+    storage.set_finalized(payload.finalized_height, &payload.finalized_hash)?;
+    storage.flush()?;
+
+    for blk in &chain {
+        let h = blk.height;
+        let bh = blk.compute_hash();
+        if h > rt.finalized.last().map(|(fh, _)| *fh).unwrap_or(0) {
+            rt.finalized.push((h, bh));
+        }
+        rt.blocks.insert(bh, blk.clone());
+    }
+    if payload.finalized_height + 1 >= rt.hc.height {
+        rt.hc = crate::consensus::HeightConsensus::new(
+            payload.finalized_height + 1,
+            rt.validators.clone(),
+        );
+        rt.install_due_validator_set();
+        rt.hc.validators = rt.validators.clone();
+    }
+    rt.hc.set_parent_hash(payload.finalized_hash);
+    rt.install_committee_schedule();
+
+    Ok(BootReconcileOutcome::Reconciled {
+        from_height: restored_fh,
+        to_height: payload.finalized_height,
+        finalized_hash: payload.finalized_hash,
+        replayed_to_height,
+    })
 }

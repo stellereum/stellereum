@@ -222,42 +222,25 @@ fn should_publish_header_now(validator_count: usize, is_proposer: bool, height: 
 /// hash of the finalized block at `S`; `None` means the local store cannot
 /// prove it, and the caller must fail closed rather than propose above an
 /// unfinalized parent.
-fn recover_finalized_tip_from_durable_blocks(
-    store: &stellereum::storage::Storage,
-    fh: u64,
-    fhash: [u8; 32],
-    target_height: u64,
-) -> Option<(u64, [u8; 32])> {
-    if target_height <= fh {
-        return None;
-    }
-    let mut cur_h = fh;
-    let mut cur_hash = fhash;
-    for h in (fh + 1)..=target_height {
-        let Ok(Some(hdr)) = store.header_at(h) else {
-            break;
-        };
-        if hdr.height != h || hdr.prev_hash != cur_hash {
-            break;
+async fn write_ahead_finalized_block(
+    ap: &stellereum::storage::AsyncPersistence,
+    height: u64,
+    bh: [u8; 32],
+    block: stellereum::sharding::Block,
+    flush_now: bool,
+) -> Result<(), String> {
+    let store = ap.storage();
+    tokio::task::spawn_blocking(move || {
+        store.put_block(&block)?;
+        store.set_finalized(height, &bh)?;
+        if flush_now {
+            store.flush()?;
         }
-        let Ok(Some(blk)) = store.get_block(&hdr.block_hash) else {
-            break;
-        };
-        if blk.height != h
-            || blk.prev_hash != cur_hash
-            || blk.precommit_qc.is_none()
-            || blk.compute_hash() != hdr.block_hash
-        {
-            break;
-        }
-        cur_h = h;
-        cur_hash = hdr.block_hash;
-    }
-    if cur_h > fh {
-        Some((cur_h, cur_hash))
-    } else {
-        None
-    }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|e| format!("persist task panicked: {e}"))?
+    .map_err(|e| format!("{e}"))
 }
 
 fn reconciled_finalized_tip(
@@ -858,6 +841,15 @@ pub(crate) async fn run_consensus_node(
                         rt.mark_validator_set_stale(s_newest, l_newest, reason);
                     }
                 }
+                if let Ok(Some(hist)) = ap.storage().load_validator_set_history() {
+                    if !hist.is_empty() {
+                        info!(
+                            "[storage] restored {} validator_set_history entries",
+                            hist.len()
+                        );
+                        rt.restore_validator_set_history(hist);
+                    }
+                }
                 if !rt.is_validator_set_stale()
                     && rt
                         .refresh_validator_set_from_staking_checked(h, ledger_h_for_check)
@@ -1057,67 +1049,13 @@ pub(crate) async fn run_consensus_node(
             if !has_snapshot {
                 ap.snapshot_state(&rt.state, restored_state_height).await;
                 let ledger = rt.staking_read().await.clone();
-                let gov = rt.governance.clone().unwrap_or_default();
+                let gov = match &rt.governance {
+                    Some(g) => g.clone(),
+                    None => rt.state.governance_read().await.clone(),
+                };
                 ap.snapshot_domains(&rt.state, &ledger, &gov, restored_state_height)
                     .await;
                 info!("[storage] wrote a snapshot of engine state at height {restored_state_height} (tip {fh})");
-            }
-        }
-
-        if let Some(ap) = &persistence {
-            if let Some((fh, fhash)) = ap.storage().finalized().ok().flatten() {
-                if let Ok(Some(genesis_bytes)) = ap.storage().get_meta("genesis_state_root") {
-                    if genesis_bytes.len() == 32 {
-                        let mut genesis_root = [0u8; 32];
-                        genesis_root.copy_from_slice(&genesis_bytes);
-                        let identity = stellereum::storage::SafetyRecordIdentity {
-                            validator: self_vote_id,
-                            chain: stellereum::safety::derive_safety_chain_id(
-                                stellereum::consensus::consensus_chain_id(),
-                                &genesis_root,
-                            ),
-                            shard: block_shard,
-                        };
-                        if let Ok(Some(rec)) = ap
-                            .storage()
-                            .safety_record_store(identity)
-                            .and_then(|s| s.load())
-                        {
-                            if let Ok(payload) =
-                                stellereum::safety::SafetyRecordPayload::decode_canonical(
-                                    &rec.payload,
-                                )
-                            {
-                                if payload.finalized_height > fh {
-                                    if let Some((rec_h, rec_hash)) =
-                                        recover_finalized_tip_from_durable_blocks(
-                                            &ap.storage(),
-                                            fh,
-                                            fhash,
-                                            payload.finalized_height,
-                                        )
-                                    {
-                                        if ap.storage().set_finalized(rec_h, &rec_hash).is_ok() {
-                                            let _ = ap.storage().flush();
-                                            rt.finalized.push((rec_h, rec_hash));
-                                            if rec_h + 1 > rt.hc.height {
-                                                rt.hc = stellereum::consensus::HeightConsensus::new(
-                                                    rec_h + 1,
-                                                    rt.validators.clone(),
-                                                );
-                                                rt.hc.set_parent_hash(rec_hash);
-                                            }
-                                            info!(
-                                                "[storage] recovered lagging finalized pointer {fh} -> {rec_h} from durable local QC-certified blocks (safety_record_v1 at {})",
-                                                payload.finalized_height
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
             }
         }
 
@@ -1165,7 +1103,10 @@ pub(crate) async fn run_consensus_node(
                                 }
                                 ap.snapshot_state(&rt.state, reached).await;
                                 let ledger = rt.staking_read().await.clone();
-                                let gov = rt.governance.clone().unwrap_or_default();
+                                let gov = match &rt.governance {
+                                    Some(g) => g.clone(),
+                                    None => rt.state.governance_read().await.clone(),
+                                };
                                 ap.snapshot_domains(&rt.state, &ledger, &gov, reached).await;
                                 info!("[storage] persisted healed engine snapshot at height {reached}");
                                 restored_state_height = reached;
@@ -1202,6 +1143,79 @@ pub(crate) async fn run_consensus_node(
                         }
                     }
                     let _ = healed;
+                }
+            }
+        }
+
+        // P0-SAFETY-BOOT-ONE-BLOCK: Fail-closed, proof-carrying reconciliation
+        // when hard `SIGKILL` / power loss left `safety_record_v1.finalized_height`
+        // ahead of `storage.finalized()` (including `fh == 0` / height 1).
+        // Never lowers `safety_record_v1`; only advances `storage.finalized()` and
+        // engine state forward if every intervening block exists locally, links to
+        // `safety_record_v1.finalized_hash`, and passes precommit QC verification.
+        let mut sigkill_reconcile_failed: Option<String> = None;
+        if let Some(ap) = &persistence {
+            if let Ok(Some(genesis_bytes)) = ap.storage().get_meta("genesis_state_root") {
+                if genesis_bytes.len() == 32 {
+                    let mut genesis_root = [0u8; 32];
+                    genesis_root.copy_from_slice(&genesis_bytes);
+                    let identity = stellereum::storage::SafetyRecordIdentity {
+                        validator: self_vote_id,
+                        chain: stellereum::safety::derive_safety_chain_id(
+                            stellereum::consensus::consensus_chain_id(),
+                            &genesis_root,
+                        ),
+                        shard: block_shard,
+                    };
+                    match stellereum::safety::reconcile_boot_sigkill_gap(
+                        &ap.storage(),
+                        identity,
+                        &mut rt,
+                        restored_state_height,
+                    )
+                    .await
+                    {
+                        Ok(stellereum::safety::BootReconcileOutcome::NoGap) => {}
+                        Ok(stellereum::safety::BootReconcileOutcome::Reconciled {
+                            from_height,
+                            to_height,
+                            finalized_hash: _,
+                            replayed_to_height,
+                        }) => {
+                            if replayed_to_height > restored_state_height {
+                                let pq_reg = rt.state.pq_registry_read().await;
+                                let active = stellereum::pq_registry::pq_lifecycle_active_at(
+                                    replayed_to_height,
+                                );
+                                if active || !pq_reg.is_empty() {
+                                    stellereum::consensus::sync_committed_pq_registry(
+                                        &pq_reg, active,
+                                    );
+                                }
+                                drop(pq_reg);
+                                ap.snapshot_state(&rt.state, replayed_to_height).await;
+                                let ledger = rt.staking_read().await.clone();
+                                let gov = match &rt.governance {
+                                    Some(g) => g.clone(),
+                                    None => rt.state.governance_read().await.clone(),
+                                };
+                                ap.snapshot_domains(&rt.state, &ledger, &gov, replayed_to_height)
+                                    .await;
+                                restored_state_height = replayed_to_height;
+                            }
+                            info!(
+                                "[storage] reconciled SIGKILL gap: recovered finalized tip {from_height} -> {to_height} \
+                                 and engine state to {restored_state_height} from durable QC-verified blocks"
+                            );
+                        }
+                        Err(e) => {
+                            let msg =
+                                format!("safety_record_v1 boot reconciliation failed closed: {e}");
+                            eprintln!("[safety] {msg}");
+                            tracing::error!("{msg}");
+                            sigkill_reconcile_failed = Some(msg);
+                        }
+                    }
                 }
             }
         }
@@ -1426,11 +1440,16 @@ pub(crate) async fn run_consensus_node(
                     ),
                     shard: block_shard,
                 };
+                let restored_finalized = if sigkill_reconcile_failed.is_some() {
+                    ap.storage().finalized().ok().flatten()
+                } else {
+                    rt.finalized.last().copied()
+                };
                 let boot_ctx = stellereum::safety::SafetyBootContext {
                     is_validator,
                     is_observer_env: observer_env,
                     new_chain_explicit: stellereum::bootstrap::is_new_chain_explicit_env(),
-                    restored_finalized: rt.finalized.last().copied(),
+                    restored_finalized,
                     restored_state_height: Some(restored_state_height),
                     restored_finalized_qc_verified,
                     legacy_checkpoint: restored_checkpoint.clone(),
@@ -1441,6 +1460,11 @@ pub(crate) async fn run_consensus_node(
                     identity,
                     boot_ctx,
                 );
+                if let Some(reason) = sigkill_reconcile_failed.take() {
+                    if matches!(rt.safety.mode(), stellereum::safety::AuthorityMode::Active) {
+                        rt.safety.quarantine(reason);
+                    }
+                }
             }
             Ok(Some(other)) => {
                 rt.safety = stellereum::safety::SafetyAuthority::new_quarantined(format!(
@@ -4476,15 +4500,33 @@ pub(crate) async fn run_consensus_node(
                                     // milliseconds and drop the peer's first vote
                                     // (live: 269ms from adopt to view change).
                                     round_started = std::time::Instant::now();
-                                    // Persist adopted bodies like finalized ones:
-                                    // they are anchor material for snapshot
-                                    // verification and healing sources after a
-                                    // restart. Without this, every adopted height
-                                    // leaves a hole that refuses the next start.
+                                    // Persist adopted bodies + finalized pointer synchronously
+                                    // (with embedded precommit QC from `rt.blocks` and flush)
+                                    // instead of queuing an async `Finalized` job: eliminates
+                                    // multi-block lag and prevents out-of-order queue writes
+                                    // from regressing `storage.finalized()` behind `safety_record_v1`.
                                     if let Some(ap) = &persistence {
-                                        ap.enqueue_block(block);
-                                        ap.enqueue_finalized(height, bh);
+                                        let adopted_block =
+                                            rt.blocks.get(&bh).cloned().unwrap_or(block);
+                                        if let Err(e) = write_ahead_finalized_block(
+                                            ap,
+                                            height,
+                                            bh,
+                                            adopted_block,
+                                            true,
+                                        )
+                                        .await
+                                        {
+                                            tracing::error!(
+                                                height,
+                                                error = %e,
+                                                "[storage] adopted block synchronous persist failed"
+                                            );
+                                        }
                                         if height.is_multiple_of(25) {
+                                            ap.enqueue_validator_set_history(
+                                                rt.export_validator_set_history(),
+                                            );
                                             ap.request_flush();
                                         }
                                     }
@@ -4650,6 +4692,34 @@ pub(crate) async fn run_consensus_node(
                 height,
                 hex::encode(&decided[..6]),
             );
+            // P0-SAFETY-BOOT-ONE-BLOCK: write-ahead the QC-carrying decided
+            // block and finalized tip pointer BEFORE `try_poll_apply` ->
+            // `install_apply_outcome` -> `safety.advance_height` fsyncs
+            // `safety_record_v1`. Sled's `db.flush()` inside `advance_height`
+            // then makes both durable together, closing the hard-SIGKILL
+            // 1-block gap on the live finalize path.
+            if let Some(ap) = &persistence {
+                if let Some(decided_block) = rt.blocks.get(&decided).cloned() {
+                    if let Err(e) = write_ahead_finalized_block(
+                        ap,
+                        decided_height,
+                        decided,
+                        decided_block,
+                        false,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            height = decided_height,
+                            error = %e,
+                            "[storage] write-ahead put_block/set_finalized failed before safety advance"
+                        );
+                        eprintln!(
+                            "[storage] write-ahead put_block/set_finalized failed at #{decided_height}: {e}"
+                        );
+                    }
+                }
+            }
             // EARLY `_hq_` QC SIDECAR (liveness, incident #21508): the QC is
             // already in hand (`try_finalize_submit` stashed it), so publish it
             // NOW — before the body persist / apply completion path — instead
@@ -4951,16 +5021,38 @@ pub(crate) async fn run_consensus_node(
                     }
                 });
             }
-            // Persist asynchronously: never block consensus on disk I/O.
+            // Write-ahead at `try_finalize_submit` already wrote the QC-carrying
+            // block and finalized pointer before `safety.advance_height` flushed
+            // sled. Verify and repair synchronously if write-ahead missed/failed,
+            // instead of enqueueing an async `Finalized` job that could race
+            // backwards with a later height.
             if let Some(ap) = &persistence {
-                if let Some(block) = rt.blocks.get(&bh).cloned() {
-                    ap.enqueue_block(block);
+                let already_persisted = ap.storage().finalized().ok().flatten()
+                    == Some((height, bh))
+                    && ap.storage().get_block(&bh).ok().flatten().is_some();
+                if !already_persisted {
+                    if let Some(block) = rt.blocks.get(&bh).cloned() {
+                        if let Err(e) =
+                            write_ahead_finalized_block(ap, height, bh, block, true).await
+                        {
+                            tracing::error!(
+                                height,
+                                error = %e,
+                                "[storage] post-apply finalized persist fallback failed"
+                            );
+                        }
+                    } else {
+                        let store = ap.storage();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            store.set_finalized(height, &bh).and_then(|_| store.flush())
+                        })
+                        .await;
+                    }
                 }
-                ap.enqueue_finalized(height, bh);
                 // Periodic durability barrier (async, no consensus stall):
-                // bounds the loss window on kill to a handful of heights so a
-                // restart can heal from peers instead of refusing to run.
+                // bounds the loss window on kill for queued consensus checkpoints.
                 if height % 25 == 0 {
+                    ap.enqueue_validator_set_history(rt.export_validator_set_history());
                     ap.request_flush();
                 }
                 // Clear the lock for the next height in the checkpoint.
@@ -5010,7 +5102,10 @@ pub(crate) async fn run_consensus_node(
                             ap.request_flush();
                             ap.snapshot_state(&rt.state, height).await;
                             let ledger = rt.staking_read().await.clone();
-                            let gov = rt.governance.clone().unwrap_or_default();
+                            let gov = match &rt.governance {
+                                Some(g) => g.clone(),
+                                None => rt.state.governance_read().await.clone(),
+                            };
                             ap.snapshot_domains(&rt.state, &ledger, &gov, height).await;
                         }
 
@@ -6465,62 +6560,44 @@ mod restart_height_tests {
         assert!(outbox_has_proposal(&outbox, b.height, b.round));
     }
 
-    #[test]
-    fn durable_block_recovery_advances_lagging_finalized_pointer_and_stops_on_gap_or_missing_qc() {
+    #[tokio::test]
+    async fn write_ahead_finalized_block_persists_block_and_tip_before_safety_flush() {
         let dir = std::env::temp_dir().join(format!(
-            "stell_durable_rec_test_{}",
+            "stell_write_ahead_test_{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let st = stellereum::storage::Storage::open(&dir).expect("open storage");
-
-        let mk_qc = |height: u64, bh: [u8; 32]| stellereum::consensus::QuorumCertificate {
-            height,
-            round: 0,
-            kind: stellereum::consensus::VoteKind::Precommit,
-            block_hash: Some(bh),
-            signatures: vec![],
-            shard_id: 0,
-        };
+        let st =
+            std::sync::Arc::new(stellereum::storage::Storage::open(&dir).expect("open storage"));
+        let ap = stellereum::storage::AsyncPersistence::start(st.clone());
 
         let mut b1 = stellereum::sharding::Block {
             height: 1,
-            prev_hash: [0x11; 32],
+            prev_hash: [0u8; 32],
             ..Default::default()
         };
         let h1 = b1.compute_hash();
-        b1.precommit_qc = Some(mk_qc(1, h1));
-        st.put_block(&b1).expect("put b1");
-        st.set_finalized(1, &h1).expect("set finalized 1");
+        b1.precommit_qc = Some(stellereum::consensus::QuorumCertificate {
+            height: 1,
+            round: 0,
+            kind: stellereum::consensus::VoteKind::Precommit,
+            block_hash: Some(h1),
+            signatures: vec![],
+            shard_id: 0,
+        });
 
-        let mut b2 = stellereum::sharding::Block {
-            height: 2,
-            prev_hash: h1,
-            ..Default::default()
-        };
-        let h2 = b2.compute_hash();
-        b2.precommit_qc = Some(mk_qc(2, h2));
-        st.put_block(&b2).expect("put b2");
+        write_ahead_finalized_block(&ap, 1, h1, b1.clone(), true)
+            .await
+            .expect("write_ahead_finalized_block");
+        assert_eq!(st.finalized().unwrap(), Some((1, h1)));
+        let stored = st.get_block(&h1).unwrap().expect("stored block 1");
+        assert_eq!(stored.compute_hash(), h1);
+        assert!(stored.precommit_qc.is_some());
 
-        // Block 3 without QC must stop recovery at 2 (fail closed).
-        let b3_no_qc = stellereum::sharding::Block {
-            height: 3,
-            prev_hash: h2,
-            ..Default::default()
-        };
-        st.put_block(&b3_no_qc).expect("put b3_no_qc");
-
-        assert_eq!(
-            recover_finalized_tip_from_durable_blocks(&st, 1, h1, 1),
-            None
-        );
-        assert_eq!(
-            recover_finalized_tip_from_durable_blocks(&st, 1, h1, 3),
-            Some((2, h2))
-        );
+        drop(ap);
         drop(st);
         let _ = std::fs::remove_dir_all(&dir);
     }

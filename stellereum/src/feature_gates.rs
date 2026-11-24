@@ -74,26 +74,36 @@ pub fn table() -> Vec<Gate> {
             symbol: "CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT",
             value: chain_spec::CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT,
             test: None,
-            note: "Exposes host.block_hash to contracts. Needs (a) the live apply path \
-                   passing block.prev_hash everywhere (the height-only entry points pass \
-                   zero), and (b) an e2e test that the value is identical on every node.",
+            note: "Exposes host.block_hash to contracts. Today the host call SUCCEEDS \
+                   (~10 fuel) and returns 32 zero bytes because svm.rs substitutes zero \
+                   while the gate is inert. The live apply path already threads \
+                   block.prev_hash; what is missing is proof on the cross-node block path, \
+                   across a reorg and across a restart, plus a decision for the \
+                   single-tx / RPC-preview callers that would still pass zero.",
         },
         Gate {
             id: "bridge-target-address-cap",
             symbol: "BRIDGE_TARGET_ADDRESS_CAP_HEIGHT",
             value: chain_spec::BRIDGE_TARGET_ADDRESS_CAP_HEIGHT,
             test: None,
-            note: "128-byte cap on bridge target addresses. Needs an e2e test that the \
-                   cap is enforced on release and that history stays replayable.",
+            note: "128-byte cap on bridge target addresses. Enforced on Withdraw \
+                   SETTLEMENT/parking, NOT on release (Release/Refund never inspect the \
+                   length), and the gate is missing from current_activation_schedule(). \
+                   Before arming: add the gate to that schedule, decide the rule for an \
+                   already-parked oversized withdraw, and pin replay of history that \
+                   predates the cap.",
         },
         Gate {
             id: "xshard-bounce-escrow",
             symbol: "XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT",
             value: chain_spec::XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT,
             test: None,
-            note: "Requires a bounce escrow before a cross-shard transfer is accepted \
-                   (docs/specs/XSHARD_BOUNCE_ESCROW.md). Needs the {0,1} shard \
-                   prerequisites and a fresh-genesis decision.",
+            note: "Requires a bounce escrow before a cross-shard transfer is accepted. \
+                   BLOCKER: runtime/cluster.rs ChainState::apply_block still records every \
+                   outbound unconditionally and refunds a timeout bounce without an \
+                   escrow-leaf or 2PC check, so arming the gate today would refund money \
+                   that was never escrowed. Also needs the {0,1} shard prerequisites and a \
+                   fresh-genesis decision.",
         },
         Gate {
             id: "upgrade-exec",

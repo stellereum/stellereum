@@ -156,7 +156,22 @@ impl InMemoryStateEngine {
         salt: &[u8],
         now: u64,
     ) -> Result<DeployOutcome, crate::contract::ContractError> {
-        self.deploy_contract_deterministic_inner(creator, code, salt, now, None)
+        self.deploy_contract_deterministic_inner(creator, code, salt, now, None, 0)
+            .await
+    }
+
+    /// Height-aware [`Self::deploy_contract_deterministic`]: validates `code`
+    /// via [`crate::contract::ContractRegistry::validate_code_at`] at
+    /// `block_height`.
+    pub async fn deploy_contract_deterministic_at(
+        &self,
+        creator: [u8; 32],
+        code: Vec<u8>,
+        salt: &[u8],
+        now: u64,
+        block_height: u64,
+    ) -> Result<DeployOutcome, crate::contract::ContractError> {
+        self.deploy_contract_deterministic_inner(creator, code, salt, now, None, block_height)
             .await
     }
 
@@ -170,7 +185,23 @@ impl InMemoryStateEngine {
         now: u64,
         abi: crate::contract_abi::ContractAbi,
     ) -> Result<DeployOutcome, crate::contract::ContractError> {
-        self.deploy_contract_deterministic_inner(creator, code, salt, now, Some(abi))
+        self.deploy_contract_deterministic_inner(creator, code, salt, now, Some(abi), 0)
+            .await
+    }
+
+    /// Height-aware [`Self::deploy_contract_deterministic_with_abi`]: validates
+    /// `code` via [`crate::contract::ContractRegistry::validate_code_at`] at
+    /// `block_height`.
+    pub async fn deploy_contract_deterministic_with_abi_at(
+        &self,
+        creator: [u8; 32],
+        code: Vec<u8>,
+        salt: &[u8],
+        now: u64,
+        abi: crate::contract_abi::ContractAbi,
+        block_height: u64,
+    ) -> Result<DeployOutcome, crate::contract::ContractError> {
+        self.deploy_contract_deterministic_inner(creator, code, salt, now, Some(abi), block_height)
             .await
     }
 
@@ -181,8 +212,9 @@ impl InMemoryStateEngine {
         salt: &[u8],
         now: u64,
         abi: Option<crate::contract_abi::ContractAbi>,
+        block_height: u64,
     ) -> Result<DeployOutcome, crate::contract::ContractError> {
-        crate::contract::ContractRegistry::validate_code(&code)?;
+        crate::contract::ContractRegistry::validate_code_at(&code, block_height)?;
         if let Some(a) = &abi {
             a.validate()
                 .map_err(|e| crate::contract::ContractError::InvalidAbi(e.to_string()))?;

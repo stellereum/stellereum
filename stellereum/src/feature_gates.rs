@@ -76,11 +76,21 @@ pub fn table() -> Vec<Gate> {
             test: None,
             note: "Caps WASM table element counts (section-4 Table declarations and the \
                    wasmi StoreLimits table_elements budget) at MAX_CONTRACT_TABLE_ELEMENTS. \
-                   INERT: every consensus deploy/execute call site keeps the legacy \
-                   uncapped Ruleset v7 acceptance, byte-identical replay. Before arming: \
-                   thread the block height through the consensus deploy/execute call sites \
-                   (validate_code_at / run_contract_hardened_at) and pin replay of history \
-                   that predates the cap.",
+                   INERT: consensus deploy/execute call sites route through validate_code_at \
+                   / run_contract_hardened_at (byte-identical replay below H), and RPC \
+                   pre-validation enforces the cap immediately. Before arming: pin replay \
+                   of history that predates the cap and update tests/w4_engine_hardening_tests.rs.",
+        },
+        Gate {
+            id: "falcon-host-fuel-v2",
+            symbol: "FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT",
+            value: chain_spec::FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT,
+            test: Some("tests/w3_falcon_fuel_and_start_tests.rs"),
+            note: "Raises host.falcon512_verify base fuel from FUEL_FALCON512_VERIFY (2_000) \
+                   to FUEL_FALCON512_VERIFY_V2 (150_000, calibrated against the 50M block \
+                   budget) and switches SysCallDeployContract to single-(start) validation \
+                   while charging actual (start) fuel against caller gas_remaining. INERT \
+                   at u64::MAX until calibrated bench numbers and rollout height are set.",
         },
         Gate {
             id: "contract-block-hash",

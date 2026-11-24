@@ -796,12 +796,13 @@ async fn dispatch_contracts_inner(
                 // `stell_sendRawTransaction` — N-03: this preview is NOT
                 // admitted to the mempool, NOT gossipped; the tx is dropped).
                 let validate_res = if hardened {
-                    crate::contract::ContractRegistry::validate_code_hardened(
+                    crate::contract::ContractRegistry::validate_code_hardened_with_table_cap(
                         &code,
                         crate::contract::VALIDATE_CODE_START_FUEL_LIMIT,
+                        true,
                     )
                 } else {
-                    crate::contract::ContractRegistry::validate_code(&code)
+                    crate::contract::ContractRegistry::validate_code_with_table_cap(&code, true)
                 };
                 if let Err(e) = validate_res {
                     return err(id, -32000, format!("deploy contract failed: {e}"));
@@ -875,12 +876,13 @@ async fn dispatch_contracts_inner(
                 st.height.load(std::sync::atomic::Ordering::Relaxed),
             );
             let validate_res = if hardened {
-                crate::contract::ContractRegistry::validate_code_hardened(
+                crate::contract::ContractRegistry::validate_code_hardened_with_table_cap(
                     &code,
                     crate::contract::VALIDATE_CODE_START_FUEL_LIMIT,
+                    true,
                 )
             } else {
-                crate::contract::ContractRegistry::validate_code(&code)
+                crate::contract::ContractRegistry::validate_code_with_table_cap(&code, true)
             };
             if let Err(e) = validate_res {
                 return err(id, -32000, format!("deploy contract failed: {e}"));

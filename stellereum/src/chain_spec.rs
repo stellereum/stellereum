@@ -159,6 +159,22 @@ pub const XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT: u64 = u64::MAX;
 /// [`crate::contract::MAX_CONTRACT_TABLE_ELEMENTS`].
 pub const WASM_TABLE_ELEMENTS_CAP_HEIGHT: u64 = u64::MAX;
 
+/// Falcon host verification fuel v2 and single-`(start)` deploy accounting
+/// activation height (`u64::MAX` = disabled, the compiled default).
+///
+/// Below this gate, `host.falcon512_verify` charges
+/// [`crate::contract::FUEL_FALCON512_VERIFY`] (`2_000` base fuel) and
+/// `SysCallDeployContract` keeps legacy validation and gas accounting
+/// byte-for-byte. At/above this gate:
+/// - `host.falcon512_verify` charges
+///   [`crate::contract::FUEL_FALCON512_VERIFY_V2`] (`150_000` base fuel,
+///   calibrated against the 50M block budget);
+/// - `SysCallDeployContract` validates the module and runs `(start)` **once**
+///   (no second validation inside `deploy_with_nonce`), caps `(start)` fuel at
+///   `min(VALIDATE_CODE_START_FUEL_LIMIT, state.gas_remaining)`, and deducts the
+///   actual `(start)` fuel consumed from `state.gas_remaining`.
+pub const FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
 #[cfg(any(test, debug_assertions))]
 thread_local! {
     static EXEC_HARDENING_V1_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
@@ -174,6 +190,8 @@ thread_local! {
     static XSHARD_BOUNCE_ESCROW_REQUIRED_OVERRIDE: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
     static WASM_TABLE_ELEMENTS_CAP_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    static FALCON_HOST_FUEL_V2_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -358,6 +376,33 @@ pub fn wasm_table_elements_cap_height() -> u64 {
 /// Ruleset v7 consensus keeps historical acceptance.
 pub fn wasm_table_elements_cap_active_at(height: u64) -> bool {
     let gate = wasm_table_elements_cap_height();
+    gate != u64::MAX && height >= gate
+}
+
+/// Set (or clear with `None`) the TEST/DEBUG-ONLY `FALCON_HOST_FUEL_V2`
+/// activation height override for the calling thread. Absent from release
+/// builds.
+#[cfg(any(test, debug_assertions))]
+pub fn set_falcon_host_fuel_v2_activation_override(activation: Option<u64>) {
+    FALCON_HOST_FUEL_V2_ACTIVATION_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// Effective `FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT` for the calling thread.
+pub fn falcon_host_fuel_v2_activation_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(h) = FALCON_HOST_FUEL_V2_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT
+}
+
+/// True iff `FALCON_HOST_FUEL_V2` (calibrated Falcon host verify fuel +
+/// single-`(start)` deploy fuel accounting) is active at `height`.
+///
+/// Strictly returns `false` for EVERY height (including `u64::MAX`) when the
+/// effective gate is `u64::MAX` (`GatedOff`, the compiled default).
+pub fn falcon_host_fuel_v2_active_at(height: u64) -> bool {
+    let gate = falcon_host_fuel_v2_activation_height();
     gate != u64::MAX && height >= gate
 }
 
@@ -662,6 +707,24 @@ pub fn current_activation_schedule() -> ChainActivationSchedule {
                 "Contract-visible host.block_hash returns the parent block hash (compiled default u64::MAX: contracts see zero)",
             ),
             ActivationGate::new(
+                "BRIDGE_TARGET_ADDRESS_CAP_HEIGHT",
+                "stellereum::bridge",
+                bridge_target_address_cap_height(),
+                "Caps native bridge Withdraw target_address UTF-8 byte length at MAX_BRIDGE_TARGET_ADDRESS_BYTES (128 bytes; compiled default u64::MAX: uncapped)",
+            ),
+            ActivationGate::new(
+                "WASM_TABLE_ELEMENTS_CAP_HEIGHT",
+                "stellereum::chain_spec",
+                wasm_table_elements_cap_height(),
+                "Caps WASM table element counts (section-4 Table declarations and wasmi StoreLimits table_elements) at MAX_CONTRACT_TABLE_ELEMENTS (compiled default u64::MAX: uncapped replay)",
+            ),
+            ActivationGate::new(
+                "FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT",
+                "stellereum::chain_spec",
+                falcon_host_fuel_v2_activation_height(),
+                "Raises host.falcon512_verify base fuel to 150,000 and switches SysCallDeployContract to single-(start) validation with caller gas accounting (compiled default u64::MAX: legacy 2,000 fuel)",
+            ),
+            ActivationGate::new(
                 "XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT",
                 "stellereum::chain_spec",
                 xshard_bounce_escrow_required_height(),
@@ -850,6 +913,18 @@ mod tests {
             (
                 "CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT",
                 CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT,
+            ),
+            (
+                "BRIDGE_TARGET_ADDRESS_CAP_HEIGHT",
+                BRIDGE_TARGET_ADDRESS_CAP_HEIGHT,
+            ),
+            (
+                "WASM_TABLE_ELEMENTS_CAP_HEIGHT",
+                WASM_TABLE_ELEMENTS_CAP_HEIGHT,
+            ),
+            (
+                "FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT",
+                FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT,
             ),
             (
                 "XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT",

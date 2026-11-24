@@ -2300,31 +2300,79 @@ impl Svm {
                 OpCode::SysCallDeployContract { code } => {
                     charge!(contract_deploy_gas(code.len()));
                     if opts.wasm_pmm_hardening {
-                        if let Err(e) = crate::contract::ContractRegistry::validate_code_hardened(
-                            code,
-                            crate::contract::VALIDATE_CODE_START_FUEL_LIMIT,
-                        ) {
-                            return VmExecutionResult::Reverted(format!(
-                                "contract deploy failed: {e}"
-                            ));
-                        }
-                        ensure_working(&mut working_contracts, ctx.contracts.as_deref());
-                        let Some(reg) = working_contracts.as_mut() else {
-                            return VmExecutionResult::Reverted(
-                                "Contract registry not available".to_string(),
-                            );
-                        };
-                        match reg.deploy_with_nonce(
-                            ctx.sender,
-                            code.clone(),
-                            opts.tx_nonce,
-                            ctx.timestamp,
-                        ) {
-                            Ok(_addr) => state.stack.push(1),
-                            Err(e) => {
+                        if crate::chain_spec::falcon_host_fuel_v2_active_at(opts.chain_height) {
+                            let start_budget = crate::contract::VALIDATE_CODE_START_FUEL_LIMIT
+                                .min(state.gas_remaining);
+                            let start_fuel_used = match crate::contract::ContractRegistry::
+                                validate_code_hardened_and_measure_at(
+                                    code,
+                                    start_budget,
+                                    opts.chain_height,
+                                ) {
+                                Ok(used) => used,
+                                Err(crate::contract::ContractError::OutOfFuel) => {
+                                    return VmExecutionResult::OutOfGas;
+                                }
+                                Err(e) => {
+                                    return VmExecutionResult::Reverted(format!(
+                                        "contract deploy failed: {e}"
+                                    ));
+                                }
+                            };
+                            if state.gas_remaining < start_fuel_used {
+                                return VmExecutionResult::OutOfGas;
+                            }
+                            state.gas_remaining -= start_fuel_used;
+                            ensure_working(&mut working_contracts, ctx.contracts.as_deref());
+                            let Some(reg) = working_contracts.as_mut() else {
+                                return VmExecutionResult::Reverted(
+                                    "Contract registry not available".to_string(),
+                                );
+                            };
+                            match reg.deploy_with_nonce_prevalidated(
+                                ctx.sender,
+                                code.clone(),
+                                opts.tx_nonce,
+                                ctx.timestamp,
+                            ) {
+                                Ok(_addr) => state.stack.push(1),
+                                Err(e) => {
+                                    return VmExecutionResult::Reverted(format!(
+                                        "contract deploy failed: {e}"
+                                    ))
+                                }
+                            }
+                        } else {
+                            if let Err(e) =
+                                crate::contract::ContractRegistry::validate_code_hardened_at(
+                                    code,
+                                    crate::contract::VALIDATE_CODE_START_FUEL_LIMIT,
+                                    opts.chain_height,
+                                )
+                            {
                                 return VmExecutionResult::Reverted(format!(
                                     "contract deploy failed: {e}"
-                                ))
+                                ));
+                            }
+                            ensure_working(&mut working_contracts, ctx.contracts.as_deref());
+                            let Some(reg) = working_contracts.as_mut() else {
+                                return VmExecutionResult::Reverted(
+                                    "Contract registry not available".to_string(),
+                                );
+                            };
+                            match reg.deploy_with_nonce_at(
+                                ctx.sender,
+                                code.clone(),
+                                opts.tx_nonce,
+                                ctx.timestamp,
+                                opts.chain_height,
+                            ) {
+                                Ok(_addr) => state.stack.push(1),
+                                Err(e) => {
+                                    return VmExecutionResult::Reverted(format!(
+                                        "contract deploy failed: {e}"
+                                    ))
+                                }
                             }
                         }
                     } else {
@@ -2334,7 +2382,12 @@ impl Svm {
                                 "Contract registry not available".to_string(),
                             );
                         };
-                        match reg.deploy(ctx.sender, code.clone(), ctx.timestamp) {
+                        match reg.deploy_at(
+                            ctx.sender,
+                            code.clone(),
+                            ctx.timestamp,
+                            opts.chain_height,
+                        ) {
                             Ok(_addr) => state.stack.push(1),
                             Err(e) => {
                                 return VmExecutionResult::Reverted(format!(
@@ -2398,7 +2451,7 @@ impl Svm {
                         block_hash: contract_block_hash,
                     };
                     let call_res = if opts.wasm_pmm_hardening {
-                        reg.call_with_context_hardened(
+                        reg.call_with_context_hardened_at(
                             contract,
                             method,
                             *arg,
@@ -2407,14 +2460,16 @@ impl Svm {
                             ctx.sender,
                             ctx.sender,
                             true,
+                            opts.chain_height,
                         )
                     } else {
-                        reg.call_with_context(
+                        reg.call_with_context_at(
                             contract,
                             method,
                             *arg,
                             state.gas_remaining,
                             &call_ctx,
+                            opts.chain_height,
                         )
                     };
                     match call_res {
@@ -2504,7 +2559,7 @@ impl Svm {
                         block_hash: contract_block_hash,
                     };
                     let call_res = if opts.wasm_pmm_hardening {
-                        reg.call_with_context_args_calldata_hardened(
+                        reg.call_with_context_args_calldata_hardened_at(
                             contract,
                             method,
                             args,
@@ -2514,15 +2569,17 @@ impl Svm {
                             ctx.sender,
                             ctx.sender,
                             true,
+                            opts.chain_height,
                         )
                     } else {
-                        reg.call_with_context_args_calldata(
+                        reg.call_with_context_args_calldata_at(
                             contract,
                             method,
                             args,
                             calldata,
                             state.gas_remaining,
                             &call_ctx,
+                            opts.chain_height,
                         )
                     };
                     match call_res {

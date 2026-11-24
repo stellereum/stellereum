@@ -137,6 +137,13 @@ pub const FUEL_BLAKE3_BASE: u64 = 20;
 pub const FUEL_BLAKE3_PER_BYTE: u64 = 1;
 /// Base fuel charged for Falcon-512 post-quantum signature verification.
 pub const FUEL_FALCON512_VERIFY: u64 = 2_000;
+/// Calibrated base fuel charged for Falcon-512 post-quantum signature
+/// verification at/above [`crate::chain_spec::FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT`].
+///
+/// Calibrated against the 50M `MAX_CONTRACT_FUEL` / block budget: ~330 Falcon
+/// verifications max per block instead of ~24,750 at `FUEL_FALCON512_VERIFY`
+/// (`2_000`).
+pub const FUEL_FALCON512_VERIFY_V2: u64 = 150_000;
 /// Base fuel charged for setting return data.
 pub const FUEL_RETURN_DATA_BASE: u64 = 10;
 /// Fuel charged per byte of return data.
@@ -731,6 +738,7 @@ impl ContractRegistry {
             caller: [0u8; 32],
             origin: [0u8; 32],
             hardened: false,
+            falcon_fuel_v2: false,
             value: 0,
             block_time: 0,
             block_hash: [0u8; 32],
@@ -762,22 +770,20 @@ impl ContractRegistry {
     /// Prevents infinite-loop DoS in `(start)` during deployment/RPC validation
     /// while permitting legitimate `(start)` initializers within `validate_fuel`.
     pub fn validate_code_hardened(code: &[u8], validate_fuel: u64) -> Result<(), ContractError> {
-        Self::validate_code_hardened_with_table_cap(code, validate_fuel, false)
+        Self::validate_code_hardened_and_measure_with_gates(code, validate_fuel, false, false)
+            .map(|_| ())
     }
 
     /// Height-aware [`Self::validate_code_hardened`]: enforces the
     /// table-elements cap at/above
-    /// [`crate::chain_spec::WASM_TABLE_ELEMENTS_CAP_HEIGHT`].
+    /// [`crate::chain_spec::WASM_TABLE_ELEMENTS_CAP_HEIGHT`] and Falcon host
+    /// fuel v2 at/above [`crate::chain_spec::FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT`].
     pub fn validate_code_hardened_at(
         code: &[u8],
         validate_fuel: u64,
         height: u64,
     ) -> Result<(), ContractError> {
-        Self::validate_code_hardened_with_table_cap(
-            code,
-            validate_fuel,
-            crate::chain_spec::wasm_table_elements_cap_active_at(height),
-        )
+        Self::validate_code_hardened_and_measure_at(code, validate_fuel, height).map(|_| ())
     }
 
     /// Hardened WASM code validation with an explicit `enforce_table_cap`
@@ -789,6 +795,47 @@ impl ContractRegistry {
         validate_fuel: u64,
         enforce_table_cap: bool,
     ) -> Result<(), ContractError> {
+        Self::validate_code_hardened_and_measure_with_gates(
+            code,
+            validate_fuel,
+            enforce_table_cap,
+            false,
+        )
+        .map(|_| ())
+    }
+
+    /// Hardened WASM code validation that returns the `(start)` fuel consumed.
+    pub fn validate_code_hardened_and_measure(
+        code: &[u8],
+        validate_fuel: u64,
+    ) -> Result<u64, ContractError> {
+        Self::validate_code_hardened_and_measure_with_gates(code, validate_fuel, false, false)
+    }
+
+    /// Height-aware [`Self::validate_code_hardened_and_measure`]: enforces
+    /// `WASM_TABLE_ELEMENTS_CAP_HEIGHT` and `FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT`
+    /// at `height` and returns the `(start)` fuel consumed.
+    pub fn validate_code_hardened_and_measure_at(
+        code: &[u8],
+        validate_fuel: u64,
+        height: u64,
+    ) -> Result<u64, ContractError> {
+        Self::validate_code_hardened_and_measure_with_gates(
+            code,
+            validate_fuel,
+            crate::chain_spec::wasm_table_elements_cap_active_at(height),
+            crate::chain_spec::falcon_host_fuel_v2_active_at(height),
+        )
+    }
+
+    /// Hardened WASM code validation with explicit gate toggles, returning the
+    /// `(start)` fuel consumed.
+    pub fn validate_code_hardened_and_measure_with_gates(
+        code: &[u8],
+        validate_fuel: u64,
+        enforce_table_cap: bool,
+        falcon_fuel_v2: bool,
+    ) -> Result<u64, ContractError> {
         if code.is_empty() {
             return Err(ContractError::EmptyCode);
         }
@@ -833,6 +880,7 @@ impl ContractRegistry {
             caller: [0u8; 32],
             origin: [0u8; 32],
             hardened: true,
+            falcon_fuel_v2,
             value: 0,
             block_time: 0,
             block_hash: [0u8; 32],
@@ -857,7 +905,8 @@ impl ContractRegistry {
                     ContractError::InvalidWasm
                 }
             })?;
-        Ok(())
+        let remaining = store.get_fuel().unwrap_or(0);
+        Ok(validate_fuel.saturating_sub(remaining))
     }
 
     /// Deploy a new contract. Returns its deterministic address.
@@ -868,6 +917,25 @@ impl ContractRegistry {
         now: u64,
     ) -> Result<[u8; 32], ContractError> {
         self.deploy_with_balance(creator, code, now, 0)
+    }
+
+    /// Height-aware [`Self::deploy`]: enforces the table-elements cap at/above
+    /// [`crate::chain_spec::WASM_TABLE_ELEMENTS_CAP_HEIGHT`].
+    pub fn deploy_at(
+        &mut self,
+        creator: [u8; 32],
+        code: Vec<u8>,
+        now: u64,
+        height: u64,
+    ) -> Result<[u8; 32], ContractError> {
+        self.deploy_inner_with_table_cap(
+            creator,
+            code,
+            now,
+            0,
+            None,
+            crate::chain_spec::wasm_table_elements_cap_active_at(height),
+        )
     }
 
     /// Deploy a new contract with an initial balance. Returns its deterministic address.
@@ -916,7 +984,19 @@ impl ContractRegistry {
         balance: u64,
         abi: Option<ContractAbi>,
     ) -> Result<[u8; 32], ContractError> {
-        Self::validate_code(&code)?;
+        self.deploy_inner_with_table_cap(creator, code, now, balance, abi, false)
+    }
+
+    fn deploy_inner_with_table_cap(
+        &mut self,
+        creator: [u8; 32],
+        code: Vec<u8>,
+        now: u64,
+        balance: u64,
+        abi: Option<ContractAbi>,
+        enforce_table_cap: bool,
+    ) -> Result<[u8; 32], ContractError> {
+        Self::validate_code_with_table_cap(&code, enforce_table_cap)?;
         if let Some(a) = &abi {
             a.validate()
                 .map_err(|e| ContractError::InvalidAbi(e.to_string()))?;
@@ -961,6 +1041,33 @@ impl ContractRegistry {
         self.deploy_with_nonce_inner(creator, code, nonce, now, 0, None)
     }
 
+    /// Height-aware [`Self::deploy_with_nonce`]: validates `code` via
+    /// [`Self::validate_code_hardened_at`] at `height`.
+    pub fn deploy_with_nonce_at(
+        &mut self,
+        creator: [u8; 32],
+        code: Vec<u8>,
+        nonce: u64,
+        now: u64,
+        height: u64,
+    ) -> Result<[u8; 32], ContractError> {
+        Self::validate_code_hardened_at(&code, VALIDATE_CODE_START_FUEL_LIMIT, height)?;
+        self.insert_contract_with_nonce(creator, code, nonce, now, 0, None)
+    }
+
+    /// Insert a contract whose WASM module has ALREADY been validated once
+    /// (used at/above [`crate::chain_spec::FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT`]
+    /// so `(start)` runs and is charged exactly once per `SysCallDeployContract`).
+    pub fn deploy_with_nonce_prevalidated(
+        &mut self,
+        creator: [u8; 32],
+        code: Vec<u8>,
+        nonce: u64,
+        now: u64,
+    ) -> Result<[u8; 32], ContractError> {
+        self.insert_contract_with_nonce(creator, code, nonce, now, 0, None)
+    }
+
     /// Deploy a new contract with an explicit sender `nonce` and initial `balance`.
     pub fn deploy_with_nonce_and_balance(
         &mut self,
@@ -995,6 +1102,18 @@ impl ContractRegistry {
         abi: Option<ContractAbi>,
     ) -> Result<[u8; 32], ContractError> {
         Self::validate_code_hardened(&code, VALIDATE_CODE_START_FUEL_LIMIT)?;
+        self.insert_contract_with_nonce(creator, code, nonce, now, balance, abi)
+    }
+
+    fn insert_contract_with_nonce(
+        &mut self,
+        creator: [u8; 32],
+        code: Vec<u8>,
+        nonce: u64,
+        now: u64,
+        balance: u64,
+        abi: Option<ContractAbi>,
+    ) -> Result<[u8; 32], ContractError> {
         if let Some(a) = &abi {
             a.validate()
                 .map_err(|e| ContractError::InvalidAbi(e.to_string()))?;
@@ -1183,6 +1302,19 @@ impl ContractRegistry {
         self.call_with_context_args(address, method, &[arg], fuel, ctx)
     }
 
+    /// Height-aware [`Self::call_with_context`].
+    pub fn call_with_context_at(
+        &mut self,
+        address: &[u8; 32],
+        method: &str,
+        arg: i64,
+        fuel: u64,
+        ctx: &ContractCallContext,
+        height: u64,
+    ) -> Result<ContractOutcome, ContractError> {
+        self.call_with_context_args_calldata_at(address, method, &[arg], &[], fuel, ctx, height)
+    }
+
     /// Call an exported method with several `i64` parameters and full context.
     pub fn call_with_context_args(
         &mut self,
@@ -1213,6 +1345,23 @@ impl ContractRegistry {
         self.call_with_context_args_inner(address, method, args, calldata, fuel, ctx)
     }
 
+    /// Height-aware [`Self::call_with_context_args_calldata`].
+    #[allow(clippy::too_many_arguments)]
+    // GATE: height-gated wrapper over call_with_options_at preserving legacy ContractCallContext.
+    pub fn call_with_context_args_calldata_at(
+        &mut self,
+        address: &[u8; 32],
+        method: &str,
+        args: &[i64],
+        calldata: &[u8],
+        fuel: u64,
+        ctx: &ContractCallContext,
+        height: u64,
+    ) -> Result<ContractOutcome, ContractError> {
+        let opts = ContractCallOptions::from(ctx);
+        self.call_with_options_at(address, method, args, calldata, fuel, &opts, height)
+    }
+
     /// Hardened (`>= H` when `hardened == true`) single-argument call accepting
     /// separate `origin` (`tx.from`) and immediate `caller`.
     #[allow(clippy::too_many_arguments)]
@@ -1238,6 +1387,35 @@ impl ContractRegistry {
             origin,
             caller,
             hardened,
+        )
+    }
+
+    /// Height-aware [`Self::call_with_context_hardened`].
+    #[allow(clippy::too_many_arguments)]
+    // GATE: height-gated wrapper over call_with_context_args_calldata_hardened_at.
+    pub fn call_with_context_hardened_at(
+        &mut self,
+        address: &[u8; 32],
+        method: &str,
+        arg: i64,
+        fuel: u64,
+        ctx: &ContractCallContext,
+        origin: [u8; 32],
+        caller: [u8; 32],
+        hardened: bool,
+        height: u64,
+    ) -> Result<ContractOutcome, ContractError> {
+        self.call_with_context_args_calldata_hardened_at(
+            address,
+            method,
+            &[arg],
+            &[],
+            fuel,
+            ctx,
+            origin,
+            caller,
+            hardened,
+            height,
         )
     }
 
@@ -1296,6 +1474,33 @@ impl ContractRegistry {
         self.call_with_options(address, method, args, calldata, fuel, &opts)
     }
 
+    /// Height-aware [`Self::call_with_context_args_calldata_hardened`].
+    #[allow(clippy::too_many_arguments)]
+    // GATE: height-gated wrapper over call_with_options_at preserving legacy ContractCallContext.
+    pub fn call_with_context_args_calldata_hardened_at(
+        &mut self,
+        address: &[u8; 32],
+        method: &str,
+        args: &[i64],
+        calldata: &[u8],
+        fuel: u64,
+        ctx: &ContractCallContext,
+        origin: [u8; 32],
+        caller: [u8; 32],
+        hardened: bool,
+        height: u64,
+    ) -> Result<ContractOutcome, ContractError> {
+        let opts = ContractCallOptions {
+            caller,
+            origin: if hardened { origin } else { caller },
+            value: ctx.value,
+            block_time: ctx.block_time,
+            block_hash: ctx.block_hash,
+            hardened,
+        };
+        self.call_with_options_at(address, method, args, calldata, fuel, &opts, height)
+    }
+
     /// Execute a contract call using explicit [`ContractCallOptions`].
     pub fn call_with_options(
         &mut self,
@@ -1305,6 +1510,49 @@ impl ContractRegistry {
         calldata: &[u8],
         fuel: u64,
         opts: &ContractCallOptions,
+    ) -> Result<ContractOutcome, ContractError> {
+        self.call_with_options_with_gates(address, method, args, calldata, fuel, opts, false, false)
+    }
+
+    /// Height-aware [`Self::call_with_options`]: enforces
+    /// [`crate::chain_spec::WASM_TABLE_ELEMENTS_CAP_HEIGHT`] and
+    /// [`crate::chain_spec::FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT`] at `height`.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: height-gated contract call forwards target, payload, budget, options, and chain height.
+    pub fn call_with_options_at(
+        &mut self,
+        address: &[u8; 32],
+        method: &str,
+        args: &[i64],
+        calldata: &[u8],
+        fuel: u64,
+        opts: &ContractCallOptions,
+        height: u64,
+    ) -> Result<ContractOutcome, ContractError> {
+        self.call_with_options_with_gates(
+            address,
+            method,
+            args,
+            calldata,
+            fuel,
+            opts,
+            crate::chain_spec::wasm_table_elements_cap_active_at(height),
+            crate::chain_spec::falcon_host_fuel_v2_active_at(height),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    // GATE: shared contract call implementation parameterized by activation gate flags.
+    fn call_with_options_with_gates(
+        &mut self,
+        address: &[u8; 32],
+        method: &str,
+        args: &[i64],
+        calldata: &[u8],
+        fuel: u64,
+        opts: &ContractCallOptions,
+        enforce_table_cap: bool,
+        falcon_fuel_v2: bool,
     ) -> Result<ContractOutcome, ContractError> {
         let contract = self
             .contracts
@@ -1321,33 +1569,25 @@ impl ContractRegistry {
             block_hash: opts.block_hash,
         };
         let (out, used, new_storage, new_balance, events, outbound_messages, return_data) =
-            if opts.hardened {
-                run_contract_hardened(
-                    *address,
-                    &contract.code,
-                    &contract.storage,
-                    contract.balance,
-                    method,
-                    args,
-                    calldata,
-                    fuel,
-                    &ctx,
-                    opts.origin,
-                    true,
-                )?
-            } else {
-                run_contract(
-                    *address,
-                    &contract.code,
-                    &contract.storage,
-                    contract.balance,
-                    method,
-                    args,
-                    calldata,
-                    fuel,
-                    &ctx,
-                )?
-            };
+            run_contract_hardened_with_gates(
+                *address,
+                &contract.code,
+                &contract.storage,
+                contract.balance,
+                method,
+                args,
+                calldata,
+                fuel,
+                &ctx,
+                if opts.hardened {
+                    opts.origin
+                } else {
+                    ctx.caller
+                },
+                opts.hardened,
+                enforce_table_cap,
+                falcon_fuel_v2,
+            )?;
         contract.storage = new_storage;
         contract.balance = new_balance;
         self.last_return_data = return_data.clone();
@@ -1582,6 +1822,7 @@ impl ContractRegistry {
             caller: [0u8; 32],
             origin: [0u8; 32],
             hardened: false,
+            falcon_fuel_v2: false,
             value: 0,
             block_time: 0,
             block_hash: [0u8; 32],
@@ -1984,6 +2225,7 @@ struct HostState {
     caller: [u8; 32],
     origin: [u8; 32],
     hardened: bool,
+    falcon_fuel_v2: bool,
     value: u64,
     block_time: u64,
     block_hash: [u8; 32],
@@ -2274,7 +2516,12 @@ fn host_linker(engine: &Engine) -> Linker<HostState> {
                     "falcon512_verify input length exceeds maximum memory",
                 ));
             }
-            let fuel = FUEL_FALCON512_VERIFY
+            let base = if caller.data().falcon_fuel_v2 {
+                FUEL_FALCON512_VERIFY_V2
+            } else {
+                FUEL_FALCON512_VERIFY
+            };
+            let fuel = base
                 .saturating_add(mlen as u64)
                 .saturating_add(pklen as u64)
                 .saturating_add(siglen as u64);
@@ -2540,50 +2787,6 @@ fn call_export_exact(
     None
 }
 
-/// Execute an exported method in a fully sandboxed, metered store with
-/// host storage (sload/sstore), event emission (emit), outbound messages (send_message),
-/// and contextual/crypto host functions (caller, value, block_time, block_hash, sha256, blake3, falcon512_verify, return_data).
-///
-/// The method may take up to [`MAX_CONTRACT_CALL_ARGS`] `i64` parameters.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
-// GATE: contract-call plumbing takes the full execution context (9 params) and returns the full outcome tuple; splitting it would churn every caller.
-fn run_contract(
-    contract_addr: [u8; 32],
-    code: &[u8],
-    initial_storage: &HashMap<i64, i64>,
-    initial_balance: u64,
-    method: &str,
-    args: &[i64],
-    calldata: &[u8],
-    fuel: u64,
-    ctx: &ContractCallContext,
-) -> Result<
-    (
-        i64,
-        u64,
-        HashMap<i64, i64>,
-        u64,
-        Vec<ContractEvent>,
-        Vec<ContractMessage>,
-        Vec<u8>,
-    ),
-    ContractError,
-> {
-    run_contract_hardened(
-        contract_addr,
-        code,
-        initial_storage,
-        initial_balance,
-        method,
-        args,
-        calldata,
-        fuel,
-        ctx,
-        ctx.caller,
-        false,
-    )
-}
-
 /// Execute an exported method with explicit `origin` (`tx.from`) and
 /// `hardened` activation toggle.
 ///
@@ -2636,9 +2839,10 @@ pub fn run_contract_hardened(
 }
 
 /// Height-aware [`run_contract_hardened`]: enforces the table-elements cap
-/// at/above [`crate::chain_spec::WASM_TABLE_ELEMENTS_CAP_HEIGHT`].
+/// at/above [`crate::chain_spec::WASM_TABLE_ELEMENTS_CAP_HEIGHT`] and Falcon
+/// host fuel v2 at/above [`crate::chain_spec::FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT`].
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-// GATE: height-gated wrapper over run_contract_hardened_with_table_cap.
+// GATE: height-gated wrapper over run_contract_hardened_with_gates.
 pub fn run_contract_hardened_at(
     contract_addr: [u8; 32],
     code: &[u8],
@@ -2664,7 +2868,7 @@ pub fn run_contract_hardened_at(
     ),
     ContractError,
 > {
-    run_contract_hardened_with_table_cap(
+    run_contract_hardened_with_gates(
         contract_addr,
         code,
         initial_storage,
@@ -2677,6 +2881,7 @@ pub fn run_contract_hardened_at(
         origin,
         hardened,
         crate::chain_spec::wasm_table_elements_cap_active_at(height),
+        crate::chain_spec::falcon_host_fuel_v2_active_at(height),
     )
 }
 
@@ -2696,6 +2901,53 @@ pub fn run_contract_hardened_with_table_cap(
     origin: [u8; 32],
     hardened: bool,
     enforce_table_cap: bool,
+) -> Result<
+    (
+        i64,
+        u64,
+        HashMap<i64, i64>,
+        u64,
+        Vec<ContractEvent>,
+        Vec<ContractMessage>,
+        Vec<u8>,
+    ),
+    ContractError,
+> {
+    run_contract_hardened_with_gates(
+        contract_addr,
+        code,
+        initial_storage,
+        initial_balance,
+        method,
+        args,
+        calldata,
+        fuel,
+        ctx,
+        origin,
+        hardened,
+        enforce_table_cap,
+        false,
+    )
+}
+
+/// Execute an exported method with explicit `enforce_table_cap` and
+/// `falcon_fuel_v2` activation toggles.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+// GATE: mirrors run_contract_hardened with explicit activation gate toggles.
+pub fn run_contract_hardened_with_gates(
+    contract_addr: [u8; 32],
+    code: &[u8],
+    initial_storage: &HashMap<i64, i64>,
+    initial_balance: u64,
+    method: &str,
+    args: &[i64],
+    calldata: &[u8],
+    fuel: u64,
+    ctx: &ContractCallContext,
+    origin: [u8; 32],
+    hardened: bool,
+    enforce_table_cap: bool,
+    falcon_fuel_v2: bool,
 ) -> Result<
     (
         i64,
@@ -2735,6 +2987,7 @@ pub fn run_contract_hardened_with_table_cap(
         caller: ctx.caller,
         origin: if hardened { origin } else { ctx.caller },
         hardened,
+        falcon_fuel_v2,
         value: ctx.value,
         block_time: ctx.block_time,
         block_hash: ctx.block_hash,

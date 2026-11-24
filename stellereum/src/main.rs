@@ -36,7 +36,13 @@ mod bin_tests;
 // counts are scheduling resources only -- no consensus input, wire byte or
 // hash reads them.
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    // Logs go to STDERR, data to STDOUT. Without this split every command that
+    // prints machine-readable output (`status --json`, `gates --yaml`) emitted
+    // two INFO lines first and the consumer could not parse it. journald and
+    // the shipped units capture both streams, so the node loses nothing.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
     let limits = node::runtime_limits::detect();
     tracing::info!(
         "[runtime] worker_threads={} max_blocking_threads={} (derived from available_parallelism)",

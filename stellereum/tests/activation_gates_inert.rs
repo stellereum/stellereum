@@ -39,7 +39,7 @@ fn the_three_incomplete_gates_are_still_inert() {
     assert_eq!(
         chain_spec::XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT,
         u64::MAX,
-        "bounce escrow needs the {0,1} shard prerequisites and a fresh-genesis decision"
+        "bounce escrow needs the {{0,1}} shard prerequisites and a fresh-genesis decision"
     );
 }
 

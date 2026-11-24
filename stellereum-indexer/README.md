@@ -127,8 +127,11 @@ source of truth and has no consensus role.
 ## API surface
 
 All routes are `GET` except the contract-source verification POST. Canonical
-routes are under `/api/v2`; legacy `/api/...` aliases exist for explorer
-compatibility. `limit` is clamped to the route maximum, `offset` is capped at
+routes are under `/api/v2`; the same handlers are also served under `/api/...`
+for explorer compatibility. Legacy `/api/...` responses carry `Deprecation`,
+`Sunset`, and `Link: </api/v2>; rel="successor-version"` headers; `/api/v2`
+responses do not. See [API_VERSIONING.md](API_VERSIONING.md) for the migration
+policy. `limit` is clamped to the route maximum, `offset` is capped at
 `1_000_000`, and `cursor` cannot be combined with a non-zero `offset`.
 
 ### Network and status
@@ -147,7 +150,7 @@ compatibility. `limit` is clamped to the route maximum, `offset` is capped at
 | --- | --- |
 | `GET /api/v2/blocks?limit&offset&cursor&shard_id` | Paginated block summaries; keyset cursor for deep history. |
 | `GET /api/v2/block/:param?shard_id` | Block by decimal height, block hash, or `shard:height`; includes transactions. |
-| `GET /api/v2/txs?limit&offset&cursor` | Recent transactions. |
+| `GET /api/v2/txs?limit&offset&cursor` | Recent transactions; keyset cursor is `<shard>:<height>:<tx_index>`. |
 | `GET /api/v2/tx/:hash` | One transaction by 32-byte hash (hex or `0x`-hex). |
 
 ### Accounts and tokens
@@ -155,7 +158,7 @@ compatibility. `limit` is clamped to the route maximum, `offset` is capped at
 | Route | Description |
 | --- | --- |
 | `GET /api/v2/account/:address` | Address summary (`address`, `address_0x`, `stl57`, tx count, status). |
-| `GET /api/v2/account/:address/txs?limit&offset&cursor` | Address transaction history. |
+| `GET /api/v2/account/:address/txs?limit&offset&cursor` | Address transaction history; keyset cursor is `<shard>:<height>:<tx_index>`. |
 | `GET /api/v2/account/:address/tokens?token&include_zero&shard_id&limit&cursor` | Token holdings with metadata. |
 | `GET /api/v2/token/:token/holders?include_zero&shard_id&limit&cursor` | Holder page for one token. |
 | `GET /api/v2/tokens?limit&offset&cursor` | Native STELL plus indexed/listed tokens. |
@@ -221,6 +224,7 @@ workspace suites.
 ## Documentation
 
 - [Indexer REST reference](https://docs.stellereum.org/api/indexer-rest)
+- [API versioning policy](API_VERSIONING.md)
 - [JSON-RPC reference](https://docs.stellereum.org/api/json-rpc)
 - [WebSocket and SSE](https://docs.stellereum.org/api/websocket-sse)
 - [Monitoring](https://docs.stellereum.org/nodes/monitoring)

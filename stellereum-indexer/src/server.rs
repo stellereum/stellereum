@@ -1,17 +1,18 @@
 use crate::db::{
     address_match_candidates, normalize_contract_key, parse_account_tokens_cursor,
     parse_block_cursor, parse_contracts_cursor, parse_contracts_program_cursor, parse_event_cursor,
-    parse_token_holders_cursor, parse_token_program_cursor, parse_tx_cursor, Database, EventFilter,
-    EventRecord, VerifiedSource,
+    parse_token_holders_cursor, parse_token_program_cursor, parse_tx_cursor_v2, Database,
+    EventFilter, EventRecord, VerifiedSource,
 };
 use crate::events::{decode_event, AbiCache, RawEvent};
 use crate::syncer::SyncStatus;
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{Path, Query, Request, State},
+    http::{HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{
         sse::{Event as SseEvent, KeepAlive, Sse},
-        IntoResponse, Json,
+        IntoResponse, Json, Response,
     },
     routing::{get, post},
     Router,
@@ -399,73 +400,99 @@ fn resolve_cursor_or_offset(
     Ok((clean_cursor, off))
 }
 
+/// Migration deadline advertised on the legacy `/api/...` aliases.
+///
+/// RFC 8594 `Sunset` value; kept in sync with `API_VERSIONING.md`.
+pub const LEGACY_API_SUNSET: &str = "Wed, 30 Jun 2027 00:00:00 GMT";
+
+/// Response headers attached to legacy `/api/...` routes only.
+///
+/// The v2 routes are the canonical surface and never carry these headers.
+async fn legacy_api_deprecation(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert("deprecation", HeaderValue::from_static("true"));
+    headers.insert("sunset", HeaderValue::from_static(LEGACY_API_SUNSET));
+    headers.insert(
+        "link",
+        HeaderValue::from_static("</api/v2>; rel=\"successor-version\""),
+    );
+    response
+}
+
+/// Build the API router.
+///
+/// Every handler is registered once under its version-independent relative
+/// path; that router is then nested twice:
+///
+/// * `/api/v2` — canonical, no deprecation headers;
+/// * `/api` — legacy alias, same handlers plus `Deprecation` / `Sunset` /
+///   `Link` headers.
+///
+/// Nesting the same router keeps both surfaces from drifting: a new route is
+/// automatically reachable under both prefixes, and a handler can never exist
+/// on one prefix only by accident. The relative path set is the union of the
+/// historical v2 spellings (`/account/:address`, `/tx/:hash`, `/txs`, ...) and
+/// the historical legacy spellings (`/accounts/:address`, `/transactions/:hash`,
+/// `/blocks/latest`, ...), so both old and new clients keep working during the
+/// migration window.
 pub fn create_router(state: AppState) -> Router {
-    Router::new()
+    let api = Router::new()
         // Core network endpoints
-        .route("/api/overview", get(get_overview))
-        .route("/api/v2/overview", get(get_overview))
-        .route("/api/stats", get(get_network_stats))
-        .route("/api/v2/stats", get(get_network_stats))
-        .route("/api/price", get(get_price))
-        .route("/api/v2/price", get(get_price))
-        .route("/api/status", get(get_status))
-        .route("/api/v2/status", get(get_status))
+        .route("/overview", get(get_overview))
+        .route("/stats", get(get_network_stats))
+        .route("/price", get(get_price))
+        .route("/status", get(get_status))
         // Validators & Staking (gram.org/validators)
-        .route("/api/validators", get(get_validators))
-        .route("/api/v2/validators", get(get_validators))
-        .route("/api/staking", get(get_staking))
-        .route("/api/v2/staking", get(get_staking))
+        .route("/validators", get(get_validators))
+        .route("/staking", get(get_staking))
         // Blocks
-        .route("/api/blocks/latest", get(get_blocks))
-        .route("/api/v2/blocks", get(get_blocks))
-        .route("/api/blocks/:param", get(get_block))
-        .route("/api/v2/block/:param", get(get_block))
+        .route("/blocks/latest", get(get_blocks))
+        .route("/blocks", get(get_blocks))
+        .route("/blocks/:param", get(get_block))
+        .route("/block/:param", get(get_block))
         // Transactions
-        .route("/api/transactions/latest", get(get_recent_txs))
-        .route("/api/v2/txs", get(get_recent_txs))
-        .route("/api/transactions/:hash", get(get_tx))
-        .route("/api/v2/tx/:hash", get(get_tx))
+        .route("/transactions/latest", get(get_recent_txs))
+        .route("/txs", get(get_recent_txs))
+        .route("/transactions/:hash", get(get_tx))
+        .route("/tx/:hash", get(get_tx))
         // Contract events (logs)
-        .route("/api/v2/contract/:address/events", get(get_contract_events))
-        .route("/api/v2/tx/:hash/events", get(get_tx_events))
-        .route("/api/v2/events", get(get_events))
+        .route("/contract/:address/events", get(get_contract_events))
+        .route("/tx/:hash/events", get(get_tx_events))
+        .route("/events", get(get_events))
         // Contract source verification (audit P2-15, Sourcify-style)
-        .route(
-            "/api/v2/contract/:address/verify",
-            post(verify_contract_source),
-        )
-        .route("/api/v2/contract/:address/source", get(get_contract_source))
+        .route("/contract/:address/verify", post(verify_contract_source))
+        .route("/contract/:address/source", get(get_contract_source))
         // Contracts, program accounts, and LIVE shard topology
-        .route("/api/v2/contracts", get(get_contracts))
-        .route(
-            "/api/v2/program/:program/accounts",
-            get(get_program_accounts),
-        )
-        .route("/api/shards", get(get_shards))
-        .route("/api/v2/shards", get(get_shards))
+        .route("/contracts", get(get_contracts))
+        .route("/program/:program/accounts", get(get_program_accounts))
+        .route("/shards", get(get_shards))
         // Accounts, tokens, holders & History
-        .route("/api/accounts/:address", get(get_account_info))
-        .route("/api/v2/account/:address", get(get_account_info))
-        .route("/api/accounts/:address/actions", get(get_account_actions))
-        .route("/api/accounts/:address/activity", get(get_account_actions))
-        .route("/api/v2/account/:address/txs", get(get_account_actions))
-        .route("/api/v2/account/:address/tokens", get(get_account_tokens))
-        .route("/api/v2/token/:token/holders", get(get_token_holders))
-        .route("/api/whales", get(get_whales))
-        .route("/api/v2/whales", get(get_whales))
+        .route("/accounts/:address", get(get_account_info))
+        .route("/account/:address", get(get_account_info))
+        .route("/accounts/:address/actions", get(get_account_actions))
+        .route("/accounts/:address/activity", get(get_account_actions))
+        .route("/account/:address/txs", get(get_account_actions))
+        .route("/account/:address/tokens", get(get_account_tokens))
+        .route("/token/:token/holders", get(get_token_holders))
+        .route("/whales", get(get_whales))
         // Verified Contracts & Tokens (gram.org/verified)
-        .route("/api/verified", get(get_verified))
-        .route("/api/v2/verified", get(get_verified))
-        .route("/api/verified/stats", get(get_verified_stats))
-        .route("/api/v2/verified/stats", get(get_verified_stats))
-        .route("/api/tokens", get(get_tokens))
-        .route("/api/v2/tokens", get(get_tokens))
+        .route("/verified", get(get_verified))
+        .route("/verified/stats", get(get_verified_stats))
+        .route("/tokens", get(get_tokens))
         // Live Geyser-lite SSE stream
-        .route("/api/v2/stream", get(stream_events))
+        .route("/stream", get(stream_events))
         // Search & Charts
-        .route("/api/search", get(search))
-        .route("/api/v2/search", get(search))
-        .route("/api/v2/stats/charts", get(get_charts))
+        .route("/search", get(search))
+        .route("/stats/charts", get(get_charts));
+
+    let legacy = api
+        .clone()
+        .layer(middleware::from_fn(legacy_api_deprecation));
+
+    Router::new()
+        .nest("/api/v2", api)
+        .nest("/api", legacy)
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -1177,7 +1204,7 @@ async fn get_recent_txs(
         Err(r) => return r,
     };
     if cursor_str.is_some() || offset == 0 {
-        let parsed = match cursor_str.as_deref().map(parse_tx_cursor).transpose() {
+        let parsed = match cursor_str.as_deref().map(parse_tx_cursor_v2).transpose() {
             Ok(c) => c,
             Err(e) => return bad_request(e),
         };
@@ -1259,7 +1286,7 @@ async fn get_account_actions(
         Err(r) => return r,
     };
     if cursor_str.is_some() || offset == 0 {
-        let parsed = match cursor_str.as_deref().map(parse_tx_cursor).transpose() {
+        let parsed = match cursor_str.as_deref().map(parse_tx_cursor_v2).transpose() {
             Ok(c) => c,
             Err(e) => return bad_request(e),
         };

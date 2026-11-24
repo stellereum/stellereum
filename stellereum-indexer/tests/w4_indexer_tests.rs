@@ -16,7 +16,7 @@ use stellereum_indexer::db::{
 };
 use stellereum_indexer::server::{
     create_router, AppState, IndexerStreamHub, StreamPublishInput, INDEXER_REPLAY_WINDOW,
-    MAX_INDEXER_SSE_CLIENTS, MAX_PROGRAM_ACCOUNTS_LIMIT,
+    LEGACY_API_SUNSET, MAX_INDEXER_SSE_CLIENTS, MAX_PROGRAM_ACCOUNTS_LIMIT,
 };
 use stellereum_indexer::syncer::{
     parse_node_sse_frame, NodeSseEvent, SseDisconnectReason, SseFrameParser, Syncer,
@@ -1123,4 +1123,155 @@ async fn indexer_stream_endpoint_filtering_replay_and_limits() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert_eq!(idle_hub.active_clients(), 0);
+}
+
+#[tokio::test]
+async fn api_v2_alias_serves_both_spellings_and_legacy_only_advertises_sunset() {
+    let db = Database::open(":memory:").expect("db");
+    let (base, client) = spawn_api(AppState::new(db)).await;
+
+    // Every spelling is reachable under BOTH namespaces: the historical v2
+    // names (`/blocks`) and the historical legacy names (`/blocks/latest`).
+    for path in [
+        "/api/blocks",
+        "/api/blocks/latest",
+        "/api/v2/blocks",
+        "/api/v2/blocks/latest",
+    ] {
+        let res = client
+            .get(format!("{base}{path}"))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert_eq!(res.status(), reqwest::StatusCode::OK, "{path}");
+    }
+
+    for path in ["/api/price", "/api/blocks/latest"] {
+        let res = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::OK, "{path}");
+        assert_eq!(
+            res.headers()
+                .get("deprecation")
+                .and_then(|v| v.to_str().ok()),
+            Some("true"),
+            "legacy {path} must advertise deprecation"
+        );
+        assert_eq!(
+            res.headers().get("sunset").and_then(|v| v.to_str().ok()),
+            Some(LEGACY_API_SUNSET),
+            "legacy {path} must advertise the sunset date"
+        );
+        let link = res
+            .headers()
+            .get("link")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            link.contains("/api/v2") && link.contains("successor-version"),
+            "legacy {path} must link to the successor version, got {link:?}"
+        );
+    }
+
+    for path in ["/api/v2/price", "/api/v2/blocks", "/api/v2/blocks/latest"] {
+        let res = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::OK, "{path}");
+        assert!(
+            res.headers().get("deprecation").is_none(),
+            "v2 {path} must not be marked deprecated"
+        );
+        assert!(
+            res.headers().get("sunset").is_none(),
+            "v2 {path} must not carry a sunset header"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tx_http_cursor_is_shard_qualified_and_legacy_compatible() {
+    let db = Database::open(":memory:").expect("db");
+    let owner = format!("0x{}", "42".repeat(32));
+    let mk = |hash: &str, height: u64, index: u32| TxRecord {
+        tx_hash: hash.to_string(),
+        block_height: height,
+        tx_index: index,
+        from_addr: owner.clone(),
+        to_addr: format!("0x{}", "99".repeat(32)),
+        from_stl57: None,
+        to_stl57: None,
+        amount: "1".to_string(),
+        fee_charged: "1".to_string(),
+        gas_limit: "10".to_string(),
+        status: "success".to_string(),
+        timestamp: 1_792_000_000 + height,
+    };
+    db.insert_transaction_in_shard(1, &mk("0xs1_h10", 10, 0))
+        .unwrap();
+    db.insert_transaction_in_shard(0, &mk("0xs0_h10", 10, 0))
+        .unwrap();
+    db.insert_transaction_in_shard(0, &mk("0xs0_h9", 9, 0))
+        .unwrap();
+
+    let (base, client) = spawn_api(AppState::new(db)).await;
+    let mut cursor: Option<String> = None;
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let url = match cursor.as_deref() {
+            Some(c) => format!("{base}/api/v2/txs?limit=1&cursor={c}"),
+            None => format!("{base}/api/v2/txs?limit=1"),
+        };
+        let page: Value = client.get(url).send().await.unwrap().json().await.unwrap();
+        seen.push(
+            page["transactions"][0]["tx_hash"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+        let cur = page["next_cursor"].as_str().map(str::to_string);
+        if let Some(ref c) = cur {
+            assert_eq!(
+                c.split(':').count(),
+                3,
+                "v2 next_cursor must be '<shard>:<height>:<tx_index>', got {c:?}"
+            );
+        }
+        cursor = cur;
+        if !page["has_more"].as_bool().unwrap() {
+            break;
+        }
+    }
+    assert_eq!(seen, vec!["0xs1_h10", "0xs0_h10", "0xs0_h9"]);
+
+    // A legacy two-field cursor is still accepted and keeps the old predicate.
+    let legacy: Value = client
+        .get(format!("{base}/api/v2/txs?limit=10&cursor=10:0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(legacy["transactions"].as_array().unwrap().len(), 1);
+    assert_eq!(legacy["transactions"][0]["tx_hash"], "0xs0_h9");
+
+    // Malformed cursors fail closed with 400, as before.
+    for bad in ["1:2:3:4", "abc", "x:1:2"] {
+        let res = client
+            .get(format!("{base}/api/v2/txs?cursor={bad}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "cursor {bad:?} must be rejected"
+        );
+        let body: Value = res.json().await.unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("tx cursor"),
+            "cursor {bad:?} must return the tx-cursor error class, got {body}"
+        );
+    }
 }

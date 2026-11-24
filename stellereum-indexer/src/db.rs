@@ -352,6 +352,69 @@ pub fn parse_block_cursor(raw: &str) -> std::result::Result<BlockCursor, String>
     }
 }
 
+/// Decoded transaction keyset cursor.
+///
+/// The v2 wire form is `"<shard>:<block_height>:<tx_index>"`, which is unique
+/// across shards: `(block_height, tx_index)` alone repeats between shards.
+/// The legacy `"<block_height>:<tx_index>"` form is still accepted and yields
+/// `shard_id: None`, preserving the pre-v2 keyset predicate exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxCursor {
+    /// Shard of the last row of the previous page (`None` for legacy cursors).
+    pub shard_id: Option<u32>,
+    pub height: u64,
+    pub tx_index: u32,
+}
+
+/// Parse a transaction keyset cursor, accepting both wire forms:
+///
+/// * `"<shard>:<block_height>:<tx_index>"` — v2, shard-qualified;
+/// * `"<block_height>:<tx_index>"` — legacy, shard unknown.
+///
+/// A caller whose query is already scoped to one shard may substitute that
+/// shard for `None` (the legacy form then means "the request's shard"); a
+/// caller that cannot determine a shard must keep `None` rather than guess.
+/// Malformed input is rejected with the same `Err(String)` / `400` error class
+/// the legacy `parse_tx_cursor` used.
+pub fn parse_tx_cursor_v2(raw: &str) -> std::result::Result<TxCursor, String> {
+    let t = raw.trim();
+    let parts: Vec<&str> = t.split(':').collect();
+    let (shard_id, h_str, idx_str) = match parts.as_slice() {
+        [height, index] => (None, *height, *index),
+        [shard, height, index] => {
+            let shard_id = shard
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| "invalid tx cursor shard".to_string())?;
+            (Some(shard_id), *height, *index)
+        }
+        _ => {
+            return Err(
+                "invalid tx cursor: expected '<block_height>:<tx_index>' or \
+                 '<shard>:<block_height>:<tx_index>'"
+                    .to_string(),
+            )
+        }
+    };
+    let height = h_str
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "invalid tx cursor height".to_string())?;
+    let tx_index = idx_str
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| "invalid tx cursor tx_index".to_string())?;
+    Ok(TxCursor {
+        shard_id,
+        height,
+        tx_index,
+    })
+}
+
+/// Legacy-only transaction cursor parser (`"<block_height>:<tx_index>"`).
+///
+/// Kept for callers that predate [`parse_tx_cursor_v2`]; the HTTP handlers use
+/// the v2 parser so a shard-qualified cursor round-trips.
 pub fn parse_tx_cursor(raw: &str) -> std::result::Result<(u64, u32), String> {
     let t = raw.trim();
     let (h_str, idx_str) = t
@@ -679,6 +742,11 @@ impl Database {
         // Keyset history indexes (W4 contract)
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tx_block_txindex ON transactions(block_height DESC, tx_index DESC)",
+            [],
+        );
+        // Shard-qualified keyset order used by the v2 transaction cursor.
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tx_block_txindex_shard ON transactions(block_height DESC, tx_index DESC, shard_id DESC)",
             [],
         );
         let _ = conn.execute(
@@ -1757,7 +1825,7 @@ impl Database {
             let mut stmt = conn.prepare(
                 "SELECT tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp
                  FROM transactions
-                 ORDER BY block_height DESC, tx_index DESC
+                 ORDER BY block_height DESC, tx_index DESC, shard_id DESC
                  LIMIT ?1 OFFSET ?2",
             )?;
             let rows = stmt.query_map(params![limit, offset], Self::map_tx_row)?;
@@ -1780,7 +1848,7 @@ impl Database {
             "SELECT tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp
              FROM transactions
              WHERE LOWER(from_addr) IN ({in_list}) OR LOWER(to_addr) IN ({in_list})
-             ORDER BY block_height DESC, tx_index DESC
+             ORDER BY block_height DESC, tx_index DESC, shard_id DESC
              LIMIT ?{limit_p} OFFSET ?{offset_p}"
         );
         let mut args: Vec<rusqlite::types::Value> =
@@ -1796,12 +1864,23 @@ impl Database {
         Ok(res)
     }
 
-    /// Keyset-paginated transactions (`cursor = "<block_height>:<tx_index>"`).
+    /// Keyset-paginated transactions.
+    ///
+    /// Cursors are parsed by [`parse_tx_cursor_v2`]. Rows are ordered by
+    /// `(block_height, tx_index, shard_id)` descending: `shard_id` is the final
+    /// tie-breaker because `(block_height, tx_index)` is only unique within a
+    /// shard. A v2 cursor carries the shard and continues exactly after that
+    /// row; a legacy cursor carries no shard and keeps the pre-v2 predicate
+    /// (`block_height`, then `tx_index`), which is what single-shard clients
+    /// already paginate with.
+    ///
+    /// The transaction endpoints are not shard-filtered, so the cursor shard is
+    /// only a tie-breaker; there is no request-shard/filter conflict to reject.
     pub fn get_account_txs_keyset(
         &self,
         address: &str,
         limit: u32,
-        cursor: Option<(u64, u32)>,
+        cursor: Option<TxCursor>,
     ) -> Result<KeysetPage<TxRecord>> {
         if limit == 0 {
             return Ok(KeysetPage {
@@ -1834,14 +1913,23 @@ impl Database {
                 "(LOWER(from_addr) IN ({in_list}) OR LOWER(to_addr) IN ({in_list}))"
             ));
         }
-        if let Some((ch, cidx)) = cursor {
-            args.push(Self::clamp_u64(ch).into());
+        if let Some(c) = cursor {
+            args.push(Self::clamp_u64(c.height).into());
             let h_p = args.len();
-            args.push((cidx as i64).into());
+            args.push((c.tx_index as i64).into());
             let idx_p = args.len();
-            clauses.push(format!(
-                "(block_height < ?{h_p} OR (block_height = ?{h_p} AND tx_index < ?{idx_p}))"
-            ));
+            if let Some(csid) = c.shard_id {
+                args.push((csid as i64).into());
+                let s_p = args.len();
+                clauses.push(format!(
+                    "(block_height < ?{h_p} OR (block_height = ?{h_p} AND tx_index < ?{idx_p}) \
+                     OR (block_height = ?{h_p} AND tx_index = ?{idx_p} AND shard_id < ?{s_p}))"
+                ));
+            } else {
+                clauses.push(format!(
+                    "(block_height < ?{h_p} OR (block_height = ?{h_p} AND tx_index < ?{idx_p}))"
+                ));
+            }
         }
         let where_sql = if clauses.is_empty() {
             String::new()
@@ -1851,29 +1939,33 @@ impl Database {
         args.push(((limit as i64).saturating_add(1)).into());
         let limit_p = args.len();
         let sql = format!(
-            "SELECT tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp
+            "SELECT tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp, shard_id
              FROM transactions
              {where_sql}
-             ORDER BY block_height DESC, tx_index DESC
+             ORDER BY block_height DESC, tx_index DESC, shard_id DESC
              LIMIT ?{limit_p}"
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), Self::map_tx_row)?;
-        let mut items = Vec::new();
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+            let rec = Self::map_tx_row(row)?;
+            let shard_id: u32 = row.get(10)?;
+            Ok((rec, shard_id))
+        })?;
+        let mut page: Vec<(TxRecord, u32)> = Vec::new();
         for r in rows {
-            items.push(r?);
+            page.push(r?);
         }
-        let has_more = items.len() > limit as usize;
+        let has_more = page.len() > limit as usize;
         if has_more {
-            items.truncate(limit as usize);
+            page.truncate(limit as usize);
         }
         let next_cursor = if has_more {
-            items
-                .last()
-                .map(|t| format!("{}:{}", t.block_height, t.tx_index))
+            page.last()
+                .map(|(t, shard_id)| format!("{shard_id}:{}:{}", t.block_height, t.tx_index))
         } else {
             None
         };
+        let items = page.into_iter().map(|(t, _)| t).collect();
         Ok(KeysetPage {
             items,
             next_cursor,
@@ -2883,5 +2975,155 @@ mod event_tests {
                 .hash,
             "0xshard1_h10_new"
         );
+    }
+
+    fn keyset_tx(tx_hash: &str, height: u64, tx_index: u32, from: &str) -> TxRecord {
+        TxRecord {
+            tx_hash: tx_hash.to_string(),
+            block_height: height,
+            tx_index,
+            from_addr: from.to_string(),
+            to_addr: format!("0x{}", "99".repeat(32)),
+            from_stl57: None,
+            to_stl57: None,
+            amount: "1".to_string(),
+            fee_charged: "1".to_string(),
+            gas_limit: "10".to_string(),
+            status: "success".to_string(),
+            timestamp: 1_792_000_000 + height,
+        }
+    }
+
+    #[test]
+    fn tx_cursor_v2_accepts_legacy_and_shard_forms_and_rejects_junk() {
+        assert_eq!(
+            parse_tx_cursor_v2("42:7").unwrap(),
+            TxCursor {
+                shard_id: None,
+                height: 42,
+                tx_index: 7
+            }
+        );
+        assert_eq!(
+            parse_tx_cursor_v2(" 3 : 42 : 7 ").unwrap(),
+            TxCursor {
+                shard_id: Some(3),
+                height: 42,
+                tx_index: 7
+            }
+        );
+        // The legacy parser keeps its two-field contract.
+        assert_eq!(parse_tx_cursor("42:7").unwrap(), (42, 7));
+
+        for bad in [
+            "", "42", "42:", ":7", "a:7", "42:b", "1:2:3:4", "x:1:2", "-1:1:2",
+        ] {
+            assert!(
+                parse_tx_cursor_v2(bad).is_err(),
+                "cursor {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn tx_keyset_v2_cursor_disambiguates_equal_height_index_across_shards() {
+        let db = Database::open(":memory:").unwrap();
+        let owner = format!("0x{}", "42".repeat(32));
+        db.insert_transaction_in_shard(1, &keyset_tx("0xs1_h10", 10, 0, &owner))
+            .unwrap();
+        db.insert_transaction_in_shard(0, &keyset_tx("0xs0_h10", 10, 0, &owner))
+            .unwrap();
+        db.insert_transaction_in_shard(0, &keyset_tx("0xs0_h9", 9, 0, &owner))
+            .unwrap();
+
+        // Page 1: under shard DESC, shard 1 wins the equal (height, index) tie.
+        let p1 = db.get_account_txs_keyset(&owner, 1, None).unwrap();
+        assert_eq!(p1.items[0].tx_hash, "0xs1_h10");
+        let c1 = parse_tx_cursor_v2(p1.next_cursor.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            c1,
+            TxCursor {
+                shard_id: Some(1),
+                height: 10,
+                tx_index: 0
+            }
+        );
+
+        // Page 2: the equal (height, index) row on shard 0 is still reachable.
+        let p2 = db.get_account_txs_keyset(&owner, 1, Some(c1)).unwrap();
+        assert_eq!(p2.items[0].tx_hash, "0xs0_h10");
+        let c2 = parse_tx_cursor_v2(p2.next_cursor.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            c2,
+            TxCursor {
+                shard_id: Some(0),
+                height: 10,
+                tx_index: 0
+            }
+        );
+
+        let p3 = db.get_account_txs_keyset(&owner, 1, Some(c2)).unwrap();
+        assert_eq!(p3.items[0].tx_hash, "0xs0_h9");
+        assert!(!p3.has_more);
+        assert!(p3.next_cursor.is_none());
+
+        // A legacy cursor keeps the pre-v2 (height, tx_index)-only predicate:
+        // it cannot distinguish the two (10, 0) rows, which is exactly the
+        // behaviour legacy clients already paginate with.
+        let legacy = parse_tx_cursor_v2("10:0").unwrap();
+        let legacy_page = db.get_account_txs_keyset(&owner, 10, Some(legacy)).unwrap();
+        assert_eq!(legacy_page.items.len(), 1);
+        assert_eq!(legacy_page.items[0].tx_hash, "0xs0_h9");
+    }
+
+    #[test]
+    fn tx_keyset_legacy_cursor_paginates_single_shard_identically() {
+        let db = Database::open(":memory:").unwrap();
+        let owner = format!("0x{}", "43".repeat(32));
+        for h in 1u64..=4u64 {
+            let hash = format!("0xs0_h{h}");
+            db.insert_transaction(&keyset_tx(&hash, h, 0, &owner))
+                .unwrap();
+        }
+
+        let p1 = db.get_account_txs_keyset(&owner, 2, None).unwrap();
+        assert_eq!(
+            p1.items
+                .iter()
+                .map(|t| t.tx_hash.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0xs0_h4", "0xs0_h3"]
+        );
+        let new_cursor = parse_tx_cursor_v2(p1.next_cursor.as_deref().unwrap()).unwrap();
+        let legacy_cursor = parse_tx_cursor_v2("3:0").unwrap();
+
+        let via_new = db
+            .get_account_txs_keyset(&owner, 2, Some(new_cursor))
+            .unwrap();
+        let via_legacy = db
+            .get_account_txs_keyset(&owner, 2, Some(legacy_cursor))
+            .unwrap();
+        assert_eq!(
+            via_new
+                .items
+                .iter()
+                .map(|t| t.tx_hash.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0xs0_h2", "0xs0_h1"]
+        );
+        assert_eq!(
+            via_new
+                .items
+                .iter()
+                .map(|t| t.tx_hash.as_str())
+                .collect::<Vec<_>>(),
+            via_legacy
+                .items
+                .iter()
+                .map(|t| t.tx_hash.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(via_new.has_more, via_legacy.has_more);
+        assert_eq!(via_new.next_cursor, via_legacy.next_cursor);
     }
 }

@@ -204,6 +204,9 @@ jobs:
       - name: Install sdk-js dependencies
         working-directory: sdk-js
         run: npm ci --no-audit --no-fund
+      - name: sdk-js RPC types sync check
+        working-directory: sdk-js
+        run: npm run check:rpc-types
       - name: sdk-js typecheck
         working-directory: sdk-js
         run: npm run typecheck

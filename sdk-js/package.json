@@ -19,7 +19,9 @@
   "scripts": {
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "build": "tsc"
+    "build": "tsc",
+    "generate:rpc-types": "node scripts/generate-rpc-types.mjs",
+    "check:rpc-types": "node scripts/generate-rpc-types.mjs --check"
   },
   "engines": {
     "node": ">=22.6"

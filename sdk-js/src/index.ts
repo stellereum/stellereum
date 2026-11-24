@@ -119,3 +119,16 @@ export {
   isDuplicateMessage,
   isRetryableError,
 } from "./errors.ts";
+
+export {
+  ETH_RPC_METHODS,
+  NET_RPC_METHODS,
+  NODE_RPC_METHODS,
+  STELL_RPC_METHODS,
+  WEB3_RPC_METHODS,
+  type EthRpcMethod,
+  type NetRpcMethod,
+  type NodeRpcMethod,
+  type StellRpcMethod,
+  type Web3RpcMethod,
+} from "./generated-rpc.ts";

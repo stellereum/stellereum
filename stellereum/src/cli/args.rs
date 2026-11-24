@@ -357,6 +357,69 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         sub: ConfigCommands,
     },
+    /// Store snapshot bootstrap and recovery operations
+    Store {
+        #[command(subcommand)]
+        sub: StoreCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum StoreCommands {
+    /// Initialize or refresh the local store from a snapshot URL or local `.tar.zst`
+    /// archive, verify SHA-256, strip stale `snap*` temp files, and run
+    /// `safety-reset` (+ `safety-init` unless `--observer`).
+    Bootstrap {
+        /// Target data directory containing `store`
+        #[arg(long, default_value = "./data")]
+        data_dir: PathBuf,
+        /// Validator keys directory containing `validator.key`
+        #[arg(long, default_value = "./keys")]
+        keys_dir: PathBuf,
+        /// Shard ID passed to `safety-init` (0 = Masterchain, 1 = Base Workchain)
+        #[arg(long, default_value_t = 0)]
+        shard: u32,
+        /// Snapshot archive URL (ignored when `--archive` is provided)
+        #[arg(
+            long,
+            default_value = "https://rpc.stellereum.org/snapshot/latest.tar.zst"
+        )]
+        snapshot_url: String,
+        /// SHA-256 manifest URL (defaults to `<snapshot-url>.sha256` in HTTP mode)
+        #[arg(long)]
+        sha256_url: Option<String>,
+        /// Fail closed if SHA-256 manifest is missing (e.g. HTTP 404) or unavailable
+        #[arg(long, default_value_t = false)]
+        require_sha256: bool,
+        /// Local `.tar.zst` snapshot archive path for offline/airgapped bootstrap
+        #[arg(long)]
+        archive: Option<PathBuf>,
+        /// Expected 64-hex SHA-256 digest pin for offline or explicit verification
+        #[arg(long)]
+        expected_sha256: Option<String>,
+        /// Backup and replace an existing `<data-dir>/store`
+        #[arg(long, default_value_t = false)]
+        refresh_if_stale: bool,
+        /// Allow replacing an existing `<data-dir>/store` (same as `--refresh-if-stale`)
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Delete existing `<data-dir>/store` instead of renaming to `store.bak-bootstrap-<ts>`
+        #[arg(long, default_value_t = false)]
+        no_backup: bool,
+        /// Confirm all legacy validators and remote signers for this key are stopped and fenced
+        #[arg(long, default_value_t = false)]
+        i_fenced_all_signers: bool,
+        /// Bootstrap as observer: clear foreign `safety_record_v1` via `safety-reset`
+        /// without requiring local validator keys or running `safety-init`
+        #[arg(long, default_value_t = false)]
+        observer: bool,
+        /// Validate paths and flags and print the bootstrap plan without mutating disk
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Emit machine-readable JSON summary instead of human-readable output
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1780,6 +1843,128 @@ mod cli_safety_init_tests {
                 assert!(json);
             }
             _ => panic!("expected Commands::Config"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_store_bootstrap_defaults_and_flags() {
+        let default_cli = Cli::try_parse_from(["stellereum", "store", "bootstrap"])
+            .expect("parse store bootstrap defaults");
+        match default_cli.command {
+            Commands::Store {
+                sub:
+                    StoreCommands::Bootstrap {
+                        data_dir,
+                        keys_dir,
+                        shard,
+                        snapshot_url,
+                        sha256_url,
+                        require_sha256,
+                        archive,
+                        expected_sha256,
+                        refresh_if_stale,
+                        force,
+                        no_backup,
+                        i_fenced_all_signers,
+                        observer,
+                        dry_run,
+                        json,
+                    },
+            } => {
+                assert_eq!(data_dir, PathBuf::from("./data"));
+                assert_eq!(keys_dir, PathBuf::from("./keys"));
+                assert_eq!(shard, 0);
+                assert_eq!(
+                    snapshot_url,
+                    "https://rpc.stellereum.org/snapshot/latest.tar.zst"
+                );
+                assert_eq!(sha256_url, None);
+                assert!(!require_sha256);
+                assert_eq!(archive, None);
+                assert_eq!(expected_sha256, None);
+                assert!(!refresh_if_stale);
+                assert!(!force);
+                assert!(!no_backup);
+                assert!(!i_fenced_all_signers);
+                assert!(!observer);
+                assert!(!dry_run);
+                assert!(!json);
+            }
+            _ => panic!("expected Commands::Store"),
+        }
+
+        let full_cli = Cli::try_parse_from([
+            "stellereum",
+            "store",
+            "bootstrap",
+            "--data-dir",
+            "/var/lib/stell/data",
+            "--keys-dir",
+            "/var/lib/stell/keys",
+            "--shard",
+            "1",
+            "--snapshot-url",
+            "https://example.org/snap.tar.zst",
+            "--sha256-url",
+            "https://example.org/snap.tar.zst.sha256",
+            "--require-sha256",
+            "--archive",
+            "/tmp/snap.tar.zst",
+            "--expected-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--refresh-if-stale",
+            "--force",
+            "--no-backup",
+            "--i-fenced-all-signers",
+            "--observer",
+            "--dry-run",
+            "--json",
+        ])
+        .expect("parse store bootstrap with all flags");
+        match full_cli.command {
+            Commands::Store {
+                sub:
+                    StoreCommands::Bootstrap {
+                        data_dir,
+                        keys_dir,
+                        shard,
+                        snapshot_url,
+                        sha256_url,
+                        require_sha256,
+                        archive,
+                        expected_sha256,
+                        refresh_if_stale,
+                        force,
+                        no_backup,
+                        i_fenced_all_signers,
+                        observer,
+                        dry_run,
+                        json,
+                    },
+            } => {
+                assert_eq!(data_dir, PathBuf::from("/var/lib/stell/data"));
+                assert_eq!(keys_dir, PathBuf::from("/var/lib/stell/keys"));
+                assert_eq!(shard, 1);
+                assert_eq!(snapshot_url, "https://example.org/snap.tar.zst");
+                assert_eq!(
+                    sha256_url.as_deref(),
+                    Some("https://example.org/snap.tar.zst.sha256")
+                );
+                assert!(require_sha256);
+                assert_eq!(archive, Some(PathBuf::from("/tmp/snap.tar.zst")));
+                assert_eq!(
+                    expected_sha256.as_deref(),
+                    Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                );
+                assert!(refresh_if_stale);
+                assert!(force);
+                assert!(no_backup);
+                assert!(i_fenced_all_signers);
+                assert!(observer);
+                assert!(dry_run);
+                assert!(json);
+            }
+            _ => panic!("expected Commands::Store"),
         }
     }
 }

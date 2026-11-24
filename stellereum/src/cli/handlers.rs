@@ -2143,7 +2143,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 );
             }
             let storage = stellereum::storage::Storage::open(&store_dir)?;
-            let removed = storage.reset_safety_record_for_recovery()?;
+            let removed = run_safety_reset_on_storage(&storage)?;
             println!(
                 "safety_record_v1 {} in {}; run `stellereum safety-init --store-dir {} \
                  --keys-dir <keys> --i-fenced-all-signers` next",
@@ -2171,26 +2171,9 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                      fencing all legacy validator processes and remote signers for this key"
                 );
             }
-            let val_pub: [u8; 32] = if let Some(hex_pk) = validator_pub {
-                let raw = hex::decode(hex_pk.trim())
-                    .map_err(|e| anyhow::anyhow!("invalid --validator-pub hex: {e}"))?;
-                raw.as_slice().try_into().map_err(|_| {
-                    anyhow::anyhow!("--validator-pub must decode to exactly 32 bytes")
-                })?
-            } else {
-                let key_path = keys_dir.join("validator.key");
-                let legacy_path = keys_dir.join("identity.key");
-                if !key_path.exists() && !legacy_path.exists() {
-                    anyhow::bail!(
-                        "no validator.key or identity.key found in {}; pass --validator-pub for remote signer",
-                        keys_dir.display()
-                    );
-                }
-                let sk = stellereum::node_keys::load_or_generate_consensus_key(&keys_dir)?;
-                sk.verifying_key().to_bytes()
-            };
+            let val_pub = resolve_consensus_validator_pubkey(&keys_dir, validator_pub)?;
             let storage = stellereum::storage::Storage::open(&store_dir)?;
-            let record = stellereum::safety::operator_safety_init(
+            let (record, payload) = run_safety_init_on_storage(
                 &storage,
                 val_pub,
                 shard,
@@ -2198,8 +2181,6 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 precommit_round_floor,
                 i_fenced_all_signers,
             )?;
-            let payload =
-                stellereum::safety::SafetyRecordPayload::decode_canonical(&record.payload)?;
             println!(
                 "safety_record_v1 initialized: validator={} shard={} generation={} height={} finalized={} prevote_floor={:?} precommit_floor={:?}",
                 hex::encode(val_pub),
@@ -3182,8 +3163,100 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 }
             }
         },
+        Commands::Store { sub } => match sub {
+            StoreCommands::Bootstrap {
+                data_dir,
+                keys_dir,
+                shard,
+                snapshot_url,
+                sha256_url,
+                require_sha256,
+                archive,
+                expected_sha256,
+                refresh_if_stale,
+                force,
+                no_backup,
+                i_fenced_all_signers,
+                observer,
+                dry_run,
+                json,
+            } => {
+                crate::cli::store_bootstrap::run_store_bootstrap(
+                    crate::cli::store_bootstrap::StoreBootstrapOptions {
+                        data_dir,
+                        keys_dir,
+                        shard,
+                        snapshot_url,
+                        sha256_url,
+                        require_sha256,
+                        archive,
+                        expected_sha256,
+                        refresh_if_stale,
+                        force,
+                        no_backup,
+                        i_fenced_all_signers,
+                        observer,
+                        dry_run,
+                        json,
+                    },
+                )?;
+            }
+        },
     }
     Ok(())
+}
+
+pub(crate) fn resolve_consensus_validator_pubkey(
+    keys_dir: &std::path::Path,
+    validator_pub: Option<String>,
+) -> anyhow::Result<[u8; 32]> {
+    if let Some(hex_pk) = validator_pub {
+        let raw = hex::decode(hex_pk.trim())
+            .map_err(|e| anyhow::anyhow!("invalid --validator-pub hex: {e}"))?;
+        raw.as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("--validator-pub must decode to exactly 32 bytes"))
+    } else {
+        let key_path = keys_dir.join("validator.key");
+        let legacy_path = keys_dir.join("identity.key");
+        if !key_path.exists() && !legacy_path.exists() {
+            anyhow::bail!(
+                "no validator.key or identity.key found in {}; pass --validator-pub for remote signer",
+                keys_dir.display()
+            );
+        }
+        let sk = stellereum::node_keys::load_or_generate_consensus_key(keys_dir)?;
+        Ok(sk.verifying_key().to_bytes())
+    }
+}
+
+pub(crate) fn run_safety_reset_on_storage(
+    storage: &stellereum::storage::Storage,
+) -> anyhow::Result<bool> {
+    storage.reset_safety_record_for_recovery()
+}
+
+pub(crate) fn run_safety_init_on_storage(
+    storage: &stellereum::storage::Storage,
+    val_pub: [u8; 32],
+    shard: u32,
+    prevote_round_floor: Option<u32>,
+    precommit_round_floor: Option<u32>,
+    i_fenced_all_signers: bool,
+) -> anyhow::Result<(
+    stellereum::storage::SafetyRecord,
+    stellereum::safety::SafetyRecordPayload,
+)> {
+    let record = stellereum::safety::operator_safety_init(
+        storage,
+        val_pub,
+        shard,
+        prevote_round_floor,
+        precommit_round_floor,
+        i_fenced_all_signers,
+    )?;
+    let payload = stellereum::safety::SafetyRecordPayload::decode_canonical(&record.payload)?;
+    Ok((record, payload))
 }
 
 /// Parse a JSON-RPC block height that may be a number, a decimal string, or a

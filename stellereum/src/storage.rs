@@ -169,6 +169,36 @@ pub struct SafetyRecordStore {
     failed: Arc<Mutex<bool>>,
 }
 
+/// On-disk schema version of the node store.
+///
+/// Bump when a key layout or encoding changes in a way that older binaries would
+/// MISREAD (a new tree alone does not need a bump: older binaries ignore it).
+/// The version is recorded in the `meta` tree on first open and checked on every
+/// later open. A store written by a NEWER binary is refused unless the operator
+/// explicitly opts in, because the alternative is a silent misinterpretation of
+/// newer data by older code.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// What an open should do with the recorded version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaDecision {
+    /// Fresh store: record the current version.
+    Initialize,
+    /// Same or older version: proceed (older versions migrate on the next run).
+    Accept,
+    /// Store written by a newer binary: refuse unless explicitly allowed.
+    DowngradeBlocked,
+}
+
+/// Pure policy, test-pinned: no clock, no I/O, no env.
+pub fn schema_decision(stored: Option<u32>, current: u32, allow_downgrade: bool) -> SchemaDecision {
+    match stored {
+        None => SchemaDecision::Initialize,
+        Some(v) if v > current && !allow_downgrade => SchemaDecision::DowngradeBlocked,
+        Some(_) => SchemaDecision::Accept,
+    }
+}
+
 impl SafetyRecordStore {
     /// Read and validate the current record. `None` is ambiguous: it may also
     /// mean lost or deleted state, not a safe fresh validator.
@@ -264,6 +294,55 @@ impl SafetyRecordStore {
             return Err(error.into());
         }
         Ok(record)
+    }
+}
+
+#[cfg(test)]
+mod schema_guard_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_store_initializes_and_same_or_older_accepts() {
+        assert_eq!(schema_decision(None, 3, false), SchemaDecision::Initialize);
+        assert_eq!(schema_decision(Some(3), 3, false), SchemaDecision::Accept);
+        assert_eq!(schema_decision(Some(2), 3, false), SchemaDecision::Accept);
+    }
+
+    #[test]
+    fn newer_store_is_refused_unless_the_operator_opts_in() {
+        assert_eq!(
+            schema_decision(Some(4), 3, false),
+            SchemaDecision::DowngradeBlocked
+        );
+        assert_eq!(schema_decision(Some(4), 3, true), SchemaDecision::Accept);
+    }
+
+    #[test]
+    fn open_records_the_version_and_refuses_a_newer_store() {
+        let dir = std::env::temp_dir().join(format!("stell-schema-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let st = Storage::open(&dir).unwrap();
+            let raw = st.get_meta("schema_version").unwrap().expect("recorded");
+            assert_eq!(
+                u32::from_be_bytes(raw.as_slice().try_into().unwrap()),
+                SCHEMA_VERSION
+            );
+        }
+        // Pretend a newer binary wrote this store.
+        {
+            let db = sled::open(&dir).unwrap();
+            let meta = db.open_tree("meta").unwrap();
+            meta.insert("schema_version", &(SCHEMA_VERSION + 1).to_be_bytes())
+                .unwrap();
+            meta.flush().unwrap();
+        }
+        let err = Storage::open(&dir)
+            .err()
+            .expect("must refuse a newer store")
+            .to_string();
+        assert!(err.contains("NEWER than this binary"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -1256,6 +1335,49 @@ impl Storage {
         let blocks = db.open_tree("blocks")?;
         let by_height = db.open_tree("by_height")?;
         let meta = db.open_tree("meta")?;
+        // Schema guard (see SCHEMA_VERSION). A store written by a newer binary
+        // is refused unless the operator opts in: misreading newer keys is worse
+        // than refusing to start.
+        {
+            let stored = meta
+                .get("schema_version")?
+                .map(|v| {
+                    let bytes: [u8; 4] = v.as_ref().try_into().map_err(|_| {
+                        anyhow!("store meta schema_version has invalid length {}", v.len())
+                    })?;
+                    Ok::<u32, anyhow::Error>(u32::from_be_bytes(bytes))
+                })
+                .transpose()?;
+            let allow = std::env::var("STELL_ALLOW_SCHEMA_DOWNGRADE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            match schema_decision(stored, SCHEMA_VERSION, allow) {
+                SchemaDecision::Initialize => {
+                    meta.insert("schema_version", &SCHEMA_VERSION.to_be_bytes())?;
+                    meta.flush()?;
+                }
+                SchemaDecision::Accept => {
+                    if let Some(v) = stored {
+                        if v < SCHEMA_VERSION {
+                            tracing::warn!(
+                                stored = v,
+                                current = SCHEMA_VERSION,
+                                "[storage] store schema is older than this binary; older keys are read as-is"
+                            );
+                        }
+                    }
+                }
+                SchemaDecision::DowngradeBlocked => {
+                    return Err(anyhow!(
+                        "store schema version {} is NEWER than this binary ({}); refusing to start. \
+                         Run the newer binary, or set STELL_ALLOW_SCHEMA_DOWNGRADE=1 only if you \
+                         knowingly downgrade (newer keys may be misread).",
+                        stored.unwrap_or(0),
+                        SCHEMA_VERSION
+                    ));
+                }
+            }
+        }
         let state = db.open_tree("state")?;
         let domains = db.open_tree("domains")?;
         let headers = db.open_tree("headers")?;

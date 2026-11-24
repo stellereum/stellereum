@@ -1,0 +1,1 @@
+[{"jsonrpc":"2.0","id":1,"method":"stell_chainId"},{"jsonrpc":"2.0","id":2,"method":"stell_getBalance","params":["0x00"]}]

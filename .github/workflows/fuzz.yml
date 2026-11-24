@@ -1,0 +1,67 @@
+# Fuzzing — decoder targets, short nightly run.
+#
+# Deliberately NOT on every PR: each target runs 60 s under libFuzzer and the
+# nightly toolchain, which is minutes of CI for a signal that only changes when
+# the decoders change. Trigger manually or let the nightly schedule catch a
+# regression that landed during the day.
+#
+# A crash here is a P0: the input is a remote peer's bytes. Fix the decoder, add
+# the crashing input to `stellereum/fuzz/corpus/<target>/` as a regression, and
+# reference the fix in docs/OPEN_DEFECTS.md.
+name: Fuzz
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - consensus_msg_decode
+          - vote_qc_decode
+          - rpc_json_decode
+          - falcon_sig_decode
+          - frame_decode
+          - transaction_decode
+          - block_decode
+          - cert_envelope_decode
+          - evm_raw_tx_decode
+          - peer_msg_decode
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      # `cargo fuzz` builds with its own sanitizer/RUSTFLAGS; do not override
+      # RUSTFLAGS here or the instrumentation is silently replaced.
+      - name: Build fuzz targets
+        working-directory: stellereum
+        run: cargo fuzz build
+
+      - name: Run ${{ matrix.target }} for 60 s
+        working-directory: stellereum
+        run: |
+          cargo fuzz run "${{ matrix.target }}" -- \
+            -max_total_time=60 -rss_limit_mb=4096 -print_final_stats=1
+
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: stellereum/fuzz/artifacts/**
+          if-no-files-found: ignore

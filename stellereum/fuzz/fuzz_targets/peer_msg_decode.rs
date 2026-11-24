@@ -32,8 +32,14 @@
 use libfuzzer_sys::fuzz_target;
 
 #[cfg(feature = "libfuzzer")]
+const MAX_INPUT: usize = 1 << 20;
+
+#[cfg(feature = "libfuzzer")]
 fuzz_target!(|data: &[u8]| {
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    if data.len() > MAX_INPUT {
+        return;
+    }
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // --- (1) the cross-shard message decoder -----------------------------
         if let Some(msg) =
             stellereum::network::P2pNetworkAdapter::parse_cross_shard_incoming(data)
@@ -75,6 +81,11 @@ fuzz_target!(|data: &[u8]| {
             }
         }
     }));
+    // A panic (including an assertion above) is the bug this harness
+    // exists to find: never let catch_unwind swallow it.
+    if panicked.is_err() {
+        std::process::abort();
+    }
 });
 #[cfg(not(feature = "libfuzzer"))]
 fn main() {}

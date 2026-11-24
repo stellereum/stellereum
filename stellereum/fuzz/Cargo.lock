@@ -2559,6 +2559,7 @@ dependencies = [
  "bincode",
  "infnode",
  "libfuzzer-sys",
+ "serde_json",
  "stellereum",
 ]
 

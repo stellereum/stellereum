@@ -30,8 +30,14 @@
 use libfuzzer_sys::fuzz_target;
 
 #[cfg(feature = "libfuzzer")]
+const MAX_INPUT: usize = 1 << 20;
+
+#[cfg(feature = "libfuzzer")]
 fuzz_target!(|data: &[u8]| {
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    if data.len() > MAX_INPUT {
+        return;
+    }
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // --- the exact / remainder views must agree -----------------------
         match stellereum::evm_adapter::RlpItem::decode_with_remainder(data) {
             Ok((item, rest)) => {
@@ -61,6 +67,11 @@ fuzz_target!(|data: &[u8]| {
         let _ = stellereum::evm_adapter::decode_raw_transaction(data);
         let _ = stellereum::evm_adapter::DecodedTransaction::decode(data);
     }));
+    // A panic (including an assertion above) is the bug this harness
+    // exists to find: never let catch_unwind swallow it.
+    if panicked.is_err() {
+        std::process::abort();
+    }
 });
 #[cfg(not(feature = "libfuzzer"))]
 fn main() {}

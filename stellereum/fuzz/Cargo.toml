@@ -14,6 +14,9 @@ stellereum = { path = ".." }
 # more than the root Cargo.toml's `../infnode/crates/infnode`.
 infnode = { path = "../../infnode/crates/infnode" }
 bincode = "1.3"
+# `rpc_json_decode` parses arbitrary JSON exactly the way the HTTP/WS
+# transports do before building `rpc::RpcRequest`.
+serde_json = "1"
 
 [dependencies.libfuzzer-sys]
 version = "0.4"
@@ -79,5 +82,33 @@ bench = false
 [[bin]]
 name = "peer_msg_decode"
 path = "fuzz_targets/peer_msg_decode.rs"
+test = false
+bench = false
+
+# Wave 4 (2026-11): decoder classes that the C1 consensus review reached by
+# READING only. Each one takes bytes/an envelope a remote peer chooses:
+#   * vote_qc_decode      — `Vote` / `QuorumCertificate` bincode frames, and
+#                           the rule that a forged/empty signature set can
+#                           never satisfy `QuorumCertificate::verify`;
+#   * rpc_json_decode     — the JSON-RPC body parser (`rpc::RpcRequest`), i.e.
+#                           the one decoder every unauthenticated HTTP/WS
+#                           client reaches;
+#   * falcon_sig_decode   — arbitrary 666-byte Falcon-512 signature frames
+#                           through the public `verify_falcon_signature`.
+[[bin]]
+name = "vote_qc_decode"
+path = "fuzz_targets/vote_qc_decode.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "rpc_json_decode"
+path = "fuzz_targets/rpc_json_decode.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "falcon_sig_decode"
+path = "fuzz_targets/falcon_sig_decode.rs"
 test = false
 bench = false

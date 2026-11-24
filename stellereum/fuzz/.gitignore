@@ -1,0 +1,10 @@
+# cargo-fuzz build output
+/target
+
+# libFuzzer crash/reproducer artifacts. A crash input that is promoted to a
+# regression belongs in `corpus/<target>/`, not here (see docs/FUZZING.md).
+/artifacts
+
+# Coverage builds
+/coverage
+*.profraw

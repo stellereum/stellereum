@@ -1,0 +1,1 @@
+{"jsonrpc":7,"id":{"nested":[1,2,3]},"method":42,"params":"not-an-object"}

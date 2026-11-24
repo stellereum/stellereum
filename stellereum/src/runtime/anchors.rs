@@ -2196,8 +2196,35 @@ impl ValidatorRuntime {
         match self.try_restore_last_decision_from_finalized_block(block) {
             Ok(()) => Ok(()),
             Err(e) => {
-                self.parent_evidence_missing = true;
-                Err(e)
+                // DEGRADE, DO NOT FREEZE (live incident 2026-11-24): our own
+                // persisted finalized tip carries a proof we cannot attribute
+                // (the set in force at that height resolved to a degenerate
+                // power, so the embedded QC scores 0 of quorum). Refusing to
+                // propose forever is a permanent halt when EVERY member has the
+                // same unverifiable tip, which is exactly what happened.
+                //
+                // The protocol already has a state for "this node does not know
+                // the parent's decision" (`last_qc = None` is canonical and the
+                // applier skips attribution deterministically). We take that
+                // state instead of fabricating evidence: we do NOT claim a
+                // decision we cannot verify. The cost is one height whose
+                // downtime accounting is skipped; every later height resumes
+                // normal evidence because the block we produce next becomes a
+                // decision we CAN verify.
+                tracing::error!(
+                    "[DOWNTIME-RESTORE] finalized tip carries unverifiable decision evidence \
+                     ({e}); continuing as a node that knows no decision for the parent height \
+                     (downtime accounting for that height is skipped)"
+                );
+                eprintln!(
+                    "[storage] DOWNTIME-RESTORE: unverifiable decision evidence for our own \
+                     finalized tip ({e}); degrading to the canonical 'no known decision' state \
+                     instead of refusing to propose"
+                );
+                self.last_decision = None;
+                self.decided_parent_votes = None;
+                self.parent_evidence_missing = false;
+                Ok(())
             }
         }
     }

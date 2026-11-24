@@ -83,6 +83,8 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
             parallel_exec,
             pure_pq,
             wait_for_supermajority,
+            node_toml: _,
+            no_telemetry: _,
         } => {
             crate::node::bootstrap::run_node(
                 config,
@@ -3103,6 +3105,81 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                     &rpc,
                     token.as_deref(),
                 )?;
+            }
+        },
+        Commands::Config { sub } => match sub {
+            ConfigCommands::Check { file, json } => {
+                let source = stellereum::node_config::discover_toml_path(file.as_deref())?;
+                let cfg = match source.path() {
+                    Some(p) => stellereum::node_config::NodeTomlConfig::from_file(p)?,
+                    None => stellereum::node_config::NodeTomlConfig::default(),
+                };
+                let resolved = cfg.resolve_effective();
+                if json {
+                    let payload = serde_json::json!({
+                        "ok": resolved.report.is_ok(),
+                        "config_file": source.path().map(|p| p.display().to_string()),
+                        "config_source": source.label(),
+                        "errors": resolved.report.errors,
+                        "warnings": resolved.report.warnings,
+                        "effective": resolved.settings,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&payload)?);
+                } else {
+                    match source.path() {
+                        Some(p) => println!(
+                            "Stellereum node configuration — {} (source: {})",
+                            p.display(),
+                            source.label()
+                        ),
+                        None => println!(
+                            "Stellereum node configuration — <none> (env + compiled defaults)"
+                        ),
+                    }
+                    println!(
+                        "\n{:<40} {:<26} {:<8} ENV VAR",
+                        "SETTING", "EFFECTIVE VALUE", "SOURCE"
+                    );
+                    println!("{}", "-".repeat(108));
+                    for s in &resolved.settings {
+                        let src = match s.source {
+                            stellereum::node_config::ConfigSource::Toml => "toml",
+                            stellereum::node_config::ConfigSource::Env => "env",
+                            stellereum::node_config::ConfigSource::Default => "default",
+                        };
+                        println!("{:<40} {:<26} {:<8} {}", s.key, s.value, src, s.env_var);
+                    }
+                    if !resolved.report.warnings.is_empty() {
+                        println!("\nWarnings ({}):", resolved.report.warnings.len());
+                        for w in &resolved.report.warnings {
+                            println!("  WARN: {w}");
+                        }
+                    }
+                    if !resolved.report.errors.is_empty() {
+                        println!("\nErrors ({}):", resolved.report.errors.len());
+                        for e in &resolved.report.errors {
+                            println!("  ERROR: {e}");
+                        }
+                    }
+                    if resolved.report.is_ok() {
+                        println!(
+                            "\nVERDICT: OK ({} warning(s))",
+                            resolved.report.warnings.len()
+                        );
+                    } else {
+                        println!(
+                            "\nVERDICT: FAILED ({} error(s), {} warning(s))",
+                            resolved.report.errors.len(),
+                            resolved.report.warnings.len()
+                        );
+                    }
+                }
+                if !resolved.report.is_ok() {
+                    anyhow::bail!(
+                        "config check failed with {} error(s)",
+                        resolved.report.errors.len()
+                    );
+                }
             }
         },
     }

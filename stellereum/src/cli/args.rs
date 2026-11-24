@@ -37,6 +37,16 @@ pub(crate) enum Commands {
         /// STELL_WAIT_SUPERMAJORITY.
         #[arg(long)]
         wait_for_supermajority: Option<u64>,
+        /// Path to Stellereum TOML node configuration file (env: STELL_NODE_TOML,
+        /// or auto-discovers ./stellereum.toml if present). Distinct from -c/--config
+        /// which is infnode's YAML configuration file.
+        #[arg(long)]
+        node_toml: Option<PathBuf>,
+        /// Disable non-essential telemetry/status-banner exposure (sets
+        /// STELL_NO_TELEMETRY=1; disables `/status` HTML dashboard while keeping
+        /// `/health`, `/healthz`, `/readyz`, and `/metrics` operational).
+        #[arg(short = 't', long, default_value_t = false)]
+        no_telemetry: bool,
     },
     /// Bootstrap a FRESH observer from zero: preflight gate, then the live
     /// sync engine (snapshot-sync incl. ledger + all domains, body walk, live).
@@ -341,6 +351,24 @@ pub(crate) enum Commands {
     Gov {
         #[command(subcommand)]
         sub: GovCommands,
+    },
+    /// Inspect and validate Stellereum TOML + environment configuration
+    Config {
+        #[command(subcommand)]
+        sub: ConfigCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ConfigCommands {
+    /// Load optional TOML config, merge STELL_* env overrides, and validate invariants
+    Check {
+        /// Path to TOML config file (error if missing; default: $STELL_NODE_TOML or ./stellereum.toml if present)
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Emit machine-readable JSON instead of the human-readable summary
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -1679,5 +1707,79 @@ mod cli_safety_init_tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn cli_parses_run_node_toml_no_telemetry_and_config_check() {
+        let run_cli = Cli::try_parse_from([
+            "stellereum",
+            "run",
+            "-c",
+            "infnode.yaml",
+            "--node-toml",
+            "/tmp/stellereum.toml",
+            "-t",
+        ])
+        .expect("parse run with --node-toml and -t");
+        match run_cli.command {
+            Commands::Run {
+                config,
+                node_toml,
+                no_telemetry,
+                ..
+            } => {
+                assert_eq!(config, PathBuf::from("infnode.yaml"));
+                assert_eq!(node_toml, Some(PathBuf::from("/tmp/stellereum.toml")));
+                assert!(no_telemetry);
+            }
+            _ => panic!("expected Commands::Run"),
+        }
+
+        let run_long = Cli::try_parse_from(["stellereum", "run", "--no-telemetry"])
+            .expect("parse run --no-telemetry");
+        match run_long.command {
+            Commands::Run {
+                config,
+                node_toml,
+                no_telemetry,
+                ..
+            } => {
+                assert_eq!(config, PathBuf::from("config.yaml"));
+                assert_eq!(node_toml, None);
+                assert!(no_telemetry);
+            }
+            _ => panic!("expected Commands::Run"),
+        }
+
+        let cfg_default =
+            Cli::try_parse_from(["stellereum", "config", "check"]).expect("parse config check");
+        assert!(matches!(
+            cfg_default.command,
+            Commands::Config {
+                sub: ConfigCommands::Check {
+                    file: None,
+                    json: false,
+                }
+            }
+        ));
+
+        let cfg_flags = Cli::try_parse_from([
+            "stellereum",
+            "config",
+            "check",
+            "--file",
+            "/etc/stellereum/node.toml",
+            "--json",
+        ])
+        .expect("parse config check --file --json");
+        match cfg_flags.command {
+            Commands::Config {
+                sub: ConfigCommands::Check { file, json },
+            } => {
+                assert_eq!(file, Some(PathBuf::from("/etc/stellereum/node.toml")));
+                assert!(json);
+            }
+            _ => panic!("expected Commands::Config"),
+        }
     }
 }

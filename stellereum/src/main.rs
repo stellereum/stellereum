@@ -43,6 +43,54 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .init();
+    // Parse CLI and apply optional TOML defaults + `-t`/`--no-telemetry` BEFORE
+    // reading `runtime_limits` or spawning the Tokio runtime / any threads so
+    // `std::env::set_var` executes strictly single-threaded.
+    let cli = cli::args::Cli::parse();
+    if let cli::args::Commands::Run {
+        ref node_toml,
+        no_telemetry,
+        ..
+    } = cli.command
+    {
+        let toml_source = stellereum::node_config::discover_toml_path(node_toml.as_deref())?;
+        let loaded_cfg = if let Some(path) = toml_source.path() {
+            let cfg = stellereum::node_config::NodeTomlConfig::from_file(path)?;
+            let applied = cfg.apply_defaults_to_env();
+            tracing::info!(
+                "[config] loaded {} (source={}, applied={} env defaults)",
+                path.display(),
+                toml_source.label(),
+                applied.len(),
+            );
+            Some(cfg)
+        } else {
+            None
+        };
+        if no_telemetry {
+            std::env::set_var(stellereum::node_config::NO_TELEMETRY_ENV, "1");
+            tracing::info!(
+                "[telemetry] disabled via -t/--no-telemetry ({}=1): /status dashboard disabled; /health, /healthz, /readyz, /metrics remain active",
+                stellereum::node_config::NO_TELEMETRY_ENV,
+            );
+        }
+        if let Some(cfg) = loaded_cfg {
+            let report = cfg.validate();
+            for warn in &report.warnings {
+                tracing::warn!("[config] {warn}");
+            }
+            if !report.is_ok() {
+                for err in &report.errors {
+                    tracing::error!("[config] {err}");
+                }
+                anyhow::bail!(
+                    "node TOML config validation failed ({} error(s)): {}",
+                    report.errors.len(),
+                    report.errors.join("; "),
+                );
+            }
+        }
+    }
     let limits = node::runtime_limits::detect();
     tracing::info!(
         "[runtime] worker_threads={} max_blocking_threads={} (derived from available_parallelism)",
@@ -55,16 +103,15 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("tokio runtime: {e}"))?;
-    runtime.block_on(run())
+    runtime.block_on(run(cli))
 }
 
-async fn run() -> anyhow::Result<()> {
+async fn run(cli: cli::args::Cli) -> anyhow::Result<()> {
     // Protocol identity MUST be installed before any node handshake: it is
     // what every peer compares against (fork id mismatch = consensus refused,
     // loudly). Startup visibility is part of the contract.
     stellereum::protocol::install_chain_identity()
         .map_err(|e| anyhow::anyhow!("protocol identity: {e}"))?;
     tracing::info!("{}", stellereum::protocol::startup_line());
-    let cli = cli::args::Cli::parse();
     cli::handlers::handle_command(cli.command).await
 }

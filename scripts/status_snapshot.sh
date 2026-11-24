@@ -36,9 +36,12 @@ MEMPOOL="$(rpc stell_mempoolSize || true)"
 CHAIN_ID="$(rpc stell_chainId || true)"
 NODE_ID="$(rpc stell_nodeId || true)"
 VERSION_JSON="$(curl -s -m "$TIMEOUT" "$EXPLORER_URL/api/version" 2>/dev/null || echo "")"
-METRICS_HEIGHT="$(curl -s -m "$TIMEOUT" "$EXPLORER_URL/metrics" 2>/dev/null | grep -E '^stell_consensus_height ' | awk '{print $2}' | head -1 || true)"
+METRICS_TEXT="$(curl -s -m "$TIMEOUT" "$EXPLORER_URL/metrics" 2>/dev/null || echo "")"
+METRICS_HEIGHT="$(printf '%s\n' "$METRICS_TEXT" | grep -E '^stell_consensus_height ' | awk '{print $2}' | head -1 || true)"
+EFFICIENCY_RATIO="$(printf '%s\n' "$METRICS_TEXT" | grep -E '^stell_validator_efficiency_ratio ' | awk '{print $2}' | head -1 || true)"
+READYZ_JSON="$(curl -s -m "$TIMEOUT" "$EXPLORER_URL/readyz" 2>/dev/null || echo "")"
 
-export TS HEIGHT_HEX SYNCING STATE_ROOT VALIDATORS MEMPOOL CHAIN_ID NODE_ID VERSION_JSON METRICS_HEIGHT
+export TS HEIGHT_HEX SYNCING STATE_ROOT VALIDATORS MEMPOOL CHAIN_ID NODE_ID VERSION_JSON METRICS_HEIGHT EFFICIENCY_RATIO READYZ_JSON
 python3 - "$RPC_URL" "$EXPLORER_URL" <<'EOF'
 import json, os, sys
 
@@ -74,6 +77,16 @@ try:
     metrics_height = int(float(mh)) if mh.strip() else None
 except Exception:
     metrics_height = None
+try:
+    eff_raw = os.environ.get("EFFICIENCY_RATIO") or ""
+    efficiency = float(eff_raw.strip()) if eff_raw.strip() else None
+except Exception:
+    efficiency = None
+try:
+    readyz = json.loads(os.environ.get("READYZ_JSON") or "")
+    ready = bool(readyz["ready"]) if isinstance(readyz, dict) and "ready" in readyz else None
+except Exception:
+    ready = None
 
 out = {
     "ok": height is not None,
@@ -83,6 +96,8 @@ out = {
     "height": height,
     "metrics_height": metrics_height,
     "heights_agree": (height is not None and metrics_height is not None and height == metrics_height),
+    "efficiency": efficiency,
+    "ready": ready,
     "syncing": rpc_result(os.environ.get("SYNCING") or ""),
     "state_root": rpc_result(os.environ.get("STATE_ROOT") or ""),
     "validators": n_validators,

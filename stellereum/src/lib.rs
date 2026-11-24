@@ -102,6 +102,7 @@ pub mod minroot_vdf;
 pub mod mmr;
 pub mod native_api;
 pub mod network;
+pub mod node_config;
 pub mod node_keys;
 pub mod oracle;
 pub mod orderbook;

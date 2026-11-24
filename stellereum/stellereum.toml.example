@@ -1,0 +1,140 @@
+# Stellereum Node TOML Configuration Example
+#
+# Discovery precedence:
+#   1. `--node-toml <PATH>` (distinct from `-c/--config` which is infnode YAML!)
+#   2. `STELL_NODE_TOML=<PATH>`
+#   3. `./stellereum.toml` in the current working directory (if present)
+#
+# Override precedence:
+#   Environment variables (`STELL_*`) ALWAYS override values set in this file.
+#   Validate your effective configuration at any time with:
+#     stellereum config check --file ./stellereum.toml
+
+[tempo]
+# Consensus loop tick quantum in ms (valid range: 10..=1000).
+tick_ms = 50
+# Minimum interval between finalized blocks in ms (0 disables flood floor).
+min_block_ms = 50
+# Base round timeout in ms (must be >= min_block_ms).
+round_timeout_ms = 3000
+round_zero_timeout_ms = 650
+down_proposer_timeout_ms = 800
+straggler_grace_ms = 0
+straggler_grace_cap_ms = 30_000
+# straggler_freshness_ms = 15_000
+catchup_interval_ms = 30_000
+catchup_budget_ms = 250
+retro_publish_interval_ms = 30_000
+retro_behind_window_secs = 120
+deadlock_timeout_secs = 300
+
+[consensus]
+chain_id = 5757
+observer = false
+workchain_observer = false
+new_chain = false
+shards = "0"
+experimental_shards = false
+pure_pq = true
+auto_upgrade = false
+# wait_supermajority = 0
+# wait_supermajority_timeout_secs = 120
+gov_allow_multinode_writes = false
+
+[storage]
+data_dir = "./data"
+# When archive = false, keep_blocks MUST be > 0.
+archive = true
+keep_blocks = 50_000
+snapshot_interval = 1000
+sled_cache_bytes = 1_073_741_824
+sled_flush_ms = 500
+sled_compression = false
+# WARNING: setting schema_downgrade_allowed = true may misread newer DB keys.
+schema_downgrade_allowed = false
+validator_set_max_lag = 300
+max_cached_blocks = 2048
+max_pq_fallback_entries = 65_536
+max_accounts_warn = 5_000_000
+snapshot_chunk_accounts = 50_000
+
+[network]
+# dns_seeds = "seeds.stellereum.org"
+# peer_pq_keys = ""
+send_timeout_ms = 2000
+broadcast_join_ms = 500
+probe_evict_after = 3
+dial_backoff_base_ms = 2000
+dial_backoff_max_ms = 300_000
+dial_budget_per_sec = 4
+cons_bcast_min_interval_ms = 25
+cons_probe_min_interval_ms = 5000
+inbound_bulk_bytes_per_sec = 524_288
+inbound_bulk_burst_bytes = 1_048_576
+dht_keep_blocks_default = 8000
+dht_prune_interval_heights = 100
+dht_prune_max_per_run = 2048
+dht_forever_ttl_ms = 3_153_600_000_000
+
+[rpc]
+# Non-loopback rpc_listen emits a warning unless STELL_RPC_AUTH_TOKEN / auth_token is set.
+rpc_listen = "127.0.0.1:8545"
+explorer_listen = "127.0.0.1:8080"
+# auth_token = "replace-with-strong-secret"
+rate_limit_per_sec = 30
+standalone_rate_limit = 300
+estimate_fee_rate_limit = 5
+ws_expensive_read_rate_limit = 5
+http_expensive_read_concurrency = 32
+ws_idle_timeout_secs = 300
+sse_idle_timeout_secs = 300
+trusted_proxy_cidrs = "127.0.0.0/8,::1/128"
+xff_mode = "rightmost"
+trust_loopback_forwarded = false
+
+[mempool]
+cap = 50_000
+per_sender = 1024
+
+[faucet]
+enabled = false
+# faucet_key_file = "./keys/faucet.key"
+# faucet_token = "replace-with-faucet-token"
+# Must be <= faucet_lifetime_cap_stell.
+faucet_drip_stell = 2
+faucet_lifetime_cap_stell = 50
+faucet_ip_max_per_hour = 20
+public_drip_nano = 2_000_000_000
+public_drip_cooldown_secs = 2700
+dev_unsafe_testkey = false
+
+[signer]
+falcon_key_file = "./keys/falcon.key"
+# remote_signer_url = "https://signer.internal:8443"
+# remote_signer_token = "replace-with-signer-token"
+key_plaintext = false
+key_prompt = false
+
+[telemetry]
+# Set enabled = false (or top-level `telemetry = false`, or pass `-t` / `--no-telemetry`)
+# to disable the `/status` HTML dashboard while keeping `/health`, `/healthz`,
+# `/readyz`, and `/metrics` operational.
+enabled = true
+liveness_alarm_ms = 300_000
+ready_max_stall_secs = 30
+ready_min_peers = 1
+health_cache_ms = 1000
+health_min_peers = 1
+health_max_finalization_lag_secs = 5
+health_critical_finalization_lag_secs = 60
+health_max_finalization_lag_blocks = 5
+health_max_mempool_age_secs = 300
+health_max_persist_age_secs = 120
+health_max_snapshot_age_secs = 3600
+
+[execution]
+parallel_exec = false
+# parallel_plan_chunk = 64
+# runtime_workers = 4
+# runtime_max_blocking = 32
+register_source = false

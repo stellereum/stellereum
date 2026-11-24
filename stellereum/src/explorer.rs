@@ -875,6 +875,24 @@ fn measured_u64(value: Option<u64>, unit: &'static str, reason: &str) -> Measure
     }
 }
 
+/// Env var disabling non-essential telemetry/status-banner exposure
+/// (set by `-t`/`--no-telemetry` on `run`, or `telemetry = false` in TOML).
+/// Keeps `/health`, `/healthz`, `/readyz`, and `/metrics` operational while
+/// disabling the `/status` HTML dashboard.
+pub const NO_TELEMETRY_ENV: &str = "STELL_NO_TELEMETRY";
+
+/// Returns true when non-essential telemetry/status-banner exposure is disabled.
+pub fn no_telemetry_enabled() -> bool {
+    matches!(
+        std::env::var(NO_TELEMETRY_ENV)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 pub struct GatewayState {
     pub rpc: Arc<RpcState>,
     pub limiter: Arc<RateLimiter>,
@@ -899,6 +917,9 @@ pub struct GatewayState {
     pub health_options: HealthOptions,
     /// One-sample TTL cache for `/health` / `/status`.
     pub health_cache: HealthCache,
+    /// Whether optional telemetry/status-banner endpoints (`/status`) are enabled.
+    /// Initialized from `!no_telemetry_enabled()`.
+    pub telemetry_enabled: bool,
     /// Separate, longer-lived cache for the data-dir scan: the one part of the
     /// payload expensive enough to matter.
     health_data_dir_cache: Mutex<Option<(u64, (u64, u64))>>,
@@ -927,6 +948,7 @@ impl GatewayState {
             captcha: Arc::new(crate::turnstile::CaptchaGate::from_env()),
             health_options: HealthOptions::from_env(),
             health_cache: HealthCache::new(),
+            telemetry_enabled: !no_telemetry_enabled(),
             health_data_dir_cache: Mutex::new(None),
             health_data_dir_scan_gate: tokio::sync::Mutex::new(()),
         }
@@ -949,9 +971,16 @@ impl GatewayState {
             captcha,
             health_options: HealthOptions::from_env(),
             health_cache: HealthCache::new(),
+            telemetry_enabled: !no_telemetry_enabled(),
             health_data_dir_cache: Mutex::new(None),
             health_data_dir_scan_gate: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Override optional telemetry/status-banner exposure (for tests/embedders).
+    pub fn with_telemetry_enabled(mut self, enabled: bool) -> Self {
+        self.telemetry_enabled = enabled;
+        self
     }
 
     /// Override health thresholds/cache/disk for tests or explicit deployments.
@@ -3209,8 +3238,86 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
-async fn status_page(State(st): State<Arc<GatewayState>>) -> (HeaderMap, Html<String>) {
+/// Summary scalars parsed from [`crate::metrics::Registry::render`] for
+/// [`status_page`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MetricsStatusSummary {
+    pub validator_efficiency_ratio: Option<f64>,
+    pub block_interval_sum_secs: Option<f64>,
+    pub block_interval_count: Option<u64>,
+}
+
+/// Extract `stell_validator_efficiency_ratio` and `stell_block_interval_seconds`
+/// (`_sum` / `_count`) from Prometheus exposition text.
+pub fn parse_metrics_status_summary(rendered: &str) -> MetricsStatusSummary {
+    let mut out = MetricsStatusSummary::default();
+    for line in rendered.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        let Some(val) = parts.next() else {
+            continue;
+        };
+        match name {
+            n if n == crate::metrics::VALIDATOR_EFFICIENCY_RATIO => {
+                out.validator_efficiency_ratio = val.parse::<f64>().ok();
+            }
+            "stell_block_interval_seconds_sum" => {
+                out.block_interval_sum_secs = val.parse::<f64>().ok();
+            }
+            "stell_block_interval_seconds_count" => {
+                out.block_interval_count = val.parse::<u64>().ok();
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+async fn status_page(State(st): State<Arc<GatewayState>>) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+    headers.insert("cache-control", "no-store".parse().unwrap());
+    if !st.telemetry_enabled || no_telemetry_enabled() {
+        return (
+            StatusCode::NOT_FOUND,
+            headers,
+            Html("status page disabled (STELL_NO_TELEMETRY=1)".to_string()),
+        )
+            .into_response();
+    }
     let p = health_current(&st).await;
+    let ready_rep = st.readiness.evaluate();
+    let ready_html = if ready_rep.ready {
+        "ready".to_string()
+    } else if ready_rep.failed_checks.is_empty() {
+        "not ready".to_string()
+    } else {
+        format!(
+            "not ready ({})",
+            html_escape(&ready_rep.failed_checks.join(", "))
+        )
+    };
+    let metrics_summary = parse_metrics_status_summary(&st.metrics.render());
+    let efficiency_html = match metrics_summary.validator_efficiency_ratio {
+        Some(r) => format!("{:.1}% ({r:.4})", r * 100.0),
+        None => "n/a".to_string(),
+    };
+    let block_interval_html = match (
+        metrics_summary.block_interval_sum_secs,
+        metrics_summary.block_interval_count,
+    ) {
+        (Some(sum), Some(count)) if count > 0 => {
+            format!("{:.3} s avg ({count} blocks)", sum / count as f64)
+        }
+        (Some(_), Some(0)) => "n/a (0 blocks observed)".to_string(),
+        _ => "n/a".to_string(),
+    };
     let status = match p.verdict.status {
         HealthStatus::Ok => "ok",
         HealthStatus::Degraded => "degraded",
@@ -3248,16 +3355,19 @@ async fn status_page(State(st): State<Arc<GatewayState>>) -> (HeaderMap, Html<St
          <tr><th>chain id</th><td>{chain_id}</td></tr>\
          <tr><th>node id</th><td><code>{node_id}</code></td></tr>\
          <tr><th>software</th><td>{software}</td></tr>\
+         <tr><th>ready (/readyz)</th><td>{ready_html}</td></tr>\
          <tr><th>height</th><td>{height}</td></tr>\
          <tr><th>finalized height</th><td>{finalized}</td></tr>\
          <tr><th>finalization lag</th><td>{lag_s} / {lag_b}</td></tr>\
          <tr><th>blocks/s</th><td>{rate}</td></tr>\
+         <tr><th>block interval</th><td>{block_interval_html}</td></tr>\
+         <tr><th>validator efficiency</th><td>{efficiency_html}</td></tr>\
          <tr><th>last finalize age</th><td>{last_fin}</td></tr>\
          <tr><th>peers</th><td>{peers}</td></tr>\
          <tr><th>mempool</th><td>{mempool}</td></tr>\
          <tr><th>data dir</th><td>{disk}</td></tr>\
          </table>\
-         <p><a href=\"/health\">/health</a> &middot; <a href=\"/metrics\">/metrics</a></p>\
+         <p><a href=\"/health\">/health</a> &middot; <a href=\"/readyz\">/readyz</a> &middot; <a href=\"/metrics\">/metrics</a></p>\
          </body></html>",
         sampled = p.sampled_at_ms,
         served = p.served_at_ms,
@@ -3295,10 +3405,7 @@ async fn status_page(State(st): State<Arc<GatewayState>>) -> (HeaderMap, Html<St
         mempool = fmt_u64(&p.mempool.size),
         disk = fmt_u64(&p.storage.data_dir_bytes),
     );
-    let mut headers = HeaderMap::new();
-    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
-    headers.insert("cache-control", "no-store".parse().unwrap());
-    (headers, Html(body))
+    (headers, Html(body)).into_response()
 }
 
 /// Liveness probe: the process is up and answering HTTP. Deliberately cheap —
@@ -3714,5 +3821,95 @@ mod tests {
         let good = hex::encode([9u8; 32]);
         assert_eq!(parse_addr(&good), Some([9u8; 32]));
         assert_eq!(parse_addr(&format!("0x{good}")), Some([9u8; 32]));
+    }
+
+    #[test]
+    fn parse_metrics_status_summary_extracts_efficiency_and_interval() {
+        let reg = crate::metrics::Registry::new();
+        reg.inc_validator_proposal_expected();
+        reg.inc_validator_proposal_produced();
+        reg.inc_validator_proposal_expected();
+        reg.observe_block_interval(0.25);
+        reg.observe_block_interval(0.75);
+        let summary = parse_metrics_status_summary(&reg.render());
+        assert_eq!(summary.validator_efficiency_ratio, Some(0.5));
+        assert_eq!(summary.block_interval_sum_secs, Some(1.0));
+        assert_eq!(summary.block_interval_count, Some(2));
+    }
+
+    #[tokio::test]
+    async fn status_page_enrichment_and_no_telemetry_flag() {
+        let rpc = Arc::new(RpcState {
+            engine: Arc::new(crate::state_engine::InMemoryStateEngine::new()),
+            mempool: Arc::new(tokio::sync::RwLock::new(crate::mempool::Mempool::default())),
+            height: Arc::new(std::sync::atomic::AtomicU64::new(5)),
+            node_id: "inf1:status-test".to_string(),
+            chain_id: 5757,
+            staking: Arc::new(tokio::sync::RwLock::new(
+                crate::staking::StakingLedger::new(),
+            )),
+            governance: Arc::new(tokio::sync::RwLock::new(
+                crate::governance::Governance::new(),
+            )),
+            recent_blocks: Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::new())),
+            receipts: Arc::new(tokio::sync::RwLock::new(crate::rpc::ReceiptIndex::default())),
+            auth_token: None,
+            tx_broadcast: None,
+            faucet: None,
+            faucet_token: None,
+            archive_store: None,
+            msg_signing_seed: None,
+            shard_registry: crate::sharding::ShardRegistry::single(),
+        });
+        let reg = crate::metrics::Registry::shared();
+        reg.observe_block_interval(0.4);
+        reg.observe_block_interval(0.6);
+
+        let mut gw = GatewayState::with_captcha(
+            rpc.clone(),
+            100,
+            ReadinessConfig {
+                max_stall_secs: 30,
+                min_peers: 0,
+            },
+            Arc::new(crate::turnstile::CaptchaGate::disabled()),
+        )
+        .with_health_options(HealthOptions {
+            data_dir: None,
+            ..Default::default()
+        })
+        .with_telemetry_enabled(true);
+        gw.metrics = reg.clone();
+        gw.note_ready_finalized(5);
+        let gw = Arc::new(gw);
+
+        let resp = status_page(State(gw.clone())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("validator efficiency"), "{html}");
+        assert!(html.contains("100.0%"), "{html}");
+        assert!(html.contains("0.500 s avg (2 blocks)"), "{html}");
+        assert!(html.contains("ready (/readyz)"), "{html}");
+        assert!(html.contains(">ready<"), "{html}");
+
+        // Disabled telemetry disables /status while keeping /health and /readyz alive.
+        let gw_off = Arc::new(
+            GatewayState::with_captcha(
+                rpc,
+                100,
+                ReadinessConfig::default(),
+                Arc::new(crate::turnstile::CaptchaGate::disabled()),
+            )
+            .with_telemetry_enabled(false),
+        );
+        let disabled_resp = status_page(State(gw_off.clone())).await;
+        assert_eq!(disabled_resp.status(), StatusCode::NOT_FOUND);
+        let (ready_code, _) = readyz(State(gw_off.clone())).await;
+        assert_eq!(ready_code, StatusCode::SERVICE_UNAVAILABLE);
+        let (health_headers, _) = health(State(gw_off)).await;
+        assert!(health_headers.contains_key("cache-control"));
     }
 }

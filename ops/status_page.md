@@ -4,6 +4,8 @@ Minimal public status surface for a Stellereum node/cluster. Everything
 published here is already public (RPC + `/metrics` + `/api/version` expose no
 secrets — see the exposure enumeration in `stellereum/src/metrics.rs`).
 
+> Standalone multi-node status service & public dashboard implementation: see [`ops/status/README.md`](status/README.md) (`ops/status/status_server.py`).
+
 ## What to publish (and where each field comes from)
 
 | Field | Meaning | Source (all verified to exist) |

@@ -1,0 +1,40 @@
+[Unit]
+Description=Stellereum Public Status Page & Cluster Observer
+Documentation=file:///opt/stellereum/ops/status/README.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Adjust User/WorkingDirectory/ExecStart to match your checkout path.
+User=stell-status
+Group=stell-status
+WorkingDirectory=/opt/stellereum
+Environment=STELL_STATUS_LISTEN=127.0.0.1:8095
+Environment=STELL_STATUS_INTERVAL=15
+Environment=STELL_STATUS_TIMEOUT=3
+Environment=STELL_STATUS_HISTORY=40
+Environment=STELL_STATUS_EXPECTED_VALIDATORS=4
+Environment=STELL_STATUS_LOG_LEVEL=INFO
+# Optional override file (STELL_STATUS_TARGETS, STELL_STATUS_TARGETS_FILE, etc.)
+EnvironmentFile=-/etc/stellereum/stell-status.env
+ExecStart=/usr/bin/python3 /opt/stellereum/ops/status/status_server.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stell-status
+
+# Hardening — status_server.py only performs outbound HTTP(S) polls and binds 127.0.0.1:8095.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

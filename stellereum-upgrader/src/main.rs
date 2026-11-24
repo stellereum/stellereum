@@ -8,16 +8,18 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use stellereum_upgrader::{
-    atomic_install, check_live_path, format_sha256_hex, is_root, resolve_staged_binary,
-    run_restart_command, spawn_child_and_wait, systemd_unit_example, verify_staged,
-    wait_for_marker, Progress, UpgradePlan, MARKER_HEADER, UPGRADE_EXIT_CODE, UPGRADE_VERSION_ENV,
-    WAIT_SUPERMAJORITY_ENV,
+    atomic_install, backup_binary, backup_path_for, check_live_path, format_sha256_hex, is_root,
+    resolve_staged_binary, rollback_binary_with_progress, run_restart_command,
+    spawn_child_and_wait, systemd_unit_example, verify_post_upgrade_health, verify_staged,
+    wait_for_marker, HealthCheckConfig, Progress, UpgradePlan, MARKER_HEADER, UPGRADE_EXIT_CODE,
+    UPGRADE_VERSION_ENV, WAIT_SUPERMAJORITY_ENV,
 };
 
 const DEFAULT_MARKER: &str = "./data/upgrade-halt.marker";
 const DEFAULT_PROGRESS: &str = "./data/upgrade-supervisor.progress";
 const DEFAULT_WAIT_SECS: u64 = 3600;
 const DEFAULT_POLL_MS: u64 = 500;
+const DEFAULT_HEALTH_WAIT_SECS: u64 = 0;
 
 #[derive(Clone, Debug)]
 struct Args {
@@ -30,6 +32,10 @@ struct Args {
     progress: PathBuf,
     wait_timeout: Duration,
     poll: Duration,
+    health_url: Option<String>,
+    health_wait_secs: u64,
+    rollback_on_fail: bool,
+    require_height_advance: bool,
     apply: bool,
     allow_root: bool,
     no_wait: bool,
@@ -51,6 +57,10 @@ impl Default for Args {
             progress: PathBuf::from(DEFAULT_PROGRESS),
             wait_timeout: Duration::from_secs(DEFAULT_WAIT_SECS),
             poll: Duration::from_millis(DEFAULT_POLL_MS),
+            health_url: None,
+            health_wait_secs: DEFAULT_HEALTH_WAIT_SECS,
+            rollback_on_fail: false,
+            require_height_advance: false,
             apply: false,
             allow_root: false,
             no_wait: false,
@@ -103,6 +113,15 @@ SAFETY:\n\
   --poll-ms MS           Poll interval (default {DEFAULT_POLL_MS}ms).\n\
   --progress PATH        Append-only progress journal\n\
                          (default: {DEFAULT_PROGRESS}).\n\
+\n\
+HEALTH & AUTO-ROLLBACK:\n\
+  --health-url URL       Post-upgrade health endpoint (JSON-RPC stell_blockNumber\n\
+                         or GET .../health when URL path ends with /health).\n\
+  --health-wait-secs N   Seconds to wait for post-upgrade health (default {DEFAULT_HEALTH_WAIT_SECS} = disabled).\n\
+  --rollback-on-fail     On restart/health failure, restore <live>.prev -> <live>\n\
+                         and re-run --restart-cmd.\n\
+  --require-height-advance\n\
+                         Require two probes showing height advance (or two /health 2xx).\n\
   -h, --help             Show this help.\n"
     )
 }
@@ -162,6 +181,19 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Option<Args>, S
                 }
                 parsed.poll = Duration::from_millis(ms);
             }
+            "--health-url" => parsed.health_url = Some(value("--health-url")?),
+            "--health-wait-secs" => {
+                let raw = value("--health-wait-secs")?;
+                let secs = raw
+                    .parse::<u64>()
+                    .map_err(|e| format!("--health-wait-secs must be seconds: {e}"))?;
+                if secs > 86_400 {
+                    return Err("--health-wait-secs is capped at one day".to_string());
+                }
+                parsed.health_wait_secs = secs;
+            }
+            "--rollback-on-fail" => parsed.rollback_on_fail = true,
+            "--require-height-advance" => parsed.require_height_advance = true,
             "--apply" => parsed.apply = true,
             "--allow-root" => parsed.allow_root = true,
             "--no-wait" => parsed.no_wait = true,
@@ -179,6 +211,9 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Option<Args>, S
     }
     if parsed.staged.is_none() && parsed.staged_dir.is_none() {
         return Err("--staged or --staged-dir is required".to_string());
+    }
+    if parsed.health_wait_secs > 0 && parsed.health_url.is_none() {
+        return Err("--health-wait-secs > 0 requires --health-url".to_string());
     }
     if parsed.supervise {
         if parsed.live.is_none() {
@@ -533,6 +568,33 @@ fn run() -> Result<(), String> {
         .live
         .as_ref()
         .ok_or_else(|| "--apply requires --live".to_string())?;
+    let restart = args
+        .restart_cmd
+        .as_deref()
+        .ok_or_else(|| "--apply requires --restart-cmd".to_string())?;
+    let backup = backup_path_for(live);
+
+    if args.rollback_on_fail {
+        if std::fs::symlink_metadata(live).is_ok() {
+            backup_binary(live, &backup, false).map_err(|e| {
+                let _ = progress.record("error", &format!("backup {e}"));
+                e
+            })?;
+            progress.record(
+                "backup",
+                &format!("live={} backup={}", live.display(), backup.display()),
+            )?;
+        } else if !backup.exists() {
+            let msg = format!(
+                "--rollback-on-fail requires existing {} or backup {}",
+                live.display(),
+                backup.display()
+            );
+            let _ = progress.record("error", &format!("backup {msg}"));
+            return Err(msg);
+        }
+    }
+
     atomic_install(live, &verified, false).map_err(|e| {
         let _ = progress.record("error", &format!("install {e}"));
         e
@@ -547,16 +609,60 @@ fn run() -> Result<(), String> {
         ),
     )?;
 
-    let restart = args
-        .restart_cmd
-        .as_deref()
-        .ok_or_else(|| "--apply requires --restart-cmd".to_string())?;
-    run_restart_command(restart).map_err(|e| {
+    if let Err(e) = run_restart_command(restart) {
         let _ = progress.record("error", &format!("restart {e}"));
-        e
-    })?;
+        if args.rollback_on_fail {
+            eprintln!(
+                "stellereum-upgrader: restart failed ({e}); rolling back {} from {}",
+                live.display(),
+                backup.display()
+            );
+            let _ =
+                rollback_binary_with_progress(live, &backup, Some(restart), false, Some(&progress));
+        }
+        return Err(e);
+    }
     println!("restart command completed: {restart}");
     progress.record("restart", &format!("cmd={restart}"))?;
+
+    if args.health_wait_secs > 0 {
+        let health_url = args
+            .health_url
+            .clone()
+            .ok_or_else(|| "--health-wait-secs > 0 requires --health-url".to_string())?;
+        let cfg = HealthCheckConfig {
+            url: health_url,
+            timeout_secs: args.health_wait_secs,
+            poll_interval_ms: args.poll.as_millis() as u64,
+            require_height_advance: args.require_height_advance,
+        };
+        if let Err(health_err) = verify_post_upgrade_health(&cfg) {
+            let _ = progress.record("error", &format!("health-check {health_err}"));
+            if args.rollback_on_fail {
+                eprintln!(
+                    "stellereum-upgrader: health check failed ({health_err}); rolling back {} from {}",
+                    live.display(),
+                    backup.display()
+                );
+                rollback_binary_with_progress(
+                    live,
+                    &backup,
+                    Some(restart),
+                    false,
+                    Some(&progress),
+                )?;
+                return Err(format!(
+                    "post-upgrade health check failed ({health_err}); rolled back {} from {}",
+                    live.display(),
+                    backup.display()
+                ));
+            }
+            return Err(health_err);
+        }
+        println!("post-upgrade health check passed: {}", cfg.url);
+        progress.record("health-check", &format!("url={} status=ok", cfg.url))?;
+    }
+
     progress.record("done", "upgrade supervisor completed")?;
     Ok(())
 }
@@ -609,6 +715,28 @@ mod tests {
             .expect("ok")
             .expect("some");
         assert!(sysd.print_systemd);
+
+        let health = parse_args(svec(&[
+            "--staged",
+            "/tmp/new",
+            "--live",
+            "/tmp/live",
+            "--restart-cmd",
+            "true",
+            "--health-url",
+            "http://127.0.0.1:8545",
+            "--health-wait-secs",
+            "15",
+            "--rollback-on-fail",
+            "--require-height-advance",
+            "--apply",
+        ]))
+        .expect("ok")
+        .expect("some");
+        assert_eq!(health.health_url.as_deref(), Some("http://127.0.0.1:8545"));
+        assert_eq!(health.health_wait_secs, 15);
+        assert!(health.rollback_on_fail);
+        assert!(health.require_height_advance);
     }
 
     #[test]
@@ -628,5 +756,6 @@ mod tests {
         assert!(parse_args(svec(&["--staged", "/a", "--apply"])).is_err());
         assert!(parse_args(svec(&["--staged="])).is_err());
         assert!(parse_args(svec(&["--staged", "/a", "--live="])).is_err());
+        assert!(parse_args(svec(&["--staged", "/a", "--health-wait-secs", "5"])).is_err());
     }
 }

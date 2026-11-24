@@ -26,10 +26,10 @@
 //! root-owned rename cannot happen silently. See `docs/UPGRADE_AND_RECOVERY.md`.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -610,13 +610,74 @@ pub fn atomic_install(live: &Path, verified: &VerifiedBinary, dry_run: bool) -> 
     if dry_run {
         return Ok(());
     }
-    let parent = live
+    atomic_write_exec(live, &verified.bytes)
+}
+
+/// Default backup path for a live binary (`<live>.prev`).
+pub fn backup_path_for(live: &Path) -> PathBuf {
+    let mut os = live.as_os_str().to_os_string();
+    os.push(".prev");
+    PathBuf::from(os)
+}
+
+fn read_regular_executable_bytes(path: &Path, label: &str) -> Result<Vec<u8>, String> {
+    let meta =
+        fs::symlink_metadata(path).map_err(|e| format!("{label} {}: {e}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "{label} {} is a SYMLINK; refusing (must be a regular file)",
+            path.display()
+        ));
+    }
+    if !meta.is_file() {
+        return Err(format!("{label} {} is not a regular file", path.display()));
+    }
+    if meta.len() > MAX_UPGRADE_BINARY_BYTES {
+        return Err(format!(
+            "{label} {} is too large ({} bytes > {MAX_UPGRADE_BINARY_BYTES})",
+            path.display(),
+            meta.len()
+        ));
+    }
+    check_parent_dir(path, label)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        if mode & 0o002 != 0 {
+            return Err(format!(
+                "{label} {} is WORLD-WRITABLE (mode {:o}); refusing",
+                path.display(),
+                mode
+            ));
+        }
+    }
+    let bytes = fs::read(path).map_err(|e| format!("read {label} {}: {e}", path.display()))?;
+    if bytes.len() as u64 > MAX_UPGRADE_BINARY_BYTES {
+        return Err(format!("{label} grew past the size cap while reading"));
+    }
+    Ok(bytes)
+}
+
+/// Atomically copy `live` to `backup` (e.g. `<live>.prev`) before an upgrade.
+pub fn backup_binary(live: &Path, backup: &Path, dry_run: bool) -> Result<(), String> {
+    check_live_path(live)?;
+    check_live_path(backup)?;
+    let bytes = read_regular_executable_bytes(live, "live binary")?;
+    if dry_run {
+        return Ok(());
+    }
+    atomic_write_exec(backup, &bytes)
+}
+
+fn atomic_write_exec(dest: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = dest
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let file_name = live
+    let file_name = dest
         .file_name()
-        .ok_or_else(|| format!("live binary {} has no file name", live.display()))?
+        .ok_or_else(|| format!("target binary {} has no file name", dest.display()))?
         .to_string_lossy();
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -637,7 +698,7 @@ pub fn atomic_install(live: &Path, verified: &VerifiedBinary, dry_run: bool) -> 
         .open(&tmp)
         .map_err(|e| format!("create temp {}: {e}", tmp.display()))?;
     let write_all = file
-        .write_all(&verified.bytes)
+        .write_all(bytes)
         .map_err(|e| format!("write temp {}: {e}", tmp.display()));
     if let Err(e) = write_all {
         let _ = fs::remove_file(&tmp);
@@ -659,12 +720,12 @@ pub fn atomic_install(live: &Path, verified: &VerifiedBinary, dry_run: bool) -> 
             return Err(format!("chmod temp {}: {e}", tmp.display()));
         }
     }
-    if let Err(e) = fs::rename(&tmp, live) {
+    if let Err(e) = fs::rename(&tmp, dest) {
         let _ = fs::remove_file(&tmp);
         return Err(format!(
             "rename {} -> {}: {e}",
             tmp.display(),
-            live.display()
+            dest.display()
         ));
     }
     sync_dir(parent)
@@ -674,6 +735,226 @@ fn sync_dir(dir: &Path) -> Result<(), String> {
     File::open(dir)
         .and_then(|f| f.sync_all())
         .map_err(|e| format!("fsync directory {}: {e}", dir.display()))
+}
+
+/// Configuration for post-upgrade health verification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HealthCheckConfig {
+    pub url: String,
+    pub timeout_secs: u64,
+    pub poll_interval_ms: u64,
+    pub require_height_advance: bool,
+}
+
+fn parse_block_number_value(val: Option<&serde_json::Value>) -> Option<u64> {
+    match val? {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                u64::from_str_radix(hex, 16).ok()
+            } else {
+                s.parse::<u64>().ok()
+            }
+        }
+        _ => None,
+    }
+}
+
+fn probe_health_get(agent: &ureq::Agent, url: &str) -> Result<(), String> {
+    let resp = agent
+        .get(url)
+        .call()
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        return Err(format!("GET {url}: HTTP {status}"));
+    }
+    Ok(())
+}
+
+fn probe_rpc_block_number(agent: &ureq::Agent, url: &str) -> Result<u64, String> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "stell_blockNumber",
+        "params": [],
+    })
+    .to_string();
+    let resp = agent
+        .post(url)
+        .set("Content-Type", "application/json")
+        .send_string(&body)
+        .map_err(|e| format!("RPC {url}: {e}"))?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        return Err(format!("RPC {url}: HTTP {status}"));
+    }
+    const MAX_HEALTH_BODY: usize = 64 * 1024;
+    let mut raw = Vec::new();
+    resp.into_reader()
+        .take(MAX_HEALTH_BODY as u64 + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("RPC {url}: read body: {e}"))?;
+    if raw.len() > MAX_HEALTH_BODY {
+        return Err(format!(
+            "RPC {url}: response exceeded {MAX_HEALTH_BODY} bytes"
+        ));
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&raw).map_err(|e| format!("RPC {url}: invalid JSON: {e}"))?;
+    if let Some(err) = value.get("error").filter(|v| !v.is_null()) {
+        return Err(format!("RPC {url}: {err}"));
+    }
+    parse_block_number_value(value.get("result"))
+        .ok_or_else(|| format!("RPC {url}: missing or invalid stell_blockNumber result"))
+}
+
+/// Poll JSON-RPC `stell_blockNumber` (or HTTP GET `/health` when the URL path
+/// ends with `/health`) until reachable within `cfg.timeout_secs`.
+///
+/// When `cfg.require_height_advance` is set, two successful probes are checked
+/// so that block height advances (`h2 > h1`) for JSON-RPC endpoints or `/health`
+/// remains healthy across two probes.
+pub fn verify_post_upgrade_health(cfg: &HealthCheckConfig) -> Result<(), String> {
+    if cfg.url.trim().is_empty() {
+        return Err("health check URL cannot be empty".to_string());
+    }
+    let path_only = cfg.url.split(['?', '#']).next().unwrap_or(&cfg.url);
+    let is_health_get = path_only.ends_with("/health");
+    let poll = Duration::from_millis(cfg.poll_interval_ms.max(10));
+    let timeout = Duration::from_secs(cfg.timeout_secs);
+    let deadline = Instant::now() + timeout;
+
+    let mut first_height: Option<u64> = None;
+    let mut first_health_ok = false;
+    let mut last_err: Option<String>;
+
+    loop {
+        let now = Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        let probe_timeout = remaining
+            .max(Duration::from_millis(200))
+            .min(Duration::from_secs(5));
+        let agent = ureq::AgentBuilder::new()
+            .timeout(probe_timeout)
+            .redirects(0)
+            .try_proxy_from_env(false)
+            .build();
+
+        if is_health_get {
+            match probe_health_get(&agent, &cfg.url) {
+                Ok(()) => {
+                    if !cfg.require_height_advance || first_health_ok {
+                        return Ok(());
+                    }
+                    first_health_ok = true;
+                    last_err = Some("waiting for second /health probe".to_string());
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        } else {
+            match probe_rpc_block_number(&agent, &cfg.url) {
+                Ok(h) => {
+                    if !cfg.require_height_advance {
+                        return Ok(());
+                    }
+                    match first_height {
+                        None => {
+                            first_height = Some(h);
+                            last_err = Some(format!(
+                                "observed initial height {h}; waiting for height to advance"
+                            ));
+                        }
+                        Some(h1) if h > h1 => {
+                            return Ok(());
+                        }
+                        Some(h1) => {
+                            last_err = Some(format!(
+                                "block height stayed at {h} (waiting for advance past {h1})"
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "post-upgrade health check failed for {} after {}s: {}",
+                cfg.url,
+                cfg.timeout_secs,
+                last_err.unwrap_or_else(|| "timed out".to_string())
+            ));
+        }
+        std::thread::sleep(poll.min(deadline - now));
+    }
+}
+
+/// Atomically restore `backup` -> `live` and run `restart_cmd` if provided.
+pub fn rollback_binary(
+    live: &Path,
+    backup: &Path,
+    restart_cmd: Option<&str>,
+    dry_run: bool,
+) -> Result<(), String> {
+    rollback_binary_with_progress(live, backup, restart_cmd, dry_run, None)
+}
+
+/// Atomically restore `backup` -> `live`, run `restart_cmd` if provided, and
+/// record `rollback` steps in `progress` when supplied.
+pub fn rollback_binary_with_progress(
+    live: &Path,
+    backup: &Path,
+    restart_cmd: Option<&str>,
+    dry_run: bool,
+    progress: Option<&Progress>,
+) -> Result<(), String> {
+    check_live_path(live)?;
+    let bytes = read_regular_executable_bytes(backup, "backup binary")?;
+    if dry_run {
+        if let Some(p) = progress {
+            p.record(
+                "rollback",
+                &format!(
+                    "dry_run=true live={} backup={}",
+                    live.display(),
+                    backup.display()
+                ),
+            )?;
+        }
+        return Ok(());
+    }
+    atomic_write_exec(live, &bytes)?;
+    if let Some(p) = progress {
+        p.record(
+            "rollback",
+            &format!(
+                "restored live={} backup={} sha256={}",
+                live.display(),
+                backup.display(),
+                sha256_hex(&bytes)
+            ),
+        )?;
+    }
+    if let Some(cmd) = restart_cmd {
+        run_restart_command(cmd).map_err(|e| {
+            if let Some(p) = progress {
+                let _ = p.record("error", &format!("rollback-restart {e}"));
+            }
+            e
+        })?;
+        if let Some(p) = progress {
+            p.record("rollback", &format!("restart cmd={cmd}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Run the operator-configured restart command via the shell.
@@ -1133,5 +1414,94 @@ mod tests {
         assert!(text.contains("step=install"));
         assert_eq!(text.lines().count(), 2);
         fs::remove_dir_all(dir.parent().expect("parent")).ok();
+    }
+
+    fn spawn_seq_http_server(
+        responses: Vec<(&'static str, String)>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::Read as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let addr = listener.local_addr().expect("addr");
+        let handle = std::thread::spawn(move || {
+            for (status, body) in responses {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let reply = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(reply.as_bytes());
+                    let _ = stream.flush();
+                }
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn health_check_supports_rpc_height_advance_and_health_endpoint() {
+        let (url, handle) = spawn_seq_http_server(vec![
+            (
+                "500 Internal Server Error",
+                r#"{"error":"booting"}"#.to_string(),
+            ),
+            (
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"result":"0x10"}"#.to_string(),
+            ),
+            (
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"result":"0x11"}"#.to_string(),
+            ),
+        ]);
+        let cfg = HealthCheckConfig {
+            url,
+            timeout_secs: 5,
+            poll_interval_ms: 20,
+            require_height_advance: true,
+        };
+        verify_post_upgrade_health(&cfg).expect("health check should pass once height advances");
+        let _ = handle.join();
+
+        let (base_url, handle_h) = spawn_seq_http_server(vec![
+            ("200 OK", r#"{"status":"ok"}"#.to_string()),
+            ("200 OK", r#"{"status":"ok"}"#.to_string()),
+        ]);
+        let cfg_h = HealthCheckConfig {
+            url: format!("{base_url}/health"),
+            timeout_secs: 5,
+            poll_interval_ms: 20,
+            require_height_advance: true,
+        };
+        verify_post_upgrade_health(&cfg_h).expect("/health two probes should succeed");
+        let _ = handle_h.join();
+    }
+
+    #[test]
+    fn rollback_binary_restores_backup_and_records_progress() {
+        let dir = temp_dir("rollback");
+        let live = dir.join("stellereum");
+        let backup = backup_path_for(&live);
+        let flag = dir.join("restarted");
+        let progress = Progress::new(dir.join("progress.log"));
+
+        write_exec(&live, b"broken-new-binary");
+        write_exec(&backup, b"good-old-binary");
+
+        rollback_binary_with_progress(&live, &backup, None, true, Some(&progress))
+            .expect("dry run");
+        assert_eq!(fs::read(&live).expect("read live"), b"broken-new-binary");
+
+        let cmd = format!("touch {}", flag.display());
+        rollback_binary_with_progress(&live, &backup, Some(&cmd), false, Some(&progress))
+            .expect("rollback");
+        assert_eq!(fs::read(&live).expect("read restored"), b"good-old-binary");
+        assert!(flag.exists(), "restart command must run during rollback");
+        let log = fs::read_to_string(progress.path()).expect("read progress");
+        assert!(log.contains("step=rollback"), "{log}");
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

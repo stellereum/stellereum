@@ -40,6 +40,10 @@
 #   --unjail-on-jail           explicitly auto-unjail a jailed validator
 #                              (requires --withdrawal-key-file; off by default)
 #   --withdrawal-key-file PATH COLD withdrawal key path (never read or printed)
+#   --canary                   canary mode for activate: activate ONLY the first
+#                              node, soak --canary-soak-secs, auto-rollback on
+#                              failure, and leave remaining nodes untouched
+#   --canary-soak-secs N       canary soak window in seconds (default: 30)
 #   -h, --help                 this text
 #
 # Environment (all optional):
@@ -73,6 +77,8 @@ COMMAND=""
 BINARY=""
 NODE_SPEC=""
 DRY_RUN=0
+CANARY=0
+CANARY_SOAK_SECS=30
 VALIDATOR=""
 UNJAIL_ON_JAIL=0
 WITHDRAWAL_KEY_FILE=""
@@ -85,7 +91,7 @@ note() { printf '[rolling-deploy] %s\n' "$*"; }
 warn() { printf '[rolling-deploy] WARN: %s\n' "$*" >&2; }
 die()  { printf '[rolling-deploy] ERROR: %s\n' "$*" >&2; exit 64; }
 
-usage() { sed -n '2,53p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,57p' "$0" | sed 's/^# \{0,1\}//'; }
 
 now_ms() {
     local n
@@ -327,10 +333,13 @@ cluster_check() {
 }
 
 show_plan() {
-    local node dir ssh unit scope rpc validator digest_note=""
+    local node dir ssh unit scope rpc validator digest_note="" idx=0
     note "DRY RUN — nothing is copied, restarted, or written."
     note "jail budget: $(jail_budget_text); warn above $(fmt_s1 "$DOWNTIME_WARN_MS")"
     note "public RPC: $PUBLIC_RPC"
+    if [ "$CANARY" -eq 1 ]; then
+        note "canary mode: activate ONLY first node (${NODES[0]}), soak ${CANARY_SOAK_SECS}s (height advancing + not jailed + cluster healthy), auto-rollback on fail"
+    fi
     if [ -n "$BINARY" ] && [ -f "$BINARY" ]; then
         digest_note="$(sha256sum "$BINARY" 2>/dev/null | cut -d' ' -f1 || true)"
     fi
@@ -348,12 +357,21 @@ show_plan() {
             note "         running $dir/stellereum is not touched"
         fi
         if [ -z "$COMMAND" ] || [ "$COMMAND" = "activate" ]; then
-            note "  activate: sha256 preflight -> cp -f stellereum stellereum.prev -> mv .new.next stellereum"
-            note "            pause $(guard_unit), then $([ "$scope" = user ] && printf 'systemctl --user' || printf 'systemctl') restart $unit, then resume the guard"
-            note "            (a live guard can start a SECOND instance on the same store)"
-            note "            wait is-active <=120 s, then local height within 5 of $PUBLIC_RPC"
-            note "            warn if downtime >15 s; abort if <3 validators or fragile=true"
+            if [ "$CANARY" -eq 1 ] && [ "$idx" -gt 0 ]; then
+                note "  activate: SKIPPED (canary mode touches only first node ${NODES[0]})"
+            else
+                note "  activate: sha256 preflight -> cp -f stellereum stellereum.prev -> mv .new.next stellereum"
+                note "            pause $(guard_unit), then $([ "$scope" = user ] && printf 'systemctl --user' || printf 'systemctl') restart $unit, then resume the guard"
+                note "            (a live guard can start a SECOND instance on the same store)"
+                note "            wait is-active <=120 s, then local height within 5 of $PUBLIC_RPC"
+                note "            warn if downtime >15 s; abort if <3 validators or fragile=true"
+                if [ "$CANARY" -eq 1 ]; then
+                    note "  canary:   soak ${CANARY_SOAK_SECS}s checking local RPC height advancing + not jailed + cluster healthy"
+                    note "            auto-rollback on fail: pause $(guard_unit), mv -f stellereum.prev stellereum, $([ "$scope" = user ] && printf 'systemctl --user' || printf 'systemctl') restart $unit, resume guard, ABORT"
+                fi
+            fi
         fi
+        idx=$((idx + 1))
     done
     note "DRY RUN complete; no node was contacted."
 }
@@ -553,6 +571,10 @@ activate_one() {
     nrun_long "$node" "$sysctl stop '$guard' >/dev/null 2>&1 || true"
     if ! nrun_long "$node" "cd '$dir' && cp -f stellereum stellereum.prev && mv -f stellereum.new.next stellereum && $sysctl restart '$unit'"; then
         nrun_long "$node" "$sysctl start '$guard' >/dev/null 2>&1 || true"
+        if [ "$CANARY" -eq 1 ]; then
+            warn "[$node] swap/restart failed; $dir/stellereum.prev holds the previous binary"
+            return 1
+        fi
         die "[$node] swap/restart failed; $dir/stellereum.prev holds the previous binary"
     fi
     nrun_long "$node" "$sysctl start '$guard' >/dev/null 2>&1 || true"
@@ -640,6 +662,98 @@ activate_one() {
     note "[$node] activation complete"
 }
 
+rollback_canary_node() {
+    local node="$1" dir unit sysctl guard
+    dir="$(node_attr "$node" DIR)"
+    unit="$(node_attr "$node" SERVICE)"
+    sysctl="$(sysctl_for "$node")"
+    guard="$(guard_unit)"
+
+    warn "[$node] CANARY ROLLBACK: restoring $dir/stellereum.prev -> $dir/stellereum and restarting $unit"
+    if ! nrun "$node" "test -f '$dir/stellereum.prev'"; then
+        warn "[$node] cannot rollback: $dir/stellereum.prev is missing"
+        return 1
+    fi
+    nrun_long "$node" "$sysctl stop '$guard' >/dev/null 2>&1 || true"
+    if ! nrun_long "$node" "cd '$dir' && mv -f stellereum.prev stellereum && $sysctl restart '$unit'"; then
+        nrun_long "$node" "$sysctl start '$guard' >/dev/null 2>&1 || true"
+        warn "[$node] CANARY ROLLBACK FAILED during restore/restart"
+        return 1
+    fi
+    nrun_long "$node" "$sysctl start '$guard' >/dev/null 2>&1 || true"
+    note "[$node] canary rollback complete; $unit restarted on previous binary"
+}
+
+canary_soak() {
+    local node="$1" dir vid start_h cur_h prev_h deadline now sleep_for
+    dir="$(node_attr "$node" DIR)"
+    vid="${VALIDATOR:-$(node_validator "$node")}"
+
+    start_h="$(node_height "$node" || true)"
+    case "$start_h" in
+        ''|*[!0-9]*)
+            warn "[$node] canary soak: local RPC height unavailable at soak start"
+            return 1
+            ;;
+    esac
+    prev_h="$start_h"
+    note "[$node] canary soak: waiting ${CANARY_SOAK_SECS}s (initial local height=$start_h)"
+
+    deadline=$(( $(date +%s) + CANARY_SOAK_SECS ))
+    while :; do
+        now="$(date +%s)"
+        if [ "$now" -ge "$deadline" ]; then
+            break
+        fi
+        sleep_for=$(( deadline - now ))
+        if [ "$sleep_for" -gt 5 ]; then
+            sleep_for=5
+        fi
+        sleep "$sleep_for"
+
+        cur_h="$(node_height "$node" || true)"
+        case "$cur_h" in
+            ''|*[!0-9]*)
+                warn "[$node] canary soak: local RPC height unreadable during soak"
+                return 1
+                ;;
+        esac
+        if [ "$cur_h" -lt "$prev_h" ]; then
+            warn "[$node] canary soak: local RPC height regressed ($prev_h -> $cur_h)"
+            return 1
+        fi
+        prev_h="$cur_h"
+        if ! check_validator "$node" "$dir" "$vid"; then
+            warn "[$node] canary soak: validator jailed during soak"
+            return 1
+        fi
+        if ! cluster_check; then
+            warn "[$node] canary soak: cluster health check failed during soak"
+            return 1
+        fi
+    done
+
+    cur_h="$(node_height "$node" || true)"
+    case "$cur_h" in
+        ''|*[!0-9]*)
+            warn "[$node] canary soak: local RPC height unreadable at end of soak"
+            return 1
+            ;;
+    esac
+    if [ "$CANARY_SOAK_SECS" -gt 0 ] && [ "$cur_h" -le "$start_h" ]; then
+        warn "[$node] canary soak: local RPC height did not advance over ${CANARY_SOAK_SECS}s ($start_h -> $cur_h)"
+        return 1
+    fi
+    if ! check_validator "$node" "$dir" "$vid"; then
+        return 1
+    fi
+    if ! cluster_check; then
+        return 1
+    fi
+    note "[$node] canary soak PASSED: height $start_h -> $cur_h over ${CANARY_SOAK_SECS}s, not jailed, cluster healthy"
+    return 0
+}
+
 do_activate() {
     local node json
 
@@ -660,6 +774,19 @@ do_activate() {
         die "cluster already has ${BASELINE_COUNT} validators; fix that before a rolling restart"
     fi
 
+    if [ "$CANARY" -eq 1 ]; then
+        node="${NODES[0]}"
+        note "=== CANARY activating node $node (soak ${CANARY_SOAK_SECS}s; remaining nodes will NOT be touched) ==="
+        if ! activate_one "$node" || ! canary_soak "$node"; then
+            warn "CANARY FAILED on node $node; rolling back and aborting rollout"
+            rollback_canary_node "$node" || true
+            warn "ROLLOUT ABORTED after canary failure on $node; remaining nodes untouched"
+            exit 1
+        fi
+        note "CANARY SUCCEEDED on node $node; remaining nodes untouched (re-run without --canary to roll out the rest)"
+        return 0
+    fi
+
     for node in "${NODES[@]}"; do
         note "=== activating node $node ==="
         if ! activate_one "$node"; then
@@ -675,6 +802,9 @@ while [ $# -gt 0 ]; do
     case "$1" in
         stage|activate) COMMAND="$1"; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
+        --canary) CANARY=1; shift ;;
+        --canary-soak-secs) [ $# -ge 2 ] || die "--canary-soak-secs needs a value"; CANARY_SOAK_SECS="$2"; shift 2 ;;
+        --canary-soak-secs=*) CANARY_SOAK_SECS="${1#*=}"; shift ;;
         --nodes) [ $# -ge 2 ] || die "--nodes needs a value"; NODE_SPEC="$2"; shift 2 ;;
         --nodes=*) NODE_SPEC="${1#*=}"; shift ;;
         --public-rpc) [ $# -ge 2 ] || die "--public-rpc needs a value"; PUBLIC_RPC="$2"; shift 2 ;;
@@ -705,6 +835,14 @@ command -v jq >/dev/null 2>&1 || die "jq is required (local parsing only; nodes 
 
 if [ -n "$VALIDATOR" ]; then
     [[ "$VALIDATOR" =~ ^[0-9a-fA-F]{64}$ ]] || die "--validator needs a 64-hex validator id"
+fi
+
+case "$CANARY_SOAK_SECS" in
+    ''|*[!0-9]*) die "--canary-soak-secs must be a non-negative integer: $CANARY_SOAK_SECS" ;;
+esac
+
+if [ "$COMMAND" = "stage" ] && [ "$CANARY" -eq 1 ]; then
+    die "--canary applies to activate (or --dry-run), not stage"
 fi
 
 if [ ${#POSITIONAL[@]} -gt 0 ]; then

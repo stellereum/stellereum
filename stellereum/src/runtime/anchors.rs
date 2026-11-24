@@ -55,6 +55,50 @@ pub(super) struct RuntimeVoteSigner<'a> {
     pub(super) cached_pq_sig: std::cell::RefCell<Option<(ValidatorId, Vec<u8>)>>,
 }
 
+impl RuntimeVoteSigner<'_> {
+    fn resolve_value_id(&self, block_hash: &[u8; 32]) -> Option<[u8; 32]> {
+        self.rt
+            .blocks
+            .get(block_hash)
+            .map(|b| b.value_id())
+            .or_else(|| self.rt.hc.value_id_of(block_hash))
+    }
+
+    fn sign_pq_with_safety(
+        &self,
+        ps: &dyn crate::remote_signer::PqSigner,
+        req: &crate::remote_signer::ConsensusSignRequest,
+        msg: &[u8],
+    ) -> Result<[u8; crate::remote_signer::FALCON_SIGNATURE_LEN], crate::remote_signer::SignerError>
+    {
+        if let Some((locked_bh, locked_round)) = self.rt.hc.locked {
+            if let Some(locked_vid) = self.resolve_value_id(&locked_bh) {
+                let _ = ps.set_consensus_lock(req.height(), locked_round, locked_vid);
+            }
+        }
+        let value_id = match req {
+            crate::remote_signer::ConsensusSignRequest::Vote {
+                round,
+                kind,
+                block_hash: Some(bh),
+                ..
+            } => {
+                let vid = self.resolve_value_id(bh);
+                if *kind == crate::consensus::VoteKind::Precommit {
+                    if let Some(v) = vid {
+                        if self.rt.hc.locked.is_none_or(|(_, lr)| *round > lr) {
+                            let _ = ps.set_consensus_lock(req.height(), *round, v);
+                        }
+                    }
+                }
+                vid
+            }
+            _ => None,
+        };
+        ps.sign_consensus_checked_with_value_id(req, msg, value_id)
+    }
+}
+
 impl crate::safety::VoteSigner for RuntimeVoteSigner<'_> {
     fn validator_id(&self) -> ValidatorId {
         self.rt.id
@@ -63,7 +107,7 @@ impl crate::safety::VoteSigner for RuntimeVoteSigner<'_> {
     fn sign_ed25519(&self, msg: &[u8]) -> Option<Vec<u8>> {
         if let Some((ps, has_fallback_ed)) = self.rt.pq_signer_entry() {
             let req = self.pq_req.as_ref()?;
-            match ps.sign_consensus_checked(req, msg) {
+            match self.sign_pq_with_safety(ps.as_ref(), req, msg) {
                 Ok(sig) => {
                     // One real Falcon signature for consensus. Counted HERE (not
                     // in post_quantum.rs) because the load-test harness embeds
@@ -115,7 +159,7 @@ impl crate::safety::VoteSigner for RuntimeVoteSigner<'_> {
                 return Some(cached);
             }
             let req = self.pq_req.as_ref()?;
-            return match ps.sign_consensus_checked(req, msg) {
+            return match self.sign_pq_with_safety(ps.as_ref(), req, msg) {
                 Ok(sig) => {
                     stellereum::metrics::global().inc_falcon_sign();
                     Some((ps.validator_id(), sig.to_vec()))

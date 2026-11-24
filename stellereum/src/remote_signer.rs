@@ -1256,11 +1256,19 @@ impl ConsensusSafetyState {
                     }
                 }
                 if block_hash.is_some() {
-                    if let (Some(_lr), Some(locked_vid), Some(vid)) =
-                        (next.locked_round, next.locked_value_id, value_id)
-                    {
-                        if vid != locked_vid {
-                            return Err(SignerError::SafetyViolation);
+                    if next.locked_round.is_some() || next.locked_value_id.is_some() {
+                        match (next.locked_value_id, value_id) {
+                            (Some(locked_vid), Some(vid)) if vid == locked_vid => {}
+                            _ => return Err(SignerError::SafetyViolation),
+                        }
+                    }
+                    if let Some(last_pc) = next.last_precommit {
+                        if last_pc.round >= *round {
+                            if let Some(pc_bh) = last_pc.target {
+                                if Some(pc_bh) != *block_hash {
+                                    return Err(SignerError::SafetyViolation);
+                                }
+                            }
                         }
                     }
                 }
@@ -1282,11 +1290,19 @@ impl ConsensusSafetyState {
                     }
                 }
                 if block_hash.is_some() {
-                    if let (Some(_lr), Some(locked_vid), Some(vid)) =
-                        (next.locked_round, next.locked_value_id, value_id)
-                    {
-                        if vid != locked_vid {
-                            return Err(SignerError::SafetyViolation);
+                    if next.locked_round.is_some() || next.locked_value_id.is_some() {
+                        match (next.locked_value_id, value_id) {
+                            (Some(locked_vid), Some(vid)) if vid == locked_vid => {}
+                            _ => return Err(SignerError::SafetyViolation),
+                        }
+                    }
+                    if let Some(last_pv) = next.last_prevote {
+                        if last_pv.round >= *round {
+                            if let Some(pv_bh) = last_pv.target {
+                                if Some(pv_bh) != *block_hash {
+                                    return Err(SignerError::SafetyViolation);
+                                }
+                            }
                         }
                     }
                 }
@@ -1589,6 +1605,15 @@ pub trait PqSigner: Send + Sync {
         req: &ConsensusSignRequest,
     ) -> Result<[u8; FALCON_SIGNATURE_LEN], SignerError>;
 
+    /// Sign a consensus request with an optional round-free `value_id` for lock enforcement.
+    fn sign_consensus_with_value_id(
+        &self,
+        req: &ConsensusSignRequest,
+        _value_id: Option<[u8; 32]>,
+    ) -> Result<[u8; FALCON_SIGNATURE_LEN], SignerError> {
+        self.sign_consensus(req)
+    }
+
     /// Verify caller-supplied preimage against `req` before signing (anti-oracle).
     fn sign_consensus_checked(
         &self,
@@ -1597,6 +1622,27 @@ pub trait PqSigner: Send + Sync {
     ) -> Result<[u8; FALCON_SIGNATURE_LEN], SignerError> {
         let _ = req.verify_preimage(caller_preimage)?;
         self.sign_consensus(req)
+    }
+
+    /// Verify caller-supplied preimage against `req` before signing with `value_id`.
+    fn sign_consensus_checked_with_value_id(
+        &self,
+        req: &ConsensusSignRequest,
+        caller_preimage: &[u8],
+        value_id: Option<[u8; 32]>,
+    ) -> Result<[u8; FALCON_SIGNATURE_LEN], SignerError> {
+        let _ = req.verify_preimage(caller_preimage)?;
+        self.sign_consensus_with_value_id(req, value_id)
+    }
+
+    /// Record a durable/in-memory consensus lock update on the signer's safety guard.
+    fn set_consensus_lock(
+        &self,
+        _height: u64,
+        _round: u32,
+        _value_id: [u8; 32],
+    ) -> Result<(), SignerError> {
+        Ok(())
     }
 
     /// Verify a 666-byte Falcon-512 signature over `req` against `self.public_key()`.
@@ -1714,6 +1760,24 @@ impl PqSigner for LocalPqSigner {
         let (sig, _gen) = self.sign_consensus_with_generation(req, None)?;
         Ok(sig)
     }
+
+    fn sign_consensus_with_value_id(
+        &self,
+        req: &ConsensusSignRequest,
+        value_id: Option<[u8; 32]>,
+    ) -> Result<[u8; FALCON_SIGNATURE_LEN], SignerError> {
+        let (sig, _gen) = self.sign_consensus_with_generation(req, value_id)?;
+        Ok(sig)
+    }
+
+    fn set_consensus_lock(
+        &self,
+        height: u64,
+        round: u32,
+        value_id: [u8; 32],
+    ) -> Result<(), SignerError> {
+        self.safety.set_lock(height, round, value_id)
+    }
 }
 
 /// Remote Falcon-512 consensus signer with pinned public key, validator_id
@@ -1816,7 +1880,24 @@ impl PqSigner for RemotePqSigner {
         &self,
         req: &ConsensusSignRequest,
     ) -> Result<[u8; FALCON_SIGNATURE_LEN], SignerError> {
-        self.sign_consensus_with_value_id(req, None)
+        RemotePqSigner::sign_consensus_with_value_id(self, req, None)
+    }
+
+    fn sign_consensus_with_value_id(
+        &self,
+        req: &ConsensusSignRequest,
+        value_id: Option<[u8; 32]>,
+    ) -> Result<[u8; FALCON_SIGNATURE_LEN], SignerError> {
+        RemotePqSigner::sign_consensus_with_value_id(self, req, value_id)
+    }
+
+    fn set_consensus_lock(
+        &self,
+        height: u64,
+        round: u32,
+        value_id: [u8; 32],
+    ) -> Result<(), SignerError> {
+        self.safety.set_lock(height, round, value_id)
     }
 }
 
@@ -2117,7 +2198,10 @@ impl PqSignerService {
     ) -> (u16, String) {
         if let Some(expected_tok) = &self.expected_bearer_token {
             let expected = format!("Bearer {expected_tok}");
-            if auth_header != Some(expected.as_str()) {
+            let authorized = auth_header
+                .map(|got| crate::rpc::constant_time_eq(got, expected.as_str()))
+                .unwrap_or(false);
+            if !authorized {
                 return (401, r#"{"error":"unauthorized"}"#.to_string());
             }
         }
@@ -2179,66 +2263,56 @@ impl PqSignerService {
     }
 }
 
-/// Serve a single HTTP/1.1 connection against [`PqSignerService`].
-pub fn serve_v2_http_connection(service: &PqSignerService, mut stream: TcpStream) {
-    let Ok(cloned) = stream.try_clone() else {
-        return;
-    };
-    let mut reader = BufReader::new(cloned);
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line).is_err() {
-        return;
-    }
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("");
+const V2_HTTP_IO_TIMEOUT: Duration = DEFAULT_TIMEOUT;
+const V2_HTTP_MAX_LINE_BYTES: usize = 8 * 1024;
+const V2_HTTP_MAX_HEADERS: usize = 64;
+const V2_HTTP_MAX_BODY_BYTES: usize = 64 * 1024;
 
-    let mut content_length = 0usize;
-    let mut auth_header: Option<String> = None;
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        let trimmed = line.trim_end();
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some((name, val)) = trimmed.split_once(':') {
-            if name.eq_ignore_ascii_case("Content-Length") {
-                content_length = val.trim().parse().unwrap_or(0);
-            } else if name.eq_ignore_ascii_case("Authorization") {
-                auth_header = Some(val.trim().to_string());
+enum V2LineRead {
+    Line(String),
+    Eof,
+    TooLong,
+    TimedOut,
+    Malformed,
+}
+
+fn read_bounded_http_line(reader: &mut BufReader<TcpStream>, max_bytes: usize) -> V2LineRead {
+    let mut line = String::new();
+    match reader
+        .by_ref()
+        .take((max_bytes + 1) as u64)
+        .read_line(&mut line)
+    {
+        Ok(0) => V2LineRead::Eof,
+        Ok(_) => {
+            if line.len() > max_bytes || (!line.ends_with('\n') && line.len() == max_bytes) {
+                V2LineRead::TooLong
+            } else {
+                V2LineRead::Line(line)
             }
         }
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            V2LineRead::TimedOut
+        }
+        Err(_) => V2LineRead::Malformed,
     }
+}
 
-    if content_length > 64 * 1024 {
-        let body = r#"{"error":"request_too_large"}"#;
-        let head = format!(
-            "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        let _ = stream.write_all(head.as_bytes());
-        let _ = stream.write_all(body.as_bytes());
-        let _ = stream.flush();
-        return;
-    }
-
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 && reader.read_exact(&mut body).is_err() {
-        return;
-    }
-
-    let (status_code, resp_body) =
-        service.handle_http_request(method, path, auth_header.as_deref(), &body);
+fn write_v2_http_response(stream: &mut TcpStream, status_code: u16, resp_body: &str) {
     let reason = match status_code {
         200 => "200 OK",
         400 => "400 Bad Request",
         401 => "401 Unauthorized",
         404 => "404 Not Found",
+        408 => "408 Request Timeout",
         409 => "409 Conflict",
+        413 => "413 Payload Too Large",
+        431 => "431 Request Header Fields Too Large",
         503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
     };
@@ -2249,6 +2323,140 @@ pub fn serve_v2_http_connection(service: &PqSignerService, mut stream: TcpStream
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(resp_body.as_bytes());
     let _ = stream.flush();
+}
+
+/// Serve a single HTTP/1.1 connection against [`PqSignerService`].
+pub fn serve_v2_http_connection(service: &PqSignerService, stream: TcpStream) {
+    serve_v2_http_connection_with_timeout(service, stream, V2_HTTP_IO_TIMEOUT);
+}
+
+/// Serve a single HTTP/1.1 connection against [`PqSignerService`] with an
+/// explicit socket read/write timeout.
+pub fn serve_v2_http_connection_with_timeout(
+    service: &PqSignerService,
+    mut stream: TcpStream,
+    io_timeout: Duration,
+) {
+    let _ = stream.set_read_timeout(Some(io_timeout));
+    let _ = stream.set_write_timeout(Some(io_timeout));
+    let Ok(cloned) = stream.try_clone() else {
+        return;
+    };
+    let mut reader = BufReader::new(cloned);
+    let request_line = match read_bounded_http_line(&mut reader, V2_HTTP_MAX_LINE_BYTES) {
+        V2LineRead::Line(l) => l,
+        V2LineRead::Eof => return,
+        V2LineRead::TooLong => {
+            write_v2_http_response(&mut stream, 431, r#"{"error":"request_line_too_large"}"#);
+            return;
+        }
+        V2LineRead::TimedOut => {
+            write_v2_http_response(&mut stream, 408, r#"{"error":"request_timeout"}"#);
+            return;
+        }
+        V2LineRead::Malformed => {
+            write_v2_http_response(&mut stream, 400, r#"{"error":"bad_request"}"#);
+            return;
+        }
+    };
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("");
+    let version = parts.next().unwrap_or("");
+    if method.is_empty()
+        || path.is_empty()
+        || !version.starts_with("HTTP/")
+        || parts.next().is_some()
+    {
+        write_v2_http_response(&mut stream, 400, r#"{"error":"bad_request_line"}"#);
+        return;
+    }
+
+    let mut content_length: Option<usize> = None;
+    let mut auth_header: Option<String> = None;
+    let mut header_count = 0usize;
+    loop {
+        let line = match read_bounded_http_line(&mut reader, V2_HTTP_MAX_LINE_BYTES) {
+            V2LineRead::Line(l) => l,
+            V2LineRead::Eof => {
+                write_v2_http_response(&mut stream, 400, r#"{"error":"incomplete_headers"}"#);
+                return;
+            }
+            V2LineRead::TooLong => {
+                write_v2_http_response(&mut stream, 431, r#"{"error":"header_too_large"}"#);
+                return;
+            }
+            V2LineRead::TimedOut => {
+                write_v2_http_response(&mut stream, 408, r#"{"error":"request_timeout"}"#);
+                return;
+            }
+            V2LineRead::Malformed => {
+                write_v2_http_response(&mut stream, 400, r#"{"error":"malformed_header"}"#);
+                return;
+            }
+        };
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        header_count += 1;
+        if header_count > V2_HTTP_MAX_HEADERS {
+            write_v2_http_response(&mut stream, 431, r#"{"error":"too_many_headers"}"#);
+            return;
+        }
+        if let Some((name, val)) = trimmed.split_once(':') {
+            if name.eq_ignore_ascii_case("Content-Length") {
+                let Ok(len) = val.trim().parse::<usize>() else {
+                    write_v2_http_response(
+                        &mut stream,
+                        400,
+                        r#"{"error":"invalid_content_length"}"#,
+                    );
+                    return;
+                };
+                if content_length.is_some_and(|prev| prev != len) {
+                    write_v2_http_response(
+                        &mut stream,
+                        400,
+                        r#"{"error":"conflicting_content_length"}"#,
+                    );
+                    return;
+                }
+                content_length = Some(len);
+            } else if name.eq_ignore_ascii_case("Authorization") {
+                auth_header = Some(val.trim().to_string());
+            }
+        } else {
+            write_v2_http_response(&mut stream, 400, r#"{"error":"malformed_header"}"#);
+            return;
+        }
+    }
+
+    let content_length = content_length.unwrap_or(0);
+    if content_length > V2_HTTP_MAX_BODY_BYTES {
+        write_v2_http_response(&mut stream, 413, r#"{"error":"request_too_large"}"#);
+        return;
+    }
+
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        if let Err(e) = reader.read_exact(&mut body) {
+            let (status, msg) = if matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) {
+                (408, r#"{"error":"request_timeout"}"#)
+            } else {
+                (400, r#"{"error":"incomplete_body"}"#)
+            };
+            write_v2_http_response(&mut stream, status, msg);
+            return;
+        }
+    }
+
+    let (status_code, resp_body) =
+        service.handle_http_request(method, path, auth_header.as_deref(), &body);
+    write_v2_http_response(&mut stream, status_code, &resp_body);
 }
 
 #[cfg(test)]

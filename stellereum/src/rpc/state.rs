@@ -1251,6 +1251,21 @@ pub async fn handle_rpc_batch_call_client(
     header_token: Option<&str>,
     client: Option<crate::client_ip::ClientIp>,
 ) -> Result<Vec<RpcResponse>, RpcResponse> {
+    handle_rpc_batch_call_with_limiter(st, items, raw_len, header_token, client, None).await
+}
+
+/// [`handle_rpc_batch_call_client`] with an optional caller-supplied per-IP
+/// [`crate::explorer::RateLimiter`] (used by the gateway `/rpc` mount so batch
+/// items draw from the gateway's configured 30/s limiter instead of the 300/s
+/// standalone limiter).
+pub async fn handle_rpc_batch_call_with_limiter(
+    st: &RpcState,
+    items: &[Value],
+    raw_len: usize,
+    header_token: Option<&str>,
+    client: Option<crate::client_ip::ClientIp>,
+    limiter: Option<&crate::explorer::RateLimiter>,
+) -> Result<Vec<RpcResponse>, RpcResponse> {
     let peer_ip = client.map(|c| c.addr);
     if items.is_empty() {
         return Err(batch_refused("empty batch"));
@@ -1286,21 +1301,23 @@ pub async fn handle_rpc_batch_call_client(
             continue;
         }
         // Per-item transport budget: the HTTP middleware charged the batch
-        // request once; every item draws the per-IP standalone budget again,
+        // request once; every item draws the per-IP transport budget again,
         // exactly as N single calls would. Over budget fails THIS item with
         // the per-item `-32000` rate shape (the socket stays answerable, the
         // siblings are unaffected) — never the whole batch.
         let ip = peer_ip.unwrap_or(LOCAL_BUCKET_IP);
-        let limiter = STANDALONE_LIMITER
-            .get_or_init(|| crate::explorer::RateLimiter::new(standalone_limit_per_sec()));
-        if !limiter.check(ip) {
+        let effective_limiter = limiter.unwrap_or_else(|| {
+            STANDALONE_LIMITER
+                .get_or_init(|| crate::explorer::RateLimiter::new(standalone_limit_per_sec()))
+        });
+        if !effective_limiter.check(ip) {
             out.push(RpcResponse {
                 jsonrpc: "2.0",
                 id,
                 result: None,
                 error: Some(RpcError {
                     code: -32000,
-                    message: "rate limit exceeded (per-IP budget on standalone RPC)".to_string(),
+                    message: "rate limit exceeded (per-IP budget)".to_string(),
                     data: None,
                 }),
             });

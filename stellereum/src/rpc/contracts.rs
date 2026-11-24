@@ -1389,12 +1389,21 @@ async fn dispatch_contracts_inner(
                     Ok(b) => b,
                     Err(e) => return err(id, -32602, e),
                 };
-            let v = crate::contract_source::verify_source_for_code_hash(
-                &onchain,
-                &source_bytes,
-                compiler,
-                flags,
-            );
+            let compiler_owned = compiler.to_string();
+            let flags_owned = flags.to_string();
+            let v = match tokio::task::spawn_blocking(move || {
+                crate::contract_source::verify_source_for_code_hash(
+                    &onchain,
+                    &source_bytes,
+                    &compiler_owned,
+                    &flags_owned,
+                )
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(_) => return err(id, -32000, "source verification task failed"),
+            };
             let registered = st.engine.get_contract_source_hash(&contract_addr).await;
             ok(
                 id,

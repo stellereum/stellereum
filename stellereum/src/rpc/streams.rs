@@ -124,10 +124,15 @@ pub struct Subscription {
     pub topic: SubscriptionTopic,
     /// Unix seconds when the subscription was created.
     pub created_at: u64,
-    /// True while a transport (WebSocket / SSE) is streaming this
+    /// True while at least one transport (WebSocket / SSE) is streaming this
     /// subscription; such entries are not swept by the TTL.
     #[serde(default)]
     pub attached: bool,
+    /// Reference count of live transports attached to this subscription.
+    /// Dropping one stream decrements this counter and only clears `attached`
+    /// when it reaches zero.
+    #[serde(default)]
+    pub attached_count: usize,
     /// The client that created it (its IP), when the caller was attributed.
     ///
     /// Used for the PER-CLIENT budget (`MAX_SUBSCRIPTIONS_PER_CLIENT`, audit
@@ -338,6 +343,17 @@ fn with_normalized_event_topics<R>(
     }
 }
 
+/// Normalize a client identity to its per-IP budget bucket key so IPv6 `/64`
+/// interface-identifier rotation (and IPv4-mapped IPv6 forms) shares a single
+/// `MAX_SUBSCRIPTIONS_PER_CLIENT` counter while leaving `Subscription.client`
+/// exact for ownership checks.
+fn subscription_client_budget_key(client: &str) -> String {
+    match client.parse::<std::net::IpAddr>() {
+        Ok(ip) => crate::rpc::budget_bucket_ip(ip).to_string(),
+        Err(_) => client.to_string(),
+    }
+}
+
 #[derive(Default)]
 struct SubscriptionIndex {
     client_counts: HashMap<String, usize>,
@@ -353,10 +369,11 @@ struct SubscriptionIndex {
 impl SubscriptionIndex {
     fn insert_entry(&mut self, id: &str, topic: &SubscriptionTopic, client: Option<&str>) {
         if let Some(c) = client {
-            if let Some(cnt) = self.client_counts.get_mut(c) {
+            let key = subscription_client_budget_key(c);
+            if let Some(cnt) = self.client_counts.get_mut(&key) {
                 *cnt += 1;
             } else {
-                self.client_counts.insert(c.to_string(), 1);
+                self.client_counts.insert(key, 1);
             }
         }
         match topic {
@@ -396,9 +413,10 @@ impl SubscriptionIndex {
 
     fn remove_entry(&mut self, id: &str, sub: &Subscription) {
         if let Some(c) = sub.client.as_deref() {
-            if let Some(cnt) = self.client_counts.get_mut(c) {
+            let key = subscription_client_budget_key(c);
+            if let Some(cnt) = self.client_counts.get_mut(&key) {
                 if *cnt <= 1 {
-                    self.client_counts.remove(c);
+                    self.client_counts.remove(&key);
                 } else {
                     *cnt -= 1;
                 }
@@ -723,7 +741,8 @@ impl SubscriptionHub {
             ));
         }
         if let Some(client) = client {
-            let held = idx.client_counts.get(client).copied().unwrap_or(0);
+            let key = subscription_client_budget_key(client);
+            let held = idx.client_counts.get(&key).copied().unwrap_or(0);
             if held >= MAX_SUBSCRIPTIONS_PER_CLIENT {
                 return Err(format!(
                     "per-client subscription limit reached ({MAX_SUBSCRIPTIONS_PER_CLIENT} live subscriptions for this client)"
@@ -744,6 +763,7 @@ impl SubscriptionHub {
                 topic,
                 created_at: now,
                 attached: false,
+                attached_count: 0,
                 client: client.map(|c| c.to_string()),
             },
         );
@@ -838,11 +858,12 @@ impl SubscriptionHub {
     }
 
     /// Mark a subscription as served by a live transport (so the TTL sweep
-    /// leaves it alone).
+    /// leaves it alone). Increments `attached_count`.
     pub fn attach(&self, id: &str) {
         let mut reg = self.registry.write().unwrap_or_else(|e| e.into_inner());
         if let Some(s) = reg.get_mut(id) {
-            s.attached = true;
+            s.attached_count = s.attached_count.saturating_add(1);
+            s.attached = s.attached_count > 0;
         }
     }
 
@@ -852,18 +873,21 @@ impl SubscriptionHub {
         let mut reg = self.registry.write().unwrap_or_else(|e| e.into_inner());
         match reg.get_mut(id) {
             Some(s) if s.client.as_deref() == client => {
-                s.attached = true;
+                s.attached_count = s.attached_count.saturating_add(1);
+                s.attached = s.attached_count > 0;
                 true
             }
             _ => false,
         }
     }
 
-    /// Mark a subscription as no longer served by a transport.
+    /// Decrement a subscription's live-transport refcount, clearing `attached`
+    /// only once no live transport remains attached.
     pub fn detach(&self, id: &str) {
         let mut reg = self.registry.write().unwrap_or_else(|e| e.into_inner());
         if let Some(s) = reg.get_mut(id) {
-            s.attached = false;
+            s.attached_count = s.attached_count.saturating_sub(1);
+            s.attached = s.attached_count > 0;
         }
     }
 
@@ -2048,6 +2072,16 @@ pub fn is_ws_expensive_method(method: &str) -> bool {
             | "stell_getAddressHistory"
             | "stell_getProgramAccounts"
             | "stell_getTokenAccountsByOwner"
+            // W4/S3: `stell_verifyContractSource` decodes caller-supplied
+            // source (up to the source-size cap), runs `wat::parse_str` (a
+            // full WASM parse/validation), hashes the rebuilt module and
+            // compares it with on-chain bytecode. It was transport-only, so an
+            // unauthenticated client could pin a core with parser work at
+            // transport speed on both HTTP and WS; the parse itself now runs
+            // on `spawn_blocking` (rpc/contracts.rs) so a slow/pathological
+            // module cannot stall an async worker, and this classification
+            // gives it the same per-IP budget as the other heavy reads.
+            | "stell_verifyContractSource"
     )
 }
 
@@ -2094,6 +2128,97 @@ pub const WS_GENERAL_RATE_LIMIT_DEFAULT: u32 = 300;
 pub(super) fn ws_general_budget() -> &'static crate::explorer::RateLimiter {
     static LIMITER: std::sync::OnceLock<crate::explorer::RateLimiter> = std::sync::OnceLock::new();
     LIMITER.get_or_init(|| crate::explorer::RateLimiter::new(WS_GENERAL_RATE_LIMIT_DEFAULT))
+}
+
+/// Hard ceiling on concurrent WebSocket sessions for the WHOLE process.
+///
+/// The per-IP transport limiters bound how fast a client can ASK for an
+/// upgrade, and [`WS_MAX_SUBS_PER_CONNECTION`] bounds what one socket can
+/// hold, but neither bounds how many sockets a process will accept: a
+/// TCP-connect flood from many buckets (or one rotated IPv6 `/64` before the
+/// /64 bucketing, or simply many hosts) could pin one task + buffers per
+/// connection. The cap is enforced BEFORE the upgrade is accepted, and a
+/// refusal is an HTTP `503` (never an upgraded-then-dropped socket), so the
+/// client learns immediately and no session state is allocated.
+///
+/// 1024 concurrent streams is far above a real operator/browser load and far
+/// below the file-descriptor / memory ceiling of a node host. The counter is
+/// released by an RAII guard on EVERY exit path (clean close, error, idle
+/// reap, failed upgrade).
+pub const WS_MAX_CONNECTIONS: usize = 1024;
+
+/// Test-only override of [`WS_MAX_CONNECTIONS`] (0 = const default).
+///
+/// Integration tests cannot open 1024 sockets, so they lower the cap, prove
+/// the pre-upgrade refusal, and restore 0. Production never touches this.
+pub(super) static WS_MAX_CONNECTIONS_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Effective WS connection ceiling: test override, else [`WS_MAX_CONNECTIONS`].
+pub fn ws_max_connections() -> usize {
+    let ov = WS_MAX_CONNECTIONS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if ov != 0 {
+        ov
+    } else {
+        WS_MAX_CONNECTIONS
+    }
+}
+
+/// Set the WS connection ceiling for tests (0 restores the const default).
+/// Absent from production builds (`any(test, debug_assertions)` only).
+#[cfg(any(test, debug_assertions))]
+pub fn set_ws_max_connections_for_tests(n: usize) {
+    WS_MAX_CONNECTIONS_OVERRIDE.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Currently live WebSocket sessions counted by the PRE-UPGRADE cap guard.
+///
+/// This is deliberately separate from [`ws_live_connections`]: that counter
+/// tracks running session tasks (incremented inside `handle_ws`), while this
+/// one is reserved by [`ws_handler`] BEFORE the upgrade so two racing clients
+/// cannot both pass a check-then-upgrade race and overshoot the cap.
+pub(super) static WS_ACTIVE_CONNECTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of connection slots currently held by the pre-upgrade cap guard.
+pub fn ws_active_connections() -> usize {
+    WS_ACTIVE_CONNECTIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// RAII slot in the global [`WS_MAX_CONNECTIONS`] budget.
+///
+/// `try_acquire` reserves one slot with a CAS loop (a plain load-then-store
+/// would let N racing upgrades each observe `n-1`), and `Drop` always returns
+/// it. The guard is moved into the upgraded connection closure so the slot
+/// covers the whole session, including a peer that vanishes mid-upgrade.
+pub(super) struct WsConnectionGuard;
+
+impl WsConnectionGuard {
+    fn try_acquire() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let cap = ws_max_connections();
+        let mut cur = WS_ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
+        loop {
+            if cur >= cap {
+                return None;
+            }
+            match WS_ACTIVE_CONNECTIONS.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(WsConnectionGuard),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
+impl Drop for WsConnectionGuard {
+    fn drop(&mut self) {
+        WS_ACTIVE_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Live WebSocket sessions on this node (incremented on upgrade, decremented
@@ -2146,6 +2271,7 @@ pub(super) const _: () = assert!(WS_MAX_SUBS_PER_CONNECTION <= MAX_SUBSCRIPTIONS
 pub(super) const _: () = assert!(MAX_SUBSCRIPTIONS_PER_CLIENT < MAX_SUBSCRIPTIONS);
 pub(super) const _: () = assert!(WS_GENERAL_RATE_LIMIT_DEFAULT > 0);
 pub(super) const _: () = assert!(WS_IDLE_TIMEOUT_SECS > 0);
+pub(super) const _: () = assert!(WS_MAX_CONNECTIONS > 0);
 
 /// Test-only override of [`WS_IDLE_TIMEOUT_SECS`] (0 = use the env/const
 /// default).
@@ -2215,7 +2341,7 @@ pub(super) fn ws_idle_timeout() -> std::time::Duration {
 //     eth_newPendingTransactionFilter, eth_newFilter, eth_getFilterChanges,
 //     eth_getFilterLogs, eth_uninstallFilter, eth_getStorageAt,
 //     eth_sendRawTransaction.
-//   transport only (stell, 52): stell_chainId, stell_nodeId, stell_blockNumber,
+//   transport only (stell, 51): stell_chainId, stell_nodeId, stell_blockNumber,
 //     stell_syncing, stell_getStateRoot, stell_latestBlocks, stell_getShards,
 //     stell_getShardTopology, stell_getBlock, stell_getBlockTransactions,
 //     stell_epochKey, stell_sendSealedTransaction, stell_mevStats,
@@ -2230,16 +2356,16 @@ pub(super) fn ws_idle_timeout() -> std::time::Duration {
 //     stell_listProposals, stell_governanceParams, stell_mempoolSize,
 //     stell_baseFee, stell_verifyMessage, stell_verifyTypedData,
 //     stell_sendRawTransaction, stell_pmmState, stell_orderBook,
-//     stell_sessionBudget, stell_getContractAbi, stell_verifyContractSource,
+//     stell_sessionBudget, stell_getContractAbi,
 //     stell_getContractSource, stell_registerContractSource,
 //     stell_getContractReceipt, stell_getInvalidations, stell_invalidationFeed,
 //     stell_unsubscribe, stell_getSubscriptions.
 //   transport + expensive + expensive-ws (1): stell_estimateFee.
-//   transport + expensive-ws (11): stell_getProof, stell_getArchiveProof,
+//   transport + expensive-ws (12): stell_getProof, stell_getArchiveProof,
 //     stell_getBalanceSpv, stell_tokenBalanceSpv, stell_runGetMethod,
 //     stell_getAddressHistory, stell_getProgramAccounts,
 //     stell_getTokenAccountsByOwner, stell_getEvents, eth_getProof,
-//     eth_getLogs.
+//     eth_getLogs, stell_verifyContractSource.
 //   transport + expensive-ws + subscription (1): stell_subscribe.
 //   transport + faucet (1): stell_faucet.
 //   transport + auth (11): stell_mempoolDump, stell_submitProposal, stell_vote,
@@ -2285,7 +2411,8 @@ pub fn rpc_rate_buckets(method: &str) -> &'static [&'static str] {
         | "stell_getTokenAccountsByOwner"
         | "stell_getEvents"
         | "eth_getProof"
-        | "eth_getLogs" => &["transport", "expensive-ws"],
+        | "eth_getLogs"
+        | "stell_verifyContractSource" => &["transport", "expensive-ws"],
         "stell_faucet" => &["transport", "faucet"],
         "stell_mempoolDump"
         | "stell_submitProposal"
@@ -2380,7 +2507,6 @@ pub fn rpc_rate_buckets(method: &str) -> &'static [&'static str] {
         | "stell_orderBook"
         | "stell_sessionBudget"
         | "stell_getContractAbi"
-        | "stell_verifyContractSource"
         | "stell_getContractSource"
         | "stell_registerContractSource"
         | "stell_getContractReceipt"
@@ -2418,12 +2544,27 @@ pub(super) async fn ws_handler(
             crate::client_ip::resolve_client_ip(&headers, addr.ip())
         })
     });
+    // GLOBAL CONNECTION CAP (see `WS_MAX_CONNECTIONS`): reserve a slot BEFORE
+    // accepting the upgrade, so a connect flood cannot allocate one session
+    // task per socket first and discover the cap afterwards. Refusal is a
+    // plain HTTP 503; an accepted session holds the slot via the RAII guard
+    // for its whole lifetime (including a peer that never completes).
+    let Some(connection_guard) = WsConnectionGuard::try_acquire() else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "websocket connection limit reached",
+        )
+            .into_response();
+    };
     // Bound the WebSocket frame buffer (2 MiB vs tungstenite's 64 MiB default)
     // while allowing slightly-over-cap frames to reach `ws_handle_text` / the
     // binary length check so the socket returns `-32600` ("request too large")
     // and remains open as expected by WS oversize tests.
     ws.max_message_size(WS_MAX_MESSAGE_BYTES * 2)
-        .on_upgrade(move |socket| handle_ws(socket, st, header_token, client))
+        .on_upgrade(move |socket| async move {
+            let _connection_guard = connection_guard;
+            handle_ws(socket, st, header_token, client).await;
+        })
 }
 
 /// One event of the WebSocket select loop.
@@ -2823,6 +2964,7 @@ pub(super) async fn rpc_handler(
     axum::extract::State(st): axum::extract::State<Arc<RpcState>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     cached_client: Option<axum::Extension<crate::client_ip::ClientIp>>,
+    cached_limiter: Option<axum::Extension<Arc<crate::explorer::RateLimiter>>>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> axum::response::Response {
@@ -2848,7 +2990,24 @@ pub(super) async fn rpc_handler(
     });
     if let Some(arr) = first.as_array() {
         let raw_len = body.len();
-        match handle_rpc_batch_call_client(&st, arr, raw_len, header_token, client).await {
+        // Gateway `/rpc` mounts install the gateway's per-IP limiter as a
+        // request extension (see `explorer::nested_rpc_rate_limit`); a batch
+        // item must draw from THAT budget (30/s by default), not from the
+        // 300/s standalone one. The standalone mount has no extension, so it
+        // keeps using `STANDALONE_LIMITER` (audit S3-GATEWAY-BATCH-RATE-BYPASS).
+        let batch_limiter = cached_limiter
+            .as_ref()
+            .map(|axum::Extension(limiter)| limiter.as_ref());
+        match handle_rpc_batch_call_with_limiter(
+            &st,
+            arr,
+            raw_len,
+            header_token,
+            client,
+            batch_limiter,
+        )
+        .await
+        {
             Ok(responses) => {
                 if responses.is_empty() {
                     // All-notification batch: nothing to answer (JSON-RPC 2.0:

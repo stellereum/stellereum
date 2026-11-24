@@ -39,7 +39,7 @@ pub fn default_rate_limit_per_sec() -> u32 {
 }
 
 const RATE_LIMITER_SHARDS: usize = 16;
-const RATE_LIMITER_MAX_ENTRIES_PER_SHARD: usize = 100_000 / RATE_LIMITER_SHARDS;
+pub const RATE_LIMITER_MAX_ENTRIES_PER_SHARD: usize = 100_000 / RATE_LIMITER_SHARDS;
 
 #[inline]
 fn rate_limiter_shard_index(ip: IpAddr) -> usize {
@@ -91,9 +91,13 @@ impl RateLimiter {
         let idx = rate_limiter_shard_index(ip);
         let mut m = self.shards[idx].lock().unwrap_or_else(|e| e.into_inner());
         // Bound memory: with many distinct source IPs the map could grow without
-        // limit. Periodically drop stale windows (O(n) per shard, rare).
-        if m.len() > RATE_LIMITER_MAX_ENTRIES_PER_SHARD {
+        // limit. Drop stale windows when at the shard cap, and fail closed for
+        // unseen IPs if the shard remains full within the active window.
+        if m.len() >= RATE_LIMITER_MAX_ENTRIES_PER_SHARD && !m.contains_key(&ip) {
             m.retain(|_, (t, _)| now.saturating_sub(*t) < 2);
+            if m.len() >= RATE_LIMITER_MAX_ENTRIES_PER_SHARD {
+                return false;
+            }
         }
         let entry = m.entry(ip).or_insert((now, 0));
         if entry.0 != now {
@@ -101,6 +105,14 @@ impl RateLimiter {
         }
         entry.1 = entry.1.saturating_add(1);
         entry.1 <= self.per_sec
+    }
+
+    /// Total number of tracked IP buckets across all shards (for diagnostics/tests).
+    pub fn total_tracked_entries(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .sum()
     }
 
     /// Drop stale windows (call periodically to bound memory).
@@ -1041,6 +1053,7 @@ async fn nested_rpc_rate_limit(
         return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
     }
     req.extensions_mut().insert(client);
+    req.extensions_mut().insert(Arc::clone(&st.rpc_limiter));
     next.run(req).await
 }
 

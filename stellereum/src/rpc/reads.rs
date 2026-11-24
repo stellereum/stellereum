@@ -3892,6 +3892,15 @@ pub(super) async fn dispatch_reads(
                 // global, so the flood is a denial of service for everyone
                 // else). The per-IP cap keeps one client from taking the
                 // node's whole budget.
+                //
+                // IPv6: the raw address stays the OWNERSHIP identity (so one
+                // host in a `/64` cannot attach to or unsubscribe another
+                // host's id), while `subscribe_for` derives the BUDGET key
+                // with `rpc::budget_bucket_ip` (the `/64` network) — rotating
+                // the low 64 bits cannot mint a fresh quota. Same contract as
+                // the SSE handler, which funnels through the same
+                // `subscribe_for` (audit S3-SUBSCRIPTION-IPV6).
+                //
                 // Fail-closed attribution (audit residual): `None`
                 // (in-process dispatch) used to create UNATTRIBUTED
                 // subscriptions that skipped the per-client cap. They now

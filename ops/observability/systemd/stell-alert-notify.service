@@ -1,0 +1,10 @@
+[Unit]
+Description=Stellereum alert notifier (Alertmanager -> log/hook, no token needed)
+
+[Service]
+Type=oneshot
+# Reads Alertmanager, reports only NEW alerts and each RESOLVED once.
+# STELL_ALERT_HOOK lets an operator pipe each line to any channel without
+# committing a token here (curl webhook, chat bot, wall).
+ExecStart=/home/imm/stellereum-project/scripts/alert-notify.sh
+Environment=STELL_ALERT_LOG=/home/imm/stellereum-project/ops/observability/alerts-delivered.log

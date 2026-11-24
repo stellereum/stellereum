@@ -1,2 +1,3 @@
 # Never commit the rendered environment file.
 .env
+alerts-delivered.log

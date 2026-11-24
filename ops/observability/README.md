@@ -324,3 +324,27 @@ Gate is green when all of:
 - The SSH tunnels authenticate as `root` because that is how the cluster is
   administered today. Use key-only auth; the helper passes `BatchMode=yes` and
   never prompts for a password.
+
+## Alert delivery without a token
+
+`alertmanager.yml` ships a `null` receiver, so alerts stay active but reach no
+human. Two options:
+
+1. **Telegram** — uncomment the `telegram-duty` receiver and set
+   `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`. Exact procedure in the comments at
+   the top of `alertmanager.yml`.
+2. **Local notifier (no secret)** — `systemd/stell-alert-notify.{service,timer}`
+   plus `scripts/alert-notify.sh`: every 60 s it reads the Alertmanager API,
+   appends only NEW alerts (and each RESOLVED exactly once) to
+   `ops/observability/alerts-delivered.log`, and runs `$STELL_ALERT_HOOK` with
+   each line if set — that hook can be a `curl` to any webhook, a chat bot or
+   `wall`, so delivery works with no third-party credentials in the repo.
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp ops/observability/systemd/stell-alert-notify.* ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now stell-alert-notify.timer
+tail -f ops/observability/alerts-delivered.log
+```
+
+Leave `alerts-delivered.log` out of git (it is ignored).

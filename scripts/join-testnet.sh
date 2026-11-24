@@ -31,6 +31,10 @@
 #   --peers-file FILE       Custom YAML peers list (default: live nodeA + nodeD)
 #   --snapshot-url URL      Snapshot archive URL
 #                           (default: https://rpc.stellereum.org/snapshot/latest.tar.zst)
+#   --sha256-url URL        Snapshot SHA-256 checksum URL
+#                           (default: <snapshot-url>.sha256)
+#   --require-sha256        Fail if snapshot SHA-256 checksum is unavailable
+#   --refresh-store         Backup and replace an existing data/store from snapshot
 #   --skip-snapshot         Do not download the HTTP snapshot
 #   --binary PATH           Path to stellereum binary (default: auto-detect)
 #   --chain-id ID           Target chain ID (default: 5757)
@@ -54,6 +58,10 @@ EXPLORER="127.0.0.1:8080"
 SEEDS="seeds.stellereum.org"
 PEERS_FILE=""
 SNAPSHOT_URL="https://rpc.stellereum.org/snapshot/latest.tar.zst"
+SHA256_URL=""
+SHA256_URL_SET=0
+REQUIRE_SHA256=0
+REFRESH_STORE=0
 SKIP_SNAPSHOT=0
 BINARY="${STELL_BIN:-}"
 CHAIN_ID="5757"
@@ -93,6 +101,10 @@ while [[ $# -gt 0 ]]; do
         --peers-file=*) PEERS_FILE="${1#--peers-file=}"; shift ;;
         --snapshot-url) SNAPSHOT_URL="${2:?--snapshot-url requires a URL}"; shift 2 ;;
         --snapshot-url=*) SNAPSHOT_URL="${1#--snapshot-url=}"; shift ;;
+        --sha256-url) SHA256_URL="${2:?--sha256-url requires a URL}"; SHA256_URL_SET=1; shift 2 ;;
+        --sha256-url=*) SHA256_URL="${1#--sha256-url=}"; SHA256_URL_SET=1; shift ;;
+        --require-sha256) REQUIRE_SHA256=1; shift ;;
+        --refresh-store) REFRESH_STORE=1; shift ;;
         --skip-snapshot) SKIP_SNAPSHOT=1; shift ;;
         --binary) BINARY="${2:?--binary requires a path}"; shift 2 ;;
         --binary=*) BINARY="${1#--binary=}"; shift ;;
@@ -342,26 +354,29 @@ fi
 # 4. Bootstrap snapshot into data/store
 if [[ "$SKIP_SNAPSHOT" == "1" ]]; then
     warn "skipping snapshot download (--skip-snapshot)"
-elif [[ -d "$HOME_DIR/data/store" ]]; then
-    log "existing store found at $HOME_DIR/data/store; skipping snapshot download"
+elif [[ -d "$HOME_DIR/data/store" && "$REFRESH_STORE" == "0" ]]; then
+    log "existing store found at $HOME_DIR/data/store; skipping snapshot download (pass --refresh-store to replace)"
 else
-    log "downloading snapshot from $SNAPSHOT_URL..."
-    curl -fsSL "$SNAPSHOT_URL" | tar -I 'zstd -d' -xf - -C "$HOME_DIR/data/"
-    rm -f "$HOME_DIR/data/store"/snap* "$HOME_DIR/data/store-shard"*"/snap"* 2>/dev/null || true
-    [[ -d "$HOME_DIR/data/store" ]] || die "snapshot extraction did not create $HOME_DIR/data/store"
-    # The published snapshot is a full store, INCLUDING the `safety_record_v1`
-    # tree of the node that produced it. Its range-proof identity belongs to
-    # THAT validator, so this node would fail the record decode and come up as a
-    # fail-closed Observer (live incident 2026-11-23). Clear it and write
-    # generation 1 for THIS node's key. `--i-fenced-all-signers` is true by
-    # construction here: the node has never run, so no signer holds the key.
-    if ! "$BINARY" safety-reset --store-dir "$HOME_DIR/data/store" --i-fenced-all-signers >/dev/null 2>&1; then
-        die "safety-reset on the extracted snapshot failed (is $BINARY the current release?)"
+    BOOTSTRAP_SCRIPT="$ROOT_DIR/scripts/auto-bootstrap-store.sh"
+    [[ -f "$BOOTSTRAP_SCRIPT" ]] || die "missing helper script: $BOOTSTRAP_SCRIPT"
+    bootstrap_args=(
+        --home "$HOME_DIR"
+        --snapshot-url "$SNAPSHOT_URL"
+        --binary "$BINARY"
+        --keys-dir "$HOME_DIR/keys"
+        --shard 0
+        --env-file "$ENV_FILE"
+    )
+    if [[ "$SHA256_URL_SET" == "1" ]]; then
+        bootstrap_args+=(--sha256-url "$SHA256_URL")
     fi
-    if ! "$BINARY" safety-init --store-dir "$HOME_DIR/data/store" --keys-dir "$HOME_DIR/keys" \
-        --shard 0 --i-fenced-all-signers; then
-        die "safety-init for this node's key failed; refusing to leave a node that cannot vote"
+    if [[ "$REQUIRE_SHA256" == "1" ]]; then
+        bootstrap_args+=(--require-sha256)
     fi
+    if [[ "$REFRESH_STORE" == "1" ]]; then
+        bootstrap_args+=(--refresh-if-stale)
+    fi
+    bash "$BOOTSTRAP_SCRIPT" "${bootstrap_args[@]}"
     ok "snapshot extracted to $HOME_DIR/data/store (safety record initialised for this node)"
 fi
 

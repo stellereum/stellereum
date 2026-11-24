@@ -480,3 +480,79 @@ The guard never touches keys, the store, the consensus lock or the config.
 ## Next
 
 Continue with [Monitoring](/nodes/monitoring) to turn these failure modes into alerts, and [Upgrades](/nodes/upgrades) for the height-triggered binary swap.
+
+## Recovery runbook (2026-11)
+
+Three failures showed up on the live fleet in one day and each has a fixed
+procedure now. The full text lives in `ops/safety_recovery_runbook.md` in the
+repository; this is the operator summary.
+
+### A validator that cannot catch up
+
+Symptom: `[sync] REFUSING snapshot at <h>: trailing header proof failed: ...`
+repeating while `view change -> height <H> round <r>` never advances. Two known
+refusals: the anchor header at the snapshot boundary was never published, or the
+historical validator set used for the proposer check is not the set in force at
+that height. Both refusals are correct; the recovery path is the public HTTP
+snapshot:
+
+```sh
+systemctl stop stell-node-guard.timer      # rule 1, see below
+systemctl mask --runtime stell-nodeC
+systemctl stop stell-nodeC
+for i in $(seq 1 45); do pgrep -f 'nodeC/steller[e]um run' >/dev/null || break; sleep 2; done
+mv data data.bak-stuck-$(date +%s) && mkdir -p data
+curl -fsSL https://rpc.stellereum.org/snapshot/latest.tar.zst | tar -I 'zstd -d' -xf - -C data/
+set -a; . ./env.C; set +a
+./stellereum safety-reset --store-dir ./data/store --i-fenced-all-signers
+./stellereum safety-init  --store-dir ./data/store --keys-dir ./keys --shard 0 --i-fenced-all-signers
+systemctl unmask stell-nodeC && systemctl start stell-nodeC
+systemctl start stell-node-guard.timer
+```
+
+Keys and `env.*` are never touched. The old `data.bak-*` tree must be deleted
+once the node is at tip: it costs inodes.
+
+### `QUARANTINED (fail-closed Observer): safety store requires recovery`
+
+The node runs and finalizes but does not vote. Its durable safety record cannot
+be decoded (a concurrent open of the store by two processes, or a torn write).
+Recover offline, with the node stopped:
+
+```sh
+./stellereum safety-reset --store-dir ./data/store --i-fenced-all-signers
+./stellereum safety-init  --store-dir ./data/store --keys-dir ./keys --shard 0 --i-fenced-all-signers
+```
+
+The first call deletes the undecodable record, the second writes generation 1
+from the current finalized head. `safety-init` refuses while a record exists, so
+a healthy record cannot be destroyed by a second invocation.
+
+### `safety_record_v1 finalized_height (N) exceeds restored finalized (N-1)`
+
+The store pointer lagged the safety record by exactly one block, so the node
+refused to vote with stale state. Root cause was the systemd stop timeout: the
+persist queue drains for up to 240 s, the default `TimeoutStopSec=90` SIGKILLed
+the node mid-drain. All units now carry a `20-stop-timeout.conf` drop-in with
+`TimeoutStopSec=300`. After a hard kill, recover with `safety-reset` +
+`safety-init` as above.
+
+## Rules that keep the fleet up
+
+1. **Pause `stell-node-guard.timer` around every stop/start.** The guard restarts
+   a stopped unit within 60 s; during a `systemctl restart` it can start a second
+   instance on the same sled store, which corrupts the safety record. The rolling
+   deploy script does this for you.
+2. **Never restart a set member while the set is below 4/4.** At 3/4 the quorum
+   is 3/3, at 2/4 it is 2/2 — one more restart halts the chain.
+3. **No heavy builds while the set is below 4/4.** A validator that shares a host
+   with a compiler starves and jails after 42 misses (16.8 s at the 400 ms floor).
+   Build with `taskset -c 8-11 nice -n 19`, or on a different machine.
+4. **Watch `df -i`, not only `df -h`.** The chunk store reached 100 % inodes with
+   1.5 GB of disk still free, which makes writes fail and corrupts the store.
+   Grace is 2 h now (`--grace-seconds 7200`), which keeps the steady state around
+   35 % of the inode budget instead of 83 %.
+5. **Automatic unjail.** `scripts/auto-unjail.sh` (user service
+   `stell-auto-unjail`, 60 s) returns a jailed validator as soon as
+   `release_height` has passed and the node is within `AUTO_UNJAIL_MAX_GAP` of
+   the tip. It only ever runs `validator unjail`; cold keys stay on their nodes.

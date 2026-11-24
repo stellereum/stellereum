@@ -329,3 +329,46 @@ A minimal dashboard:
 ## Next
 
 Pair these signals with the incident procedures in [Operations](/nodes/operations). [Indexer REST](/api/indexer-rest#health-and-readiness) covers the separate indexer health endpoint.
+
+## Live 4-node stack (2026-11)
+
+The repository ships a complete stack under `ops/observability/`: Prometheus
+(v2.55), Alertmanager (v0.27), Grafana (11.3) and node-exporter, with per-service
+CPU/memory caps because the stack shares a host with a validator.
+
+The nodes bind their metrics to `127.0.0.1:8080`, so the stack does not scrape
+them over the network: `scripts/observe-local.sh` opens SSH tunnels
+(A `9080`, C `9081`, D `9082`; B is scraped locally on `:18081`, which its env
+sets). `observe-local.sh --check` answers `RESULT 4/4 nodes reachable` when the
+whole path works.
+
+Alerts follow the TON alert-bot taxonomy, mapped to the metric names this node
+actually exports:
+
+| Alert | Fires when |
+| --- | --- |
+| `ValidatorQuorumLow` | active set < 4 or `stell_validator_set_fragile == 1` |
+| `ValidatorJailed` / `ValidatorNotVoting` | jailed, or efficiency < 0.9 for 15 m |
+| `NodeOutOfSync` / `BlockStall` | height lag > 50, or no height change for 60 s |
+| `DiskUsageHigh` / `DiskWillFillIn24h` | > 80 %, or `predict_linear` says 24 h |
+| `InodesHigh` | inode usage > 80 % (the failure that hides behind free disk) |
+| `ApplySlow` / `CpuPerBlockHigh` | p95 apply > 50 ms / p95 CPU per block > 400 ms |
+| `PersistQueueBacklog` | > 100 queued persist jobs for 5 m |
+| `DivergenceDetected` / `ForkDetected` | any increase — page immediately |
+
+### Validator efficiency
+
+`stell_validator_efficiency_ratio` = proposals emitted / proposal slots owned,
+over the last 1024 slots (1.0 when none). It is the analogue of TON's
+`check_ef` and Solana's skip rate, and it is the first number to look at when a
+node is "up but useless". Slots the node cannot legally fill (not in the active
+set) are not counted as misses, and both propose paths (normal gate and the
+prebuild fast-forward) count as produced.
+
+### Readiness
+
+`/readyz` and the `stell_ready` gauge are produced by the consensus loop as of
+2026-11-24 (peer count + finality freshness + height). Before that they were
+hard-wired to 0 and would have removed a healthy node from any load balancer's
+rotation; if you meet an older binary, trust `stell_consensus_height` advancing
+instead.

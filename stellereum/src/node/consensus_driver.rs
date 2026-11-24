@@ -2059,6 +2059,12 @@ pub(crate) async fn run_consensus_node(
     let mut split_join_n: u64 = 0;
     loop {
         _tick_no += 1;
+        // P0-READINESS-DEAD: /readyz and stell_ready had no producer at all, so
+        // a load balancer would have dropped a healthy node. Peer count is
+        // cheap (mesh length) and refreshed periodically, not every tick.
+        if _tick_no.is_multiple_of(20) {
+            stellereum::explorer::set_readiness_peers(adapter.validator_mesh().len());
+        }
         // Per-peer compact-work budgets are per TICK (C2/F-8/H1): a peer can
         // force at most a bounded number of index lookups/pull replies each
         // tick, no matter how many envelopes its bucket admits.
@@ -2964,7 +2970,11 @@ pub(crate) async fn run_consensus_node(
             // slot this node OWNS. This is the same once-per-round guard as
             // the gate diagnostic below, so it cannot double-count a tick.
             // Counting only: it never feeds the gate decision.
-            if round == 0 && rt.is_proposer() {
+            // An opportunity the node could not legally fill (not in the
+            // active set, stale validator set, quarantined) is not a miss, so
+            // it is not counted as expected: `can_vote` keeps the ratio honest
+            // instead of dragging it down while the node is an observer.
+            if round == 0 && rt.is_proposer() && can_vote {
                 stellereum::metrics::global().inc_validator_proposal_expected();
             }
             // One increment per round we OWE a proposal and cannot emit it:
@@ -4701,6 +4711,9 @@ pub(crate) async fn run_consensus_node(
             // past it (the height advance happens right here), but naming it
             // keeps every line below honest about what it publishes.
             let height = completed.height;
+            // P0-READINESS-DEAD: a block was just installed, so the gateway can
+            // honestly report readiness (finality freshness + height).
+            stellereum::explorer::note_readiness_finalized(height);
             let bh = completed.hash;
             let root = completed.root;
             {
@@ -5589,14 +5602,12 @@ pub(crate) async fn run_consensus_node(
                 stellereum::metrics::global()
                     .observe_phase("propose", phase_t.elapsed().as_secs_f64());
                 if let Some(block) = proposed {
-                    // Validator-efficiency KPI: the fast-forward path emits a
-                    // proposal but is NOT a second counting site for
-                    // `stell_validator_proposals_produced_total` (the normal
-                    // propose gate is the single site this KPI watches). A
-                    // height served by a prebuild-hit fast forward therefore
-                    // enters `expected` but not `produced`; the ratio reads
-                    // LOW for such heights, never high. Documented in the
-                    // Wave 1 metrics handoff rather than papered over here.
+                    // Validator-efficiency KPI: the fast-forward path fills a
+                    // slot exactly like the normal gate, so it must count as
+                    // produced. Leaving it out made the ratio read low for
+                    // every prebuild-hit height (the blind spot recorded in
+                    // the Wave 1 handoff).
+                    stellereum::metrics::global().inc_validator_proposal_produced();
                     let height = rt.hc.height;
                     let round = rt.hc.round;
                     let bh = block.compute_hash();

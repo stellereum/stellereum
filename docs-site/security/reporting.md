@@ -16,20 +16,16 @@ turns a bug into an exploit.
 
 ## Where to report
 
-Use the process in `SECURITY.md` at the repository root.
+Use the private channels defined in `SECURITY.md` at the repository root and
+advertised at `/.well-known/security.txt` (RFC 9116):
 
-::: warning The contact details are not published yet
-The security email and PGP block in `SECURITY.md` have not been filled in. The
-owning organization must publish them before mainnet. Until they are published:
+- **GitHub private advisory** (preferred):
+  `https://github.com/stellereum/stellereum/security/advisories/new`
+- **X/Twitter DM**: `https://x.com/stellereum`
 
-- do **not** assume a monitored mailbox exists;
-- use a private channel the maintainers have published out of band;
-- if you must use email, put `[no-pgp]` in the subject and ask for a secure
-  channel.
-
-A security policy without a working private contact is not shippable. This is a
-known release blocker, not a detail.
-:::
+Do **not** open a public issue, post proof-of-concept transaction payloads, or
+test against the live validator set (denial of service against the four live
+nodes is not authorized, even in a "safe" form).
 
 Include:
 
@@ -91,13 +87,24 @@ still serious; a `REMOTE` finding that only logs noise is not critical.
 
 | Step | Target |
 | --- | --- |
-| Acknowledge receipt | **2 business days** |
-| Initial triage (valid/invalid, severity) | **5 business days** |
-| Fix timeline for confirmed Critical/High | communicated at triage, updated weekly |
-| Public advisory + credit | with the fix release, or **90 days** after the report, whichever the reporter agrees to |
+| Acknowledge receipt | **3 business days** |
+| Triage + severity (CVSS) | **10 business days** |
+| Fix or mitigation for Critical/High | **30 days** |
+| Coordinated disclosure | **90 days**, or earlier by agreement |
+| Credit | in the advisory and the release notes, unless you prefer otherwise |
 
-If you hear nothing within the acknowledgement window, assume the mail was lost
-and re-send with `[resend]` in the subject.
+We will tell you if a report is out of scope, duplicated, or not reproducible,
+and why. We will not silently close a report.
+
+## CVE process
+
+1. A privately reported issue is confirmed and assigned a CVSS vector.
+2. A fix lands with a regression test; the test name is recorded in
+   `docs/OPEN_DEFECTS.md`.
+3. If exploitable on a deployed network, an advisory is published with affected
+   versions, mitigation, and the fixed version after operators have had the
+   agreed upgrade window.
+4. Technical details are published only after that advisory/upgrade window.
 
 ## Safe harbour
 

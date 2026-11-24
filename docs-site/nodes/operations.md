@@ -265,6 +265,54 @@ It compares nodes against each other and against `scripts/cluster-nodes.conf`:
 
 If preflight fails, fix the config and re-run. Do not deploy.
 
+## Operator CLI (`status` and `gates`)
+
+Two read-only CLI commands inspect live cluster health and compile-time
+protocol activation gates without touching keys or the store:
+
+### `stellereum status`
+
+Prints a one-screen cluster summary (height, validator set, quorum/total power,
+per-member state, jail release height, and a `verdict` + `next action`):
+
+```bash
+# Human summary against local RPC
+stellereum status
+
+# Remote RPC + expected validator count (flags a 3-of-4 set as DEGRADED)
+stellereum status --rpc http://127.0.0.1:8545 --expect 4
+
+# Machine-readable JSON for cron / alerting / second-operator checks
+stellereum status --rpc http://127.0.0.1:8545 --expect 4 --json
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--rpc <URL>` | `http://127.0.0.1:8545` | Node JSON-RPC endpoint (`stell_blockNumber`, `stell_getValidators`, `stell_getValidatorStatus`) |
+| `--expect <N>` | unset | Expected validator count; jailed members drop out of `stell_getValidators`, so passing `--expect 4` reports a 3-of-4 cluster as `DEGRADED` instead of `healthy` |
+| `--json` | off | Emit structured JSON (`rpc`, `height`, `validator_count`, `fragile`, `quorum`, `total_power`, `validators`, `verdict`, `next`) |
+
+### `stellereum gates`
+
+Prints the activation-gate table (`id`, `status`, `height`, proving `test`)
+sourced from `stellereum/src/feature_gates.rs`:
+
+```bash
+# Human-readable table
+stellereum gates
+
+# Render the committed YAML manifest (pinned to docs/feature_gates.yaml)
+stellereum gates --yaml
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--yaml` | off | Render the machine-readable YAML manifest (`docs/feature_gates.yaml`); a library test pins the committed manifest to this output |
+
+For node configuration validation (`--node-toml`, `stellereum config check`,
+and `-t` / `--no-telemetry`), see
+[Run an observer — configuration](/nodes/observer#configuration-stellereum-toml-and-t).
+
 ## `stelops`
 
 `scripts/tools/stelops` reads the store offline (build it once; it depends on

@@ -137,6 +137,40 @@ running binary satisfies the plan.
 
 ## Staging the binary
 
+### Verify a release artifact (`cosign` + SBOM + SHA-256)
+
+Tagged `v*` releases are built in CI (`.github/workflows/release.yml`) with
+`cargo build --release --locked` and gated by `cargo-deny` (`deny.toml`) and
+`cargo-audit` (RustSec). Each release publishes five assets:
+
+| Asset | Purpose |
+| --- | --- |
+| `stellereum-x86_64-unknown-linux-gnu` | Node binary |
+| `….sha256` | SHA-256 digest checked before staging |
+| `….sbom.spdx.json` | SPDX SBOM (dependency inventory) |
+| `….sig` + `….pem` | Keyless `cosign` signature + OIDC workflow certificate |
+
+Verify both the keyless signature and the SHA-256 digest before staging onto
+any node (`docs/RELEASE.md`):
+
+```bash
+cosign verify-blob \
+  --certificate stellereum-x86_64-unknown-linux-gnu.pem \
+  --signature   stellereum-x86_64-unknown-linux-gnu.sig \
+  --certificate-identity-regexp '^https://github\.com/stellereum/stellereum/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  stellereum-x86_64-unknown-linux-gnu
+
+sha256sum -c stellereum-x86_64-unknown-linux-gnu.sha256
+```
+
+`rolling-deploy.sh stage` verifies the SHA-256 digest against the local file
+you pass, not the `cosign` signature — running `cosign verify-blob` first is
+the operator check that proves the binary was built by the repository's Release
+workflow.
+
+### On-disk staging rules
+
 The plan's `name` builds the candidate path. The node tries, in order:
 
 ```text
@@ -253,6 +287,28 @@ stellereum-upgrader --supervise --live PATH (--staged PATH | --staged-dir DIR) [
 | `--wait-timeout SECS` | bound for waiting on plan/marker |
 | `--poll-ms MS` | poll interval |
 | `--progress PATH` | append-only journal |
+| `--health-url URL` | post-upgrade health endpoint (JSON-RPC `stell_blockNumber`, or `GET .../health` when path ends with `/health`) |
+| `--health-wait-secs N` | seconds to wait for post-upgrade health (default `0` = disabled; requires `--health-url`) |
+| `--rollback-on-fail` | back up `<live>` to `<live>.prev` before swap; on restart or health failure, restore `<live>.prev -> <live>` and re-run `--restart-cmd` |
+| `--require-height-advance` | require two probes showing height advance (or two `/health` `2xx` responses) |
+
+### Health-gated upgrade with auto-rollback
+
+```bash
+stellereum-upgrader \
+  --marker /srv/stellereum/data/upgrade-halt.marker \
+  --staged /srv/stellereum/data/upgrades/v0.2.0/stellereum \
+  --live /srv/stellereum/bin/stellereum \
+  --restart-cmd 'systemctl --user restart stellereum' \
+  --health-url http://127.0.0.1:8545 \
+  --health-wait-secs 30 \
+  --require-height-advance \
+  --rollback-on-fail \
+  --apply
+```
+
+Note that `--rollback-on-fail` only restores the pre-`H` binary safely if the
+store has not crossed an irreversible post-`H` schema/state change.
 
 ### Supervisor mode (recommended)
 
@@ -487,7 +543,25 @@ scripts/rolling-deploy.sh activate --public-rpc https://rpc.example.org
 
 # stage a subset
 scripts/rolling-deploy.sh stage ./stellereum/target/release/stellereum A C
+
+# canary mode: activate ONLY the first node, soak 30s (or --canary-soak-secs N),
+# and auto-rollback to stellereum.prev if height stalls, validator jails, or
+# cluster health drops — leaving remaining nodes untouched
+scripts/rolling-deploy.sh activate --canary --canary-soak-secs 30
 ```
+
+With `--canary`:
+
+1. `activate` touches **only** the first node in `--nodes` (skipping the rest).
+2. After restart and catch-up, `canary_soak` polls for `--canary-soak-secs`
+   (default `30` s), verifying that local `stell_blockNumber` advances (never
+   regresses), the validator is not jailed, and `stell_getValidators` remains
+   healthy (`>= 3` validators, `fragile=false`).
+3. If activation or soak fails, `rolling-deploy.sh` pauses
+   `stell-node-guard.timer`, restores `stellereum.prev -> stellereum`, restarts
+   the unit, resumes the guard, and exits `1` with all remaining nodes
+   untouched. Once the canary passes, re-run `activate` without `--canary` to
+   roll out the remaining nodes.
 
 The script reads `scripts/cluster-nodes.conf` for hosts, directories, units,
 RPC ports and optional `NODE_<X>_VALIDATOR` ids. It never reads an env file and

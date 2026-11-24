@@ -202,6 +202,70 @@ systemctl restart stell-validator   # or your unit name
 
 The hot key now signs votes; the cold key can stay offline.
 
+## Node configuration (`stellereum.toml` and `-t`)
+
+Validators follow the same configuration split as observers: `-c` / `--config`
+loads `infnode` P2P YAML (`node.yaml`), while `--node-toml <FILE>` (or
+`STELL_NODE_TOML`, or `./stellereum.toml`) loads Stellereum's typed TOML
+config (`stellereum/stellereum.toml.example`).
+
+- **Precedence:** CLI flags (such as `-t` / `--no-telemetry`) > `STELL_*`
+  environment variables (**env always overrides TOML**) > TOML file > compiled
+  defaults.
+- **Validation:** run `stellereum config check [--file ./stellereum.toml] [--json]`
+  before restarting a validator to inspect effective values, sources
+  (`toml`/`env`/`default`), and invariant errors (secrets are redacted).
+- **Telemetry toggle (`-t` / `--no-telemetry`):** disables `GET /status`
+  (`404 Not Found`) while keeping `/health`, `/healthz`, `/readyz`, and
+  `/metrics` active. See [Run an observer — configuration](/nodes/observer#configuration-stellereum-toml-and-t).
+
+## Remote signer (`RemotePqSigner` / `RemoteSigner`)
+
+To keep the hot Falcon-512 voting key out of the validator node's process
+memory, run the consensus signer out-of-process behind `STELL_REMOTE_SIGNER_URL`
+(see `ops/keys_runbook.md` for the full runbook):
+
+- **v2 FULL-PQ (`RemotePqSigner` / `PqSigner`):** signs Falcon-512 BFT votes
+  and proposals (`GET /v2/public_key`, `POST /v2/sign`) with anti-oracle
+  preimage verification (`STELLEREUM_BFT_VOTE_V3` / proposal bytes) and durable
+  anti-equivocation (`ConsensusSafetyGuard` + `SafetyRecordStore`).
+- **v1 Legacy (`RemoteSigner`):** legacy Ed25519 remote signer path.
+
+Configure the node via `0600` environment variables or `[signer]` in
+`stellereum.toml`:
+
+```bash
+STELL_REMOTE_SIGNER_URL=https://signer.internal:8443
+STELL_REMOTE_SIGNER_TOKEN=<REDACT_TOKEN>
+```
+
+Fail-closed guarantees enforced by the node:
+
+1. **Zero local fallback:** when `STELL_REMOTE_SIGNER_URL` is non-empty, the
+   node never opens or generates `./keys/falcon.key`; an unreachable signer
+   aborts startup or refuses to sign.
+2. **HTTPS off loopback:** plain `http://` is permitted only on loopback
+   (`127.0.0.1`, `[::1]`, `localhost`); non-loopback `http://` fails closed.
+3. **Pinned identity & local re-verify:** startup checks `scheme_id == 2`
+   (Falcon-512), 897-byte pubkey, and `validator_id`, pins the key for the
+   process lifetime, and re-verifies every returned signature locally.
+
+Before switching a store onto a remote signer, stop and fence all legacy
+processes/signers for that key, then initialize the durable safety store if
+needed:
+
+```bash
+stellereum safety-init \
+  --store-dir ./data/store \
+  --keys-dir ./keys \
+  --validator-pub <64-HEX-VALIDATOR-PUB> \
+  --shard 0 \
+  --i-fenced-all-signers
+```
+
+Archive or remove any stale local `./keys/falcon.key` on the validator host
+once `[post-quantum] validator Falcon-512 pubkey (v2 signer): ...` is confirmed.
+
 ## `stellereum validator` reference
 
 Every subcommand accepts `--rpc` (default `http://127.0.0.1:8545`),
@@ -330,12 +394,31 @@ stellereum validator apply-commission \
 
 ## Voting-key rotation
 
+Preserves the immutable 32-byte `validator_id` and withdrawal address. The
+rotation takes effect after `PQ_ROTATION_DELAY_HEIGHTS = 30_000` heights; the
+current key continues voting until then.
+
 ```bash
+# 1. Stage a new Falcon-512 key in a separate directory (do not overwrite live falcon.key yet)
+STELL_KEY_PASSPHRASE='<passphrase>' stellereum keys init \
+  --keys-dir ./keys-next --falcon-file ./keys-next/falcon.key
+
+# 2. Check current rotation_seq
+stellereum validator status --validator <ID>
+
+# 3. Dry-run for 4-eyes review, then broadcast with the cold withdrawal key
 stellereum validator rotate-voting-key \
   --withdrawal-key-file ./keys/withdrawal.key \
   --validator-id <ID> \
   --rotation-seq <CURRENT_SEQ> \
-  --new-voting-key-file ./keys/falcon-new.key
+  --new-voting-key-file ./keys-next/falcon.key \
+  --dry-run
+
+stellereum validator rotate-voting-key \
+  --withdrawal-key-file ./keys/withdrawal.key \
+  --validator-id <ID> \
+  --rotation-seq <CURRENT_SEQ> \
+  --new-voting-key-file ./keys-next/falcon.key
 ```
 
 - `--rotation-seq` must equal the record's `next_seq` (`rotation_seq` in
@@ -348,8 +431,11 @@ stellereum validator rotate-voting-key \
 - The last **2** keys are retained in history, so votes at recent heights still
   verify.
 
-After the effective height, put the new key on the host and restart. A hot key
-rotation does **not** change the validator id or the withdrawal address.
+At the effective height (`announced_height + 30_000`), pause
+`stell-node-guard.timer`, install the new key in your remote signer (or replace
+`./keys/falcon.key` preserving `0600` permissions and `enc2:` encryption),
+restart the node, and resume the guard. A hot key rotation does **not** change
+the validator id or the withdrawal address.
 
 ::: danger Rotating the node's Falcon key with `keys rotate-falcon`
 `stellereum keys rotate-falcon --force` generates a **new validator address**
@@ -398,6 +484,28 @@ stellereum validator unjail \
 
 A validator that cannot stay inside the hardware table will be jailed again.
 Fix the host before unjailing.
+
+### 4-eyes approval and audit log
+
+High-impact cold-key operations (`validator unjail`, `change-withdrawal`,
+`rotate-voting-key`, `unbond`, `withdraw`, `gov propose`, `gov vote`) follow a
+two-operator workflow (`ops/keys_runbook.md` §5):
+
+1. **Pre-flight & dry-run (Operator A):** check `stellereum status --expect 4`
+   and `stellereum validator status --validator <ID>`, confirm `released: yes`
+   and gas balance on `withdrawal_address`, then run `validator unjail --dry-run`
+   and share the redacted command, `Hash`, `Validator ID`, `Withdrawal`,
+   `Top-up`, `Chain Id`, and `Nonce` (never share seeds, passphrases, or tokens).
+2. **Independent verification (Operator B):** query the node RPC from a
+   separate session, confirm the 42-miss root cause is resolved so the validator
+   will not immediately re-jail, verify `Nonce` and `Validator ID`, and record
+   explicit approval referencing the dry-run `Hash`.
+3. **Execute & log:** Operator A submits without `--dry-run` (or submits the
+   offline-signed `raw` hex via `stell_sendRawTransaction`), confirms
+   `jailed: false`, and appends a redacted record (with `utc`, `op_a`, `op_b`,
+   `action`, `validator_id`, `chain_id`, `nonce`, `tx_hash`, `included_height`,
+   `ticket`, `result`) to an append-only `0600` operator audit log such as
+   `/var/log/stellereum/key-ops-audit.log`.
 
 ### Claim a withdrawal address before you need it
 

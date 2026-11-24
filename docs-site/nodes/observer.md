@@ -170,6 +170,64 @@ stellereum run --config node.yaml --shard 0 --parallel-exec
 `--parallel-exec` enables disjoint-wave parallel block execution. It is the
 normal flag for both observers and validators.
 
+## Configuration (`stellereum.toml` and `-t`)
+
+Stellereum separates P2P transport configuration (`infnode` YAML passed via
+`-c` / `--config`, e.g. `node.yaml`) from node policy, RPC, storage, signer,
+faucet, and telemetry settings (`stellereum.toml` or `STELL_*` environment
+variables).
+
+> **Important:** `-c` / `--config` on `stellereum run` is reserved for
+> `infnode`'s YAML file. Always pass `--node-toml <FILE>` (or set
+> `STELL_NODE_TOML=<FILE>`) for Stellereum TOML config.
+
+### Precedence & discovery
+
+Settings are resolved in strict priority order (highest to lowest):
+
+1. **CLI flags** (e.g. `-t` / `--no-telemetry`)
+2. **Environment variables** (`STELL_*`) — **always** override TOML values
+3. **TOML file** (`stellereum/stellereum.toml.example`), discovered via:
+   - `--node-toml <FILE>` (fails loudly if missing)
+   - `STELL_NODE_TOML=<FILE>` (fails loudly if missing)
+   - `./stellereum.toml` in the working directory (auto-discovered if present)
+4. **Compiled defaults**
+
+Every TOML section rejects unknown fields (`#[serde(deny_unknown_fields)]`), so
+typos fail at startup.
+
+### Validate config before starting (`stellereum config check`)
+
+```bash
+# Auto-discover $STELL_NODE_TOML or ./stellereum.toml, merged with STELL_* env
+stellereum config check
+
+# Validate an explicit TOML file (fails if missing)
+stellereum config check --file ./stellereum.toml
+
+# Machine-readable JSON output (secret fields redacted as <redacted>)
+stellereum config check --file ./stellereum.toml --json
+```
+
+`config check` prints each setting's effective value and source (`toml`, `env`,
+or `default`), checks invariants (for example `min_block_ms <= round_timeout_ms`,
+`keep_blocks > 0` when `archive = false`, and valid `remote_signer_url` schemes),
+and exits non-zero on parse or validation errors.
+
+### Disable human status dashboard (`-t` / `--no-telemetry`)
+
+Pass `-t` / `--no-telemetry` on `stellereum run` (or set `STELL_NO_TELEMETRY=1`,
+or `[telemetry] enabled = false` / `telemetry = false` in TOML) to disable the
+human `/status` HTML dashboard (`GET /status` returns `404 Not Found`):
+
+```bash
+stellereum run --config node.yaml --node-toml ./stellereum.toml -t --shard 0 --parallel-exec
+```
+
+Operational endpoints — `GET /health`, `GET /healthz`, `GET /readyz`, and
+`GET /metrics` — remain active so systemd watchdogs, load balancers, and
+Prometheus scrapes keep working.
+
 ## Ports
 
 | Port | Protocol | Purpose | Exposure |

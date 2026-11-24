@@ -114,7 +114,20 @@ Rules:
 1. First request: omit both `cursor` and `offset` (or use `offset=0`).
 2. Next page: send **only** `cursor=<next_cursor>`.
 3. Stop when `next_cursor` is `null` or `has_more` is `false`.
-4. Do not parse cursors; they are opaque and route-specific.
+4. Treat cursors as opaque tokens and pass `next_cursor` back verbatim.
+
+### Shard-qualified `tx_cursor`
+
+Transaction list routes (`GET /api/v2/txs` and `GET /api/v2/account/:address/txs`)
+order rows by `(block_height, tx_index, shard_id)` descending, because
+`(block_height, tx_index)` is only unique within a shard.
+
+- **`next_cursor` wire format:** `<shard_id>:<block_height>:<tx_index>` (for
+  example `0:194:3`), continuing strictly after `(height, tx_index, shard_id)`.
+- **Backward compatibility:** the cursor parser (`parse_tx_cursor_v2`) also
+  accepts legacy two-part cursors `<block_height>:<tx_index>` (continuing after
+  `(height, tx_index)` without a shard tie-breaker).
+- **Validation:** malformed cursors fail with `400 {"error":"invalid tx cursor ..."}`.
 
 Page shape varies by route but always includes `limit`, `offset` (or 0),
 `next_cursor` and usually `has_more`.
@@ -331,23 +344,30 @@ through REST when the replay window has expired.
 
 ## Legacy aliases
 
-The router mounts both the v2 paths and an older `/api/...` spelling of the
-same handlers. They are aliases, not a second API:
+`/api/v2/` is the canonical API surface. The router mounts the same route
+handlers at `/api/...` as legacy aliases wrapped in deprecation middleware:
+
+- Every `/api/...` response includes RFC 8594 / RFC 8288 migration headers:
+  - `Deprecation: true`
+  - `Sunset: Wed, 30 Jun 2027 00:00:00 GMT`
+  - `Link: </api/v2>; rel="successor-version"`
+- `/api/v2/...` responses never carry these deprecation headers.
 
 | Legacy | v2 |
 | --- | --- |
 | `/api/overview`, `/api/stats`, `/api/price`, `/api/status` | `/api/v2/...` |
-| `/api/blocks/latest` | `/api/v2/blocks` |
-| `/api/blocks/:param` | `/api/v2/block/:param` |
-| `/api/transactions/latest` | `/api/v2/txs` |
-| `/api/transactions/:hash` | `/api/v2/tx/:hash` |
-| `/api/accounts/:address` and `/actions` / `/activity` | `/api/v2/account/:address` and `/txs` |
+| `/api/blocks/latest`, `/api/blocks` | `/api/v2/blocks` |
+| `/api/blocks/:param`, `/api/block/:param` | `/api/v2/block/:param` |
+| `/api/transactions/latest`, `/api/txs` | `/api/v2/txs` |
+| `/api/transactions/:hash`, `/api/tx/:hash` | `/api/v2/tx/:hash` |
+| `/api/accounts/:address`, `/api/account/:address` | `/api/v2/account/:address` |
+| `/api/accounts/:address/actions`, `/activity`, `/account/:address/txs` | `/api/v2/account/:address/txs` |
 | `/api/validators`, `/api/staking`, `/api/tokens`, `/api/whales`, `/api/shards` | `/api/v2/...` |
 | `/api/verified`, `/api/verified/stats` | `/api/v2/...` |
 | `/api/search` | `/api/v2/search` |
 
-New clients should use `/api/v2/`. The aliases exist for the explorer and old
-links.
+New clients should use `/api/v2/` directly and plan migration off `/api/...`
+before the `Sunset` date.
 
 ## Error handling
 

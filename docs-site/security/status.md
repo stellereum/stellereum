@@ -54,12 +54,40 @@ These are real, in-tree mechanisms with tests. “Tested” still does not mean
 - **Upgrade staging**: safe name, regular file, size cap, exact SHA-256,
   private copy of the verified bytes, parent-directory check.
 - **Wallet message signing** with domain separation and chain binding.
-- **Faucet** with fail-closed token, per-IP budget and lifetime cap.
+- **Faucet** with fail-closed token, per-IP hourly budget, lifetime cap, and
+  **salted-IP privacy**: hourly rate-limit buckets store only a truncated
+  keyed BLAKE3 digest (`BLAKE3_KEYED(salt, normalized_bucket)[..16]` hex, using
+  a persisted `faucet_ip_salt_v1` salt after IPv4 / IPv6 `/64` normalization),
+  never raw client IP addresses in memory or persisted state
+  (`stellereum/src/rpc/faucet.rs`).
+- **Release supply-chain verification**: tagged `v*` releases build with
+  `--locked`, run `cargo-deny` and `cargo-audit` in CI, publish an SPDX SBOM,
+  and are signed keyless with `cosign` (`docs/RELEASE.md`).
 - **Remote PQ signer** for validator consensus keys, with pinned key and no
   local fallback.
 - **Session keys** with scope, cumulative gas budget, expiry and terminal
   revocation.
 - **Paymaster v2** with two Falcon-512 signatures, per-transaction caps and joint reservation.
+
+## Security policy, CVE process, and `security.txt`
+
+`SECURITY.md` at the repository root defines the vulnerability reporting and
+CVE process, and `/.well-known/security.txt` (RFC 9116, served on both
+`docs.stellereum.org` and `stellereum.org`) points researchers to the private
+channels:
+
+- **Private reporting:** GitHub Security Advisories
+  (`https://github.com/stellereum/stellereum/security/advisories/new`,
+  preferred) or X/Twitter DM (`https://x.com/stellereum`). Do not open public
+  issues, post PoCs, or run unauthorized DoS against the live 4-node set.
+- **Targets (`SECURITY.md`):** 3 business days acknowledgement, 10 business days
+  triage + CVSS severity, 30 days fix or mitigation for Critical/High, and
+  90 days coordinated disclosure (or earlier by agreement).
+- **CVE handling:** confirmed reports receive a CVSS vector and a fix pinned by
+  a regression test recorded in `docs/OPEN_DEFECTS.md`; if exploitable on a
+  deployed network, an advisory (affected versions, mitigation, fixed version)
+  is published after the agreed operator upgrade window, with technical details
+  released only afterwards.
 
 ## What is NOT covered
 
@@ -67,9 +95,9 @@ This is the list to read before trusting a claim.
 
 ### No external audit, no bug bounty
 
-There is **no standing bounty program**. The security contact email and PGP
-block in `SECURITY.md` are not published yet. A policy without a working
-private contact is not shippable. See [Reporting](/security/reporting).
+There is **no standing bounty program**. Private disclosure channels are active
+via `SECURITY.md` and `/.well-known/security.txt` (see [Reporting](/security/reporting)),
+but internal reviews and harnesses do not substitute for an external audit.
 
 ### Consensus and network
 

@@ -91,6 +91,9 @@ pub extern "C" fn shares_of(user_id: i64) -> i64 {
 /// packed_arg: (user_id * 10,000,000,000) + (amount_a * 100,000) + amount_b
 #[no_mangle]
 pub extern "C" fn deposit(packed: i64) -> i64 {
+    if sload(SLOT_INITIALIZED) != 1 {
+        return ERR_UNAUTHORIZED;
+    }
     if packed <= 0 {
         return ERR_INVALID_ARGUMENT;
     }
@@ -163,6 +166,9 @@ pub extern "C" fn deposit(packed: i64) -> i64 {
 /// packed_arg: (user_id * 1,000,000) + shares_to_burn
 #[no_mangle]
 pub extern "C" fn withdraw(packed: i64) -> i64 {
+    if sload(SLOT_INITIALIZED) != 1 {
+        return ERR_UNAUTHORIZED;
+    }
     if packed <= 0 {
         return ERR_INVALID_ARGUMENT;
     }
@@ -270,6 +276,9 @@ pub extern "C" fn swap_quote_b_for_a(dy: i64) -> i64 {
 /// Execute Swap Token A -> Token B: swap_a_for_b(dx) -> dy
 #[no_mangle]
 pub extern "C" fn swap_a_for_b(dx: i64) -> i64 {
+    if sload(SLOT_INITIALIZED) != 1 {
+        return ERR_UNAUTHORIZED;
+    }
     let dy = swap_quote(dx);
     if dy <= 0 {
         return ERR_INVALID_ARGUMENT;
@@ -299,6 +308,9 @@ pub extern "C" fn swap_a_for_b(dx: i64) -> i64 {
 /// Execute Swap Token B -> Token A: swap_b_for_a(dy) -> dx
 #[no_mangle]
 pub extern "C" fn swap_b_for_a(dy: i64) -> i64 {
+    if sload(SLOT_INITIALIZED) != 1 {
+        return ERR_UNAUTHORIZED;
+    }
     let dx = swap_quote_b_for_a(dy);
     if dx <= 0 {
         return ERR_INVALID_ARGUMENT;

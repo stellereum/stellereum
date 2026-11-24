@@ -251,24 +251,41 @@ fn execute_transfer(from: i64, to: i64, amount: i64) -> i64 {
         return ERR_INVALID_ARGUMENT;
     }
 
-    sstore(from_slot, from_bal - amount);
+    let new_from_bal = from_bal - amount;
 
     let to_slot = balance_slot(to);
-    let to_bal = sload(to_slot);
+    let to_bal = if to_slot == from_slot {
+        new_from_bal
+    } else {
+        sload(to_slot)
+    };
     let new_to_bal = match to_bal.checked_add(net) {
         Some(v) => v,
         None => return ERR_OVERFLOW,
     };
-    sstore(to_slot, new_to_bal);
 
-    if fee > 0 {
+    let treasury_update = if fee > 0 {
         let treasury = sload(SLOT_TREASURY_ACCOUNT);
         let treasury_slot = balance_slot(treasury);
-        let treasury_bal = sload(treasury_slot);
+        let treasury_bal = if treasury_slot == to_slot {
+            new_to_bal
+        } else if treasury_slot == from_slot {
+            new_from_bal
+        } else {
+            sload(treasury_slot)
+        };
         let new_treasury_bal = match treasury_bal.checked_add(fee) {
             Some(v) => v,
             None => return ERR_OVERFLOW,
         };
+        Some((treasury_slot, new_treasury_bal))
+    } else {
+        None
+    };
+
+    sstore(from_slot, new_from_bal);
+    sstore(to_slot, new_to_bal);
+    if let Some((treasury_slot, new_treasury_bal)) = treasury_update {
         sstore(treasury_slot, new_treasury_bal);
     }
 

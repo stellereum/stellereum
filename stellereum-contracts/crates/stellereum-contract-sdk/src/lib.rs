@@ -35,6 +35,8 @@ mod host {
         pub fn caller(dest_ptr: i32);
         /// Native value attached to the call.
         pub fn value() -> i64;
+        /// Current block timestamp in seconds since Unix epoch.
+        pub fn block_time() -> i64;
     }
 }
 
@@ -77,6 +79,13 @@ pub fn value() -> u64 {
     unsafe { host::value() as u64 }
 }
 
+/// Current block timestamp in seconds since Unix epoch.
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+pub fn block_time() -> i64 {
+    unsafe { host::block_time() }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 mod host_mock {
     use std::cell::RefCell;
@@ -87,6 +96,7 @@ mod host_mock {
         static EVENTS: RefCell<Vec<(i64, i64)>> = const { RefCell::new(Vec::new()) };
         static CALLER: RefCell<[u8; 32]> = const { RefCell::new([0u8; 32]) };
         static VALUE: RefCell<u64> = const { RefCell::new(0) };
+        static BLOCK_TIME: RefCell<i64> = const { RefCell::new(0) };
     }
 
     pub fn sload(key: i64) -> i64 {
@@ -106,6 +116,7 @@ mod host_mock {
         EVENTS.with(|e| e.borrow_mut().clear());
         CALLER.with(|c| *c.borrow_mut() = [0u8; 32]);
         VALUE.with(|v| *v.borrow_mut() = 0);
+        BLOCK_TIME.with(|t| *t.borrow_mut() = 0);
     }
 
     /// Set the mock authenticated caller (test double for `host.caller`).
@@ -126,6 +137,16 @@ mod host_mock {
     /// Read the mock attached value.
     pub fn mock_value() -> u64 {
         VALUE.with(|v| *v.borrow())
+    }
+
+    /// Set the mock block timestamp (test double for `host.block_time`).
+    pub fn set_mock_block_time(ts: i64) {
+        BLOCK_TIME.with(|t| *t.borrow_mut() = ts);
+    }
+
+    /// Read the mock block timestamp.
+    pub fn mock_block_time() -> i64 {
+        BLOCK_TIME.with(|t| *t.borrow())
     }
 
     pub fn get_mock_events() -> Vec<(i64, i64)> {
@@ -182,6 +203,19 @@ pub fn set_mock_value(value: u64) {
     host_mock::set_mock_value(value)
 }
 
+/// Mock block timestamp (test double; on wasm32 reads `host.block_time`).
+#[cfg(not(target_arch = "wasm32"))]
+#[inline(always)]
+pub fn block_time() -> i64 {
+    host_mock::mock_block_time()
+}
+
+/// Set the mock block timestamp (tests only).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_mock_block_time(ts: i64) {
+    host_mock::set_mock_block_time(ts)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub fn get_mock_events() -> Vec<(i64, i64)> {
     host_mock::get_mock_events()
@@ -235,13 +269,17 @@ mod caller_mock_tests {
         reset_mock_state();
         assert_eq!(caller(), [0u8; 32]);
         assert_eq!(value(), 0);
+        assert_eq!(block_time(), 0);
         set_mock_caller([0xABu8; 32]);
         set_mock_value(12345);
+        set_mock_block_time(1_750_000_000);
         assert_eq!(caller(), [0xABu8; 32]);
         assert_eq!(value(), 12345);
+        assert_eq!(block_time(), 1_750_000_000);
         reset_mock_state();
         assert_eq!(caller(), [0u8; 32]);
         assert_eq!(value(), 0);
+        assert_eq!(block_time(), 0);
     }
 
     #[test]

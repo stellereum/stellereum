@@ -27,7 +27,8 @@
 extern crate std;
 
 use stellereum_contract_sdk::{
-    caller_is, emit, setup_wasm_panic_handler, sload, sstore, ERR_INVALID_ARGUMENT, SUCCESS,
+    block_time, caller_is, emit, setup_wasm_panic_handler, sload, sstore, ERR_INVALID_ARGUMENT,
+    SUCCESS,
 };
 
 setup_wasm_panic_handler!();
@@ -185,8 +186,11 @@ pub extern "C-unwind" fn initiate_recovery(packed: i64) -> i64 {
         panic!("invalid recovery owner");
     }
 
+    let current_ref = block_time();
+    if current_ref < 0 {
+        panic!("invalid block_time");
+    }
     sstore(SLOT_PENDING_OWNER, new_owner);
-    let current_ref = 1_750_000_000;
     sstore(SLOT_RECOVERY_TIMESTAMP, current_ref);
 
     emit(TOPIC_RECOVERY_INITIATED, new_owner);
@@ -205,14 +209,18 @@ pub extern "C-unwind" fn cancel_recovery(caller_id: i64) -> i64 {
 
 /// Social Recovery - Step 2: Finalize Recovery
 #[no_mangle]
-pub extern "C-unwind" fn finalize_recovery(now_timestamp: i64) -> i64 {
+pub extern "C-unwind" fn finalize_recovery(_now_timestamp: i64) -> i64 {
     let pending = sload(SLOT_PENDING_OWNER);
     if pending <= 0 {
         panic!("no pending recovery");
     }
 
     let init_time = sload(SLOT_RECOVERY_TIMESTAMP);
-    if now_timestamp < init_time + RECOVERY_TIMELOCK_SECS {
+    let now = block_time();
+    let unlock_time = init_time
+        .checked_add(RECOVERY_TIMELOCK_SECS)
+        .expect("recovery timestamp overflow");
+    if now < unlock_time {
         panic!("timelock not elapsed: recovery is pending challenge period");
     }
 
@@ -243,8 +251,14 @@ pub extern "C-unwind" fn set_tenant(packed: i64) -> i64 {
         return ERR_INVALID_ARGUMENT;
     }
 
-    let now = 1_750_000_000;
-    let deadline = now + (duration_hours * 3600);
+    let now = block_time();
+    if now < 0 {
+        return ERR_INVALID_ARGUMENT;
+    }
+    let deadline = match now.checked_add(duration_hours * 3600) {
+        Some(v) => v,
+        None => return ERR_INVALID_ARGUMENT,
+    };
 
     sstore(SLOT_TENANT, tenant_id);
     sstore(SLOT_RENTAL_DEADLINE, deadline);
@@ -264,17 +278,18 @@ pub extern "C-unwind" fn revoke_rental(caller_id: i64) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C-unwind" fn get_active_tenant(now_timestamp: i64) -> i64 {
+pub extern "C-unwind" fn get_active_tenant(_now_timestamp: i64) -> i64 {
     let deadline = sload(SLOT_RENTAL_DEADLINE);
-    if deadline == 0 || now_timestamp >= deadline {
+    let now = block_time();
+    if deadline == 0 || now < 0 || now >= deadline {
         return 0;
     }
     sload(SLOT_TENANT)
 }
 
 #[no_mangle]
-pub extern "C-unwind" fn is_rental_active(now_timestamp: i64) -> i64 {
-    if get_active_tenant(now_timestamp) > 0 {
+pub extern "C-unwind" fn is_rental_active(_now_timestamp: i64) -> i64 {
+    if get_active_tenant(0) > 0 {
         1
     } else {
         0
@@ -458,7 +473,9 @@ pub extern "C-unwind" fn get_session_budget(session_id: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellereum_contract_sdk::{id_to_caller, reset_mock_state, set_mock_caller};
+    use stellereum_contract_sdk::{
+        id_to_caller, reset_mock_state, set_mock_block_time, set_mock_caller,
+    };
 
     #[test]
     fn test_account_object_lifecycle() {
@@ -472,13 +489,15 @@ mod tests {
         assert_eq!(rotate_guardian(42 * 10_000_000_000 + 777), 777);
         assert_eq!(get_guardian(0), 777);
 
-        // Social recovery: guardian 777 proposes new owner 888
+        // Social recovery: guardian 777 proposes new owner 888 at deterministic block_time
+        set_mock_block_time(1_750_000_000);
         set_mock_caller(id_to_caller(777));
         assert_eq!(initiate_recovery(777 * 10_000_000_000 + 888), 888);
         assert_eq!(get_pending_owner(0), 888);
 
-        // Finalize recovery after timelock (72 hours elapsed)
+        // Finalize recovery after timelock (72 hours elapsed on host block_time)
         let now = 1_750_000_000 + RECOVERY_TIMELOCK_SECS + 1;
+        set_mock_block_time(now);
         assert_eq!(finalize_recovery(now), 888);
         assert_eq!(get_owner(0), 888);
 
@@ -488,16 +507,19 @@ mod tests {
         assert_eq!(get_owner(0), 999);
 
         // Set tenant: owner 999 delegates to tenant 555 for 168 hours
+        let ref_now = 1_750_000_000;
+        set_mock_block_time(ref_now);
         set_mock_caller(id_to_caller(999));
         let rent_arg = 999 * 10_000_000_000 + 555 * 10_000 + 168;
         assert_eq!(set_tenant(rent_arg), 555);
 
-        let ref_now = 1_750_000_000;
+        set_mock_block_time(ref_now + 3600);
         assert_eq!(get_active_tenant(ref_now + 3600), 555);
         assert_eq!(is_rental_active(ref_now + 3600), 1);
 
         // Auto-reclaim after deadline
         let after_deadline = ref_now + (168 * 3600) + 1;
+        set_mock_block_time(after_deadline);
         assert_eq!(get_active_tenant(after_deadline), 0);
         assert_eq!(is_rental_active(after_deadline), 0);
 

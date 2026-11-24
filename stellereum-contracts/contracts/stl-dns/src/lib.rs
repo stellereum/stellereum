@@ -127,7 +127,7 @@ pub extern "C" fn init(treasury_account: i64) -> i64 {
 /// Optical hue shift (0..359) with overflow safety
 #[no_mangle]
 pub extern "C" fn get_hue(domain_id: i64) -> i64 {
-    let unsigned_id = (domain_id as u64) & 0x7FFF_FFFF_FFFF_FFFF;
+    let unsigned_id = ((domain_id as u64) & 0x7FFF_FFFF_FFFF_FFFF) as u128;
     ((unsigned_id * 137) % 360) as i64
 }
 
@@ -186,7 +186,7 @@ pub extern "C" fn place_bid(packed_arg: i64) -> i64 {
     let rem1 = packed_arg % 10_000_000_000;
     let bidder_id = rem1 / 10_000;
 
-    if domain_id <= 0 || bidder_id <= 0 {
+    if domain_id <= 0 || bidder_id <= 0 || bidder_id >= 100_000 {
         return ERR_INVALID_ARGUMENT;
     }
 

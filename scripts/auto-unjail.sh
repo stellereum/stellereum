@@ -119,8 +119,12 @@ pass() {
         fi
         h=$((h))
         local gap=$((t - h))
-        if [ "$gap" -gt "$MAX_GAP" ] || [ "$gap" -lt -2 ]; then
-            echo "[auto-unjail] $name jailed, release passed, but gap=$gap > $MAX_GAP; waiting for it to catch up"
+        # A NEGATIVE gap means the node is AHEAD of the public reference tip
+        # (the reference lags a little): that is a synced node, not a suspicious
+        # one. Only a large negative gap (a different chain / bogus reference)
+        # is refused.
+        if [ "$gap" -gt "$MAX_GAP" ] || [ "$gap" -lt -50 ]; then
+            echo "[auto-unjail] $name jailed, release passed, but gap=$gap outside [-50, $MAX_GAP]; waiting"
             continue
         fi
         if [ "$DRY" = 1 ]; then

@@ -421,3 +421,86 @@ After (must hold at/above `H`):
 - [ ] Deploy the armed `{0,1}` build/genesis to all nodes before `H`; verify
       every node has the same shard set, XPC activation and `H`.
 - [ ] Never lower `H` afterwards.
+
+---
+
+## 4. `WASM_TABLE_ELEMENTS_CAP_HEIGHT`
+
+Pinned by `stellereum/tests/w4_engine_hardening_tests.rs`.
+
+### 4.1 Where the gate is consulted
+
+| Place | Role |
+| --- | --- |
+| `chain_spec::WASM_TABLE_ELEMENTS_CAP_HEIGHT` | compiled gate, `u64::MAX` |
+| `chain_spec::wasm_table_elements_cap_height()` | effective height (test/debug override) |
+| `chain_spec::wasm_table_elements_cap_active_at(h)` | single activation predicate |
+| `contract::MAX_CONTRACT_TABLE_ELEMENTS` | table element cap: `16_384` |
+| `contract::validate_memory_limits` / `store_limits_with_table_cap` | section-4 `Table` declaration check and `wasmi::StoreLimits::table_elements` budget |
+| `contract::ContractRegistry::validate_code_at` / `validate_code_hardened_at` | height-gated code validation |
+| `contract::run_contract_hardened_at` | height-gated execution budget |
+| `svm::Svm` (`SysCallDeployContract` / contract call paths) | consensus deploy/execute call sites (must thread block `height` before arming) |
+| RPC pre-validation paths | enforces `enforce_table_cap = true` immediately (node-local mempool filter) |
+
+### 4.2 Checklist to arm
+
+- [ ] Thread block `height` through all consensus deploy/execute call sites
+      (`validate_code_hardened_at` / `run_contract_hardened_at`) while keeping
+      node-local RPC pre-validation enforcing the cap immediately.
+- [ ] Register `WASM_TABLE_ELEMENTS_CAP_HEIGHT` in
+      `chain_spec::current_activation_schedule()`.
+- [ ] Add a post-activation block-path e2e (`apply_block_transition` on two
+      engines): `(table 1000000 funcref)` deploys below `H` and fails with
+      `ContractError::InvalidWasm` at/above `H`, with identical `state_root`
+      across both engines.
+- [ ] Add a historical replay e2e: a pre-`H` block deploying an oversized table
+      replays under the armed binary with the identical state root.
+- [ ] Set `WASM_TABLE_ELEMENTS_CAP_HEIGHT = H` in `chain_spec.rs`.
+- [ ] Update the `wasm-table-elements-cap` row in `feature_gates.rs`: point
+      `test:` at the new e2e and update the note.
+- [ ] Regenerate `docs/feature_gates.yaml` with `stellereum gates --yaml`.
+- [ ] Update `stellereum/tests/w4_engine_hardening_tests.rs` (and any inert
+      pin assertions) to reflect the armed height `H`.
+- [ ] Deploy the armed binary to all nodes before `H`; verify
+      `stellereum gates` and `current_activation_schedule()` match across every
+      node.
+- [ ] Never lower `H` afterwards.
+
+---
+
+## 5. `FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT`
+
+### 5.1 Where the gate is consulted
+
+| Place | Role |
+| --- | --- |
+| `chain_spec::FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT` | compiled gate, `u64::MAX` |
+| `chain_spec::falcon_host_fuel_v2_active_at(h)` | single activation predicate |
+| `contract::FUEL_FALCON512_VERIFY` (`2_000`) / `FUEL_FALCON512_VERIFY_V2` (`150_000`) | pre- vs post-activation base fuel for `host.falcon512_verify` |
+| `svm::Svm` (`SysCallDeployContract`) | single module validation and single `(start)` fuel deduction from `state.gas_remaining` at/above `H` |
+
+### 5.2 Checklist to arm
+
+- [ ] Confirm `FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT` (`u64::MAX` compiled
+      default), `FUEL_FALCON512_VERIFY_V2 = 150_000`, and single `(start)` gas
+      charging in `SysCallDeployContract` are wired and registered in
+      `chain_spec::current_activation_schedule()` and `feature_gates::table()`.
+- [ ] Record `benches/pq_end_to_end.rs` 1-vCPU vs 16-core verification timings
+      justifying `FUEL_FALCON512_VERIFY_V2 = 150_000`.
+- [ ] Add/verify a differential pre/post-activation test: pre-`H` gas/fuel is
+      byte-identical to legacy (`2_000` base fuel + legacy `(start)` billing);
+      post-`H` charges `150_000` base fuel (+ byte charges) and deducts single
+      `(start)` fuel from `state.gas_remaining`.
+- [ ] Add/verify a contract-level test proving a `(start)` loop cannot execute
+      twice or bypass `state.gas_remaining`.
+- [ ] Add/verify a post-activation `apply_block_transition` e2e and historical
+      replay pin across two engines.
+- [ ] Set `FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT = H` in `chain_spec.rs`,
+      update the `feature_gates.rs` row (`test:` pointing to the proving e2e),
+      and regenerate `docs/feature_gates.yaml` with `stellereum gates --yaml`.
+- [ ] Update inert pin assertions in the `activation_gate_*` tests to match
+      the armed height `H`.
+- [ ] Deploy the armed binary to all nodes before `H`; verify
+      `stellereum gates` and `current_activation_schedule()` match across every
+      node.
+- [ ] Never lower `H` afterwards.

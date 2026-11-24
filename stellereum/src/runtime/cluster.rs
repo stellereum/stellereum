@@ -396,9 +396,40 @@ impl ChainState {
         // key order). Transport effects (ack publish, KV prune) are live-path
         // node-local effects and are deliberately NOT mirrored: they cannot
         // move the state root.
+        let bounce_escrow_gate =
+            crate::chain_spec::xshard_bounce_escrow_required_active_at(block.height);
+        if bounce_escrow_gate {
+            let hashes: Vec<[u8; 32]> = self.produced_cross_shard.keys().copied().collect();
+            for tx_hash in hashes {
+                if !self.state.legacy_escrow_leaf_committed(&tx_hash).await {
+                    self.produced_cross_shard.remove(&tx_hash);
+                }
+            }
+        }
+        let xpc_in_block: HashSet<[u8; 32]> = if bounce_escrow_gate {
+            block
+                .cross_shard_out
+                .iter()
+                .filter(|m| m.is_xpc())
+                .map(|m| m.tx.compute_tx_hash())
+                .collect()
+        } else {
+            HashSet::new()
+        };
         for msg in &block.cross_shard_out {
             if msg.is_transfer() && msg.is_outbound_for(block.shard_id) {
                 let tx_hash = msg.tx.compute_tx_hash();
+                if bounce_escrow_gate {
+                    let applied = block
+                        .transactions
+                        .iter()
+                        .position(|t| t.compute_tx_hash() == tx_hash)
+                        .and_then(|idx| self.applied_statuses.get(idx).copied())
+                        .unwrap_or(false);
+                    if !applied || !self.state.has_legacy_escrow_leaf(&msg.tx).await {
+                        continue;
+                    }
+                }
                 self.produced_cross_shard
                     .entry(tx_hash)
                     .or_insert((msg.tx.clone(), block.height));
@@ -412,34 +443,60 @@ impl ChainState {
         inbound_sorted.sort_by_key(|m| CrossShardKey::of(m));
         for msg in inbound_sorted {
             let key = CrossShardKey::of(msg);
+            if bounce_escrow_gate && msg.is_xpc() {
+                if self.state.is_cross_shard_consumed(&key).await {
+                    self.consumed_cross_shard.insert(key);
+                }
+                let tx_hash = msg.tx.compute_tx_hash();
+                if self.state.is_cross_shard_completed(&tx_hash).await {
+                    self.completed_cross_shard.insert(tx_hash);
+                }
+                continue;
+            }
             if msg.is_transfer() {
+                if bounce_escrow_gate && !self.state.is_cross_shard_consumed(&key).await {
+                    continue;
+                }
                 self.consumed_cross_shard.insert(key);
             } else if msg.is_ack() || msg.is_bounce() {
                 if msg.merkle_inclusion_proof.is_some() || msg.trusted {
                     continue;
                 }
-                if self
-                    .completed_cross_shard
-                    .contains(&msg.tx.compute_tx_hash())
-                {
+                let tx_hash = msg.tx.compute_tx_hash();
+                if self.completed_cross_shard.contains(&tx_hash) {
                     continue;
                 }
-                let linked = self
-                    .produced_cross_shard
-                    .contains_key(&msg.tx.compute_tx_hash());
+                if bounce_escrow_gate
+                    && (xpc_in_block.contains(&tx_hash)
+                        || self.state.xpc_record(&tx_hash).await.is_some())
+                {
+                    tracing::warn!(
+                        "cross-shard bounce/ack refused at the escrow gate: tx {} owns a 2PC record",
+                        hex::encode(&tx_hash[..8])
+                    );
+                    continue;
+                }
+                let linked = self.produced_cross_shard.contains_key(&tx_hash);
                 if !linked {
                     continue;
                 }
                 if msg.is_bounce() {
-                    let hp = self.produced_cross_shard[&msg.tx.compute_tx_hash()].1;
+                    let hp = self.produced_cross_shard[&tx_hash].1;
                     if !crate::sharding::bounce_eligible(hp, block.height) {
+                        continue;
+                    }
+                    if bounce_escrow_gate && !self.state.has_legacy_escrow_leaf(&msg.tx).await {
+                        tracing::warn!(
+                            "cross-shard bounce refused at the escrow gate: tx {} has no committed source escrow leaf",
+                            hex::encode(&tx_hash[..8])
+                        );
                         continue;
                     }
                 }
                 if !self.consumed_cross_shard.insert(key) {
                     continue;
                 }
-                if !self.completed_cross_shard.insert(msg.tx.compute_tx_hash()) {
+                if !self.completed_cross_shard.insert(tx_hash) {
                     continue;
                 }
                 if msg.is_bounce() {
@@ -498,6 +555,23 @@ impl ChainState {
     /// byte-identical on both paths.
     pub async fn validator_set(&self) -> crate::consensus::ValidatorSet {
         self.state.staking_read().await.to_validator_set()
+    }
+
+    /// Mirror introspection over `produced_cross_shard`, matching
+    /// `ValidatorRuntime::produced_cross_shard_height`.
+    pub fn produced_cross_shard_height(&self, tx_hash: &[u8; 32]) -> Option<u64> {
+        self.produced_cross_shard.get(tx_hash).map(|(_, h)| *h)
+    }
+
+    /// Mirror introspection over `completed_cross_shard`, matching
+    /// `ValidatorRuntime::is_transfer_completed`.
+    pub fn is_transfer_completed(&self, tx_hash: &[u8; 32]) -> bool {
+        self.completed_cross_shard.contains(tx_hash)
+    }
+
+    /// Mirror introspection over `consumed_cross_shard`.
+    pub fn is_cross_shard_consumed(&self, key: &CrossShardKey) -> bool {
+        self.consumed_cross_shard.contains(key)
     }
 
     /// Snapshot the current state (call at each finalized height).

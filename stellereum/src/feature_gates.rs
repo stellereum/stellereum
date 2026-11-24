@@ -1,0 +1,184 @@
+//! Machine-readable activation gates (Wave 2 deliverable).
+//!
+//! Every height-gated protocol change lives in [`crate::chain_spec`] as a
+//! `*_ACTIVATION_HEIGHT` / `*_HEIGHT` constant. A constant is fine for the code
+//! and useless for an operator or an auditor, who need three things at once:
+//! **which gate**, **what height it activates at**, and **which test proves the
+//! behaviour behind it**. This module is the single source of truth for that
+//! table; `stellereum gates` prints it and `stellereum gates --yaml` renders the
+//! committed manifest `docs/feature_gates.yaml`, which a test pins to this file
+//! so the document cannot drift from the code.
+//!
+//! Semantics of `value`:
+//! * a concrete height — the gate turns on there;
+//! * `0` — already active on this chain (activated at genesis);
+//! * [`u64::MAX`] — deliberately inert; the code path exists but is not armed.
+
+use crate::chain_spec;
+
+/// One row of the gate table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gate {
+    /// Stable identifier used by docs, CI and operators.
+    pub id: &'static str,
+    /// The Rust constant this row describes.
+    pub symbol: &'static str,
+    /// Current activation height (`0` = genesis, `u64::MAX` = inert).
+    pub value: u64,
+    /// Regression test that proves the gated behaviour, if one exists.
+    pub test: Option<&'static str>,
+    /// Why the gate exists / what must be true before arming it.
+    pub note: &'static str,
+}
+
+impl Gate {
+    /// `ACTIVE`, `INERT` (never fires) or `SCHEDULED` (a real future height).
+    pub fn status(&self) -> &'static str {
+        if self.value == u64::MAX {
+            "INERT"
+        } else if self.value == 0 {
+            "ACTIVE"
+        } else {
+            "SCHEDULED"
+        }
+    }
+}
+
+/// The authoritative gate table. Keep in sync with `chain_spec` — the values are
+/// read from the constants themselves, not duplicated.
+pub fn table() -> Vec<Gate> {
+    vec![
+        Gate {
+            id: "exec-hardening-v1",
+            symbol: "EXEC_HARDENING_V1_ACTIVATION_HEIGHT",
+            value: chain_spec::EXEC_HARDENING_V1_ACTIVATION_HEIGHT,
+            test: Some("tests/r1_frozen_apply_svm_tests.rs"),
+            note: "Hardened execution rules for the VM surface.",
+        },
+        Gate {
+            id: "wasm-xshard-pmm-hardening",
+            symbol: "WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT",
+            value: chain_spec::WASM_XSHARD_PMM_HARDENING_ACTIVATION_HEIGHT,
+            test: Some("tests/r1_wasm_hardening_tests.rs"),
+            note: "Cross-shard PMM hardening (fuel/limit accounting).",
+        },
+        Gate {
+            id: "wasm-xshard-contract-send-refusal",
+            symbol: "WASM_XSHARD_CONTRACT_SEND_REFUSAL_HEIGHT",
+            value: chain_spec::WASM_XSHARD_CONTRACT_SEND_REFUSAL_HEIGHT,
+            test: Some("tests/review_final_cross_shard_contract_send.rs"),
+            note: "Contracts may not emit cross-shard sends they cannot account for.",
+        },
+        Gate {
+            id: "contract-block-hash",
+            symbol: "CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT",
+            value: chain_spec::CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT,
+            test: None,
+            note: "Exposes host.block_hash to contracts. Needs (a) the live apply path \
+                   passing block.prev_hash everywhere (the height-only entry points pass \
+                   zero), and (b) an e2e test that the value is identical on every node.",
+        },
+        Gate {
+            id: "bridge-target-address-cap",
+            symbol: "BRIDGE_TARGET_ADDRESS_CAP_HEIGHT",
+            value: chain_spec::BRIDGE_TARGET_ADDRESS_CAP_HEIGHT,
+            test: None,
+            note: "128-byte cap on bridge target addresses. Needs an e2e test that the \
+                   cap is enforced on release and that history stays replayable.",
+        },
+        Gate {
+            id: "xshard-bounce-escrow",
+            symbol: "XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT",
+            value: chain_spec::XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT,
+            test: None,
+            note: "Requires a bounce escrow before a cross-shard transfer is accepted \
+                   (docs/specs/XSHARD_BOUNCE_ESCROW.md). Needs the {0,1} shard \
+                   prerequisites and a fresh-genesis decision.",
+        },
+        Gate {
+            id: "upgrade-exec",
+            symbol: "DEFAULT_UPGRADE_EXEC_ACTIVATION_HEIGHT",
+            value: chain_spec::DEFAULT_UPGRADE_EXEC_ACTIVATION_HEIGHT,
+            test: Some("tests/upgrade_exec_gate_tests.rs"),
+            note: "Governance-driven binary upgrade execution (exit 42 path).",
+        },
+    ]
+}
+
+/// Human table for `stellereum gates`.
+pub fn render_table() -> String {
+    let mut out = String::from("ID                                STATUS     VALUE      TEST\n");
+    for g in table() {
+        out.push_str(&format!(
+            "{:<33} {:<10} {:<10} {}\n",
+            g.id,
+            g.status(),
+            if g.value == u64::MAX {
+                "u64::MAX".to_string()
+            } else {
+                g.value.to_string()
+            },
+            g.test.unwrap_or("MISSING")
+        ));
+    }
+    out.push_str(
+        "\nINERT = the code exists but the gate never fires (needs a test + an \
+         activation height).\n",
+    );
+    out
+}
+
+/// The committed manifest. A test pins `docs/feature_gates.yaml` to this output.
+pub fn render_yaml() -> String {
+    let mut out = String::from(
+        "# GENERATED by `stellereum gates --yaml`. Do not edit by hand.\n\
+         # Source of truth: stellereum/src/feature_gates.rs (values from chain_spec).\n\
+         gates:\n",
+    );
+    for g in table() {
+        out.push_str(&format!("  - id: {}\n", g.id));
+        out.push_str(&format!("    symbol: {}\n", g.symbol));
+        out.push_str(&format!("    activation_height: {}\n", g.value));
+        out.push_str(&format!("    status: {}\n", g.status()));
+        out.push_str(&format!("    test: {}\n", g.test.unwrap_or("MISSING")));
+        out.push_str(&format!("    note: {:?}\n", g.note));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_gate_has_a_unique_id_and_a_symbol_that_exists() {
+        let t = table();
+        let mut ids: Vec<&str> = t.iter().map(|g| g.id).collect();
+        ids.sort_unstable();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(before, ids.len(), "duplicate gate id");
+        for g in &t {
+            assert!(!g.id.is_empty() && !g.symbol.is_empty());
+            assert!(!g.note.is_empty(), "{} needs a note", g.id);
+            // A gate that is LIVE must name its proving test. An inert gate may
+            // carry one (it often proves the pre-activation behaviour) or say
+            // MISSING when it has none — which is exactly the signal the three
+            // activation-debt rows are supposed to broadcast.
+            if g.status() != "INERT" {
+                assert!(g.test.is_some(), "{} is live without a test", g.id);
+            }
+        }
+    }
+
+    #[test]
+    fn committed_manifest_matches_the_table() {
+        let committed = include_str!("../../docs/feature_gates.yaml");
+        assert_eq!(
+            committed,
+            render_yaml(),
+            "docs/feature_gates.yaml drifted from src/feature_gates.rs; \
+             regenerate with `stellereum gates --yaml`"
+        );
+    }
+}

@@ -25,6 +25,7 @@ pub mod data_plane_rs;
 pub mod dns_seeds;
 pub mod evm_adapter;
 pub mod explorer;
+pub mod feature_gates;
 pub mod governance;
 pub mod hash384;
 // GATE: HashPool apply wiring is default-OFF (`state_engine::HASH_POOL_ENABLED

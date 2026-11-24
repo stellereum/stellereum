@@ -288,6 +288,16 @@ pub(crate) enum Commands {
         #[arg(long, default_value_t = false)]
         i_fenced_all_signers: bool,
     },
+    /// Print the activation-gate table (id, status, height, proving test).
+    ///
+    /// `--yaml` renders the committed manifest `docs/feature_gates.yaml`; the
+    /// library test `feature_gates::tests::committed_manifest_matches_the_table`
+    /// pins the file to the same output, so the document cannot drift.
+    Gates {
+        /// Render the machine-readable manifest instead of the human table
+        #[arg(long, default_value_t = false)]
+        yaml: bool,
+    },
     /// Delete a durable consensus safety record that can no longer be decoded
     /// (store corruption, an unsupported concurrent open, a lost record), so
     /// that `safety-init` can write generation 1 again.

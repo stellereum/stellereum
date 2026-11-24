@@ -1956,6 +1956,13 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
             println!("  4. SPV Light Mode: Wallets verify state via Patricia-Merkle BoC proofs");
             println!("  5. Full Node Mode: Downloads block chunks via 'fetch_blob' and verifies\n");
         }
+        Commands::Gates { yaml } => {
+            if yaml {
+                print!("{}", stellereum::feature_gates::render_yaml());
+            } else {
+                print!("{}", stellereum::feature_gates::render_table());
+            }
+        }
         Commands::SafetyReset {
             store_dir,
             i_fenced_all_signers,

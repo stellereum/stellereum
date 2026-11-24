@@ -1663,7 +1663,7 @@ async fn walk_chain_once_with_lanes(
         // persistence job, which takes ownership of the verified bytes instead
         // of paying a third full copy per block. Slot `i` is never read again
         // (the successor and the pre-extracted tail are).
-        let b = std::mem::take(&mut blocks[i]);
+        let mut b = std::mem::take(&mut blocks[i]);
         // A block header commits to the state it BUILDS ON, so this is checked
         // against the root before applying, not after.
         let root_before = rt.state.get_state_root().await;
@@ -1731,6 +1731,58 @@ async fn walk_chain_once_with_lanes(
             // A verified walked decision restores the parent downtime evidence
             // a failed boot reconstruction could not (DOWNTIME-RESTORE).
             rt.parent_evidence_missing = false;
+        }
+        // S1-WALK-SAFETY-QUARANTINE: WRITE-AHEAD the durable finality record.
+        //
+        // `apply_and_advance` below durably fsyncs `safety_record_v1` with
+        // `finalized_height = b.height` (and every later iteration fsyncs the
+        // next height), while the walked BODY and the finalized tip pointer
+        // used to be merely ENQUEUED and only flushed once after the whole
+        // loop. An aborted walk (an early `return None`) or a crash before the
+        // persist queue drained therefore left
+        // `safety_record_v1.finalized_height > storage.finalized()`, and
+        // `SafetyAuthority::open_from_storage` fail-closes that direction
+        // permanently ("finalized_height ... exceeds restored finalized").
+        //
+        // Write the body and the pointer FIRST, through the same `Storage`
+        // handle, so they precede the safety record in sled's log: the safety
+        // record's own `db.flush()` inside `advance_height` then makes them
+        // durable too (sled's flush covers every tree of the Db). This is
+        // write-ahead, not a per-block fsync: no extra barrier is added to a
+        // walk of up to `policy::max_walk_gap()` blocks. A crash in the window
+        // between this write and the apply can only leave the finalized
+        // pointer AHEAD of the safety record with the QC-carrying body present,
+        // which boot reconciles (it can never quarantine the node).
+        if let Some(ap) = persist {
+            let store = ap.storage();
+            let height = b.height;
+            let hash = bh;
+            let written = tokio::task::spawn_blocking(move || {
+                let res = store
+                    .put_block(&b)
+                    .and_then(|_| store.set_finalized(height, &hash));
+                (b, res)
+            })
+            .await;
+            match written {
+                Ok((body, Ok(()))) => b = body,
+                Ok((_, Err(e))) => {
+                    // Fail closed without advancing safety: a durable order we
+                    // cannot establish must not be papered over.
+                    eprintln!(
+                        "[sync] refusing peer chain: cannot persist finalized block {} before advancing safety: {e}",
+                        hex::encode(bh)
+                    );
+                    return None;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[sync] refusing peer chain: finalized persist task for block {} failed: {e}",
+                        hex::encode(bh)
+                    );
+                    return None;
+                }
+            }
         }
         rt.apply_and_advance(bh, &b).await;
         {
@@ -1803,8 +1855,10 @@ async fn walk_chain_once_with_lanes(
                 );
             }
         }
-        // Persist the verified body (finalize-path parity): the job takes the
-        // body by MOVE — same bytes, same job, no extra full copy.
+        // Persist the post-apply artifacts (finalize-path parity). The BODY and
+        // the finalized tip pointer were already written above, BEFORE the
+        // safety advance (S1-WALK-SAFETY-QUARANTINE); only the state artifacts
+        // that require the applied state root are written here.
         let applied_height = b.height;
         let walked_post_root = rt.state.get_state_root().await;
         if let Some(ap) = persist {
@@ -1833,8 +1887,6 @@ async fn walk_chain_once_with_lanes(
                     let _ = store.set_evm_bindings_cursor(applied_height);
                 }
             }
-            ap.enqueue_block(b);
-            ap.enqueue_finalized(applied_height, bh);
         }
         // Fail fast on divergence: the NEXT block in this same validated chain
         // commits to the state our apply must have produced. Without this, a
@@ -1877,6 +1929,14 @@ async fn walk_chain_once_with_lanes(
              height cannot be elected until the parent is known"
         );
     }
+    // S1-WALK-SCHEDULE-RESET: `HeightConsensus::new` starts on the legacy
+    // ParentHash schedule. A node that just caught up would keep electing
+    // committees the parent-hash way while the rest of the network votes under
+    // the CN-VRF v3 epoch-beacon schedule (at/after activation), so its votes
+    // would be attributed to the wrong committee and it could never certify
+    // the caught-up height. Install the height-correct schedule exactly like
+    // `apply_and_advance` does after every finalized block.
+    rt.install_committee_schedule();
     // Announce the caught-up tip so peers behind US learn it in place: a node
     // that catches up silently strands whoever waits for its old-height votes
     // (they moved on and will never vote the old height again). Same broadcast
@@ -2446,5 +2506,114 @@ mod recovery_walk_tests {
             verified_qc_sidecar_hash(&rt, &qc, 2).is_none(),
             "a sidecar is bound to its own height"
         );
+    }
+
+    /// S1-WALK-SAFETY-QUARANTINE + S1-WALK-SCHEDULE-RESET.
+    ///
+    /// A walk with persistence enabled must (1) have already written the
+    /// durable finalized tip pointer and the QC-carrying body for the walked
+    /// head by the time it returns -- they are written BEFORE
+    /// `apply_and_advance` fsyncs `safety_record_v1`, so an aborted walk or a
+    /// crash can never leave the safety record ahead of `storage.finalized()`
+    /// (the direction boot quarantines) -- and (2) leave consensus on the
+    /// height-correct CN-VRF v3 epoch-beacon schedule instead of the
+    /// `ParentHash` default that `HeightConsensus::new` installs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // GATE: process-global PQ registry, as in the tests above.
+    async fn recovery_walk_write_aheads_finality_and_installs_beacon_schedule() {
+        let _global = crate::node::policy::test_support::global_lock();
+        const B: u64 = 4;
+        const N: u64 = 10;
+        let ks = vec![SigningKey::from_bytes(&[0x6A; 32])];
+        let fks = fks_for(&ks);
+        let vs = vset(&ks);
+        let (blocks, tip_root) = build_chain(&ks, &fks, N).await;
+
+        let (adapter, dir) = test_adapter("walk-durable-finality").await;
+        let adapter = Arc::new(adapter);
+        let tail: Vec<&Block> = blocks.iter().filter(|b| b.height > B).collect();
+        let report = adapter.retro_publish_blocks(tail, blocks.len()).await;
+        assert_eq!(
+            report.failed, 0,
+            "all recovery bodies must publish: {:?}",
+            report.first_error
+        );
+        adapter
+            .persist_block_header(MASTERCHAIN_SHARD, blocks.last().expect("non-empty chain"))
+            .await;
+
+        let lagging_engine = Arc::new(InMemoryStateEngine::new());
+        seed_engine_pq_keys(&lagging_engine, &ks, &fks).await;
+        let mut lagging = ValidatorRuntime::new(ks[0].clone(), vs, lagging_engine, 1);
+        for b in blocks.iter().take(B as usize) {
+            lagging.apply_and_advance(b.compute_hash(), b).await;
+        }
+        // CN-VRF v3 activates at the RE-ANCHORED height (N + 1) for the
+        // lagging node: every WALKED block (<= N) still validates/applies under
+        // the same ParentHash rules the producer used (so the fixture's roots
+        // are unchanged), while the freshly built `HeightConsensus` for N + 1
+        // must not be left on its `ParentHash` default. The epoch-0 bootstrap
+        // beacon is deterministic (see `active_epoch_beacon`), so
+        // `Beacon(Some(_))` is installed rather than fail-closed.
+        const ACTIVATION: u64 = N + 1;
+        lagging.set_cnvrf_v3_activation_height_for_tests(ACTIVATION);
+
+        let store_dir = dir.join("walk-store");
+        std::fs::create_dir_all(&store_dir).expect("store tmpdir");
+        let storage =
+            Arc::new(stellereum::storage::Storage::open(&store_dir).expect("open walk storage"));
+        let persist = Arc::new(stellereum::storage::AsyncPersistence::start(
+            storage.clone(),
+        ));
+
+        let head_hash = blocks.last().expect("non-empty chain").compute_hash();
+        let rpc = test_rpc_state();
+        let got = walk_chain_once_with_lanes(
+            &adapter,
+            &mut lagging,
+            MASTERCHAIN_SHARD,
+            N,
+            head_hash,
+            Some(&persist),
+            &rpc,
+            crate::node::policy::max_walk_gap(),
+            SyncLanes::default(),
+        )
+        .await;
+        assert_eq!(got, Some(N), "walk must reach the advertised head");
+        assert_eq!(
+            lagging.state.get_state_root().await,
+            tip_root,
+            "walked state must equal the producer's"
+        );
+
+        // (1) Write-ahead durability: the pointer + body are already in the
+        // store even though the walk only `request_flush`ed asynchronously.
+        assert_eq!(
+            storage.finalized().expect("read finalized"),
+            Some((N, head_hash)),
+            "the walked finalized tip must be durable before/with the safety record"
+        );
+        assert!(
+            storage
+                .get_block(&head_hash)
+                .expect("read walked body")
+                .is_some(),
+            "the walked body (with its decision QC) must be durable too"
+        );
+
+        // (2) The caught-up node keeps the epoch-beacon schedule.
+        assert_eq!(
+            lagging.hc.committee_schedule,
+            lagging.committee_schedule_at(lagging.hc.height),
+            "re-anchored height must use the runtime's height-correct schedule"
+        );
+        assert!(
+            lagging.hc.committee_schedule.is_beacon(),
+            "a caught-up node must not reset to the ParentHash schedule"
+        );
+
+        drop(persist);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -67,6 +67,9 @@ pub const MAX_CONTRACT_PAGES_64: u32 = 64;
 pub const MAX_CONTRACT_PAGES_128: u32 = 128;
 /// Maximum linear memory a contract may allocate (128 pages * 64 KiB = 8 MiB).
 pub const MAX_CONTRACT_MEMORY: usize = (MAX_CONTRACT_PAGES as usize) * WASM_PAGE_SIZE;
+/// Maximum WASM table elements allowed per contract table when the table-cap
+/// gate is active (`WASM_TABLE_ELEMENTS_CAP_HEIGHT` or RPC pre-validation).
+pub const MAX_CONTRACT_TABLE_ELEMENTS: usize = 16_384;
 
 /// Base gas charged for contract deployment and validation.
 pub const GAS_DEPLOY_BASE: u64 = 2_000;
@@ -536,8 +539,10 @@ fn read_leb128_u32(bytes: &[u8]) -> Result<(u32, usize), ContractError> {
     Err(ContractError::InvalidWasm)
 }
 
-/// Validate that WASM module memory declarations do not exceed `MAX_CONTRACT_PAGES`.
-fn validate_memory_limits(code: &[u8]) -> Result<(), ContractError> {
+/// Validate that WASM module memory declarations do not exceed
+/// `MAX_CONTRACT_PAGES`, and (when `enforce_table_cap` is true) that table
+/// declarations do not exceed `MAX_CONTRACT_TABLE_ELEMENTS`.
+fn validate_memory_limits(code: &[u8], enforce_table_cap: bool) -> Result<(), ContractError> {
     if code.len() < 8 || &code[0..4] != b"\0asm" {
         return Ok(()); // Defer to wasmi::Module::new
     }
@@ -554,7 +559,42 @@ fn validate_memory_limits(code: &[u8]) -> Result<(), ContractError> {
         let sec_bytes = &code[pos..pos + sec_len];
         pos += sec_len;
 
-        if sec_id == 5 {
+        if sec_id == 4 && enforce_table_cap {
+            // Table section: [count, (elemtype, limits)...]
+            let mut sec_pos = 0;
+            let (count, n) = read_leb128_u32(&sec_bytes[sec_pos..])?;
+            sec_pos += n;
+            for _ in 0..count {
+                if sec_pos >= sec_bytes.len() {
+                    return Err(ContractError::InvalidWasm);
+                }
+                // Element reference type byte (0x70 funcref / 0x6F externref).
+                sec_pos += 1;
+                if sec_pos >= sec_bytes.len() {
+                    return Err(ContractError::InvalidWasm);
+                }
+                let (flags, n) = read_leb128_u32(&sec_bytes[sec_pos..])?;
+                sec_pos += n;
+                if sec_pos >= sec_bytes.len() {
+                    return Err(ContractError::InvalidWasm);
+                }
+                let (min_elems, n) = read_leb128_u32(&sec_bytes[sec_pos..])?;
+                sec_pos += n;
+                if min_elems as usize > MAX_CONTRACT_TABLE_ELEMENTS {
+                    return Err(ContractError::InvalidWasm);
+                }
+                if flags & 1 != 0 {
+                    if sec_pos >= sec_bytes.len() {
+                        return Err(ContractError::InvalidWasm);
+                    }
+                    let (max_elems, n) = read_leb128_u32(&sec_bytes[sec_pos..])?;
+                    sec_pos += n;
+                    if max_elems as usize > MAX_CONTRACT_TABLE_ELEMENTS {
+                        return Err(ContractError::InvalidWasm);
+                    }
+                }
+            }
+        } else if sec_id == 5 {
             // Memory section: [count, (limits)...]
             let mut sec_pos = 0;
             let (count, n) = read_leb128_u32(&sec_bytes[sec_pos..])?;
@@ -630,29 +670,59 @@ impl ContractRegistry {
     /// instead of becoming a permanently uncallable contract that still cost
     /// the creator their deployment gas.
     pub fn validate_code(code: &[u8]) -> Result<(), ContractError> {
+        Self::validate_code_with_table_cap(code, false)
+    }
+
+    /// Height-aware [`Self::validate_code`]: enforces the table-elements cap
+    /// at/above [`crate::chain_spec::WASM_TABLE_ELEMENTS_CAP_HEIGHT`].
+    pub fn validate_code_at(code: &[u8], height: u64) -> Result<(), ContractError> {
+        Self::validate_code_with_table_cap(
+            code,
+            crate::chain_spec::wasm_table_elements_cap_active_at(height),
+        )
+    }
+
+    /// Validate wasm code with an explicit `enforce_table_cap` toggle.
+    pub fn validate_code_with_table_cap(
+        code: &[u8],
+        enforce_table_cap: bool,
+    ) -> Result<(), ContractError> {
         if code.is_empty() {
             return Err(ContractError::EmptyCode);
         }
         if code.len() > MAX_CONTRACT_CODE_SIZE {
             return Err(ContractError::CodeTooLarge);
         }
-        validate_memory_limits(code)?;
+        validate_memory_limits(code, enforce_table_cap)?;
         let engine = contract_engine();
         let module = cached_module(engine, code).map_err(|_| ContractError::InvalidWasm)?;
         for export in module.exports() {
-            if let ExternType::Memory(mem_ty) = export.ty() {
-                if mem_ty.minimum() > MAX_CONTRACT_PAGES as u64 {
-                    return Err(ContractError::InvalidWasm);
-                }
-                if let Some(max) = mem_ty.maximum() {
-                    if max > MAX_CONTRACT_PAGES as u64 {
+            match export.ty() {
+                ExternType::Memory(mem_ty) => {
+                    if mem_ty.minimum() > MAX_CONTRACT_PAGES as u64 {
                         return Err(ContractError::InvalidWasm);
                     }
+                    if let Some(max) = mem_ty.maximum() {
+                        if max > MAX_CONTRACT_PAGES as u64 {
+                            return Err(ContractError::InvalidWasm);
+                        }
+                    }
                 }
+                ExternType::Table(table_ty) if enforce_table_cap => {
+                    if table_ty.minimum() > MAX_CONTRACT_TABLE_ELEMENTS as u64 {
+                        return Err(ContractError::InvalidWasm);
+                    }
+                    if let Some(max) = table_ty.maximum() {
+                        if max > MAX_CONTRACT_TABLE_ELEMENTS as u64 {
+                            return Err(ContractError::InvalidWasm);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         let host = HostState {
-            limits: store_limits(),
+            limits: store_limits_with_table_cap(enforce_table_cap),
             contract_addr: [0u8; 32],
             balance: 0,
             storage: HashMap::new(),
@@ -692,29 +762,69 @@ impl ContractRegistry {
     /// Prevents infinite-loop DoS in `(start)` during deployment/RPC validation
     /// while permitting legitimate `(start)` initializers within `validate_fuel`.
     pub fn validate_code_hardened(code: &[u8], validate_fuel: u64) -> Result<(), ContractError> {
+        Self::validate_code_hardened_with_table_cap(code, validate_fuel, false)
+    }
+
+    /// Height-aware [`Self::validate_code_hardened`]: enforces the
+    /// table-elements cap at/above
+    /// [`crate::chain_spec::WASM_TABLE_ELEMENTS_CAP_HEIGHT`].
+    pub fn validate_code_hardened_at(
+        code: &[u8],
+        validate_fuel: u64,
+        height: u64,
+    ) -> Result<(), ContractError> {
+        Self::validate_code_hardened_with_table_cap(
+            code,
+            validate_fuel,
+            crate::chain_spec::wasm_table_elements_cap_active_at(height),
+        )
+    }
+
+    /// Hardened WASM code validation with an explicit `enforce_table_cap`
+    /// toggle (true for RPC pre-validation and post-activation consensus; false
+    /// below [`crate::chain_spec::WASM_TABLE_ELEMENTS_CAP_HEIGHT`] for replay
+    /// parity).
+    pub fn validate_code_hardened_with_table_cap(
+        code: &[u8],
+        validate_fuel: u64,
+        enforce_table_cap: bool,
+    ) -> Result<(), ContractError> {
         if code.is_empty() {
             return Err(ContractError::EmptyCode);
         }
         if code.len() > MAX_CONTRACT_CODE_SIZE {
             return Err(ContractError::CodeTooLarge);
         }
-        validate_memory_limits(code)?;
+        validate_memory_limits(code, enforce_table_cap)?;
         let engine = contract_engine();
         let module = cached_module(engine, code).map_err(|_| ContractError::InvalidWasm)?;
         for export in module.exports() {
-            if let ExternType::Memory(mem_ty) = export.ty() {
-                if mem_ty.minimum() > MAX_CONTRACT_PAGES as u64 {
-                    return Err(ContractError::InvalidWasm);
-                }
-                if let Some(max) = mem_ty.maximum() {
-                    if max > MAX_CONTRACT_PAGES as u64 {
+            match export.ty() {
+                ExternType::Memory(mem_ty) => {
+                    if mem_ty.minimum() > MAX_CONTRACT_PAGES as u64 {
                         return Err(ContractError::InvalidWasm);
                     }
+                    if let Some(max) = mem_ty.maximum() {
+                        if max > MAX_CONTRACT_PAGES as u64 {
+                            return Err(ContractError::InvalidWasm);
+                        }
+                    }
                 }
+                ExternType::Table(table_ty) if enforce_table_cap => {
+                    if table_ty.minimum() > MAX_CONTRACT_TABLE_ELEMENTS as u64 {
+                        return Err(ContractError::InvalidWasm);
+                    }
+                    if let Some(max) = table_ty.maximum() {
+                        if max > MAX_CONTRACT_TABLE_ELEMENTS as u64 {
+                            return Err(ContractError::InvalidWasm);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         let host = HostState {
-            limits: store_limits(),
+            limits: store_limits_with_table_cap(enforce_table_cap),
             contract_addr: [0u8; 32],
             balance: 0,
             storage: HashMap::new(),
@@ -1895,12 +2005,21 @@ impl HostState {
 
 /// The resource limits every contract store runs under.
 fn store_limits() -> StoreLimits {
-    StoreLimitsBuilder::new()
+    store_limits_with_table_cap(false)
+}
+
+/// Resource limits for a contract store, optionally bounding table element
+/// allocations to [`MAX_CONTRACT_TABLE_ELEMENTS`].
+fn store_limits_with_table_cap(enforce_table_cap: bool) -> StoreLimits {
+    let mut builder = StoreLimitsBuilder::new()
         .memory_size(MAX_CONTRACT_MEMORY)
         .memories(4)
         .tables(4)
-        .instances(16)
-        .build()
+        .instances(16);
+    if enforce_table_cap {
+        builder = builder.table_elements(MAX_CONTRACT_TABLE_ELEMENTS);
+    }
+    builder.build()
 }
 
 fn get_memory(caller: &mut wasmi::Caller<'_, HostState>) -> Result<Memory, wasmi::Error> {
@@ -2500,6 +2619,95 @@ pub fn run_contract_hardened(
     ),
     ContractError,
 > {
+    run_contract_hardened_with_table_cap(
+        contract_addr,
+        code,
+        initial_storage,
+        initial_balance,
+        method,
+        args,
+        calldata,
+        fuel,
+        ctx,
+        origin,
+        hardened,
+        false,
+    )
+}
+
+/// Height-aware [`run_contract_hardened`]: enforces the table-elements cap
+/// at/above [`crate::chain_spec::WASM_TABLE_ELEMENTS_CAP_HEIGHT`].
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+// GATE: height-gated wrapper over run_contract_hardened_with_table_cap.
+pub fn run_contract_hardened_at(
+    contract_addr: [u8; 32],
+    code: &[u8],
+    initial_storage: &HashMap<i64, i64>,
+    initial_balance: u64,
+    method: &str,
+    args: &[i64],
+    calldata: &[u8],
+    fuel: u64,
+    ctx: &ContractCallContext,
+    origin: [u8; 32],
+    hardened: bool,
+    height: u64,
+) -> Result<
+    (
+        i64,
+        u64,
+        HashMap<i64, i64>,
+        u64,
+        Vec<ContractEvent>,
+        Vec<ContractMessage>,
+        Vec<u8>,
+    ),
+    ContractError,
+> {
+    run_contract_hardened_with_table_cap(
+        contract_addr,
+        code,
+        initial_storage,
+        initial_balance,
+        method,
+        args,
+        calldata,
+        fuel,
+        ctx,
+        origin,
+        hardened,
+        crate::chain_spec::wasm_table_elements_cap_active_at(height),
+    )
+}
+
+/// Execute an exported method with explicit `enforce_table_cap` control.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+// GATE: mirrors run_contract_hardened with explicit table-elements cap toggle.
+pub fn run_contract_hardened_with_table_cap(
+    contract_addr: [u8; 32],
+    code: &[u8],
+    initial_storage: &HashMap<i64, i64>,
+    initial_balance: u64,
+    method: &str,
+    args: &[i64],
+    calldata: &[u8],
+    fuel: u64,
+    ctx: &ContractCallContext,
+    origin: [u8; 32],
+    hardened: bool,
+    enforce_table_cap: bool,
+) -> Result<
+    (
+        i64,
+        u64,
+        HashMap<i64, i64>,
+        u64,
+        Vec<ContractEvent>,
+        Vec<ContractMessage>,
+        Vec<u8>,
+    ),
+    ContractError,
+> {
     if args.len() > MAX_CONTRACT_CALL_ARGS {
         return Err(ContractError::AbiMismatch(format!(
             "a call may take at most {MAX_CONTRACT_CALL_ARGS} arguments, got {}",
@@ -2518,7 +2726,7 @@ pub fn run_contract_hardened(
     };
 
     let host = HostState {
-        limits: store_limits(),
+        limits: store_limits_with_table_cap(enforce_table_cap),
         contract_addr,
         balance: initial_balance,
         storage: initial_storage.clone(),

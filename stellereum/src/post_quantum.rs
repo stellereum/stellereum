@@ -2147,8 +2147,164 @@ enum FalconSignAttempt {
 
 const FALCON_PUBKEY_CACHE_CAP: usize = 4096;
 
-static FALCON_PUBKEY_CACHE: std::sync::LazyLock<RwLock<HashMap<[u8; 32], [u16; 512]>>> =
-    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+/// Capacity of the never-evict tier (see [`FalconPubkeyCache::pinned`]).
+///
+/// Consensus validator sets are small (hundreds at most); 1024 leaves room for
+/// a full committee plus rotations without ever growing unbounded.
+const FALCON_PUBKEY_PINNED_CAP: usize = 1024;
+
+/// Successful verifications after which a key is promoted to the never-evict
+/// tier.
+///
+/// Consensus keys verify on every vote/proposal, so they cross this after the
+/// first few votes of a height. A hostile transaction only needs ONE junk key
+/// to reach `unpack_falcon_pubkey_ntt` (the decode happens before the signature
+/// is checked), so counting only SUCCESSFUL verifications keeps a key-flood of
+/// garbage signatures from promoting (and thereby protecting) itself.
+const FALCON_PUBKEY_PIN_AFTER_SUCCESSES: u8 = 2;
+
+/// One LRU-tier cache entry.
+#[derive(Clone, Copy)]
+struct FalconPubkeyCacheEntry {
+    h_ntt: [u16; 512],
+    /// Count of fully verified signatures under this key (saturating).
+    good_verifications: u8,
+}
+
+/// Bounded two-tier Falcon-512 public-key cache.
+///
+/// S1-FALCON-CACHE-THRASH: the previous implementation wiped the WHOLE map on
+/// reaching the cap, so 4097 junk transaction pubkeys (each of which decodes
+/// before its signature is rejected) evicted every validator consensus key at
+/// once and the next consensus round paid a full NTT decode per vote. This
+/// structure never clears wholesale: the LRU tier evicts exactly ONE oldest
+/// entry per insert, and keys that have repeatedly verified successfully are
+/// protected in a separate never-evict tier that ordinary churn cannot touch.
+#[derive(Default)]
+struct FalconPubkeyCache {
+    /// LRU tier, bounded by [`FALCON_PUBKEY_CACHE_CAP`].
+    lru: HashMap<[u8; 32], FalconPubkeyCacheEntry>,
+    /// FIFO ring of keys inserted into `lru`, in insertion order. Promotion to
+    /// the pinned tier leaves stale keys here; eviction skips them.
+    order: std::collections::VecDeque<[u8; 32]>,
+    /// Never-evict tier: consensus-grade keys, bounded by
+    /// [`FALCON_PUBKEY_PINNED_CAP`] (its own ring, so even this tier evicts
+    /// one oldest entry instead of being unbounded).
+    pinned: HashMap<[u8; 32], [u16; 512]>,
+    pinned_order: std::collections::VecDeque<[u8; 32]>,
+}
+
+impl FalconPubkeyCache {
+    fn len(&self) -> usize {
+        self.lru.len() + self.pinned.len()
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: &[u8; 32]) -> bool {
+        self.pinned.contains_key(key) || self.lru.contains_key(key)
+    }
+
+    fn get(&self, key: &[u8; 32]) -> Option<[u16; 512]> {
+        self.pinned
+            .get(key)
+            .copied()
+            .or_else(|| self.lru.get(key).map(|e| e.h_ntt))
+    }
+
+    /// Insert a freshly decoded key, evicting at most ONE oldest LRU entry.
+    fn insert(&mut self, key: [u8; 32], h_ntt: [u16; 512]) {
+        if self.pinned.contains_key(&key) {
+            return;
+        }
+        if let Some(entry) = self.lru.get_mut(&key) {
+            entry.h_ntt = h_ntt;
+            return;
+        }
+        while self.lru.len() >= FALCON_PUBKEY_CACHE_CAP {
+            let Some(oldest) = self.order.pop_front() else {
+                // Cannot happen (every LRU insert pushes exactly one ring
+                // slot), but never loop forever if an invariant were broken.
+                break;
+            };
+            // Promoted keys were removed from `lru`; their ring slot is stale.
+            self.lru.remove(&oldest);
+        }
+        self.lru.insert(
+            key,
+            FalconPubkeyCacheEntry {
+                h_ntt,
+                good_verifications: 0,
+            },
+        );
+        self.order.push_back(key);
+    }
+
+    /// Record a SUCCESSFUL verification and promote repeatedly-good keys to the
+    /// never-evict tier.
+    fn note_verified(&mut self, key: &[u8; 32]) {
+        if self.pinned.contains_key(key) {
+            return;
+        }
+        let Some(entry) = self.lru.get_mut(key) else {
+            return;
+        };
+        entry.good_verifications = entry.good_verifications.saturating_add(1);
+        if entry.good_verifications < FALCON_PUBKEY_PIN_AFTER_SUCCESSES {
+            return;
+        }
+        let h_ntt = entry.h_ntt;
+        self.lru.remove(key);
+        self.pin(*key, h_ntt);
+    }
+
+    /// Move a key into the never-evict tier. When the tier is full the OLDEST
+    /// pin is dropped (one entry, never a wholesale clear).
+    fn pin(&mut self, key: [u8; 32], h_ntt: [u16; 512]) {
+        if self.pinned.insert(key, h_ntt).is_none() {
+            self.pinned_order.push_back(key);
+        }
+        while self.pinned.len() > FALCON_PUBKEY_PINNED_CAP {
+            let Some(oldest) = self.pinned_order.pop_front() else {
+                break;
+            };
+            self.pinned.remove(&oldest);
+        }
+    }
+}
+
+static FALCON_PUBKEY_CACHE: std::sync::LazyLock<RwLock<FalconPubkeyCache>> =
+    std::sync::LazyLock::new(|| RwLock::new(FalconPubkeyCache::default()));
+
+/// Pin a Falcon-512 public key into the never-evict tier.
+///
+/// Consensus PQ-key registration (validator keys) SHOULD call this so a burst
+/// of attacker-supplied transaction pubkeys can never evict a consensus key.
+/// Returns `false` for a non-canonical or undecodable key (nothing is pinned).
+pub fn pin_falcon_pubkey(pubkey: &[u8]) -> bool {
+    if pubkey.len() != FALCON512_PUBKEY_LEN || pubkey[0] != 0x09 {
+        return false;
+    }
+    let mut h_ntt = [0u16; 512];
+    if !modq_decode(&mut h_ntt, &pubkey[1..]) {
+        return false;
+    }
+    ntt(&mut h_ntt);
+    let key = *blake3::hash(pubkey).as_bytes();
+    FALCON_PUBKEY_CACHE
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .pin(key, h_ntt);
+    true
+}
+
+/// Number of entries in the Falcon public-key cache (LRU + pinned). Test /
+/// observability only; participates in no digest or consensus decision.
+pub fn falcon_pubkey_cache_len() -> usize {
+    FALCON_PUBKEY_CACHE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
+}
 
 /// Unpack a canonical Falcon-512 public key and return `h_ntt = ntt(h)` from
 /// the bounded cache (precomputed once on cache miss).
@@ -2163,7 +2319,7 @@ fn unpack_falcon_pubkey_ntt(pubkey: &[u8]) -> Option<[u16; 512]> {
         return None;
     }
     let key = *blake3::hash(pubkey).as_bytes();
-    if let Some(&h_ntt) = FALCON_PUBKEY_CACHE
+    if let Some(h_ntt) = FALCON_PUBKEY_CACHE
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .get(&key)
@@ -2175,16 +2331,24 @@ fn unpack_falcon_pubkey_ntt(pubkey: &[u8]) -> Option<[u16; 512]> {
         return None;
     }
     ntt(&mut h_ntt);
-    {
-        let mut cache = FALCON_PUBKEY_CACHE
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        if cache.len() >= FALCON_PUBKEY_CACHE_CAP && !cache.contains_key(&key) {
-            cache.clear();
-        }
-        cache.insert(key, h_ntt);
-    }
+    FALCON_PUBKEY_CACHE
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, h_ntt);
     Some(h_ntt)
+}
+
+/// Promote a key that just verified to the never-evict tier once it has proven
+/// itself (see [`FALCON_PUBKEY_PIN_AFTER_SUCCESSES`]).
+fn note_falcon_pubkey_verified(pubkey: &[u8]) {
+    if pubkey.len() != FALCON512_PUBKEY_LEN {
+        return;
+    }
+    let key = *blake3::hash(pubkey).as_bytes();
+    FALCON_PUBKEY_CACHE
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .note_verified(&key);
 }
 
 fn unpack_falcon_sig(sig: &[u8]) -> Option<([u8; 40], [i16; 512])> {
@@ -2275,7 +2439,14 @@ fn verify_falcon512(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
         norm_sq += s1_c * s1_c + s2_c * s2_c;
     }
 
-    norm_sq <= FALCON_NORM_BOUND_SQ
+    if norm_sq > FALCON_NORM_BOUND_SQ {
+        return false;
+    }
+    // Only a SUCCESSFUL verification promotes a key towards the never-evict
+    // tier (S1-FALCON-CACHE-THRASH): a garbage signature still decodes/caches
+    // the key, but can never pin itself.
+    note_falcon_pubkey_verified(pubkey);
+    true
 }
 
 #[cfg(test)]
@@ -3548,8 +3719,8 @@ mod tests {
             let cache = FALCON_PUBKEY_CACHE
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            assert_eq!(cache.get(&key), Some(&expected_h_ntt));
-            assert!(cache.len() <= FALCON_PUBKEY_CACHE_CAP);
+            assert_eq!(cache.get(&key), Some(expected_h_ntt));
+            assert!(cache.len() <= FALCON_PUBKEY_CACHE_CAP + FALCON_PUBKEY_PINNED_CAP);
         }
 
         // Invalid pubkey (bad header) must not decode or enter cache.
@@ -3561,6 +3732,69 @@ mod tests {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(&bad_key));
+    }
+
+    /// S1-FALCON-CACHE-THRASH regression: a flood of junk transaction pubkeys
+    /// must evict ONE oldest entry at a time and must never remove a consensus
+    /// validator key that has proven itself (pinned tier).
+    #[test]
+    fn test_falcon_pubkey_cache_evicts_one_not_whole_map_and_pins_consensus_keys() {
+        // (a) Data-structure level, fully deterministic: one insert evicts one
+        // oldest LRU entry, and never the whole map.
+        let mut cache = FalconPubkeyCache::default();
+        let victim_key = [0x01u8; 32];
+        cache.insert(victim_key, [0u16; 512]);
+        while cache.lru.len() < FALCON_PUBKEY_CACHE_CAP {
+            let mut k = [0u8; 32];
+            k[0..8].copy_from_slice(&(cache.lru.len() as u64).to_le_bytes());
+            k[8] = 0xC5;
+            cache.insert(k, [0u16; 512]);
+        }
+        // The consensus key is promoted to the never-evict tier after repeated
+        // successful verifications.
+        let consensus_key = [0x02u8; 32];
+        cache.insert(consensus_key, [7u16; 512]);
+        for _ in 0..FALCON_PUBKEY_PIN_AFTER_SUCCESSES {
+            cache.note_verified(&consensus_key);
+        }
+        assert!(cache.pinned.contains_key(&consensus_key));
+        // Now flood with junk: each insert evicts exactly one oldest entry.
+        for i in 0..(FALCON_PUBKEY_CACHE_CAP + 1) {
+            let mut k = [0u8; 32];
+            k[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            k[8] = 0xEE;
+            cache.insert(k, [1u16; 512]);
+            assert!(
+                cache.lru.len() <= FALCON_PUBKEY_CACHE_CAP,
+                "LRU tier stays bounded"
+            );
+            assert!(
+                cache.pinned.contains_key(&consensus_key),
+                "consensus key survives the junk-key flood"
+            );
+        }
+        assert_eq!(cache.get(&consensus_key), Some([7u16; 512]));
+        assert!(!cache.contains_key(&victim_key), "oldest LRU entry evicted");
+
+        // (b) Global wiring: a key that verifies successfully repeatedly (the
+        // consensus vote path) is actually promoted in the process-wide cache.
+        let consensus = FalconKeypair::generate_from_seed(0x7A);
+        let msg = b"consensus vote";
+        let sig = consensus.sign(msg);
+        for _ in 0..FALCON_PUBKEY_PIN_AFTER_SUCCESSES {
+            assert!(verify_falcon512(consensus.pubkey(), msg, &sig));
+        }
+        let consensus_key = *blake3::hash(consensus.pubkey()).as_bytes();
+        let mut expected = consensus.h;
+        ntt(&mut expected);
+        let global = FALCON_PUBKEY_CACHE
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            global.pinned.contains_key(&consensus_key),
+            "a repeatedly-verified consensus key must be pinned"
+        );
+        assert_eq!(global.get(&consensus_key), Some(expected));
     }
 
     #[test]

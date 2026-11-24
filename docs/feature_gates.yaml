@@ -19,6 +19,12 @@ gates:
     status: ACTIVE
     test: tests/review_final_cross_shard_contract_send.rs
     note: "Contracts may not emit cross-shard sends they cannot account for."
+  - id: wasm-table-elements-cap
+    symbol: WASM_TABLE_ELEMENTS_CAP_HEIGHT
+    activation_height: 18446744073709551615
+    status: INERT
+    test: MISSING
+    note: "Caps WASM table element counts (section-4 Table declarations and the wasmi StoreLimits table_elements budget) at MAX_CONTRACT_TABLE_ELEMENTS. INERT: every consensus deploy/execute call site keeps the legacy uncapped Ruleset v7 acceptance, byte-identical replay. Before arming: thread the block height through the consensus deploy/execute call sites (validate_code_at / run_contract_hardened_at) and pin replay of history that predates the cap."
   - id: contract-block-hash
     symbol: CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT
     activation_height: 18446744073709551615

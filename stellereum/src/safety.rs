@@ -741,17 +741,27 @@ impl SafetyAuthority {
                         if pv.height == payload.height
                             && payload.highest_prevote_round.is_none_or(|r| pv.round > r)
                         {
-                            // Conservative: raise prevote floor (if non-nil, resolve value_id if block present).
-                            let target = pv.target.map(|bh| {
-                                let vid = storage
-                                    .get_block(&bh)
-                                    .ok()
-                                    .flatten()
-                                    .filter(|b| b.compute_hash() == bh)
-                                    .map(|b| b.value_id())
-                                    .unwrap_or(bh);
-                                (bh, vid)
-                            });
+                            // Conservative: raise prevote floor; fail closed (quarantine) if a
+                            // non-nil legacy prevote block body is missing so we never fabricate
+                            // `value_id == bh`.
+                            let target = match pv.target {
+                                None => None,
+                                Some(bh) => {
+                                    let Some(vid) = storage
+                                        .get_block(&bh)
+                                        .ok()
+                                        .flatten()
+                                        .filter(|b| b.compute_hash() == bh)
+                                        .map(|b| b.value_id())
+                                    else {
+                                        return Self::new_quarantined(format!(
+                                            "legacy vote_watermark prevote target {} missing from storage; cannot resolve value_id",
+                                            hex::encode(bh)
+                                        ));
+                                    };
+                                    Some((bh, vid))
+                                }
+                            };
                             payload.note_prevote(pv.round, target);
                             need_persist = true;
                         }

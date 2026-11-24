@@ -14,6 +14,20 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Serializes commitment-digest publication (S1-STATEROOT-CONCURRENT-STALE).
+///
+/// The commitment fold drops every domain lock across its `.await`s, so two
+/// concurrent root reads can compute digests for different generations and race
+/// the final `state_trie.write()`; the slower one used to overwrite a newer
+/// digest with an older value. Holding this mutex makes fold+publish one
+/// critical section. It is only ever acquired by
+/// [`InMemoryStateEngine::commit_consensus_domains_if_stale`] and is never held
+/// while acquiring a domain or trie lock from another path, so it cannot
+/// deadlock; the section is short (one digest fold), so process-wide
+/// serialization costs nothing measurable even in multi-shard processes.
+static COMMIT_PUBLISH_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// Does `bytes` start with the CURRENT state-snapshot magic?
 ///
 /// bincode's fixint encoding writes integers little-endian, so the magic is
@@ -997,29 +1011,64 @@ impl InMemoryStateEngine {
     /// The digest is still written into the trie, so the trie remains the authority
     /// a reader can cross-check against the in-memory subsystems.
     pub(super) async fn commit_consensus_domains_if_stale(&self) {
-        let generation = self
-            .commitment_generation
-            .load(std::sync::atomic::Ordering::Acquire);
-        let stamp = generation.wrapping_add(1);
-        if self
-            .committed_generation
-            .load(std::sync::atomic::Ordering::Acquire)
-            == stamp
-        {
+        // S1-STATEROOT-CONCURRENT-STALE: the fold below drops every domain lock
+        // across its `.await`s, so two concurrent root reads used to be able to
+        // compute digests for different generations and race the final
+        // `state_trie.write()`: the slower one could overwrite a newer digest
+        // (and stamp it) with an older value. Serialize the whole fold+insert
+        // (see COMMIT_PUBLISH_LOCK). The lock is only ever taken here, so it
+        // cannot deadlock against the `*_write` accessors (which never take it).
+        let _commit = COMMIT_PUBLISH_LOCK.lock().await;
+        // Bounded retry: `*_write` mutations do not take the publish lock, so
+        // one can still land while this fold runs. Publish only a digest whose
+        // source generation is still current under the trie write lock, and
+        // fold again for the newer generation instead of leaving the reader
+        // with a stale root.
+        const MAX_COMMIT_ATTEMPTS: usize = 4;
+        for _ in 0..MAX_COMMIT_ATTEMPTS {
+            let generation = self
+                .commitment_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            let stamp = generation.wrapping_add(1);
+            if self
+                .committed_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                == stamp
+            {
+                return;
+            }
+
+            let digest = self.commit_consensus_domains_cached().await;
+            let mut trie = self.state_trie.write().await;
+            // Re-check UNDER the write lock: only publish the digest if no
+            // committed subsystem moved while it was being folded. A racing
+            // mutation makes this digest at best torn and at worst older than
+            // what is already in the trie, so it must never be inserted.
+            if self
+                .commitment_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != generation
+            {
+                drop(trie);
+                continue;
+            }
+            trie.insert(&crate::commitment::commitment_key(), &digest);
+            // Record the generation we observed. The store happens after the
+            // insert (still under the trie write lock), so any later reader
+            // either sees the committed stamp or recomputes -- never a digest
+            // published for a different generation.
+            self.committed_generation
+                .store(stamp, std::sync::atomic::Ordering::Release);
             return;
         }
-
-        let digest = self.commit_consensus_domains_cached().await;
-        self.state_trie
-            .write()
-            .await
-            .insert(&crate::commitment::commitment_key(), &digest);
-
-        // Record the generation we observed. If a mutation raced in after the load
-        // but before this store, the stored stamp is stale and the next call
-        // recomputes -- the safe direction.
-        self.committed_generation
-            .store(stamp, std::sync::atomic::Ordering::Release);
+        // Continuous writer churn kept generation ahead of the fold for every
+        // attempt. Publishing anything here could regress the root, so leave
+        // both the trie and the stamp untouched; the next read (or the next
+        // quiet moment on the consensus path) recomputes. Safe direction only.
+        tracing::warn!(
+            "[state] commitment fold raced mutations for {} attempts; deferring to the next root read",
+            MAX_COMMIT_ATTEMPTS
+        );
     }
 
     /// Recompute the commitment digest, reusing the cached preimage of every
@@ -3420,5 +3469,82 @@ mod tests {
         engine.restore_snapshot(&checkpoint).await.expect("restore");
         assert!(engine.evm_bindings_read().await.is_empty());
         assert_eq!(engine.get_state_root().await, expected_root);
+    }
+
+    /// S1-STATEROOT-CONCURRENT-STALE regression.
+    ///
+    /// A root read that folds the commitment digest, then loses the race to a
+    /// mutation before it writes the trie, must NOT publish its now-stale
+    /// digest over the newer one. The old code inserted unconditionally, so a
+    /// slow reader clobbered a newer root (and stamped it as committed).
+    ///
+    /// The interleaving is forced deterministically: block the read on the
+    /// `state_trie` write lock AFTER its fold has run, mutate a committed
+    /// domain while it is parked, then let it finish. The returned root must
+    /// be the one for the mutated state, not the pre-mutation digest.
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_root_read_cannot_publish_a_stale_commitment() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+
+        fn poll_once<F: Future>(fut: &mut Pin<Box<F>>) -> Poll<F::Output> {
+            let mut cx = Context::from_waker(Waker::noop());
+            fut.as_mut().poll(&mut cx)
+        }
+
+        let engine = InMemoryStateEngine::new();
+        let base = engine.get_state_root().await;
+
+        // Mutation A bumps the commitment generation.
+        assert!(engine
+            .evm_bindings_write()
+            .await
+            .bind([0xAA; 20], [0x11; 32])
+            .unwrap());
+
+        // Start a root read and hold the trie write lock, so the read runs its
+        // whole fold and parks exactly at the publish step.
+        let trie_guard = engine.state_trie.write().await;
+        let mut pending = Box::pin(engine.get_state_root());
+        assert!(
+            poll_once(&mut pending).is_pending(),
+            "the read must park on the trie write lock"
+        );
+        drop(trie_guard);
+
+        // Mutation B lands while the fold for A is parked: A's digest is stale.
+        assert!(engine
+            .evm_bindings_write()
+            .await
+            .bind([0xBB; 20], [0x22; 32])
+            .unwrap());
+
+        let observed = pending.await;
+
+        // Reference engine that saw exactly A then B.
+        let reference = InMemoryStateEngine::new();
+        assert!(reference
+            .evm_bindings_write()
+            .await
+            .bind([0xAA; 20], [0x11; 32])
+            .unwrap());
+        assert!(reference
+            .evm_bindings_write()
+            .await
+            .bind([0xBB; 20], [0x22; 32])
+            .unwrap());
+        let expected = reference.get_state_root().await;
+
+        assert_ne!(observed, base, "the root must move with the mutations");
+        assert_eq!(
+            observed, expected,
+            "a parked reader must not publish the digest it folded before mutation B"
+        );
+        assert_eq!(
+            engine.get_state_root().await,
+            expected,
+            "the trie must hold the current digest after the race"
+        );
     }
 }

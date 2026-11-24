@@ -149,6 +149,16 @@ pub const BRIDGE_TARGET_ADDRESS_CAP_HEIGHT: u64 = u64::MAX;
 /// `docs/specs/XSHARD_BOUNCE_ESCROW.md` for the exact sequencing.
 pub const XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT: u64 = u64::MAX;
 
+/// WASM table element count cap activation height (`u64::MAX` = disabled,
+/// the compiled default).
+///
+/// Below this gate, consensus WASM deployment and execution keep the legacy
+/// acceptance rules (no `table_elements` cap) so live Ruleset v7 replay is
+/// byte-identical. At/above this gate (or on RPC pre-validation), section `4`
+/// (`Table`) declarations and runtime table allocations are capped at
+/// [`crate::contract::MAX_CONTRACT_TABLE_ELEMENTS`].
+pub const WASM_TABLE_ELEMENTS_CAP_HEIGHT: u64 = u64::MAX;
+
 #[cfg(any(test, debug_assertions))]
 thread_local! {
     static EXEC_HARDENING_V1_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
@@ -162,6 +172,8 @@ thread_local! {
     static BRIDGE_TARGET_ADDRESS_CAP_OVERRIDE: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
     static XSHARD_BOUNCE_ESCROW_REQUIRED_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    static WASM_TABLE_ELEMENTS_CAP_OVERRIDE: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -319,6 +331,33 @@ pub fn xshard_bounce_escrow_required_height() -> u64 {
 /// single-shard chain keeps the historical bytes.
 pub fn xshard_bounce_escrow_required_active_at(height: u64) -> bool {
     let gate = xshard_bounce_escrow_required_height();
+    gate != u64::MAX && height >= gate
+}
+
+/// Set (or clear with `None`) the TEST/DEBUG-ONLY `WASM_TABLE_ELEMENTS_CAP`
+/// activation height override for the calling thread. Absent from release
+/// builds.
+#[cfg(any(test, debug_assertions))]
+pub fn set_wasm_table_elements_cap_override(activation: Option<u64>) {
+    WASM_TABLE_ELEMENTS_CAP_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// Effective `WASM_TABLE_ELEMENTS_CAP_HEIGHT` for the calling thread.
+pub fn wasm_table_elements_cap_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(h) = WASM_TABLE_ELEMENTS_CAP_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    WASM_TABLE_ELEMENTS_CAP_HEIGHT
+}
+
+/// True iff the WASM table elements cap is active at `height`.
+///
+/// Strictly returns `false` for EVERY height (including `u64::MAX`) when the
+/// effective gate is `u64::MAX` (`GatedOff`, the compiled default), so live
+/// Ruleset v7 consensus keeps historical acceptance.
+pub fn wasm_table_elements_cap_active_at(height: u64) -> bool {
+    let gate = wasm_table_elements_cap_height();
     gate != u64::MAX && height >= gate
 }
 

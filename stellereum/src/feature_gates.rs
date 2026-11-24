@@ -70,6 +70,19 @@ pub fn table() -> Vec<Gate> {
             note: "Contracts may not emit cross-shard sends they cannot account for.",
         },
         Gate {
+            id: "wasm-table-elements-cap",
+            symbol: "WASM_TABLE_ELEMENTS_CAP_HEIGHT",
+            value: chain_spec::WASM_TABLE_ELEMENTS_CAP_HEIGHT,
+            test: None,
+            note: "Caps WASM table element counts (section-4 Table declarations and the \
+                   wasmi StoreLimits table_elements budget) at MAX_CONTRACT_TABLE_ELEMENTS. \
+                   INERT: every consensus deploy/execute call site keeps the legacy \
+                   uncapped Ruleset v7 acceptance, byte-identical replay. Before arming: \
+                   thread the block height through the consensus deploy/execute call sites \
+                   (validate_code_at / run_contract_hardened_at) and pin replay of history \
+                   that predates the cap.",
+        },
+        Gate {
             id: "contract-block-hash",
             symbol: "CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT",
             value: chain_spec::CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT,

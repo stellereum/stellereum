@@ -1956,7 +1956,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
             println!("  4. SPV Light Mode: Wallets verify state via Patricia-Merkle BoC proofs");
             println!("  5. Full Node Mode: Downloads block chunks via 'fetch_blob' and verifies\n");
         }
-        Commands::Status { rpc, json } => {
+        Commands::Status { rpc, json, expect } => {
             let height = rpc_call(&rpc, "stell_blockNumber", serde_json::json!([]))
                 .ok()
                 .and_then(|v| match v {
@@ -2030,7 +2030,15 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 }));
             }
 
-            let verdict = if !jailed.is_empty() {
+            let missing = expect.map(|n| n.saturating_sub(rows.len())).unwrap_or(0);
+            let verdict = if missing > 0 {
+                format!(
+                    "DEGRADED: only {} of {} validators are in the set ({} missing, most likely jailed)",
+                    rows.len(),
+                    expect.unwrap_or(rows.len()),
+                    missing
+                )
+            } else if !jailed.is_empty() {
                 format!(
                     "DEGRADED: {} validator(s) jailed{}",
                     jailed.len(),

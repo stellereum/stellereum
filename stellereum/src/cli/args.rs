@@ -300,6 +300,11 @@ pub(crate) enum Commands {
         /// Machine-readable JSON instead of the human summary
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Expected number of validators. When given, a smaller in-set count is
+        /// reported as DEGRADED: jailed members do not appear in the set list,
+        /// so without this the summary would call a 3-of-4 cluster healthy.
+        #[arg(long)]
+        expect: Option<usize>,
     },
     /// Print the activation-gate table (id, status, height, proving test).
     ///
@@ -1514,9 +1519,10 @@ mod cli_safety_init_tests {
     fn cli_parses_status_and_gates_subcommands() {
         let cli = Cli::try_parse_from(["stellereum", "status", "--json"]).expect("parse status");
         match cli.command {
-            Commands::Status { rpc, json } => {
+            Commands::Status { rpc, json, expect } => {
                 assert_eq!(rpc, "http://127.0.0.1:8545");
                 assert!(json);
+                assert_eq!(expect, None);
             }
             _ => panic!("unexpected command"),
         }

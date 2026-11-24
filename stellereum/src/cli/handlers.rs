@@ -1956,6 +1956,164 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
             println!("  4. SPV Light Mode: Wallets verify state via Patricia-Merkle BoC proofs");
             println!("  5. Full Node Mode: Downloads block chunks via 'fetch_blob' and verifies\n");
         }
+        Commands::Status { rpc, json } => {
+            let height = rpc_call(&rpc, "stell_blockNumber", serde_json::json!([]))
+                .ok()
+                .and_then(|v| match v {
+                    serde_json::Value::Number(n) => n.as_u64(),
+                    serde_json::Value::String(s) => {
+                        let s = s.trim();
+                        if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                            u64::from_str_radix(h, 16).ok()
+                        } else {
+                            s.parse::<u64>().ok()
+                        }
+                    }
+                    _ => None,
+                });
+            let vs = rpc_call(&rpc, "stell_getValidators", serde_json::json!([]))?;
+            let fragile = vs.get("fragile").and_then(|v| v.as_bool()).unwrap_or(true);
+            let fragile_reason = vs
+                .get("fragile_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let quorum = vs.get("quorum").and_then(|v| v.as_str()).unwrap_or("?");
+            let total = vs
+                .get("total_power")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let empty = Vec::new();
+            let entries = vs
+                .get("validators")
+                .and_then(|v| v.as_array())
+                .unwrap_or(&empty);
+
+            let mut rows = Vec::new();
+            let mut jailed = Vec::new();
+            for e in entries {
+                let vid = e.get("validator").and_then(|v| v.as_str()).unwrap_or("?");
+                let power = e.get("power").and_then(|v| v.as_str()).unwrap_or("?");
+                let st = rpc_call(
+                    &rpc,
+                    "stell_getValidatorStatus",
+                    serde_json::json!({ "validator": vid }),
+                )
+                .ok();
+                let is_jailed = st
+                    .as_ref()
+                    .and_then(|v| v.get("jailed"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let in_set = st
+                    .as_ref()
+                    .and_then(|v| v.get("in_set"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let release = st
+                    .as_ref()
+                    .and_then(|v| v.get("release_height"))
+                    .and_then(|v| v.as_u64());
+                let bond = st
+                    .as_ref()
+                    .and_then(|v| v.get("self_bond"))
+                    .and_then(|v| v.as_u64());
+                if is_jailed {
+                    jailed.push((vid, release));
+                }
+                rows.push(serde_json::json!({
+                    "validator": vid,
+                    "power": power,
+                    "in_set": in_set,
+                    "jailed": is_jailed,
+                    "release_height": release,
+                    "self_bond": bond,
+                }));
+            }
+
+            let verdict = if !jailed.is_empty() {
+                format!(
+                    "DEGRADED: {} validator(s) jailed{}",
+                    jailed.len(),
+                    if fragile {
+                        " and the set is FRAGILE (no spare)"
+                    } else {
+                        ""
+                    }
+                )
+            } else if fragile {
+                "FRAGILE: every validator must stay up".to_string()
+            } else {
+                "healthy".to_string()
+            };
+            let next = if let Some((vid, Some(rel))) = jailed.first() {
+                format!(
+                    "unjail {} once tip >= {} (scripts/auto-unjail.sh does this automatically)",
+                    &vid[..8.min(vid.len())],
+                    rel
+                )
+            } else if fragile {
+                "restore the jailed/missing member; do not restart anyone until 4/4".to_string()
+            } else {
+                String::new()
+            };
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "rpc": rpc,
+                        "height": height,
+                        "validator_count": rows.len(),
+                        "fragile": fragile,
+                        "fragile_reason": fragile_reason,
+                        "quorum": quorum,
+                        "total_power": total,
+                        "validators": rows,
+                        "verdict": verdict,
+                        "next": next,
+                    })
+                );
+            } else {
+                println!("Stellereum node status — {}", rpc);
+                match height {
+                    Some(h) => println!("  height        : {h}"),
+                    None => println!("  height        : UNREACHABLE"),
+                }
+                println!(
+                    "  validators    : {} (fragile: {})",
+                    rows.len(),
+                    if fragile { "yes" } else { "no" }
+                );
+                if fragile && !fragile_reason.is_empty() {
+                    println!("  fragility     : {fragile_reason}");
+                }
+                println!("  quorum / power: {quorum} / {total}");
+                println!("  members       :");
+                for r in &rows {
+                    let vid = r.get("validator").and_then(|v| v.as_str()).unwrap_or("?");
+                    let state = if r.get("jailed").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        match r.get("release_height").and_then(|v| v.as_u64()) {
+                            Some(rel) => format!("JAILED (release {rel})"),
+                            None => "JAILED".to_string(),
+                        }
+                    } else if r.get("in_set").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        "active".to_string()
+                    } else {
+                        "not in set".to_string()
+                    };
+                    println!(
+                        "    {}  {:<26}  power {}",
+                        &vid[..8.min(vid.len())],
+                        state,
+                        r.get("power").and_then(|v| v.as_str()).unwrap_or("?")
+                    );
+                }
+                println!("  verdict       : {verdict}");
+                if !next.is_empty() {
+                    println!("  next action   : {next}");
+                }
+            }
+        }
         Commands::Gates { yaml } => {
             if yaml {
                 print!("{}", stellereum::feature_gates::render_yaml());

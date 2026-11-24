@@ -288,6 +288,19 @@ pub(crate) enum Commands {
         #[arg(long, default_value_t = false)]
         i_fenced_all_signers: bool,
     },
+    /// One-screen operator status: height, validator set, quorum, jails,
+    /// efficiency and a verdict with the next action.
+    ///
+    /// Talks only to the node's own JSON-RPC (no keys, no writes), so it is
+    /// safe to run from cron or by a second operator during an incident.
+    Status {
+        /// Node JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Machine-readable JSON instead of the human summary
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Print the activation-gate table (id, status, height, proving test).
     ///
     /// `--yaml` renders the committed manifest `docs/feature_gates.yaml`; the
@@ -1496,6 +1509,23 @@ pub(crate) enum BridgeCommands {
 #[cfg(test)]
 mod cli_safety_init_tests {
     use super::*;
+
+    #[test]
+    fn cli_parses_status_and_gates_subcommands() {
+        let cli = Cli::try_parse_from(["stellereum", "status", "--json"]).expect("parse status");
+        match cli.command {
+            Commands::Status { rpc, json } => {
+                assert_eq!(rpc, "http://127.0.0.1:8545");
+                assert!(json);
+            }
+            _ => panic!("unexpected command"),
+        }
+        let cli = Cli::try_parse_from(["stellereum", "gates", "--yaml"]).expect("parse gates");
+        match cli.command {
+            Commands::Gates { yaml } => assert!(yaml),
+            _ => panic!("unexpected command"),
+        }
+    }
 
     #[test]
     fn cli_parses_safety_reset_subcommand() {

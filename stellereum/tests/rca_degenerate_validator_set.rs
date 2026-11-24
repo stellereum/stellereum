@@ -37,9 +37,9 @@
 //! the required power is `floor(2*4/3)+1 = 3`: exactly the live
 //! `0 of 3 required power` message.
 //!
-//! Tests 1 and 2 pass today and pin the mechanism; test 3 is the fail-before
-//! reproduction of the halt condition (validator-set history is in-memory, so
-//! a restart cannot answer for the tip's own height).
+//! Tests 1 and 2 pin the mechanism; test 3 verifies that a restart at the
+//! finalized tip resolves `TIP` to the restored bonded set (never the
+//! boot config set) and attributes the tip's own QC.
 
 use std::sync::Arc;
 
@@ -243,23 +243,16 @@ fn power_one_config_set_attributes_zero_of_three_for_a_bonded_set_qc() {
     );
 }
 
-/// 3. FAIL-BEFORE: a restart at the finalized tip must still be able to
+/// 3. Regression pin: a restart at the finalized tip must still be able to
 /// attribute the tip's own QC.
 ///
 /// Shape of the live boot: the runtime is constructed with the config set at
 /// the height it will propose at (`TIP + 1`), the restored ledger yields the
 /// bonded set, and `refresh_validator_set_from_staking_checked(TIP, TIP)`
-/// installs it with activation `TIP + 1`. `validator_set_for_height(TIP)`
-/// therefore resolves to the `(0, config_set)` entry -> power 1 each,
-/// quorum 3 -> the tip QC scores 0.
-///
-/// The intended invariant is that the set resolved for a height the node has
-/// ALREADY finalized must be able to verify that height's decision proof.
-/// Today the validator-set history is in-memory only, so it cannot.
-#[ignore = "OPEN (RCA 2026-11-24): validator-set history is not persisted across \
-            restart; the finalized tip's height resolves to the boot config set \
-            (4 x power 1, quorum 3) and the tip's real QC attributes 0. Fix is a \
-            persistent/derived set-history restore, out of scope for this wave."]
+/// restores it. Previously it staged only at `TIP + 1` and pushed `(0, config_set)`,
+/// causing `validator_set_for_height(TIP)` to score 0 of 3. Now the restored
+/// bonded set covers `TIP`, while `validator_set_for_height_strict` refuses
+/// unknown older heights below `TIP`.
 #[tokio::test]
 async fn restart_at_the_finalized_tip_must_attribute_the_tip_qc() {
     let keys: Vec<SigningKey> = (1..=4).map(key).collect();

@@ -23,7 +23,7 @@ fn verified_qc_sidecar_hash(
         return None;
     }
     let bh = qc.block_hash?;
-    let validators = rt.validator_set_for_height(height);
+    let validators = rt.validator_set_for_height_strict(height)?;
     if !qc.verify_with_schedule(&validators, rt.committee_schedule_at(height)) {
         return None;
     }
@@ -303,13 +303,11 @@ pub(crate) async fn try_snapshot_sync(
         };
         let anchor = if use_tail_anchor {
             // F5 set-at-height: each window height's QC is checked against the
-            // set in force AT THAT height (`validator_set_for_height`), never
-            // the live set. On today's single-set chains the resolver answers
-            // the same set at every height, so this is behavior-identical to
-            // the single-set wrapper it replaces.
+            // strict set in force AT THAT height (`validator_set_for_height_strict`),
+            // never the live set or a silent fallback.
             match stellereum::sync::verify_snapshot_anchor_tail_with_sets_and_schedule(
                 boundary + 1,
-                |h| Some(rt.validator_set_for_height(h)),
+                |h| rt.validator_set_for_height_strict(h),
                 // Review F2: the same committee schedule the producer drew
                 // under (epoch beacon at/after CN-VRF v3 activation, the
                 // parent-hash draw below it).
@@ -333,11 +331,14 @@ pub(crate) async fn try_snapshot_sync(
                 }
             }
         } else {
-            match stellereum::sync::verify_snapshot_anchor_with_schedule(
+            // F5 set-at-height: even a short-gap chain-anchored snapshot must
+            // verify each height's QC and proposer slot against the exact set
+            // in force AT THAT height, failing closed on any unknown height.
+            match stellereum::sync::verify_snapshot_anchor_with_sets_and_schedule(
                 rt.finalized.last().copied(),
                 [0u8; 32],
                 boundary + 1,
-                &rt.validators,
+                |h| rt.validator_set_for_height_strict(h),
                 // Review F2: header QCs are checked under the schedule in
                 // force at each height, never a forced parent-hash draw.
                 |h| rt.committee_schedule_at(h),
@@ -380,11 +381,20 @@ pub(crate) async fn try_snapshot_sync(
             continue;
         }
         // F5 set-at-height trust gate: the snapshot must additionally commit
-        // to the validator set at `boundary`, and to exactly the set that
-        // verified its anchor (resolved at the boundary height). On today's
-        // single-set chains the snapshot commits to the one set in force, so
-        // this is behavior-identical to the non-binding path it replaces.
-        let anchor_set = rt.validator_set_for_height(boundary);
+        // to the strict validator set at `boundary`, and to exactly the set
+        // that verified its anchor (resolved at the boundary height).
+        let Some(anchor_set) = rt.validator_set_for_height_strict(boundary) else {
+            eprintln!(
+                "[sync] REFUSING snapshot at {boundary}: no validator set resolvable at boundary height"
+            );
+            consecutive_misses = consecutive_misses.saturating_add(1);
+            tokio::time::sleep(std::time::Duration::from_millis(
+                stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
+            ))
+            .await;
+            boundary = boundary.saturating_sub(probe_step);
+            continue;
+        };
         let mut installed_via_snapv4 = false;
         if let Some(manifest) = snapv4_manifest {
             let snap_anchor = stellereum::snapshot_v4::TrustedSnapshotAnchor {
@@ -1565,7 +1575,7 @@ async fn walk_chain_once_with_lanes(
             &blocks,
             expected_first_height,
             our_last,
-            &|h| Some(rt.validator_set_for_height(h)),
+            &|h| rt.validator_set_for_height_strict(h),
             rt.shard_id,
             // Review F2: every block's decision proof is verified and
             // attributed under the committee schedule IN FORCE AT ITS HEIGHT
@@ -1630,7 +1640,7 @@ async fn walk_chain_once_with_lanes(
             match stellereum::sync::verify_synced_blocks_against_anchor_with_sets(
                 light,
                 &blocks,
-                &|h| Some(rt.validator_set_for_height(h)),
+                &|h| rt.validator_set_for_height_strict(h),
             ) {
                 Ok(r) => Some(r),
                 Err(e) => {
@@ -1909,6 +1919,10 @@ async fn walk_chain_once_with_lanes(
         }
     }
     if let Some(ap) = persist {
+        let hist = rt.export_validator_set_history();
+        if !hist.is_empty() {
+            ap.enqueue_validator_set_history(hist);
+        }
         ap.request_flush();
     }
     // Re-anchor consensus on the WALKED height with FRESH round state (never the
@@ -1973,7 +1987,54 @@ async fn walk_chain_once_with_lanes(
     Some(next_height.saturating_sub(1))
 }
 
-/// Re-publish this node's already-finalized block BODIES, oldest first.
+/// Effective retro-publish depth: at least `RETRO_PUBLISH_DEPTH`, widened to
+/// cover the full snapshot probe span (`probe_step * probe_steps + tail`) up
+/// to the DHT retention horizon so published snapshot boundaries always have
+/// retro-published headers and bodies within retention.
+pub(crate) fn effective_retro_publish_depth(snapshot_interval: u64, keep_blocks: u64) -> u64 {
+    let step = stellereum::sync::snapshot_probe_step(snapshot_interval);
+    let steps = stellereum::sync::snapshot_probe_steps(snapshot_interval);
+    let max_snap_span = step
+        .saturating_mul(steps)
+        .saturating_add(stellereum::sync::SNAPSHOT_ANCHOR_TAIL_WINDOW);
+    RETRO_PUBLISH_DEPTH
+        .max(max_snap_span)
+        .min(keep_blocks.max(RETRO_PUBLISH_DEPTH))
+}
+
+/// Snapshot-boundary anchor windows (`[B - 1, B, B + 1]`) inside the active
+/// retro-publish horizon so lagging peers never stall waiting for the
+/// oldest-first backfill cursor to reach the newest snapshot boundaries.
+pub(crate) fn snapshot_boundary_anchor_heights(
+    tip: u64,
+    snapshot_interval: u64,
+    depth: u64,
+) -> Vec<u64> {
+    if tip == 0 {
+        return Vec::new();
+    }
+    let step = stellereum::sync::snapshot_probe_step(snapshot_interval);
+    let steps = stellereum::sync::snapshot_probe_steps(snapshot_interval);
+    let floor = tip.saturating_sub(depth).saturating_add(1).max(1);
+    let mut b = (tip / step) * step;
+    let mut heights = Vec::new();
+    for _ in 0..steps {
+        if b == 0 || b < floor {
+            break;
+        }
+        for h in [b.saturating_sub(1), b, b.saturating_add(1)] {
+            if h >= floor && h <= tip && !heights.contains(&h) {
+                heights.push(h);
+            }
+        }
+        b = b.saturating_sub(step);
+    }
+    heights.sort_unstable();
+    heights
+}
+
+/// Re-publish this node's already-finalized block BODIES and immutable headers,
+/// oldest first (plus recent snapshot-boundary anchor windows when backfilling).
 ///
 /// A body only reaches the DHT from `P2pNetworkAdapter::broadcast_block`, and
 /// that is called in exactly one place in the tree -- genesis. The live finalize
@@ -1983,10 +2044,11 @@ async fn walk_chain_once_with_lanes(
 /// `block sync: missing block <hash>`. Walking our own history back from the tip
 /// makes that walk meet a contiguous run of fetchable bodies.
 ///
-/// BODY ONLY. `retro_publish_blocks` writes no height pointer and no block-hash
-/// index, which is what makes this safe to run from a node that is itself behind:
-/// replaying the head pointer from a stale chain would rewind the advertised head
-/// and strand the very node trying to catch up.
+/// NO HEAD POINTER REWIND: `retro_publish_blocks` writes immutable bodies and
+/// per-height header/index/QC blobs only, with zero KV writes and zero
+/// `shard_head` writes, which is what makes this safe to run from a node that
+/// is itself behind: replaying the head pointer from a stale chain would rewind
+/// the advertised head and strand the very node trying to catch up.
 ///
 /// Bodies come from `rt.blocks` (this run, in memory) first and from the local
 /// block store second (earlier runs -- the case that actually bites). A pruned
@@ -2000,9 +2062,12 @@ pub(crate) async fn retro_publish_pass(
 ) {
     let Some(ap) = persistence else { return };
     let tip = rt.hc.height.saturating_sub(1);
-    // The next bounded window above the cursor, never further back than DEPTH so a
+    let snap_int = crate::node::policy::snapshot_interval();
+    let depth =
+        effective_retro_publish_depth(snap_int, stellereum::network::retention_keep_blocks());
+    // The next bounded window above the cursor, never further back than `depth` so a
     // restart does not try to publish an entire chain at once.
-    let from = (*published_upto + 1).max(tip.saturating_sub(RETRO_PUBLISH_DEPTH) + 1);
+    let from = (*published_upto + 1).max(tip.saturating_sub(depth) + 1);
     if from > tip {
         return; // at our own tip: nothing new to push
     }
@@ -2020,10 +2085,36 @@ pub(crate) async fn retro_publish_pass(
     // Everything from earlier runs: the only copy is the local block store.
     // `Storage` is synchronous sled, so keep it off the async executor.
     let have: std::collections::HashSet<u64> = bodies.iter().map(|b| b.height).collect();
-    let wanted: Vec<u64> = (from..=to).filter(|h| !have.contains(h)).collect();
-    if !wanted.is_empty() {
+    let mut wanted: Vec<u64> = (from..=to).filter(|h| !have.contains(h)).collect();
+
+    // When backfilling below tip (`to < tip`), also collect any missing blocks
+    // in the recent snapshot-boundary anchor windows `[B - 1, B, B + 1]` so
+    // snapshot boundaries have immutable headers immediately without waiting
+    // for the oldest-first cursor to crawl up to tip.
+    let mut boundary_bodies: Vec<stellereum::sharding::Block> = Vec::new();
+    let boundary_heights: Vec<u64> = if to < tip {
+        snapshot_boundary_anchor_heights(tip, snap_int, depth)
+            .into_iter()
+            .filter(|h| *h < from || *h > to)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut boundary_wanted: Vec<u64> = Vec::new();
+    for h in &boundary_heights {
+        if let Some((_, hash)) = rt.finalized.iter().find(|(fh, _)| fh == h) {
+            if let Some(b) = rt.blocks.get(hash) {
+                boundary_bodies.push(b.clone());
+                continue;
+            }
+        }
+        boundary_wanted.push(*h);
+    }
+
+    if !wanted.is_empty() || !boundary_wanted.is_empty() {
         let store = ap.storage();
-        let from_disk = tokio::task::spawn_blocking(move || {
+        wanted.sort_unstable();
+        let (from_disk, boundary_from_disk) = tokio::task::spawn_blocking(move || {
             let mut out: Vec<stellereum::sharding::Block> = Vec::new();
             for h in wanted {
                 let Ok(hashes) = store.hashes_at_height(h) else {
@@ -2035,21 +2126,58 @@ pub(crate) async fn retro_publish_pass(
                     }
                 }
             }
-            out
+            let mut b_out: Vec<stellereum::sharding::Block> = Vec::new();
+            for h in boundary_wanted {
+                let Ok(hashes) = store.hashes_at_height(h) else {
+                    continue;
+                };
+                for hash in hashes {
+                    if let Ok(Some(b)) = store.get_block(&hash) {
+                        b_out.push(b);
+                    }
+                }
+            }
+            (out, b_out)
         })
         .await
         .unwrap_or_default();
         bodies.extend(from_disk);
         bodies.sort_by_key(|b| b.height);
+        boundary_bodies.extend(boundary_from_disk);
+        boundary_bodies.sort_by_key(|b| b.height);
     }
     // A fork can put more than one body at a height; the pass stays bounded anyway.
     bodies.truncate(RETRO_PUBLISH_MAX_PER_PASS);
 
-    if !bodies.is_empty() {
+    if !bodies.is_empty() || !boundary_bodies.is_empty() {
         if let Some(lane) = publish_lane {
             let a = adapter.clone();
             lane.submit(async move {
-                let report = a
+                if !bodies.is_empty() {
+                    let report = a
+                        .retro_publish_blocks(bodies.iter(), RETRO_PUBLISH_MAX_PER_PASS)
+                        .await;
+                    if report.published > 0 || report.failed > 0 {
+                        info!(
+                            "[retro-publish] heights {from}..={to}: published {}/{}, failed {}{}",
+                            report.published,
+                            report.attempted,
+                            report.failed,
+                            match &report.first_error {
+                                Some(e) => format!(" ({e})"),
+                                None => String::new(),
+                            }
+                        );
+                    }
+                }
+                if !boundary_bodies.is_empty() {
+                    let max_b = boundary_bodies.len();
+                    let _ = a.retro_publish_blocks(boundary_bodies.iter(), max_b).await;
+                }
+            });
+        } else {
+            if !bodies.is_empty() {
+                let report = adapter
                     .retro_publish_blocks(bodies.iter(), RETRO_PUBLISH_MAX_PER_PASS)
                     .await;
                 if report.published > 0 || report.failed > 0 {
@@ -2064,22 +2192,12 @@ pub(crate) async fn retro_publish_pass(
                         }
                     );
                 }
-            });
-        } else {
-            let report = adapter
-                .retro_publish_blocks(bodies.iter(), RETRO_PUBLISH_MAX_PER_PASS)
-                .await;
-            if report.published > 0 || report.failed > 0 {
-                info!(
-                    "[retro-publish] heights {from}..={to}: published {}/{}, failed {}{}",
-                    report.published,
-                    report.attempted,
-                    report.failed,
-                    match &report.first_error {
-                        Some(e) => format!(" ({e})"),
-                        None => String::new(),
-                    }
-                );
+            }
+            if !boundary_bodies.is_empty() {
+                let max_b = boundary_bodies.len();
+                let _ = adapter
+                    .retro_publish_blocks(boundary_bodies.iter(), max_b)
+                    .await;
             }
         }
     }

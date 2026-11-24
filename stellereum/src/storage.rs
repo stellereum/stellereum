@@ -1894,6 +1894,36 @@ impl Storage {
         }
     }
 
+    // ---------- Validator-set activation history (P0-PEER-SNAPSHOT-ANCHOR) ----------
+
+    const VALIDATOR_SET_HISTORY_META_KEY: &'static [u8] = b"validator_set_history_v1";
+
+    /// Persist the ordered `(activation_height, ValidatorSet)` history in `"meta"`
+    /// so restarts retain exact per-height validator sets for snapshot anchor
+    /// and tip-QC verification.
+    pub fn put_validator_set_history(
+        &self,
+        history: &[(u64, crate::consensus::ValidatorSet)],
+    ) -> Result<()> {
+        let encoded = bincode::serialize(history)?;
+        self.meta
+            .insert(Self::VALIDATOR_SET_HISTORY_META_KEY, encoded.as_slice())?;
+        Ok(())
+    }
+
+    /// Load persisted `(activation_height, ValidatorSet)` history from `"meta"`,
+    /// if present.
+    pub fn load_validator_set_history(
+        &self,
+    ) -> Result<Option<Vec<(u64, crate::consensus::ValidatorSet)>>> {
+        let Some(bytes) = self.meta.get(Self::VALIDATOR_SET_HISTORY_META_KEY)? else {
+            return Ok(None);
+        };
+        let mut entries: Vec<(u64, crate::consensus::ValidatorSet)> = bincode::deserialize(&bytes)?;
+        entries.sort_by_key(|(h, _)| *h);
+        Ok(Some(entries))
+    }
+
     pub fn header_count(&self) -> Result<usize> {
         Ok(self.headers.len())
     }
@@ -6268,6 +6298,7 @@ pub enum PersistJob {
     XshardHeaders {
         bytes: Vec<u8>,
     },
+    ValidatorSetHistory(Vec<(u64, crate::consensus::ValidatorSet)>),
     Consensus(Box<ConsensusCheckpoint>),
     Finalized {
         height: u64,
@@ -6340,6 +6371,7 @@ pub fn persist_job_label(job: &PersistJob) -> &'static str {
         PersistJob::EvmBindingsState { .. } => "EVM bindings state snapshot",
         PersistJob::PqRegistry { .. } => "PQ registry snapshot",
         PersistJob::XshardHeaders { .. } => "cross-shard header registry",
+        PersistJob::ValidatorSetHistory(_) => "Validator-set activation history",
         PersistJob::Consensus(_) => "Consensus safety checkpoint",
         PersistJob::Finalized { .. } => "Finalized tip pointer",
         PersistJob::Prune { .. } => "Prune pass",
@@ -6375,6 +6407,7 @@ pub fn persist_drop_consequence(job: &PersistJob) -> &'static str {
         | PersistJob::EvmBindingsState { .. }
         | PersistJob::PqRegistry { .. }
         | PersistJob::XshardHeaders { .. }
+        | PersistJob::ValidatorSetHistory(_)
         | PersistJob::Flush => {
             "recoverable auxiliary state; the next cadence/finalize refreshes it"
         }
@@ -6496,6 +6529,9 @@ impl AsyncPersistence {
                     }
                     PersistJob::PqRegistry { height, bytes } => st.put_pq_registry(height, &bytes),
                     PersistJob::XshardHeaders { bytes } => st.put_xshard_headers(&bytes),
+                    PersistJob::ValidatorSetHistory(history) => {
+                        st.put_validator_set_history(&history)
+                    }
                     PersistJob::Consensus(cp) => st.set_consensus(&cp),
                     PersistJob::Finalized { height, hash } => st.set_finalized(height, &hash),
                     PersistJob::Receipts {
@@ -6771,6 +6807,15 @@ impl AsyncPersistence {
     /// finalize; `BoundedWait` keeps that window as small as the disk allows.
     pub fn enqueue_xshard_headers(&self, bytes: Vec<u8>) {
         self.push(PersistJob::XshardHeaders { bytes });
+    }
+
+    /// Non-blocking: enqueue the ordered `(activation_height, ValidatorSet)`
+    /// history snapshot (`BoundedWait` policy).
+    pub fn enqueue_validator_set_history(
+        &self,
+        history: Vec<(u64, crate::consensus::ValidatorSet)>,
+    ) {
+        self.push(PersistJob::ValidatorSetHistory(history));
     }
 
     /// Capture + enqueue the full domain snapshot (A9), plus the session-key

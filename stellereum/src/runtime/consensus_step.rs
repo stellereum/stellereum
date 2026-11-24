@@ -2390,6 +2390,28 @@ impl ValidatorRuntime {
             self.mark_validator_set_stale(state_height, ledger_height, reason);
             return false;
         }
+        // Boot / snapshot restore at an already-finalized tip (`state_height < hc.height`,
+        // e.g. `TIP` while `hc.height == TIP + 1`) with no prior history in memory and
+        // a unit-power config bootstrap placeholder in `self.validators`:
+        // Do NOT record `(0, config_set)` as if the boot placeholder governed `0..=TIP`.
+        // Seed `(ledger_height, vs)` as the authoritative bonded set covering `state_height`
+        // (`TIP`) so `validator_set_for_height(TIP)` and `validator_set_for_height_strict(TIP)`
+        // attribute the tip's own QC instead of falling back to the 4x1 config set, while
+        // `validator_set_for_height_strict(h)` for `h < ledger_height` still fails closed (`None`).
+        let is_unit_power_config =
+            !self.validators.is_empty() && self.validators.validators.values().all(|&p| p == 1);
+        if self.validator_set_history.is_empty()
+            && state_height > 0
+            && state_height < self.hc.height
+            && ledger_height <= state_height
+            && self.finalized.len() <= 1
+            && is_unit_power_config
+        {
+            let vs = ledger.to_validator_set();
+            if !vs.is_empty() && vs.validators.values().any(|&p| p > 1) {
+                self.validator_set_history.push_back((ledger_height, vs));
+            }
+        }
         self.install_validator_set_from_ledger(
             ledger,
             state_height,
@@ -2599,9 +2621,15 @@ impl ValidatorRuntime {
         );
         self.validators = vs.clone();
         self.hc.validators = vs.clone();
-        self.validator_set_history.push_back((activation, vs));
-        while self.validator_set_history.len() > VALIDATOR_SET_HISTORY_CAP {
-            self.validator_set_history.pop_front();
+        if self
+            .validator_set_history
+            .back()
+            .is_none_or(|(_, cur)| cur.validators != vs.validators)
+        {
+            self.validator_set_history.push_back((activation, vs));
+            while self.validator_set_history.len() > VALIDATOR_SET_HISTORY_CAP {
+                self.validator_set_history.pop_front();
+            }
         }
         true
     }
@@ -2681,29 +2709,100 @@ impl ValidatorRuntime {
     /// (verify against a newer set may refuse an ancient QC, never accept a
     /// quorum that was not one).
     pub fn validator_set_for_height(&self, h: u64) -> ValidatorSet {
+        let mut best: Option<(u64, &ValidatorSet)> = None;
+        for (activation, vs) in &self.validator_set_history {
+            if *activation <= h {
+                best = Some((*activation, vs));
+            }
+        }
         // A staged change already answers for heights at/above its
         // activation, even before the node advances there: the switch is
         // pre-agreed, not speculative.
         if let Some((activation, pending)) = &self.pending_validators {
-            if *activation <= h {
+            if *activation <= h && best.is_none_or(|(b_act, _)| *activation >= b_act) {
                 return pending.clone();
             }
         }
-        if h >= self.hc.height {
+        if h >= self.hc.height
+            && self
+                .validator_set_history
+                .back()
+                .is_none_or(|(last_act, _)| *last_act <= self.hc.height)
+        {
             return self.validators.clone();
         }
-        let mut best: Option<&ValidatorSet> = None;
-        for (activation, vs) in &self.validator_set_history {
-            if *activation <= h {
-                best = Some(vs);
-            }
-        }
-        best.cloned().unwrap_or_else(|| {
+        best.map(|(_, vs)| vs.clone()).unwrap_or_else(|| {
             self.validator_set_history
                 .front()
                 .map(|(_, vs)| vs.clone())
                 .unwrap_or_else(|| self.validators.clone())
         })
+    }
+
+    /// Strict per-height validator-set resolver for snapshot anchor and sync
+    /// verification (`P0-PEER-SNAPSHOT-ANCHOR`).
+    ///
+    /// Unlike [`Self::validator_set_for_height`], this NEVER silently
+    /// substitutes a neighboring/oldest history entry when `h` predates the
+    /// earliest recorded activation in `validator_set_history`, and refuses
+    /// (`None`) whenever the runtime's validator set is marked stale.
+    pub fn validator_set_for_height_strict(&self, h: u64) -> Option<ValidatorSet> {
+        if self.validator_set_stale {
+            return None;
+        }
+        let mut best: Option<(u64, &ValidatorSet)> = None;
+        for (activation, vs) in &self.validator_set_history {
+            if *activation <= h {
+                best = Some((*activation, vs));
+            }
+        }
+        if let Some((activation, pending)) = &self.pending_validators {
+            if *activation <= h && best.is_none_or(|(b_act, _)| *activation >= b_act) {
+                return Some(pending.clone());
+            }
+        }
+        if h >= self.hc.height
+            && self
+                .validator_set_history
+                .back()
+                .is_none_or(|(last_act, _)| *last_act <= self.hc.height)
+        {
+            return Some(self.validators.clone());
+        }
+        if self.validator_set_history.is_empty() {
+            return Some(self.validators.clone());
+        }
+        best.map(|(_, vs)| vs.clone())
+    }
+
+    /// Snapshot of the ordered `(activation_height, ValidatorSet)` history for
+    /// durable persistence in [`crate::storage::Storage`].
+    pub fn export_validator_set_history(&self) -> Vec<(u64, ValidatorSet)> {
+        self.validator_set_history.iter().cloned().collect()
+    }
+
+    /// Restore a previously persisted `(activation_height, ValidatorSet)`
+    /// history into the runtime (bounded by [`VALIDATOR_SET_HISTORY_CAP`]).
+    ///
+    /// Aligns `self.validators` and `self.hc.validators` to the newest entry
+    /// with `activation <= self.hc.height` if one exists.
+    pub fn restore_validator_set_history(&mut self, mut history: Vec<(u64, ValidatorSet)>) {
+        history.sort_by_key(|(h, _)| *h);
+        history.dedup_by(|a, b| a.0 == b.0 && a.1.validators == b.1.validators);
+        if history.len() > VALIDATOR_SET_HISTORY_CAP {
+            let drain = history.len() - VALIDATOR_SET_HISTORY_CAP;
+            history.drain(..drain);
+        }
+        self.validator_set_history = history.into_iter().collect();
+        if let Some((_, in_force)) = self
+            .validator_set_history
+            .iter()
+            .rev()
+            .find(|(act, _)| *act <= self.hc.height)
+        {
+            self.validators = in_force.clone();
+            self.hc.validators = in_force.clone();
+        }
     }
 
     /// Install a validator set derived from the MASTERCHAIN's staking ledger.

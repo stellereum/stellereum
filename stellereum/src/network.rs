@@ -1871,12 +1871,14 @@ impl P2pNetworkAdapter {
         let writes = plan_block_body_publish(&epoch, block)?;
         apply_publish_plan(&self.node, &writes).await?;
         let block_hash = block.compute_hash();
-        if claim_hq_publish(
-            &self.recent_hq_published,
-            block.shard_id,
-            block.height,
-            block_hash,
-        ) {
+        if publish_block_header_companion(&self.node, &epoch, block).await
+            && claim_hq_publish(
+                &self.recent_hq_published,
+                block.shard_id,
+                block.height,
+                block_hash,
+            )
+        {
             publish_block_qc_companion(&self.node, &epoch, block).await;
         }
         Ok(block_hash)
@@ -1933,7 +1935,9 @@ impl P2pNetworkAdapter {
                 match plan_block_body_publish(&epoch, b) {
                     Ok(writes) => {
                         apply_publish_plan(&node, &writes).await?;
-                        if claim_hq_publish(&recent_hq, b.shard_id, b.height, b.compute_hash()) {
+                        if publish_block_header_companion(&node, &epoch, b).await
+                            && claim_hq_publish(&recent_hq, b.shard_id, b.height, b.compute_hash())
+                        {
                             publish_block_qc_companion(&node, &epoch, b).await;
                         }
                         Ok(())
@@ -3643,6 +3647,42 @@ pub fn plan_block_body_publish_bytes(
     Ok(body_write(epoch, block_hash, body.to_vec()))
 }
 
+/// Plan the immutable header, v2 header, and height-to-hash index writes for `block`
+/// (`_h_`, `_h2_`, `_hi_`) that ride alongside retro-published blocks.
+///
+/// Safe to republish from any node: keyed by `(epoch, shard_id, height)` with zero
+/// `kv` writes and zero effect on `shard_{shard}_head` or `PREFIX_LATEST_HEIGHT`.
+pub fn plan_block_header_writes(epoch: &EpochTag, block: &Block) -> Vec<PublishWrite> {
+    let mut writes = Vec::with_capacity(3);
+    let block_hash = block.compute_hash();
+    let rec = crate::storage::BlockHeaderRecord::of(block);
+    if let Ok(bytes) = bincode::serialize(&rec) {
+        writes.push(PublishWrite {
+            bucket: BUCKET_STELLEREUM_HEADERS,
+            name: header_name(epoch, block.height),
+            bytes,
+            kv: Vec::new(),
+        });
+    }
+    let rec_v2 = crate::storage::BlockHeaderRecordV2::of(block);
+    if let Ok(v2_bytes) = bincode::serialize(&rec_v2) {
+        writes.push(PublishWrite {
+            bucket: BUCKET_STELLEREUM_HEADERS,
+            name: header_v2_name(epoch, block.shard_id, block.height),
+            bytes: v2_bytes,
+            kv: Vec::new(),
+        });
+    }
+    let idx = format!("{}:{}", block.height, hex::encode(block_hash));
+    writes.push(PublishWrite {
+        bucket: BUCKET_STELLEREUM_HEADERS,
+        name: header_index_name(epoch, block.shard_id, block.height),
+        bytes: idx.into_bytes(),
+        kv: Vec::new(),
+    });
+    writes
+}
+
 /// Plan the optional height-addressed precommit-QC sidecar write (`_hq_{shard}_{height}`)
 /// that rides alongside retro-published block bodies.
 ///
@@ -3689,6 +3729,29 @@ fn claim_hq_publish(
     }
     guard.insert((shard_id, height), (block_hash, now));
     true
+}
+
+async fn publish_block_header_companion(node: &Arc<Node>, epoch: &EpochTag, block: &Block) -> bool {
+    let ttl = dht_blob_ttl_ms(retention_keep_blocks());
+    let slots = header_publish_slots();
+    let writes = plan_block_header_writes(epoch, block);
+    if writes.len() < 3 {
+        return false;
+    }
+    let mut all_stored = true;
+    for (idx, w) in writes.into_iter().enumerate() {
+        let (charge, lane) = match idx {
+            0 => (slots[0].charge, slots[0].lane),
+            1 => (ReplStoreKind::Companion, slots[0].lane),
+            _ => (slots[1].charge, slots[1].lane),
+        };
+        let stored =
+            paced_store_blob_in_lane(node, w.bucket, &w.name, &w.bytes, ttl, charge, lane).await;
+        if stored == 0 {
+            all_stored = false;
+        }
+    }
+    all_stored
 }
 
 async fn publish_block_qc_companion(node: &Arc<Node>, epoch: &EpochTag, block: &Block) {
@@ -6177,8 +6240,22 @@ mod pointer_overwrite_tests {
         assert_eq!(report.published, 1);
         assert_eq!(report.failed, 0);
 
-        // Both body and _hq_ sidecar are retrievable, while shard_head remains untouched.
+        // Body, immutable headers/index, and _hq_ sidecar are all retrievable,
+        // while shard_head remains untouched.
         assert!(adapter.fetch_block(&hash).await.is_some());
+        let fetched_hash = adapter
+            .fetch_head_hash(0, 42)
+            .await
+            .expect("retro_publish_blocks must publish immutable height index");
+        assert_eq!(fetched_hash, hash);
+        assert!(
+            adapter.fetch_block_header(0, 42, hash).await.is_some(),
+            "retro_publish_blocks must publish immutable header"
+        );
+        assert!(
+            adapter.fetch_block_header_v2(0, 42, hash).await.is_some(),
+            "retro_publish_blocks must publish immutable v2 header"
+        );
         let fetched_qc = adapter
             .fetch_block_qc(0, 42)
             .await

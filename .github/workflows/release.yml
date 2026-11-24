@@ -1,0 +1,88 @@
+# Release — signed, reproducible-ish artifacts for a tag.
+#
+# Trigger: pushing a tag `v*`. Outputs, attached to the GitHub Release:
+#   stellereum-x86_64-unknown-linux-gnu            the node binary
+#   stellereum-x86_64-unknown-linux-gnu.sha256     its digest
+#   stellereum-x86_64-unknown-linux-gnu.sbom.spdx.json
+#   stellereum-x86_64-unknown-linux-gnu.sig / .pem cosign keyless signature
+#
+# Verify before deploying (README §Release in docs/RELEASE.md):
+#   cosign verify-blob \
+#     --certificate stellereum-*.pem --signature stellereum-*.sig \
+#     --certificate-identity-regexp '^https://github.com/stellereum/stellereum/' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#     stellereum-x86_64-unknown-linux-gnu
+#   sha256sum -c stellereum-x86_64-unknown-linux-gnu.sha256
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # create the release and upload assets
+  id-token: write   # cosign keyless (no long-lived signing key)
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  BIN: stellereum-x86_64-unknown-linux-gnu
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: stellereum
+          shared-key: release
+
+      # `--locked` is the reproducibility contract: the release must build from
+      # the committed lockfile, not from whatever the registry serves today.
+      - name: Build node (release, locked)
+        working-directory: stellereum
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Name, digest, SBOM
+        run: |
+          cp stellereum/target/x86_64-unknown-linux-gnu/release/stellereum "$BIN"
+          sha256sum "$BIN" > "$BIN.sha256"
+          cat "$BIN.sha256"
+
+      - name: SBOM (SPDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          path: ${{ env.BIN }}
+          format: spdx-json
+          output-file: ${{ env.BIN }}.sbom.spdx.json
+
+      - uses: sigstore/cosign-installer@v3
+
+      # Keyless signing: the signature is bound to this workflow's OIDC identity,
+      # so a verifier checks "built by this repo's Release workflow" instead of
+      # trusting a key file that could be copied anywhere.
+      - name: Sign the binary (keyless)
+        run: |
+          cosign sign-blob --yes \
+            --output-signature "$BIN.sig" \
+            --output-certificate "$BIN.pem" \
+            "$BIN"
+
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.BIN }}
+            ${{ env.BIN }}.sha256
+            ${{ env.BIN }}.sbom.spdx.json
+            ${{ env.BIN }}.sig
+            ${{ env.BIN }}.pem
+          fail_on_unmatched_files: true

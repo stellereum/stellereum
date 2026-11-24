@@ -232,3 +232,31 @@ jobs:
       - name: Build load-test harness
         working-directory: scripts/loadtest/loadtest
         run: cargo build --locked
+
+  # (g) Supply chain: advisories, licence drift, wildcard requirements, unknown
+  # registries. Policy lives in deny.toml. Read-only, no secrets.
+  deny:
+    name: deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+          manifest-path: stellereum/Cargo.toml
+
+  # (h) RustSec advisory check as an independent second opinion: cargo-deny can
+  # be silenced with an ignore, cargo-audit cannot be silenced by this repo at
+  # all, so a disagreement between them is visible in review.
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: stellereum

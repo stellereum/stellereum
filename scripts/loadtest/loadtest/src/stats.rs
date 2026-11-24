@@ -86,6 +86,13 @@ pub struct SenderOutcome {
     pub retries: u64,
     pub last_hash: Option<String>,
     pub stop_reason: Option<String>,
+    /// Submit -> observed on-chain nonce latencies for this sender, seconds.
+    /// Recorded when an RPC nonce read shows the transaction's nonce advanced;
+    /// this is inclusion as the RPC reports it, not BFT finality time.
+    pub confirmation_s: Vec<f64>,
+    /// Accepted nonces whose inclusion has not been observed yet:
+    /// `(nonce, accepted_at)`.
+    pub pending_confirm: Vec<(u64, std::time::Instant)>,
 }
 
 impl SenderOutcome {
@@ -97,6 +104,27 @@ impl SenderOutcome {
 
     pub fn backlog(&self) -> u64 {
         self.accepted.saturating_sub(self.included())
+    }
+
+    /// Move every pending nonce below `onchain` into `confirmation_s`.
+    ///
+    /// A nonce `n` is included when the observed on-chain nonce is `> n`.
+    /// Non-finite or negative durations are dropped rather than reported.
+    pub fn flush_confirmed(&mut self, onchain: u64, at: std::time::Instant) {
+        let mut keep = Vec::with_capacity(self.pending_confirm.len());
+        let mut done = Vec::new();
+        for (nonce, accepted_at) in self.pending_confirm.drain(..) {
+            if nonce < onchain {
+                let secs = at.saturating_duration_since(accepted_at).as_secs_f64();
+                if secs.is_finite() && secs >= 0.0 {
+                    done.push(secs);
+                }
+            } else {
+                keep.push((nonce, accepted_at));
+            }
+        }
+        self.pending_confirm = keep;
+        self.confirmation_s.extend(done);
     }
 }
 
@@ -380,6 +408,15 @@ pub fn build_report(
     let zero_tx_blocks = tx_per_block_values.iter().filter(|v| **v == 0.0).count();
     let total_txs_in_blocks: u64 = measured_blocks.iter().filter_map(|b| b.txs).sum();
 
+    // End-to-end confirmation: submission accepted by the RPC until a nonce
+    // read shows it on chain. The resolution is the harness poll cadence, not
+    // a node timestamp; see the report line and docs/PERF_MATRIX.md.
+    let confirmation_values: Vec<f64> = outcomes
+        .iter()
+        .flat_map(|o| o.confirmation_s.iter().copied())
+        .collect();
+    let confirmation = distribution(&confirmation_values);
+
     // The node's own report: timestamps are whole seconds, so this is a coarse
     // cross-check, not a replacement for the observed arrival intervals.
     let mut node_diffs = Vec::new();
@@ -488,6 +525,16 @@ pub fn build_report(
         text,
         "included (on-chain nonce delta): {included}   included rate: {} tx/s   backlog after drain: {backlog}",
         fmt(included_tps, 2)
+    );
+    let _ = writeln!(
+        text,
+        "{}",
+        dist_line(
+            "confirmation submit->nonce (s)",
+            confirmation.as_ref(),
+            " s",
+            3
+        )
     );
     let _ = writeln!(
         text,
@@ -693,6 +740,7 @@ pub fn build_report(
             "unknown": receipts.unknown,
         },
         "block_time_s": dist_json(block_time.as_ref()),
+        "confirmation_latency_s": dist_json(confirmation.as_ref()),
         "node_block_interval_s": dist_json(node_interval.as_ref()),
         "node_zero_diff_pairs": node_zero,
         "node_metrics_block_interval_s": match meta.metrics_block_interval {
@@ -872,6 +920,8 @@ mod tests {
             retries: 0,
             last_hash: None,
             stop_reason: None,
+            confirmation_s: Vec::new(),
+            pending_confirm: Vec::new(),
         };
         assert_eq!(o.included(), 2);
         assert_eq!(o.backlog(), 2);

@@ -819,6 +819,28 @@ fn parse_metrics_block_interval(text: &str) -> Option<(f64, u64)> {
 // Sender loop
 // ============================================================================
 
+/// Record submit -> observed-nonce latency for every pending nonce below
+/// `onchain`. Shared by the sender loop and the drain so a transaction is
+/// counted once, at the first poll that shows it included.
+fn flush_confirmations(
+    pending: &mut Vec<(u64, Instant)>,
+    out: &mut Vec<f64>,
+    onchain: u64,
+    at: Instant,
+) {
+    pending.retain(|(nonce, accepted_at)| {
+        if *nonce < onchain {
+            let secs = at.saturating_duration_since(*accepted_at).as_secs_f64();
+            if secs.is_finite() && secs >= 0.0 {
+                out.push(secs);
+            }
+            false
+        } else {
+            true
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 // GATE: the sender needs the full immutable config plus the shared run handles;
 // bundling them into a struct would only hide the ownership boundaries.
@@ -845,6 +867,8 @@ fn sender_loop(
     let mut retries = 0u64;
     let mut last_hash: Option<String> = None;
     let mut stop_reason: Option<String> = None;
+    let mut confirmation_s: Vec<f64> = Vec::new();
+    let mut pending_confirm: Vec<(u64, Instant)> = Vec::new();
     let mut mode = match cfg.pq_mode {
         PqMode::Implicit => PqMode::Implicit,
         _ => PqMode::Explicit,
@@ -876,7 +900,15 @@ fn sender_loop(
                 break 'outer;
             }
             match read_nonce(&client, &address) {
-                Ok(n) => onchain = n,
+                Ok(n) => {
+                    onchain = n;
+                    flush_confirmations(
+                        &mut pending_confirm,
+                        &mut confirmation_s,
+                        onchain,
+                        Instant::now(),
+                    );
+                }
                 Err(e) => {
                     stats.read_errors.fetch_add(1, Ordering::Relaxed);
                     stats.record_error(&e);
@@ -946,6 +978,7 @@ fn sender_loop(
                     stats.accepted.fetch_add(1, Ordering::Relaxed);
                     last_hash = Some(computed_hash.clone());
                     accepted_this = true;
+                    pending_confirm.push((nonce, Instant::now()));
                     if activation_pending {
                         match wait_for_nonce(
                             &client,
@@ -959,6 +992,12 @@ fn sender_loop(
                         ) {
                             Ok(n) => {
                                 onchain = n;
+                                flush_confirmations(
+                                    &mut pending_confirm,
+                                    &mut confirmation_s,
+                                    onchain,
+                                    Instant::now(),
+                                );
                                 mode = PqMode::Implicit;
                                 activation_pending = false;
                             }
@@ -977,6 +1016,7 @@ fn sender_loop(
                     stats.duplicates.fetch_add(1, Ordering::Relaxed);
                     last_hash = Some(computed_hash.clone());
                     accepted_this = true;
+                    pending_confirm.push((nonce, Instant::now()));
                     if activation_pending {
                         match wait_for_nonce(
                             &client,
@@ -990,6 +1030,12 @@ fn sender_loop(
                         ) {
                             Ok(n) => {
                                 onchain = n;
+                                flush_confirmations(
+                                    &mut pending_confirm,
+                                    &mut confirmation_s,
+                                    onchain,
+                                    Instant::now(),
+                                );
                                 mode = PqMode::Implicit;
                                 activation_pending = false;
                             }
@@ -1115,6 +1161,8 @@ fn sender_loop(
         retries,
         last_hash,
         stop_reason,
+        confirmation_s,
+        pending_confirm,
     }
 }
 
@@ -1182,8 +1230,9 @@ fn drain(
 
     loop {
         let mut all_done = true;
-        for (i, o) in outcomes.iter().enumerate() {
+        for i in 0..outcomes.len() {
             if onchain[i] >= targets[i] {
+                outcomes[i].flush_confirmed(onchain[i], Instant::now());
                 continue;
             }
             all_done = false;
@@ -1194,11 +1243,12 @@ fn drain(
                 break;
             }
             let client = &clients[i % clients.len()];
-            match read_nonce(client, &o.address) {
+            match read_nonce(client, &outcomes[i].address) {
                 Ok(n) => {
                     if n > onchain[i] {
                         onchain[i] = n.min(targets[i]);
                     }
+                    outcomes[i].flush_confirmed(onchain[i], Instant::now());
                 }
                 Err(e) => {
                     stats.read_errors.fetch_add(1, Ordering::Relaxed);
@@ -1217,6 +1267,7 @@ fn drain(
 
     for (i, o) in outcomes.iter_mut().enumerate() {
         o.onchain_nonce_after = onchain[i];
+        o.flush_confirmed(onchain[i], Instant::now());
     }
 }
 
@@ -1665,6 +1716,8 @@ mod tests {
             retries: 0,
             last_hash: Some("abc".to_string()),
             stop_reason: None,
+            confirmation_s: Vec::new(),
+            pending_confirm: Vec::new(),
         };
         let stats = Stats::new(0, 0, 0);
         let sample = sample_receipts_until(

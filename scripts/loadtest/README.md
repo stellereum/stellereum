@@ -9,6 +9,8 @@ present. Known live-cluster hosts additionally require `--operator-order`.**
 
 The Wave-2 procedure, funding math and stop conditions live in
 [`docs/LOADTEST_RUNBOOK.md`](../../docs/LOADTEST_RUNBOOK.md).
+The reproducible N × rate × block-floor matrix and its evidence rules live in
+[`docs/PERF_MATRIX.md`](../../docs/PERF_MATRIX.md).
 
 ---
 
@@ -237,11 +239,14 @@ while balance and base fee are decimal strings.
 
 ## 7. Reading the output
 
+The shape is shown below; the numbers are illustrative, not a claim.
+
 ```
 submitted (unique signed txs): 54001
 accepted: 54000   failed: 0   duplicates: 0   retries: 3   429s: 0   unresolved: 0
 achieved accepted rate: 60.00 tx/s
 included (on-chain nonce delta): 54000   included rate: 60.00 tx/s   backlog after drain: 0
+confirmation submit->nonce (s): n=54000 min=0.041 p50=0.287 p95=0.702 p99=1.311 max=2.004 mean=0.322 s
 block time observed (s): n=900 min=0.802 p50=1.001 p95=1.204 p99=1.402 max=2.110 mean=1.003 s
 tx per block: n=900 min=40 p50=60 p95=61 p99=62 max=64 mean=60.00
 node-reported interval (1 s timestamps): ...
@@ -262,6 +267,11 @@ node-reported interval (1 s timestamps): ...
 * **achieved accepted tx/s** — accepted / actual sending window.
 * **included** — sum of on-chain nonce advances for the sender set after drain.
   This is the authoritative "made it into blocks" count.
+* **confirmation** — accepted submission to the first RPC nonce read that shows
+  the transaction included. It is inclusion as the RPC reports it, **not** BFT
+  finality, and its resolution is the poll cadence (`--nonce-poll-ms` during
+  the window, `--drain-poll-ms` after it). Exported as
+  `confirmation_latency_s`; a binary built before this field omits it.
 * **backlog after drain** — accepted but not executed. Non-zero is a FAIL.
 * **block time** — wall-clock arrival intervals of new `stell_blockNumber`
   heights, sampled every `--poll-ms`. Percentiles are over the sending window.
@@ -289,6 +299,9 @@ funding failure, `4` ABORTED by a stop condition.
 * Block-time percentiles are measured at `--poll-ms` resolution (default 200 ms)
   and the first interval includes poller startup; both are visible in the
   sample count.
+* Confirmation latencies are RPC-observed: a nonce read shows the transaction
+  included. Resolution is `--nonce-poll-ms` during the window and
+  `--drain-poll-ms` after it, and it is inclusion, not BFT finality.
 * The default node budget is 300 standalone RPC requests/second per IP. A
   500 tx/s wave from one IP needs the operator to raise
   `STELL_STANDALONE_RATE_LIMIT` on the target (restart required). The harness

@@ -1,7 +1,7 @@
 //! Fail-loud liveness alarm: pure decision-function matrix + counter.
 //!
-//! The alarm itself lives in the production drain loop (`src/main.rs`,
-//! backed by `src/liveness_alarm.rs`). An end-to-end test through the real
+//! The alarm itself lives in the production drain loop (`src/node/consensus_driver/`),
+//! backed by `stellereum::liveness_alarm`. An end-to-end test through the real
 //! loop is deliberately NOT attempted here: the existing harness
 //! (`tests/support/consensus_cluster.rs`) drives `ValidatorRuntime`
 //! directly on a virtual clock and never runs `run_consensus_node` (no
@@ -14,10 +14,7 @@
 //! NOTE on harness integration: not trivial (see above) — pure-fn tests
 //! suffice per the task brief.
 
-#[path = "../src/liveness_alarm.rs"]
-mod liveness_alarm;
-
-use liveness_alarm::{
+use stellereum::liveness_alarm::{
     liveness_alarm_count, liveness_alarm_due, liveness_alarm_silence_ms, note_liveness_alarm,
     now_ms as alarm_now_ms, should_liveness_alarm, LIVENESS_ALARM_SILENCE_MS,
     LIVENESS_ALARM_THROTTLE_MS,

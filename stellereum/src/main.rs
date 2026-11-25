@@ -8,14 +8,6 @@ use clap::Parser;
 mod cli;
 mod node;
 
-/// Fail-loud consensus-traffic liveness alarm (tiny helper, no consensus/wire
-/// impact). Included by path so `src/lib.rs` stays untouched; the drain loop
-/// below owns all state and wiring, this only decides and counts — and the
-/// same file is included by `tests/liveness_alarm_tests.rs` for the pure-fn
-/// matrix.
-#[path = "liveness_alarm.rs"]
-pub(crate) mod liveness_alarm;
-
 #[cfg(test)]
 mod bin_tests;
 

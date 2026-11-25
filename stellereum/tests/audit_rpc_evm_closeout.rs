@@ -752,6 +752,11 @@ fn f10_metrics_exposes_nothing_sensitive() {
             || line.starts_with('#')
             || line.starts_with("stell_consensus_")
             || line.starts_with("stell_block_")
+            || line.starts_with("stell_phase_seconds")
+            || line.starts_with("stell_cpu_per_block_seconds")
+            || line.starts_with("stell_falcon_sign_total")
+            || line.starts_with("stell_apply_seconds")
+            || line.starts_with("stell_propose_gate_blocked_total")
             || line.starts_with("stell_peer_latency_seconds")
             || line.starts_with("stell_peer_round_lag")
             || line.starts_with("stell_fork_total")
@@ -919,7 +924,11 @@ fn light_client_is_wired_into_the_sync_path() {
         include_str!("../src/main.rs"),
         include_str!("../src/cli/args.rs"),
         include_str!("../src/cli/handlers.rs"),
-        include_str!("../src/node/consensus_driver.rs"),
+        include_str!("../src/node/consensus_driver/mod.rs"),
+        include_str!("../src/node/consensus_driver/tick.rs"),
+        include_str!("../src/node/consensus_driver/adopt.rs"),
+        include_str!("../src/node/consensus_driver/propose.rs"),
+        include_str!("../src/node/consensus_driver/catchup.rs"),
     );
     const RUNTIME_RS: &str = include_str!("../src/runtime/mod.rs");
     const RPC_RS: &str = concat!(

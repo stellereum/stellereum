@@ -27,7 +27,8 @@ use stellereum::storage::{DomainSnapshot, Storage};
 #[test]
 fn heal_failure_path_refuses_instead_of_mislabeling() {
     let src = concat!(
-        include_str!("../src/node/consensus_driver.rs"),
+        include_str!("../src/node/consensus_driver/mod.rs"),
+        include_str!("../src/node/consensus_driver/catchup.rs"),
         include_str!("../src/node/policy.rs"),
     );
 

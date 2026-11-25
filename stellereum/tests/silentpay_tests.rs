@@ -24,25 +24,18 @@
 //!     other collisions) + spend-sig domain distinct
 //!  F. SHAKE-256 NIST-vector pin (vendored sponge check)
 
-#[path = "../src/silentpay.rs"]
-mod silentpay;
-// GATE: cross-verify KAT only needs the HashPool tags/commit/null shapes;
-// the rest of the included module is intentionally unused here.
-#[path = "../src/hashpool.rs"]
-#[allow(dead_code)]
-mod hashpool;
-
 use ml_kem::{
     kem::{FromSeed, KeyExport},
     MlKem768,
 };
-use silentpay::{
-    sp_attacker_rebuild, sp_chain_step, sp_commit, sp_nullifier, sp_send, sp_shake256,
+use stellereum::hashpool;
+use stellereum::post_quantum::{verify_pq_signature, FalconKeypair, PqScheme};
+use stellereum::silentpay::{
+    self, sp_attacker_rebuild, sp_chain_step, sp_commit, sp_nullifier, sp_send, sp_shake256,
     sp_shake256_32, sp_spend_sig_msg, sp_stealth_address, SpError, SpNote, SpPool, SpRecipient,
     SpSpendAuth, SP_CHAIN_DST, SP_CT_LEN, SP_EK_LEN, SP_GENESIS_CHAIN, SP_SPEND_DST,
     SP_STEALTH_DST,
 };
-use stellereum::post_quantum::{verify_pq_signature, FalconKeypair, PqScheme};
 
 // ---------------------------------------------------------------------------
 // Helpers

@@ -35,6 +35,7 @@ pub mod hash384;
 pub mod hashpool;
 pub mod light_client;
 pub mod light_client_cli;
+pub mod liveness_alarm;
 pub mod mempool;
 pub mod metrics;
 pub mod mev;

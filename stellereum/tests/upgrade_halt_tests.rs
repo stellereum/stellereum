@@ -501,7 +501,10 @@ fn satisfaction_truth_table() {
 ///   helper.
 #[test]
 fn halt_lane_drains_writes_marker_then_exits() {
-    let driver = include_str!("../src/node/consensus_driver.rs");
+    let driver = concat!(
+        include_str!("../src/node/consensus_driver/mod.rs"),
+        include_str!("../src/node/consensus_driver/tick.rs"),
+    );
     let bootstrap = include_str!("../src/node/bootstrap.rs");
     let proto = include_str!("../../infnode/crates/infnode/src/proto.rs");
 

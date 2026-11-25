@@ -941,6 +941,8 @@ impl Database {
 
     pub fn insert_transaction_in_shard(&self, shard_id: u32, tx: &TxRecord) -> Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let h = Self::clamp_u64(tx.block_height);
+        let ts = Self::clamp_u64(tx.timestamp);
         conn.execute(
             "INSERT OR REPLACE INTO transactions
              (shard_id, tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp)
@@ -948,7 +950,7 @@ impl Database {
             params![
                 shard_id,
                 tx.tx_hash,
-                tx.block_height,
+                h,
                 tx.tx_index,
                 tx.from_addr,
                 tx.to_addr,
@@ -956,7 +958,7 @@ impl Database {
                 tx.fee_charged,
                 tx.gas_limit,
                 tx.status,
-                tx.timestamp
+                ts
             ],
         )?;
 
@@ -967,7 +969,7 @@ impl Database {
              ON CONFLICT(address) DO UPDATE SET
                  tx_count = tx_count + 1,
                  last_seen_height = MAX(last_seen_height, ?2)",
-            params![tx.from_addr, tx.block_height],
+            params![tx.from_addr, h],
         )?;
 
         // Update recipient account
@@ -978,7 +980,7 @@ impl Database {
                  ON CONFLICT(address) DO UPDATE SET
                      tx_count = tx_count + 1,
                      last_seen_height = MAX(last_seen_height, ?2)",
-                params![tx.to_addr, tx.block_height],
+                params![tx.to_addr, h],
             )?;
         }
 
@@ -1038,7 +1040,7 @@ impl Database {
             params![
                 shard_id,
                 e.tx_hash,
-                e.block_height,
+                Self::clamp_u64(e.block_height),
                 e.log_index,
                 e.contract,
                 e.topic0,
@@ -1069,7 +1071,7 @@ impl Database {
                 stmt.execute(params![
                     shard_id,
                     e.tx_hash,
-                    e.block_height,
+                    Self::clamp_u64(e.block_height),
                     e.log_index,
                     e.contract,
                     e.topic0,
@@ -1461,7 +1463,7 @@ impl Database {
                 v.flags,
                 v.source_hash.to_lowercase(),
                 v.code_hash.to_lowercase(),
-                v.verified_at,
+                Self::clamp_u64(v.verified_at),
             ],
         )?;
         Ok(())
@@ -1646,12 +1648,16 @@ impl Database {
     }
 
     pub fn get_block_by_height(&self, height: u64) -> Result<Option<BlockRecord>> {
+        if height > i64::MAX as u64 {
+            return Ok(None);
+        }
+        let h = height as i64;
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT shard_id, height, hash, timestamp, tx_count, proposer, state_root
              FROM blocks WHERE height = ?1 ORDER BY shard_id ASC LIMIT 1",
         )?;
-        let mut rows = stmt.query_map(params![height], |row| {
+        let mut rows = stmt.query_map(params![h], |row| {
             let proposer: Option<String> = row.get(5)?;
             let proposer_stl57 = proposer.as_deref().and_then(to_stl57);
             Ok(BlockRecord {
@@ -1677,12 +1683,16 @@ impl Database {
         shard_id: u32,
         height: u64,
     ) -> Result<Option<BlockRecord>> {
+        if height > i64::MAX as u64 {
+            return Ok(None);
+        }
+        let h = height as i64;
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT shard_id, height, hash, timestamp, tx_count, proposer, state_root
              FROM blocks WHERE shard_id = ?1 AND height = ?2",
         )?;
-        let mut rows = stmt.query_map(params![shard_id, height], |row| {
+        let mut rows = stmt.query_map(params![shard_id, h], |row| {
             let proposer: Option<String> = row.get(5)?;
             let proposer_stl57 = proposer.as_deref().and_then(to_stl57);
             Ok(BlockRecord {
@@ -1738,12 +1748,16 @@ impl Database {
     }
 
     pub fn get_block_txs(&self, height: u64) -> Result<Vec<TxRecord>> {
+        if height > i64::MAX as u64 {
+            return Ok(Vec::new());
+        }
+        let h = height as i64;
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp
              FROM transactions WHERE block_height = ?1 ORDER BY tx_index ASC",
         )?;
-        let rows = stmt.query_map(params![height], Self::map_tx_row)?;
+        let rows = stmt.query_map(params![h], Self::map_tx_row)?;
         let mut res = Vec::new();
         for r in rows {
             res.push(r?);
@@ -1764,12 +1778,16 @@ impl Database {
     }
 
     pub fn get_block_txs_for_shard(&self, shard_id: u32, height: u64) -> Result<Vec<TxRecord>> {
+        if height > i64::MAX as u64 {
+            return Ok(Vec::new());
+        }
+        let h = height as i64;
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp
              FROM transactions WHERE shard_id = ?1 AND block_height = ?2 ORDER BY tx_index ASC",
         )?;
-        let rows = stmt.query_map(params![shard_id, height], Self::map_tx_row)?;
+        let rows = stmt.query_map(params![shard_id, h], Self::map_tx_row)?;
         let mut res = Vec::new();
         for r in rows {
             res.push(r?);

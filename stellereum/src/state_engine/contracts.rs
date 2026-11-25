@@ -728,6 +728,7 @@ impl InMemoryStateEngine {
     /// - Zero state changes: mutations to storage or balances are immediately discarded.
     /// - Zero gas fee charged to any account.
     /// - Bounded by a safety fuel limit (e.g. 5,000,000 fuel) to prevent infinite loops.
+    /// - Offloaded onto `tokio::task::spawn_blocking` without holding `contracts` `RwLock`.
     pub async fn run_get_method(
         &self,
         address: &[u8; 32],
@@ -735,13 +736,29 @@ impl InMemoryStateEngine {
         args: &[i64],
         fuel_limit: Option<u64>,
     ) -> crate::contract::GetMethodResponse {
-        let contracts = self.contracts.read().await;
-        contracts.run_get_method(address, method, args, fuel_limit)
+        let maybe_contract = {
+            let contracts = self.contracts.read().await;
+            contracts.contracts.get(address).cloned()
+        };
+        let Some(contract) = maybe_contract else {
+            return crate::contract::GetMethodResponse::error("contract not found", 0);
+        };
+        let addr = *address;
+        let method = method.to_string();
+        let args = args.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut snapshot = crate::contract::ContractRegistry::new();
+            snapshot.contracts.insert(addr, contract);
+            snapshot.run_get_method(&addr, &method, &args, fuel_limit)
+        })
+        .await
+        .unwrap_or_else(|_| crate::contract::GetMethodResponse::error("get method task failed", 0))
     }
 
     /// Read-only getter execution validated against the contract's ABI
     /// manifest: the method and its arguments must match the manifest, and
     /// the typed return value is decoded from the outcome.
+    /// Offloaded onto `tokio::task::spawn_blocking` without holding `contracts` `RwLock`.
     pub async fn run_get_method_typed(
         &self,
         address: &[u8; 32],
@@ -749,8 +766,23 @@ impl InMemoryStateEngine {
         args: &[crate::contract_abi::AbiValue],
         fuel_limit: Option<u64>,
     ) -> crate::contract::GetMethodResponse {
-        let contracts = self.contracts.read().await;
-        contracts.run_get_method_typed(address, method, args, fuel_limit)
+        let maybe_contract = {
+            let contracts = self.contracts.read().await;
+            contracts.contracts.get(address).cloned()
+        };
+        let Some(contract) = maybe_contract else {
+            return crate::contract::GetMethodResponse::error("contract not found", 0);
+        };
+        let addr = *address;
+        let method = method.to_string();
+        let args = args.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut snapshot = crate::contract::ContractRegistry::new();
+            snapshot.contracts.insert(addr, contract);
+            snapshot.run_get_method_typed(&addr, &method, &args, fuel_limit)
+        })
+        .await
+        .unwrap_or_else(|_| crate::contract::GetMethodResponse::error("get method task failed", 0))
     }
 
     /// Read-only getter execution with a single `i64` argument.

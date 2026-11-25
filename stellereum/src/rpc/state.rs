@@ -903,6 +903,9 @@ impl RpcState {
         // the receipt index stays the source of truth for the RPC reads.
         drop(idx);
         for (i, tx) in txs.iter().enumerate() {
+            if i > 0 && i % 64 == 0 {
+                tokio::task::yield_now().await;
+            }
             let success = statuses.get(i).copied().unwrap_or(false);
             let hash = hashes[i];
             publish_new_tx(
@@ -1323,7 +1326,7 @@ pub async fn handle_rpc_batch_call_with_limiter(
             });
             continue;
         }
-        let _expensive_permit = match try_acquire_http_expensive_read(&req.method) {
+        let _expensive_permit = match try_acquire_http_expensive_read_with_ip(&req.method, ip) {
             Ok(p) => p,
             Err(msg) => {
                 out.push(RpcResponse {

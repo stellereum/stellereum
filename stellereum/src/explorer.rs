@@ -3738,8 +3738,9 @@ pub fn router(gateway: Arc<GatewayState>) -> Router {
         // so a browser can `EventSource("/events")` against the public
         // gateway without going through the `/rpc` prefix. Idle streams are
         // reaped on the handler's configured window (SSE_IDLE_TIMEOUT_SECS /
-        // STELL_SSE_IDLE_TIMEOUT_SECS), so one request cannot hold a gateway
-        // concurrency permit forever.
+        // STELL_SSE_IDLE_TIMEOUT_SECS), and concurrent streams are bounded by
+        // `SSE_MAX_CONNECTIONS`, `SSE_MAX_CONNECTIONS_PER_CLIENT`, and
+        // `MAX_ATTACHED_PER_SUB` via RAII guards released on stream drop.
         .route("/events", get(crate::rpc::sse_handler))
         .layer(middleware::from_fn_with_state(gateway.clone(), rate_limit))
         .with_state(gateway);

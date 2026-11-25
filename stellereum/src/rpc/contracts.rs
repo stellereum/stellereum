@@ -321,20 +321,44 @@ pub(super) async fn preview_contract_call(
         }
     }
     let ctx = preview_call_context(*sender, block_time);
+    enum OwnedPreviewCall {
+        Plain(Vec<i64>),
+        RawArgs(Vec<i64>, Vec<u8>),
+        Abi(Vec<AbiValue>),
+    }
+    let owned_call = match call {
+        PreviewCall::Plain(args) => OwnedPreviewCall::Plain(args.to_vec()),
+        PreviewCall::RawArgs(args, calldata) => {
+            OwnedPreviewCall::RawArgs(args.to_vec(), calldata.to_vec())
+        }
+        PreviewCall::Abi(args) => OwnedPreviewCall::Abi(args.to_vec()),
+    };
+    let contract_addr = *contract_addr;
+    let method_owned = method.to_string();
     let exec: Result<
         (i64, u64, Vec<crate::contract::ContractEvent>),
         crate::contract::ContractError,
-    > = match call {
-        PreviewCall::Plain(args) => work
-            .call_with_context_args(contract_addr, method, args, gas_limit, &ctx)
+    > = tokio::task::spawn_blocking(move || match owned_call {
+        OwnedPreviewCall::Plain(args) => work
+            .call_with_context_args(&contract_addr, &method_owned, &args, gas_limit, &ctx)
             .map(|o| (o.result, o.fuel_used, o.events)),
-        PreviewCall::RawArgs(args, calldata) => work
-            .call_with_context_args_calldata(contract_addr, method, args, calldata, gas_limit, &ctx)
+        OwnedPreviewCall::RawArgs(args, calldata) => work
+            .call_with_context_args_calldata(
+                &contract_addr,
+                &method_owned,
+                &args,
+                &calldata,
+                gas_limit,
+                &ctx,
+            )
             .map(|o| (o.result, o.fuel_used, o.events)),
-        PreviewCall::Abi(args) => work
-            .call_abi_with_context(contract_addr, method, args, gas_limit, &ctx)
+        OwnedPreviewCall::Abi(args) => work
+            .call_abi_with_context(&contract_addr, &method_owned, &args, gas_limit, &ctx)
             .map(|o| (o.result, o.fuel_used, o.events)),
-    };
+    })
+    .await
+    .map_err(|_| crate::contract::ContractError::Trapped)
+    .and_then(|r| r);
     // Same outcome mapping as the engine's structured-call helpers.
     match exec {
         Ok((ret, used, events)) => crate::state_engine::ContractCallOutcome {

@@ -688,7 +688,9 @@ pub(super) async fn simulate_and_estimate_fee(
     mut sim_tx: Transaction,
     gas_budget: u64,
 ) -> Json<RpcResponse> {
-    let is_cross_shard = sim_tx.source_shard != sim_tx.target_shard;
+    let source_shard = sim_tx.source_shard;
+    let target_shard = sim_tx.target_shard;
+    let is_cross_shard = source_shard != target_shard;
     let is_plain_fast_path = sim_tx.payload.is_empty()
         && !crate::evm_adapter::is_evm_carrier_tx(&sim_tx)
         && !crate::evm_adapter::is_evm_binding_tx(&sim_tx);
@@ -767,16 +769,24 @@ pub(super) async fn simulate_and_estimate_fee(
         // gone: it could only ever evaluate to 5 000 000, so the `.max()` was
         // dead code pretending to be a caller-controllable floor.
         sim_tx.gas_limit = gas_budget;
-        let gas_consumed = match sim_engine.execute_payload(&sim_tx, now).await {
-            Ok((crate::svm::VmExecutionResult::Success { gas_used, .. }, _)) => gas_used,
-            Ok((crate::svm::VmExecutionResult::OutOfGas, _)) => {
+        let handle = tokio::runtime::Handle::current();
+        let exec_res = tokio::task::spawn_blocking(move || {
+            handle.block_on(sim_engine.execute_payload(&sim_tx, now))
+        })
+        .await;
+        let gas_consumed = match exec_res {
+            Ok(Ok((crate::svm::VmExecutionResult::Success { gas_used, .. }, _))) => gas_used,
+            Ok(Ok((crate::svm::VmExecutionResult::OutOfGas, _))) => {
                 return err(id, -32000, "simulation out of gas");
             }
-            Ok((crate::svm::VmExecutionResult::Reverted(reason), _)) => {
+            Ok(Ok((crate::svm::VmExecutionResult::Reverted(reason), _))) => {
                 return err(id, -32000, format!("simulation reverted: {reason}"));
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 return err(id, -32000, format!("simulation failed: {e}"));
+            }
+            Err(_) => {
+                return err(id, -32000, "simulation task failed");
             }
         };
         (surcharge, base_fee, gas_consumed)
@@ -792,8 +802,8 @@ pub(super) async fn simulate_and_estimate_fee(
             "gas_limit": gas_limit,
             "estimated_fee": estimated_fee,
             "base_fee": base_fee,
-            "source_shard": sim_tx.source_shard,
-            "target_shard": sim_tx.target_shard,
+            "source_shard": source_shard,
+            "target_shard": target_shard,
             "is_cross_shard": is_cross_shard,
             // The gas budget the simulation actually ran with, and the fixed
             // ceiling it can never exceed (audit W7.2): a caller can see the
@@ -936,95 +946,101 @@ pub(super) async fn handle_get_proof(
     // the fold is a write, so it must not happen while the read lock below
     // is held.
     let _ = st.engine.get_state_root().await;
-    let trie = st.engine.state_trie.read().await;
-    // The root is read from the SAME trie snapshot the proofs come from, so
-    // the answer can never mix a root from one state with a proof from
-    // another.
-    let root = trie.root_hash();
-
-    // Account: inclusion proof when the account is in the trie, exclusion
-    // proof when it is not. Both are anchored at the same root.
-    let account_proof = trie
-        .compressed()
-        .generate_proof(&address)
-        .or_else(|| trie.compressed().generate_exclusion_proof(&address));
-    let (account_nodes, balance, nonce, account_exists) = match &account_proof {
-        Some(p) if p.kind == crate::cpat2::ProofKind::Inclusion => {
-            let (b, n) = decode_account_leaf(&p.value);
-            // Fail closed: never serve a proof this node cannot verify
-            // against the root it is serving. A broken proof is worse than
-            // no proof, because the client would believe it.
-            if !crate::cpat2::verify_proof(&root, &address, &p.value, p) {
-                return err(
-                    id,
-                    -32000,
-                    "internal error: generated account proof does not verify",
-                );
-            }
-            (p.to_nodes(), b, n, true)
-        }
-        Some(p) => {
-            if !crate::cpat2::verify_exclusion_proof(&root, &address, p) {
-                return err(
-                    id,
-                    -32000,
-                    "internal error: generated exclusion proof does not verify",
-                );
-            }
-            (p.to_nodes(), 0u64, 0u64, false)
-        }
-        // An empty trie has nothing to prove against.
-        None => (Vec::new(), 0u64, 0u64, false),
+    // Clone the compressed trie snapshot under a brief read lock, then release
+    // the lock before offloading proof generation + verification onto
+    // `spawn_blocking`.
+    let compressed = {
+        let trie = st.engine.state_trie.read().await;
+        trie.compressed().clone()
     };
+    let proof_res = tokio::task::spawn_blocking(move || {
+        // The root is read from the SAME trie snapshot the proofs come from, so
+        // the answer can never mix a root from one state with a proof from
+        // another.
+        let root = compressed.root_hash();
 
-    let mut storage_proofs: Vec<Value> = Vec::with_capacity(storage_keys.len());
-    for k in &storage_keys {
-        let proof = trie
-            .compressed()
-            .generate_proof(k)
-            .or_else(|| trie.compressed().generate_exclusion_proof(k));
-        match proof {
+        // Account: inclusion proof when the account is in the trie, exclusion
+        // proof when it is not. Both are anchored at the same root.
+        let account_proof = compressed
+            .generate_proof(&address)
+            .or_else(|| compressed.generate_exclusion_proof(&address));
+        let (account_nodes, balance, nonce, account_exists) = match &account_proof {
             Some(p) if p.kind == crate::cpat2::ProofKind::Inclusion => {
-                if !crate::cpat2::verify_proof(&root, k, &p.value, &p) {
-                    return err(
-                        id,
-                        -32000,
-                        "internal error: generated storage proof does not verify",
-                    );
+                let (b, n) = decode_account_leaf(&p.value);
+                // Fail closed: never serve a proof this node cannot verify
+                // against the root it is serving. A broken proof is worse than
+                // no proof, because the client would believe it.
+                if !crate::cpat2::verify_proof(&root, &address, &p.value, p) {
+                    return Err("internal error: generated account proof does not verify");
                 }
-                storage_proofs.push(json!({
-                    "key": hex::encode(k),
-                    "value": hex::encode(&p.value),
-                    "exists": true,
-                    "proof": p.to_nodes(),
-                }));
+                (p.to_nodes(), b, n, true)
             }
             Some(p) => {
-                if !crate::cpat2::verify_exclusion_proof(&root, k, &p) {
-                    return err(
-                        id,
-                        -32000,
-                        "internal error: generated storage exclusion proof does not verify",
-                    );
+                if !crate::cpat2::verify_exclusion_proof(&root, &address, p) {
+                    return Err("internal error: generated exclusion proof does not verify");
                 }
-                storage_proofs.push(json!({
-                    "key": hex::encode(k),
-                    "value": Value::Null,
-                    "exists": false,
-                    "proof": p.to_nodes(),
-                }));
+                (p.to_nodes(), 0u64, 0u64, false)
             }
-            None => {
-                storage_proofs.push(json!({
-                    "key": hex::encode(k),
-                    "value": Value::Null,
-                    "exists": false,
-                    "proof": Vec::<String>::new(),
-                }));
+            // An empty trie has nothing to prove against.
+            None => (Vec::new(), 0u64, 0u64, false),
+        };
+
+        let mut storage_proofs: Vec<Value> = Vec::with_capacity(storage_keys.len());
+        for k in &storage_keys {
+            let proof = compressed
+                .generate_proof(k)
+                .or_else(|| compressed.generate_exclusion_proof(k));
+            match proof {
+                Some(p) if p.kind == crate::cpat2::ProofKind::Inclusion => {
+                    if !crate::cpat2::verify_proof(&root, k, &p.value, &p) {
+                        return Err("internal error: generated storage proof does not verify");
+                    }
+                    storage_proofs.push(json!({
+                        "key": hex::encode(k),
+                        "value": hex::encode(&p.value),
+                        "exists": true,
+                        "proof": p.to_nodes(),
+                    }));
+                }
+                Some(p) => {
+                    if !crate::cpat2::verify_exclusion_proof(&root, k, &p) {
+                        return Err(
+                            "internal error: generated storage exclusion proof does not verify",
+                        );
+                    }
+                    storage_proofs.push(json!({
+                        "key": hex::encode(k),
+                        "value": Value::Null,
+                        "exists": false,
+                        "proof": p.to_nodes(),
+                    }));
+                }
+                None => {
+                    storage_proofs.push(json!({
+                        "key": hex::encode(k),
+                        "value": Value::Null,
+                        "exists": false,
+                        "proof": Vec::<String>::new(),
+                    }));
+                }
             }
         }
-    }
-    drop(trie);
+        Ok((
+            root,
+            account_nodes,
+            balance,
+            nonce,
+            account_exists,
+            storage_proofs,
+        ))
+    })
+    .await;
+
+    let (root, account_nodes, balance, nonce, account_exists, storage_proofs) = match proof_res {
+        Ok(Ok(v)) => v,
+        Ok(Err(msg)) => return err(id, -32000, msg),
+        Err(_) => return err(id, -32000, "proof generation task failed"),
+    };
 
     let root_hex = hex::encode(root);
     ok(
@@ -1144,9 +1160,15 @@ pub(super) async fn handle_get_archive_proof(
         );
     };
     let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
-    match store.serve_archive_proof(height, &key, tip).await {
-        Ok(proof) => ok(id, proof.to_json()),
-        Err(e) => err(id, -32004, format!("{e:#}")),
+    let handle = tokio::runtime::Handle::current();
+    match tokio::task::spawn_blocking(move || {
+        handle.block_on(store.serve_archive_proof(height, &key, tip))
+    })
+    .await
+    {
+        Ok(Ok(proof)) => ok(id, proof.to_json()),
+        Ok(Err(e)) => err(id, -32004, format!("{e:#}")),
+        Err(_) => err(id, -32000, "archive proof task failed"),
     }
 }
 

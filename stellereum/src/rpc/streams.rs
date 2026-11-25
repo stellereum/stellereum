@@ -34,7 +34,8 @@ pub const SUBSCRIPTION_ID_BYTES: usize = 16;
 
 /// Capacity of the in-process fan-out channel (notifications buffered per
 /// transport before the slow consumer is dropped).
-pub(super) const STREAM_BROADCAST_CAPACITY: usize = 1024;
+pub const STREAM_BROADCAST_CAPACITY: usize = 8192;
+pub(super) const _: () = assert!(STREAM_BROADCAST_CAPACITY > MAX_SUBSCRIPTIONS);
 
 /// Maximum accounts one `accountUpdates` subscription may watch.
 ///
@@ -856,7 +857,18 @@ impl SubscriptionHub {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
 
+/// Maximum number of concurrent SSE transports attached to a single subscription.
+pub const MAX_ATTACHED_PER_SUB: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AttachError {
+    NotFound,
+    LimitReached,
+}
+
+impl SubscriptionHub {
     /// Mark a subscription as served by a live transport (so the TTL sweep
     /// leaves it alone). Increments `attached_count`.
     pub fn attach(&self, id: &str) {
@@ -867,17 +879,26 @@ impl SubscriptionHub {
         }
     }
 
-    /// Attach a transport only when `client` owns the subscription.
-    /// Returns false for an unknown id or a different owner (no id oracle).
+    /// Attach a transport only when `client` owns the subscription and the
+    /// subscription has fewer than [`MAX_ATTACHED_PER_SUB`] attached streams.
+    /// Returns false for an unknown id, a different owner (no id oracle), or
+    /// when the per-subscription attach cap is reached.
     pub fn attach_for(&self, id: &str, client: Option<&str>) -> bool {
+        self.try_attach_for(id, client).is_ok()
+    }
+
+    pub(super) fn try_attach_for(&self, id: &str, client: Option<&str>) -> Result<(), AttachError> {
         let mut reg = self.registry.write().unwrap_or_else(|e| e.into_inner());
         match reg.get_mut(id) {
             Some(s) if s.client.as_deref() == client => {
+                if s.attached_count >= MAX_ATTACHED_PER_SUB {
+                    return Err(AttachError::LimitReached);
+                }
                 s.attached_count = s.attached_count.saturating_add(1);
                 s.attached = s.attached_count > 0;
-                true
+                Ok(())
             }
-            _ => false,
+            _ => Err(AttachError::NotFound),
         }
     }
 
@@ -981,6 +1002,9 @@ impl SubscriptionHub {
         let (shard_id, height) = notification_meta(&result);
         let mut result = Some(result);
         for (i, id) in targets.into_iter().enumerate() {
+            if i > 0 && i % 256 == 0 {
+                std::thread::yield_now();
+            }
             let val = if i + 1 == addressed {
                 result.take().unwrap()
             } else {
@@ -1852,6 +1876,141 @@ fn idle_timeout_from_env(name: &str) -> Option<std::time::Duration> {
         .map(std::time::Duration::from_secs)
 }
 
+/// Hard ceiling on concurrent SSE streams for the WHOLE process.
+pub const SSE_MAX_CONNECTIONS: usize = 1024;
+
+/// Hard ceiling on concurrent SSE streams per client IP / IPv6 `/64` bucket.
+pub const SSE_MAX_CONNECTIONS_PER_CLIENT: usize = MAX_SUBSCRIPTIONS_PER_CLIENT;
+
+pub(super) static SSE_MAX_CONNECTIONS_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub(super) static SSE_MAX_CONNECTIONS_PER_CLIENT_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub(super) static SSE_ACTIVE_CONNECTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+static SSE_CLIENT_CONNECTIONS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<std::net::IpAddr, usize>>,
+> = std::sync::OnceLock::new();
+
+fn sse_client_connections_map() -> &'static std::sync::Mutex<HashMap<std::net::IpAddr, usize>> {
+    SSE_CLIENT_CONNECTIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Effective global SSE connection ceiling: test override, else [`SSE_MAX_CONNECTIONS`].
+pub fn sse_max_connections() -> usize {
+    let ov = SSE_MAX_CONNECTIONS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if ov != 0 {
+        ov
+    } else {
+        SSE_MAX_CONNECTIONS
+    }
+}
+
+/// Effective per-client SSE connection ceiling: test override, else [`SSE_MAX_CONNECTIONS_PER_CLIENT`].
+pub fn sse_max_connections_per_client() -> usize {
+    let ov = SSE_MAX_CONNECTIONS_PER_CLIENT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if ov != 0 {
+        ov
+    } else {
+        SSE_MAX_CONNECTIONS_PER_CLIENT
+    }
+}
+
+/// Currently active SSE connection count.
+pub fn sse_active_connections() -> usize {
+    SSE_ACTIVE_CONNECTIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Currently active SSE connection count for `ip`'s `/64`/IPv4 budget bucket.
+pub fn sse_client_connections(ip: std::net::IpAddr) -> usize {
+    let bucket = budget_bucket_ip(ip);
+    sse_client_connections_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&bucket)
+        .copied()
+        .unwrap_or(0)
+}
+
+#[cfg(any(test, debug_assertions))]
+pub fn set_sse_max_connections_for_tests(n: usize) {
+    SSE_MAX_CONNECTIONS_OVERRIDE.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(any(test, debug_assertions))]
+pub fn set_sse_max_connections_per_client_for_tests(n: usize) {
+    SSE_MAX_CONNECTIONS_PER_CLIENT_OVERRIDE.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SseCapError {
+    GlobalLimit,
+    PerClientLimit,
+}
+
+/// RAII slot guarding both the global [`SSE_MAX_CONNECTIONS`] and per-client
+/// [`SSE_MAX_CONNECTIONS_PER_CLIENT`] limits. Acquired before `Sse::new` and
+/// released when the stream (or error path) drops.
+pub(super) struct SseConnectionGuard {
+    bucket_ip: std::net::IpAddr,
+}
+
+impl SseConnectionGuard {
+    fn try_acquire(ip: std::net::IpAddr) -> Result<Self, SseCapError> {
+        use std::sync::atomic::Ordering;
+        let global_cap = sse_max_connections();
+        let mut cur = SSE_ACTIVE_CONNECTIONS.load(Ordering::Acquire);
+        loop {
+            if cur >= global_cap {
+                return Err(SseCapError::GlobalLimit);
+            }
+            match SSE_ACTIVE_CONNECTIONS.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+
+        let bucket_ip = budget_bucket_ip(ip);
+        let client_cap = sse_max_connections_per_client();
+        let mut map = sse_client_connections_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let held = map.get(&bucket_ip).copied().unwrap_or(0);
+        if held >= client_cap {
+            drop(map);
+            SSE_ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+            return Err(SseCapError::PerClientLimit);
+        }
+        map.insert(bucket_ip, held + 1);
+        Ok(Self { bucket_ip })
+    }
+}
+
+impl Drop for SseConnectionGuard {
+    fn drop(&mut self) {
+        let mut map = sse_client_connections_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(cnt) = map.get_mut(&self.bucket_ip) {
+            if *cnt <= 1 {
+                map.remove(&self.bucket_ip);
+            } else {
+                *cnt -= 1;
+            }
+        }
+        drop(map);
+        SSE_ACTIVE_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// SSE transport: the same notifications as the WebSocket, framed as
 /// `text/event-stream` (`data: {"subscription":...,"result":{...}}\n\n`).
 ///
@@ -1870,6 +2029,16 @@ pub async fn sse_handler(
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     Query(q): Query<StreamQuery>,
 ) -> Result<axum::response::Response, axum::http::StatusCode> {
+    let peer_ip = peer.map(|axum::extract::ConnectInfo(addr)| {
+        crate::client_ip::resolve_client_ip(&headers, addr.ip()).addr
+    });
+    let sse_guard = SseConnectionGuard::try_acquire(peer_ip.unwrap_or(LOCAL_BUCKET_IP)).map_err(
+        |e| match e {
+            SseCapError::GlobalLimit => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            SseCapError::PerClientLimit => axum::http::StatusCode::TOO_MANY_REQUESTS,
+        },
+    )?;
+
     let hub = hub();
     // Subscribe to the fan-out BEFORE creating the subscription: a
     // notification published between the two would otherwise be lost.
@@ -1877,9 +2046,6 @@ pub async fn sse_handler(
     let mut ids: Vec<String> = Vec::new();
     let mut owned: Vec<String> = Vec::new();
     let mut attached: Vec<String> = Vec::new();
-    let peer_ip = peer.map(|axum::extract::ConnectInfo(addr)| {
-        crate::client_ip::resolve_client_ip(&headers, addr.ip()).addr
-    });
     let client = peer_ip
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| LOCAL_SUBSCRIBER_ID.to_string());
@@ -1888,11 +2054,15 @@ pub async fn sse_handler(
         // Attach is owner-bound: the id (and the events on it) belongs to the
         // client that created it. An unknown id and another client's id are
         // indistinguishable (404), so the endpoint is not an id oracle.
-        if hub.attach_for(want, Some(client.as_str())) {
-            attached.push(want.to_string());
-            ids.push(want.to_string());
-        } else {
-            return Err(axum::http::StatusCode::NOT_FOUND);
+        match hub.try_attach_for(want, Some(client.as_str())) {
+            Ok(()) => {
+                attached.push(want.to_string());
+                ids.push(want.to_string());
+            }
+            Err(AttachError::NotFound) => return Err(axum::http::StatusCode::NOT_FOUND),
+            Err(AttachError::LimitReached) => {
+                return Err(axum::http::StatusCode::TOO_MANY_REQUESTS)
+            }
         }
     } else {
         let topics = match parse_stream_topics(&q) {
@@ -1924,8 +2094,15 @@ pub async fn sse_handler(
     let guard = SubscriptionGuard { owned, attached };
     let idle = sse_idle_timeout();
     let stream = futures::stream::unfold(
-        (rx, id_set, guard, tokio::time::Instant::now() + idle, idle),
-        |(mut rx, ids, guard, deadline, idle)| async move {
+        (
+            rx,
+            id_set,
+            guard,
+            sse_guard,
+            tokio::time::Instant::now() + idle,
+            idle,
+        ),
+        |(mut rx, ids, guard, sse_guard, deadline, idle)| async move {
             loop {
                 // Idle reap (audit F12): no forwarded event within the window
                 // ends the stream. Transport keep-alive frames are generated
@@ -1944,7 +2121,10 @@ pub async fn sse_handler(
                                 serde_json::to_string(&note).unwrap_or_else(|_| "{}".to_string());
                             let ev = axum::response::sse::Event::default().data(payload);
                             let next_deadline = tokio::time::Instant::now() + idle;
-                            return Some((Ok(ev), (rx, ids, guard, next_deadline, idle)));
+                            return Some((
+                                Ok(ev),
+                                (rx, ids, guard, sse_guard, next_deadline, idle),
+                            ));
                         }
                     }
                     Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
@@ -1957,7 +2137,7 @@ pub async fn sse_handler(
                             .event("lagged")
                             .data(notice.to_string());
                         let next_deadline = tokio::time::Instant::now() + idle;
-                        return Some((Ok(ev), (rx, ids, guard, next_deadline, idle)));
+                        return Some((Ok(ev), (rx, ids, guard, sse_guard, next_deadline, idle)));
                     }
                     Ok(Err(broadcast::error::RecvError::Closed)) => return None,
                 }
@@ -2147,11 +2327,40 @@ pub(super) fn ws_general_budget() -> &'static crate::explorer::RateLimiter {
 /// reap, failed upgrade).
 pub const WS_MAX_CONNECTIONS: usize = 1024;
 
+/// Hard ceiling on concurrent WebSocket sessions per client IP / IPv6 `/64`
+/// bucket. Prevents one IP from pinning all [`WS_MAX_CONNECTIONS`] slots.
+pub const WS_MAX_CONNECTIONS_PER_IP: usize = 32;
+
+/// Timeout for sending a single WebSocket frame (`socket.send`). Slow
+/// consumers that fail to drain within this window are closed cleanly instead
+/// of pinning WS slots forever.
+pub const WS_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+pub(super) static WS_WRITE_TIMEOUT_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(any(test, debug_assertions))]
+pub fn set_ws_write_timeout_ms_for_tests(ms: u64) {
+    WS_WRITE_TIMEOUT_OVERRIDE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(super) fn ws_write_timeout() -> std::time::Duration {
+    let ov = WS_WRITE_TIMEOUT_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if ov != 0 {
+        std::time::Duration::from_millis(ov)
+    } else {
+        WS_WRITE_TIMEOUT
+    }
+}
+
 /// Test-only override of [`WS_MAX_CONNECTIONS`] (0 = const default).
 ///
 /// Integration tests cannot open 1024 sockets, so they lower the cap, prove
 /// the pre-upgrade refusal, and restore 0. Production never touches this.
 pub(super) static WS_MAX_CONNECTIONS_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub(super) static WS_MAX_CONNECTIONS_PER_IP_OVERRIDE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Effective WS connection ceiling: test override, else [`WS_MAX_CONNECTIONS`].
@@ -2164,11 +2373,26 @@ pub fn ws_max_connections() -> usize {
     }
 }
 
+/// Effective per-IP WS connection ceiling: test override, else [`WS_MAX_CONNECTIONS_PER_IP`].
+pub fn ws_max_connections_per_ip() -> usize {
+    let ov = WS_MAX_CONNECTIONS_PER_IP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if ov != 0 {
+        ov
+    } else {
+        WS_MAX_CONNECTIONS_PER_IP
+    }
+}
+
 /// Set the WS connection ceiling for tests (0 restores the const default).
 /// Absent from production builds (`any(test, debug_assertions)` only).
 #[cfg(any(test, debug_assertions))]
 pub fn set_ws_max_connections_for_tests(n: usize) {
     WS_MAX_CONNECTIONS_OVERRIDE.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(any(test, debug_assertions))]
+pub fn set_ws_max_connections_per_ip_for_tests(n: usize) {
+    WS_MAX_CONNECTIONS_PER_IP_OVERRIDE.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Currently live WebSocket sessions counted by the PRE-UPGRADE cap guard.
@@ -2180,44 +2404,97 @@ pub fn set_ws_max_connections_for_tests(n: usize) {
 pub(super) static WS_ACTIVE_CONNECTIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+static WS_CLIENT_CONNECTIONS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<std::net::IpAddr, usize>>,
+> = std::sync::OnceLock::new();
+
+fn ws_client_connections_map() -> &'static std::sync::Mutex<HashMap<std::net::IpAddr, usize>> {
+    WS_CLIENT_CONNECTIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
 /// Number of connection slots currently held by the pre-upgrade cap guard.
 pub fn ws_active_connections() -> usize {
     WS_ACTIVE_CONNECTIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// RAII slot in the global [`WS_MAX_CONNECTIONS`] budget.
+/// Number of WebSocket connection slots currently held for `ip`'s budget bucket.
+pub fn ws_ip_connections(ip: std::net::IpAddr) -> usize {
+    let bucket = budget_bucket_ip(ip);
+    ws_client_connections_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&bucket)
+        .copied()
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WsCapError {
+    Global,
+    PerIp,
+}
+
+/// RAII slot in the global [`WS_MAX_CONNECTIONS`] and per-IP
+/// [`WS_MAX_CONNECTIONS_PER_IP`] budgets.
 ///
-/// `try_acquire` reserves one slot with a CAS loop (a plain load-then-store
-/// would let N racing upgrades each observe `n-1`), and `Drop` always returns
-/// it. The guard is moved into the upgraded connection closure so the slot
-/// covers the whole session, including a peer that vanishes mid-upgrade.
-pub(super) struct WsConnectionGuard;
+/// `try_acquire_for` reserves one slot with a CAS loop + per-IP mutex (a plain
+/// load-then-store would let N racing upgrades each observe `n-1`), and `Drop`
+/// always returns both. The guard is moved into the upgraded connection closure
+/// so the slot covers the whole session, including a peer that vanishes
+/// mid-upgrade.
+pub(super) struct WsConnectionGuard {
+    bucket_ip: std::net::IpAddr,
+}
 
 impl WsConnectionGuard {
-    fn try_acquire() -> Option<Self> {
+    fn try_acquire_for(ip: std::net::IpAddr) -> Result<Self, WsCapError> {
         use std::sync::atomic::Ordering;
         let cap = ws_max_connections();
-        let mut cur = WS_ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
+        let mut cur = WS_ACTIVE_CONNECTIONS.load(Ordering::Acquire);
         loop {
             if cur >= cap {
-                return None;
+                return Err(WsCapError::Global);
             }
             match WS_ACTIVE_CONNECTIONS.compare_exchange_weak(
                 cur,
                 cur + 1,
                 Ordering::AcqRel,
-                Ordering::Relaxed,
+                Ordering::Acquire,
             ) {
-                Ok(_) => return Some(WsConnectionGuard),
+                Ok(_) => break,
                 Err(actual) => cur = actual,
             }
         }
+        let bucket_ip = budget_bucket_ip(ip);
+        let ip_cap = ws_max_connections_per_ip();
+        let mut map = ws_client_connections_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let held = map.get(&bucket_ip).copied().unwrap_or(0);
+        if held >= ip_cap {
+            drop(map);
+            WS_ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+            return Err(WsCapError::PerIp);
+        }
+        map.insert(bucket_ip, held + 1);
+        Ok(WsConnectionGuard { bucket_ip })
     }
 }
 
 impl Drop for WsConnectionGuard {
     fn drop(&mut self) {
-        WS_ACTIVE_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let mut map = ws_client_connections_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(cnt) = map.get_mut(&self.bucket_ip) {
+            if *cnt <= 1 {
+                map.remove(&self.bucket_ip);
+            } else {
+                *cnt -= 1;
+            }
+        }
+        drop(map);
+        WS_ACTIVE_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -2529,6 +2806,16 @@ pub fn rpc_rate_buckets(method: &str) -> &'static [&'static str] {
 /// HTTP endpoint: the API token in the headers gates the same methods, and
 /// the peer address feeds the per-IP limits. A WebSocket must never be a way
 /// AROUND the auth gate.
+async fn ws_send_with_timeout(
+    socket: &mut axum::extract::ws::WebSocket,
+    msg: axum::extract::ws::Message,
+) -> bool {
+    matches!(
+        tokio::time::timeout(ws_write_timeout(), socket.send(msg)).await,
+        Ok(Ok(()))
+    )
+}
+
 pub(super) async fn ws_handler(
     headers: axum::http::HeaderMap,
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
@@ -2544,17 +2831,29 @@ pub(super) async fn ws_handler(
             crate::client_ip::resolve_client_ip(&headers, addr.ip())
         })
     });
-    // GLOBAL CONNECTION CAP (see `WS_MAX_CONNECTIONS`): reserve a slot BEFORE
-    // accepting the upgrade, so a connect flood cannot allocate one session
-    // task per socket first and discover the cap afterwards. Refusal is a
-    // plain HTTP 503; an accepted session holds the slot via the RAII guard
-    // for its whole lifetime (including a peer that never completes).
-    let Some(connection_guard) = WsConnectionGuard::try_acquire() else {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "websocket connection limit reached",
-        )
-            .into_response();
+    // GLOBAL + PER-IP CONNECTION CAP (`WS_MAX_CONNECTIONS`,
+    // `WS_MAX_CONNECTIONS_PER_IP`): reserve slots BEFORE accepting the upgrade,
+    // so a connect flood cannot allocate one session task per socket first and
+    // discover the cap afterwards. Refusal is HTTP 503 (global) or 429 (per-IP);
+    // an accepted session holds both slots via the RAII guard for its whole
+    // lifetime (including a peer that never completes).
+    let ip = client.map(|c| c.addr).unwrap_or(LOCAL_BUCKET_IP);
+    let connection_guard = match WsConnectionGuard::try_acquire_for(ip) {
+        Ok(g) => g,
+        Err(WsCapError::Global) => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "websocket connection limit reached",
+            )
+                .into_response();
+        }
+        Err(WsCapError::PerIp) => {
+            return (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                "per-IP websocket connection limit reached",
+            )
+                .into_response();
+        }
     };
     // Bound the WebSocket frame buffer (2 MiB vs tungstenite's 64 MiB default)
     // while allowing slightly-over-cap frames to reach `ws_handle_text` / the
@@ -2646,10 +2945,11 @@ pub(super) async fn handle_ws_with_timeout(
                                 ),
                             );
                             let out = serde_json::to_string(&resp.0).unwrap_or_default();
-                            if socket
-                                .send(axum::extract::ws::Message::Text(out))
-                                .await
-                                .is_err()
+                            if !ws_send_with_timeout(
+                                &mut socket,
+                                axum::extract::ws::Message::Text(out),
+                            )
+                            .await
                             {
                                 break;
                             }
@@ -2670,10 +2970,8 @@ pub(super) async fn handle_ws_with_timeout(
                         }
                     }
                     axum::extract::ws::Message::Ping(p) => {
-                        if socket
-                            .send(axum::extract::ws::Message::Pong(p))
+                        if !ws_send_with_timeout(&mut socket, axum::extract::ws::Message::Pong(p))
                             .await
-                            .is_err()
                         {
                             break;
                         }
@@ -2694,10 +2992,8 @@ pub(super) async fn handle_ws_with_timeout(
                 }
                 deadline = tokio::time::Instant::now() + idle_timeout;
                 let payload = serde_json::to_string(&note).unwrap_or_else(|_| "{}".to_string());
-                if socket
-                    .send(axum::extract::ws::Message::Text(payload))
+                if !ws_send_with_timeout(&mut socket, axum::extract::ws::Message::Text(payload))
                     .await
-                    .is_err()
                 {
                     break;
                 }
@@ -2714,11 +3010,7 @@ pub(super) async fn handle_ws_with_timeout(
                 // Explicit lag notice instead of a silent skip: the client
                 // learns it missed events and where replay can resume.
                 let out = lagged_notice(skipped).to_string();
-                if socket
-                    .send(axum::extract::ws::Message::Text(out))
-                    .await
-                    .is_err()
-                {
+                if !ws_send_with_timeout(&mut socket, axum::extract::ws::Message::Text(out)).await {
                     break;
                 }
             }
@@ -2754,10 +3046,7 @@ pub(super) async fn ws_handle_text(
             ),
         );
         let out = serde_json::to_string(&resp.0).unwrap_or_default();
-        return socket
-            .send(axum::extract::ws::Message::Text(out))
-            .await
-            .is_ok();
+        return ws_send_with_timeout(socket, axum::extract::ws::Message::Text(out)).await;
     }
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -2773,10 +3062,7 @@ pub(super) async fn ws_handle_text(
                 }),
             };
             let out = serde_json::to_string(&resp).unwrap_or_default();
-            return socket
-                .send(axum::extract::ws::Message::Text(out))
-                .await
-                .is_ok();
+            return ws_send_with_timeout(socket, axum::extract::ws::Message::Text(out)).await;
         }
     };
     let req: RpcRequest = match serde_json::from_value(parsed) {
@@ -2793,10 +3079,7 @@ pub(super) async fn ws_handle_text(
                 }),
             };
             let out = serde_json::to_string(&resp).unwrap_or_default();
-            return socket
-                .send(axum::extract::ws::Message::Text(out))
-                .await
-                .is_ok();
+            return ws_send_with_timeout(socket, axum::extract::ws::Message::Text(out)).await;
         }
     };
     let id = req.id.clone().unwrap_or(Value::Null);
@@ -2816,10 +3099,7 @@ pub(super) async fn ws_handle_text(
                 "general budget exhausted for this IP on this socket (retry shortly)",
             );
             let out = serde_json::to_string(&denied.0).unwrap_or_default();
-            return socket
-                .send(axum::extract::ws::Message::Text(out))
-                .await
-                .is_ok();
+            return ws_send_with_timeout(socket, axum::extract::ws::Message::Text(out)).await;
         }
     }
     // PER-MESSAGE expensive-read budget (see above): the upgrade request was
@@ -2835,10 +3115,7 @@ pub(super) async fn ws_handle_text(
                 "expensive-read budget exhausted for this IP on this socket (retry shortly)",
             );
             let out = serde_json::to_string(&denied.0).unwrap_or_default();
-            return socket
-                .send(axum::extract::ws::Message::Text(out))
-                .await
-                .is_ok();
+            return ws_send_with_timeout(socket, axum::extract::ws::Message::Text(out)).await;
         }
     }
     // GEYSER-LITE REPLAY CURSOR (see `GEYSER_REPLAY_WINDOW`): an expired
@@ -2854,10 +3131,7 @@ pub(super) async fn ws_handle_text(
         if let Err(e) = hub().check_replay_cursor(after_seq) {
             let denied = err(id, -32005, e.to_string());
             let out = serde_json::to_string(&denied.0).unwrap_or_default();
-            return socket
-                .send(axum::extract::ws::Message::Text(out))
-                .await
-                .is_ok();
+            return ws_send_with_timeout(socket, axum::extract::ws::Message::Text(out)).await;
         }
     }
     // PER-CONNECTION SUBSCRIPTION CAP (see `WS_MAX_SUBS_PER_CONNECTION`):
@@ -2874,10 +3148,7 @@ pub(super) async fn ws_handle_text(
             ),
         );
         let out = serde_json::to_string(&denied.0).unwrap_or_default();
-        return socket
-            .send(axum::extract::ws::Message::Text(out))
-            .await
-            .is_ok();
+        return ws_send_with_timeout(socket, axum::extract::ws::Message::Text(out)).await;
     }
     let id_for_replay = id.clone();
     let resp = dispatch_client(st.as_ref(), id, &method, &params, header_token, client).await;
@@ -2925,32 +3196,190 @@ pub(super) async fn ws_handle_text(
         }
     }
     let out = serde_json::to_string(&resp.0).unwrap_or_default();
-    if socket
-        .send(axum::extract::ws::Message::Text(out))
-        .await
-        .is_err()
-    {
+    if !ws_send_with_timeout(socket, axum::extract::ws::Message::Text(out)).await {
         return false;
     }
     if let Some(message) = replay_refused {
         let denied = err(id_for_replay, -32005, message);
         let out = serde_json::to_string(&denied.0).unwrap_or_default();
-        return socket
-            .send(axum::extract::ws::Message::Text(out))
-            .await
-            .is_ok();
+        return ws_send_with_timeout(socket, axum::extract::ws::Message::Text(out)).await;
     }
-    for note in replay {
+    for (i, note) in replay.into_iter().enumerate() {
+        if i > 0 && i % 32 == 0 {
+            tokio::task::yield_now().await;
+        }
         let out = serde_json::to_string(&note).unwrap_or_else(|_| "{}".to_string());
-        if socket
-            .send(axum::extract::ws::Message::Text(out))
-            .await
-            .is_err()
-        {
+        if !ws_send_with_timeout(socket, axum::extract::ws::Message::Text(out)).await {
             return false;
         }
     }
     true
+}
+
+/// Default per-IP burst capacity for the HTTP expensive-read token bucket.
+pub const HTTP_EXPENSIVE_READ_BURST_DEFAULT: u32 = 16;
+
+/// Default per-IP refill rate (tokens/second) for the HTTP expensive-read token bucket.
+pub const HTTP_EXPENSIVE_READ_REFILL_PER_SEC_DEFAULT: u32 = 10;
+
+/// Maximum concurrent in-flight HTTP expensive reads allowed for any single IP
+/// / IPv6 `/64` bucket out of the 32 global `http_expensive_read_semaphore` permits.
+pub const HTTP_EXPENSIVE_READ_MAX_PER_IP: usize = 8;
+
+const EXPENSIVE_BUCKET_MAX_ENTRIES: usize = 65_536;
+
+fn http_expensive_read_refill_per_sec() -> u32 {
+    std::env::var("STELL_HTTP_EXPENSIVE_READ_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(HTTP_EXPENSIVE_READ_REFILL_PER_SEC_DEFAULT)
+}
+
+#[derive(Clone, Copy)]
+struct TokenBucketEntry {
+    tokens_milli: u64,
+    last_refill: std::time::Instant,
+}
+
+/// Per-IP token bucket (keyed on `budget_bucket_ip(ip)`) for HTTP expensive reads.
+pub struct HttpExpensiveTokenBucket {
+    capacity_milli: u64,
+    refill_per_sec_milli: u64,
+    entries: std::sync::Mutex<HashMap<std::net::IpAddr, TokenBucketEntry>>,
+}
+
+impl HttpExpensiveTokenBucket {
+    pub fn new(capacity: u32, refill_per_sec: u32) -> Self {
+        let cap = capacity.max(1) as u64 * 1000;
+        let refill = refill_per_sec.max(1) as u64 * 1000;
+        Self {
+            capacity_milli: cap,
+            refill_per_sec_milli: refill,
+            entries: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn check(&self, ip: std::net::IpAddr) -> bool {
+        self.check_at(ip, std::time::Instant::now())
+    }
+
+    pub fn check_at(&self, ip: std::net::IpAddr, now: std::time::Instant) -> bool {
+        let key = budget_bucket_ip(ip);
+        let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= EXPENSIVE_BUCKET_MAX_ENTRIES && !map.contains_key(&key) {
+            map.retain(|_, e| now.saturating_duration_since(e.last_refill).as_secs() < 60);
+            if map.len() >= EXPENSIVE_BUCKET_MAX_ENTRIES {
+                return false;
+            }
+        }
+        let entry = map.entry(key).or_insert(TokenBucketEntry {
+            tokens_milli: self.capacity_milli,
+            last_refill: now,
+        });
+        let elapsed_ms = now.saturating_duration_since(entry.last_refill).as_millis() as u64;
+        if elapsed_ms > 0 {
+            let added = elapsed_ms
+                .saturating_mul(self.refill_per_sec_milli)
+                .checked_div(1000)
+                .unwrap_or(0);
+            if added > 0 {
+                entry.tokens_milli = entry
+                    .tokens_milli
+                    .saturating_add(added)
+                    .min(self.capacity_milli);
+                entry.last_refill = now;
+            }
+        }
+        if entry.tokens_milli >= 1000 {
+            entry.tokens_milli -= 1000;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+pub(super) fn http_expensive_read_ip_bucket() -> &'static HttpExpensiveTokenBucket {
+    static BUCKET: std::sync::OnceLock<HttpExpensiveTokenBucket> = std::sync::OnceLock::new();
+    BUCKET.get_or_init(|| {
+        let rate = http_expensive_read_refill_per_sec();
+        let cap = rate.max(HTTP_EXPENSIVE_READ_BURST_DEFAULT);
+        HttpExpensiveTokenBucket::new(cap, rate)
+    })
+}
+
+static HTTP_EXPENSIVE_IP_INFLIGHT: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<std::net::IpAddr, usize>>,
+> = std::sync::OnceLock::new();
+
+fn http_expensive_ip_inflight_map() -> &'static std::sync::Mutex<HashMap<std::net::IpAddr, usize>> {
+    HTTP_EXPENSIVE_IP_INFLIGHT.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+pub(super) struct HttpExpensiveIpInflightGuard {
+    bucket_ip: std::net::IpAddr,
+}
+
+impl HttpExpensiveIpInflightGuard {
+    fn try_acquire(ip: std::net::IpAddr) -> Option<Self> {
+        let bucket_ip = budget_bucket_ip(ip);
+        let mut map = http_expensive_ip_inflight_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let held = map.get(&bucket_ip).copied().unwrap_or(0);
+        if held >= HTTP_EXPENSIVE_READ_MAX_PER_IP {
+            return None;
+        }
+        map.insert(bucket_ip, held + 1);
+        Some(Self { bucket_ip })
+    }
+}
+
+impl Drop for HttpExpensiveIpInflightGuard {
+    fn drop(&mut self) {
+        let mut map = http_expensive_ip_inflight_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(cnt) = map.get_mut(&self.bucket_ip) {
+            if *cnt <= 1 {
+                map.remove(&self.bucket_ip);
+            } else {
+                *cnt -= 1;
+            }
+        }
+    }
+}
+
+pub struct HttpExpensiveReadGuard {
+    _global_permit: tokio::sync::SemaphorePermit<'static>,
+    _ip_inflight: HttpExpensiveIpInflightGuard,
+}
+
+/// Acquire both the per-IP expensive-read token bucket + per-IP concurrency
+/// cap (`HTTP_EXPENSIVE_READ_MAX_PER_IP = 8`) AND the global
+/// `http_expensive_read_semaphore` (32 permits) for HTTP calls to
+/// [`is_ws_expensive_method`]. Prevents one client from starving all 32 permits.
+pub fn try_acquire_http_expensive_read_with_ip(
+    method: &str,
+    ip: std::net::IpAddr,
+) -> Result<Option<HttpExpensiveReadGuard>, &'static str> {
+    if !is_ws_expensive_method(method) {
+        return Ok(None);
+    }
+    if !http_expensive_read_ip_bucket().check(ip) {
+        return Err("per-IP expensive-read budget exhausted (retry shortly)");
+    }
+    let ip_inflight = HttpExpensiveIpInflightGuard::try_acquire(ip)
+        .ok_or("per-IP expensive-read concurrency limit reached (retry shortly)")?;
+    let global_permit = match try_acquire_http_expensive_read(method)? {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    Ok(Some(HttpExpensiveReadGuard {
+        _global_permit: global_permit,
+        _ip_inflight: ip_inflight,
+    }))
 }
 /// axum handler for the JSON-RPC endpoint.
 ///
@@ -3025,7 +3454,8 @@ pub(super) async fn rpc_handler(
         Err(e) => return err(Value::Null, -32600, format!("invalid request: {e}")).into_response(),
     };
     let id = req.id.unwrap_or(Value::Null);
-    let _expensive_permit = match try_acquire_http_expensive_read(&req.method) {
+    let ip = client.map(|c| c.addr).unwrap_or(LOCAL_BUCKET_IP);
+    let _expensive_permit = match try_acquire_http_expensive_read_with_ip(&req.method, ip) {
         Ok(p) => p,
         Err(msg) => return err(id, -32000, msg).into_response(),
     };

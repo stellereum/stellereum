@@ -424,6 +424,40 @@ fn is_loopback_listen(listen: &str) -> bool {
     trimmed.eq_ignore_ascii_case("localhost")
 }
 
+fn is_loopback_http_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    let Some(rest) = trimmed.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    if host_port.is_empty() {
+        return false;
+    }
+    let host = if let Some(inner) = host_port.strip_prefix('[') {
+        let Some((addr, tail)) = inner.split_once(']') else {
+            return false;
+        };
+        if !tail.is_empty() && !tail.starts_with(':') {
+            return false;
+        }
+        addr
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => h,
+            Some(_) => return false,
+            None => host_port,
+        }
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    matches!(host.parse::<std::net::IpAddr>(), Ok(ip) if ip.is_loopback())
+}
+
 impl NodeTomlConfig {
     /// Extract the normalized `[telemetry]` configuration, whether written as
     /// `telemetry = false` or `[telemetry] enabled = false`.
@@ -1635,7 +1669,7 @@ impl NodeTomlConfig {
             self.signer.remote_signer_url.as_deref(),
             false,
         );
-        let _remote_signer_token = resolve_opt_str(
+        let remote_signer_token = resolve_opt_str(
             &mut settings,
             "signer.remote_signer_token",
             "STELL_REMOTE_SIGNER_TOKEN",
@@ -1791,9 +1825,17 @@ impl NodeTomlConfig {
             );
         }
         if let Some(url) = &remote_signer_url {
-            if !url.starts_with("http://") && !url.starts_with("https://") {
+            let url_trimmed = url.trim();
+            if !url_trimmed.starts_with("http://") && !url_trimmed.starts_with("https://") {
                 report.errors.push(format!(
                     "signer.remote_signer_url ('{url}') must start with http:// or https://"
+                ));
+            } else if url_trimmed.starts_with("http://")
+                && remote_signer_token.is_some()
+                && !is_loopback_http_url(url_trimmed)
+            {
+                report.errors.push(format!(
+                    "signer.remote_signer_url ('{url}') uses plaintext http:// for a non-loopback host while remote_signer_token is configured; use https:// or a loopback URL"
                 ));
             }
         }

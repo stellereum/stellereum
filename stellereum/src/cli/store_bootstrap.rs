@@ -307,6 +307,7 @@ pub(crate) fn run_store_bootstrap(opts: StoreBootstrapOptions) -> Result<()> {
     extract_tar_zst(&archive_path, &staging_dir)?;
     normalize_extracted_layout(&staging_dir)?;
     let snap_files_removed = strip_stale_snap_files(&staging_dir)?;
+    validate_staged_top_level_entries(&staging_dir)?;
 
     // Re-check sled locks right before replacing existing store(s).
     ensure_data_dir_stores_unlocked(&opts.data_dir)?;
@@ -791,35 +792,59 @@ fn strip_stale_snap_files(root: &Path) -> Result<usize> {
     Ok(removed)
 }
 
+fn is_allowed_staged_store_dir(name: &str) -> bool {
+    if name == "store" {
+        return true;
+    }
+    if let Some(suffix) = name.strip_prefix("store-shard") {
+        return !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit());
+    }
+    false
+}
+
+fn validate_staged_top_level_entries(staging_dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(staging_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let ft = entry.file_type()?;
+        if !ft.is_dir() || !is_allowed_staged_store_dir(&name_str) {
+            bail!(
+                "refusing snapshot archive: unexpected top-level entry '{}' (only 'store' and 'store-shard*' directories are allowed)",
+                name_str
+            );
+        }
+    }
+    Ok(())
+}
+
 fn commit_staged_entries(
     staging_dir: &Path,
     data_dir: &Path,
     ts: &str,
     no_backup: bool,
 ) -> Result<()> {
+    validate_staged_top_level_entries(staging_dir)?;
     for entry in fs::read_dir(staging_dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
+        if !entry.file_type()?.is_dir() || !is_allowed_staged_store_dir(&name_str) {
+            continue;
+        }
         let src = entry.path();
         let dst = data_dir.join(&name);
 
         if dst.exists() {
-            if name_str.starts_with("store-shard") {
-                if no_backup {
-                    if dst.is_dir() {
-                        fs::remove_dir_all(&dst)?;
-                    } else {
-                        fs::remove_file(&dst)?;
-                    }
+            if no_backup {
+                if dst.is_dir() {
+                    fs::remove_dir_all(&dst)?;
                 } else {
-                    let bp = unique_backup_path(data_dir, &name_str, ts);
-                    fs::rename(&dst, &bp)?;
+                    fs::remove_file(&dst)?;
                 }
-            } else if dst.is_dir() {
-                fs::remove_dir_all(&dst)?;
             } else {
-                fs::remove_file(&dst)?;
+                let bp = unique_backup_path(data_dir, &name_str, ts);
+                fs::rename(&dst, &bp)?;
             }
         }
         fs::rename(&src, &dst)
@@ -1025,5 +1050,56 @@ mod tests {
         assert_eq!(ts.len(), 16);
         assert!(ts.ends_with('Z'));
         assert_eq!(&ts[8..9], "T");
+    }
+
+    #[test]
+    fn commit_staged_entries_refuses_unexpected_dirs_and_preserves_keys() {
+        let base = std::env::temp_dir().join(format!(
+            "stell-bootstrap-scope-{}-{}",
+            std::process::id(),
+            unix_nanos()
+        ));
+        let staging = base.join("staging");
+        let data = base.join("data");
+        fs::create_dir_all(staging.join("store")).unwrap();
+        fs::create_dir_all(staging.join("keys")).unwrap();
+        fs::write(staging.join("keys").join("evil.key"), b"attacker").unwrap();
+
+        fs::create_dir_all(data.join("keys")).unwrap();
+        fs::write(data.join("keys").join("validator.key"), b"victim-secret").unwrap();
+        fs::create_dir_all(data.join("store")).unwrap();
+        fs::write(data.join("store").join("db"), b"old-db").unwrap();
+
+        let err = commit_staged_entries(&staging, &data, "20261125T000000Z", true)
+            .expect_err("unexpected keys/ directory in staging must be refused");
+        assert!(err.to_string().contains("unexpected top-level entry"));
+        assert_eq!(
+            fs::read(data.join("keys").join("validator.key")).unwrap(),
+            b"victim-secret",
+            "existing keys/ directory must never be touched or deleted"
+        );
+        assert_eq!(
+            fs::read(data.join("store").join("db")).unwrap(),
+            b"old-db",
+            "refusal must leave existing store/ intact"
+        );
+
+        // Allowed store + store-shard1 move cleanly without touching keys/.
+        fs::remove_dir_all(staging.join("keys")).unwrap();
+        fs::create_dir_all(staging.join("store-shard1")).unwrap();
+        fs::write(staging.join("store").join("db"), b"new-db").unwrap();
+        fs::write(staging.join("store-shard1").join("db"), b"new-shard1").unwrap();
+        commit_staged_entries(&staging, &data, "20261125T000000Z", false).unwrap();
+        assert_eq!(fs::read(data.join("store").join("db")).unwrap(), b"new-db");
+        assert_eq!(
+            fs::read(data.join("store-shard1").join("db")).unwrap(),
+            b"new-shard1"
+        );
+        assert_eq!(
+            fs::read(data.join("keys").join("validator.key")).unwrap(),
+            b"victim-secret"
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

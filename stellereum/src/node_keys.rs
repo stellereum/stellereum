@@ -267,6 +267,12 @@ pub fn decrypt_bytes(raw: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
             }
             let salt = hex::decode(parts[0]).map_err(|e| anyhow!("invalid salt hex: {e}"))?;
             let nonce = hex::decode(parts[1]).map_err(|e| anyhow!("invalid nonce hex: {e}"))?;
+            if nonce.len() != 24 {
+                bail!(
+                    "invalid enc2 nonce length: expected 24 bytes, got {}",
+                    nonce.len()
+                );
+            }
             let ct = hex::decode(parts[2]).map_err(|e| anyhow!("invalid ciphertext hex: {e}"))?;
             let mut key = derive_key(pass, &salt)?;
             let cipher = XChaCha20Poly1305::new(Key::from_slice(&key[..]));
@@ -289,9 +295,11 @@ pub fn decrypt_bytes(raw: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
             // passphrase hashing) — outside this audit's reach. DEPRECATED:
             // re-save through `encrypt_bytes` (enc2: Argon2id 64MiB/3/4 +
             // random salt) at the next passphrase rotation. See operator item.
-            let plain_str = infnode::keyring::unprotect(s_trimmed)
-                .map_err(|e| anyhow!("invalid legacy enc blob: {e}"))?;
-            return Ok(plain_str.into_bytes());
+            let plain_str = Zeroizing::new(
+                infnode::keyring::unprotect(s_trimmed)
+                    .map_err(|e| anyhow!("invalid legacy enc blob: {e}"))?,
+            );
+            return Ok(plain_str.as_bytes().to_vec());
         }
     }
 
@@ -323,7 +331,7 @@ fn read_secret_from_tty(prompt: &str) -> Option<String> {
     let no_echo = stty(&["-echo"]);
     eprint!("{prompt}");
     let _ = std::io::stderr().flush();
-    let mut line = String::new();
+    let mut line = Zeroizing::new(String::new());
     let read = std::io::stdin().lock().read_line(&mut line);
     if no_echo {
         let _ = stty(&["echo"]);
@@ -475,8 +483,9 @@ pub fn load_falcon_key(path: &Path) -> Result<crate::post_quantum::FalconKeypair
         }
     }
     verify_file_perms(path)?;
-    let raw =
-        std::fs::read(path).map_err(|e| anyhow!("read falcon key {}: {e}", path.display()))?;
+    let raw = Zeroizing::new(
+        std::fs::read(path).map_err(|e| anyhow!("read falcon key {}: {e}", path.display()))?,
+    );
     let pass = Zeroizing::new(get_passphrase());
     let plain_bytes = Zeroizing::new(decrypt_bytes(&raw, pass.as_deref())?);
     let key = crate::post_quantum::FalconKeypair::from_bytes(&plain_bytes).ok_or_else(|| {
@@ -589,7 +598,7 @@ pub fn load_node_keys(dir: &Path) -> Result<infnode::keyring::NodeKeys> {
     let e2e_path = dir.join("e2e.key");
     verify_file_perms(&e2e_path)?;
 
-    let e2e_raw = std::fs::read(&e2e_path).map_err(|e| anyhow!("e2e.key: {e}"))?;
+    let e2e_raw = Zeroizing::new(std::fs::read(&e2e_path).map_err(|e| anyhow!("e2e.key: {e}"))?);
 
     let pass = Zeroizing::new(get_passphrase());
     let e2e_plain = Zeroizing::new(decrypt_bytes(&e2e_raw, pass.as_deref())?);
@@ -609,10 +618,12 @@ pub fn load_node_keys(dir: &Path) -> Result<infnode::keyring::NodeKeys> {
             "e2e.key: legacy x25519 key refused (FULL-PQ wipe: delete e2e.key and restart to generate a KEM key)"
         );
     }
-    let kem_seed: [u8; infnode::mailbox::KEM_SEED_LEN] = e2e_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("e2e kem seed must be 64 bytes"))?;
+    let kem_seed: Zeroizing<[u8; infnode::mailbox::KEM_SEED_LEN]> = Zeroizing::new(
+        e2e_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("e2e kem seed must be 64 bytes"))?,
+    );
     let kem_ek = infnode::mailbox::kem_ek_from_seed(&kem_seed);
 
     if let Err(e) = upgrade_plaintext_key_to_encrypted(&e2e_path, &e2e_raw, e2e_plain.as_slice()) {
@@ -626,7 +637,10 @@ pub fn load_node_keys(dir: &Path) -> Result<infnode::keyring::NodeKeys> {
         );
     }
 
-    Ok(infnode::keyring::NodeKeys { kem_seed, kem_ek })
+    Ok(infnode::keyring::NodeKeys {
+        kem_seed: *kem_seed,
+        kem_ek,
+    })
 }
 
 /// Consensus-only Ed25519 validator key file (NOT a transport identity).
@@ -647,46 +661,66 @@ pub fn load_or_generate_consensus_key(dir: &Path) -> Result<ed25519_dalek::Signi
     let path = dir.join(CONSENSUS_KEY_FILE);
     if path.exists() {
         verify_file_perms(&path)?;
-        let raw = std::fs::read(&path).map_err(|e| anyhow!("{CONSENSUS_KEY_FILE}: {e}"))?;
+        let raw =
+            Zeroizing::new(std::fs::read(&path).map_err(|e| anyhow!("{CONSENSUS_KEY_FILE}: {e}"))?);
         let pass = Zeroizing::new(get_passphrase());
         let plain = Zeroizing::new(decrypt_bytes(&raw, pass.as_deref())?);
-        let seed: [u8; 32] = hex::decode(std::str::from_utf8(&plain)?.trim())
-            .map_err(|e| anyhow!("consensus key hex: {e}"))?
-            .try_into()
-            .map_err(|_| anyhow!("consensus seed must be 32 bytes"))?;
+        let decoded = Zeroizing::new(
+            hex::decode(std::str::from_utf8(&plain)?.trim())
+                .map_err(|e| anyhow!("consensus key hex: {e}"))?,
+        );
+        let seed: Zeroizing<[u8; 32]> = Zeroizing::new(
+            decoded
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("consensus seed must be 32 bytes"))?,
+        );
+        if let Err(e) = upgrade_plaintext_key_to_encrypted(&path, &raw, plain.as_slice()) {
+            tracing::warn!(
+                "could not re-encrypt {} in place: {e} (key left as-is, still usable)",
+                path.display()
+            );
+        }
         return Ok(ed25519_dalek::SigningKey::from_bytes(&seed));
     }
 
     // One-time migration of the legacy Ed25519 identity seed.
     let legacy = dir.join("identity.key");
-    let (key, mut seed, was_legacy) = if legacy.exists() {
+    let (key, seed, was_legacy) = if legacy.exists() {
         verify_file_perms(&legacy)?;
-        let raw = std::fs::read(&legacy).map_err(|e| anyhow!("identity.key: {e}"))?;
+        let raw = Zeroizing::new(std::fs::read(&legacy).map_err(|e| anyhow!("identity.key: {e}"))?);
         let pass = Zeroizing::new(get_passphrase());
         let plain = Zeroizing::new(decrypt_bytes(&raw, pass.as_deref())?);
-        let seed: [u8; 32] = hex::decode(std::str::from_utf8(&plain)?.trim())
-            .map_err(|e| anyhow!("identity key hex: {e}"))?
-            .try_into()
-            .map_err(|_| anyhow!("identity seed must be 32 bytes"))?;
+        let decoded = Zeroizing::new(
+            hex::decode(std::str::from_utf8(&plain)?.trim())
+                .map_err(|e| anyhow!("identity key hex: {e}"))?,
+        );
+        let seed: Zeroizing<[u8; 32]> = Zeroizing::new(
+            decoded
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("identity seed must be 32 bytes"))?,
+        );
         let key = ed25519_dalek::SigningKey::from_bytes(&seed);
         (key, seed, true)
     } else {
         let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let seed = key.to_bytes();
+        let seed = Zeroizing::new(key.to_bytes());
         (key, seed, false)
     };
 
-    // Persist under the same policy as the other node keys: encrypted when a
-    // passphrase is available, plaintext only with the explicit override.
-    let seed_hex = Zeroizing::new(hex::encode(seed));
-    zeroize::Zeroize::zeroize(&mut seed);
-    let blob: Zeroizing<Vec<u8>> =
-        if plaintext_keys_allowed() || (was_legacy && get_passphrase().is_none()) {
-            Zeroizing::new(seed_hex.as_bytes().to_vec())
-        } else {
-            let pass = passphrase_for_write("consensus key")?;
-            Zeroizing::new(encrypt_bytes(seed_hex.as_bytes(), pass.as_str())?.into_bytes())
-        };
+    // Persist under the same policy as the other node keys: encrypted with
+    // `enc2:` when a passphrase is available, plaintext ONLY when the operator
+    // explicitly opted in with `STELL_KEY_PLAINTEXT=1` (never silently write
+    // a plaintext `validator.key` during migration).
+    let seed_hex = Zeroizing::new(hex::encode(*seed));
+    drop(seed);
+    let blob: Zeroizing<Vec<u8>> = if plaintext_keys_allowed() {
+        Zeroizing::new(seed_hex.as_bytes().to_vec())
+    } else {
+        let pass = passphrase_for_write("consensus key")?;
+        Zeroizing::new(encrypt_bytes(seed_hex.as_bytes(), pass.as_str())?.into_bytes())
+    };
     atomic_write_private(&path, blob.as_slice())?;
 
     if was_legacy {
@@ -1238,13 +1272,26 @@ mod tests {
             hex::encode([0x33u8; 32]).as_bytes(),
         );
 
-        // FULL-PQ: the legacy seed is NOT a node identity. It is moved ONCE
-        // into the consensus-only validator.key and the file is renamed, so
-        // transport never sees it (fail-closed for identity, continuity for
-        // the frozen Ed-keyed consensus set).
-        let loaded = load_node_keys(&dir).expect("legacy key must migrate");
+        // Without passphrase and without STELL_KEY_PLAINTEXT=1, plaintext
+        // validator.key migration must fail closed.
+        let err = match load_node_keys(&dir) {
+            Err(e) => e,
+            Ok(_) => panic!("plaintext validator.key migration must be refused without opt-in"),
+        };
+        assert!(format!("{err:#}").contains(ENV_PLAINTEXT));
+        assert!(!dir.join("validator.key").exists());
+        assert!(dir.join("identity.key").exists());
+
+        // With passphrase set, migration encrypts validator.key with enc2:.
+        std::env::set_var(ENV_PASSPHRASE, "migrate-consensus-passphrase");
+        let loaded = load_node_keys(&dir).expect("legacy key must migrate when passphrase is set");
         assert_eq!(loaded.kem_seed, keys.kem_seed);
         assert!(dir.join("validator.key").exists(), "consensus key created");
+        let val_raw = std::fs::read_to_string(dir.join("validator.key")).unwrap();
+        assert!(
+            val_raw.starts_with("enc2:"),
+            "migrated validator.key must be encrypted with enc2:"
+        );
         assert!(
             !dir.join("identity.key").exists(),
             "legacy identity.key must be retired"

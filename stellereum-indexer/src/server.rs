@@ -7,8 +7,8 @@ use crate::db::{
 use crate::events::{decode_event, AbiCache, RawEvent};
 use crate::syncer::SyncStatus;
 use axum::{
-    extract::{Path, Query, Request, State},
-    http::{HeaderValue, StatusCode},
+    extract::{ConnectInfo, Path, Query, Request, State},
+    http::{HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{Event as SseEvent, KeepAlive, Sse},
@@ -19,15 +19,16 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, RwLock, Semaphore};
 use tower_http::cors::CorsLayer;
 
 /// Maximum number of events one page may carry.
@@ -47,6 +48,21 @@ pub const STREAM_BROADCAST_CAPACITY: usize = 1024;
 
 /// Maximum concurrent SSE clients allowed on `GET /api/v2/stream`.
 pub const MAX_INDEXER_SSE_CLIENTS: usize = 256;
+
+/// Maximum concurrent SSE clients per IP / IPv6 `/64` bucket on `GET /api/v2/stream`.
+pub const MAX_INDEXER_SSE_PER_IP: usize = 8;
+
+/// Maximum concurrent in-flight HTTP requests on the indexer API router.
+pub const MAX_INDEXER_CONCURRENT_REQUESTS: usize = 512;
+
+/// Request timeout (seconds) enforced by the indexer API middleware.
+pub const INDEXER_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Default per-IP request rate limit (requests/sec) on the indexer API router.
+pub const INDEXER_RATE_LIMIT_PER_SEC_DEFAULT: u32 = 120;
+
+/// Default per-IP rate limit (requests/sec) on `/api/v2/program/:program/accounts`.
+pub const INDEXER_PROGRAM_ACCOUNTS_RATE_LIMIT_DEFAULT: u32 = 20;
 
 /// Idle reap timeout (seconds) for `GET /api/v2/stream`.
 pub const SSE_IDLE_TIMEOUT_SECS: u64 = 300;
@@ -82,13 +98,31 @@ pub struct StreamPublishInput {
     pub payload: Value,
 }
 
+/// Reason an SSE stream acquire failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SseAcquireError {
+    GlobalLimit,
+    PerIpLimit,
+}
+
 /// RAII guard tracking an active SSE client slot in [`IndexerStreamHub`].
 pub struct SseClientGuard {
     active_clients: Arc<AtomicUsize>,
+    ip_clients: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    bucket_ip: IpAddr,
 }
 
 impl Drop for SseClientGuard {
     fn drop(&mut self) {
+        let mut map = self.ip_clients.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cnt) = map.get_mut(&self.bucket_ip) {
+            if *cnt <= 1 {
+                map.remove(&self.bucket_ip);
+            } else {
+                *cnt -= 1;
+            }
+        }
+        drop(map);
         self.active_clients.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -99,7 +133,9 @@ pub struct IndexerStreamHub {
     next_seq: AtomicU64,
     replay: Mutex<VecDeque<IndexerStreamEvent>>,
     active_clients: Arc<AtomicUsize>,
+    ip_clients: Arc<Mutex<HashMap<IpAddr, usize>>>,
     max_clients: usize,
+    max_clients_per_ip: usize,
     idle_timeout: Duration,
 }
 
@@ -112,13 +148,23 @@ impl IndexerStreamHub {
     }
 
     pub fn with_limits(max_clients: usize, idle_timeout: Duration) -> Self {
+        Self::with_all_limits(max_clients, MAX_INDEXER_SSE_PER_IP, idle_timeout)
+    }
+
+    pub fn with_all_limits(
+        max_clients: usize,
+        max_clients_per_ip: usize,
+        idle_timeout: Duration,
+    ) -> Self {
         let (tx, _rx) = broadcast::channel(STREAM_BROADCAST_CAPACITY);
         Self {
             tx,
             next_seq: AtomicU64::new(1),
             replay: Mutex::new(VecDeque::with_capacity(INDEXER_REPLAY_WINDOW)),
             active_clients: Arc::new(AtomicUsize::new(0)),
+            ip_clients: Arc::new(Mutex::new(HashMap::new())),
             max_clients,
+            max_clients_per_ip: max_clients_per_ip.max(1),
             idle_timeout,
         }
     }
@@ -164,31 +210,63 @@ impl IndexerStreamHub {
         self.active_clients.load(Ordering::Acquire)
     }
 
+    pub fn active_clients_for_ip(&self, ip: IpAddr) -> usize {
+        let bucket = stellereum::rpc::budget_bucket_ip(ip);
+        self.ip_clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&bucket)
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub fn max_clients(&self) -> usize {
         self.max_clients
+    }
+
+    pub fn max_clients_per_ip(&self) -> usize {
+        self.max_clients_per_ip
     }
 
     pub fn idle_timeout(&self) -> Duration {
         self.idle_timeout
     }
 
-    /// Attempt to reserve a client slot (`None` if at `max_clients`).
+    /// Attempt to reserve a client slot (`None` if at `max_clients` or `max_clients_per_ip`).
     pub fn try_acquire_client(&self) -> Option<SseClientGuard> {
+        self.try_acquire_client_for_ip(stellereum::rpc::LOCAL_BUCKET_IP)
+            .ok()
+    }
+
+    /// Attempt to reserve both a global slot and a per-IP/bucket slot.
+    pub fn try_acquire_client_for_ip(&self, ip: IpAddr) -> Result<SseClientGuard, SseAcquireError> {
         loop {
             let cur = self.active_clients.load(Ordering::Acquire);
             if cur >= self.max_clients {
-                return None;
+                return Err(SseAcquireError::GlobalLimit);
             }
             if self
                 .active_clients
                 .compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Some(SseClientGuard {
-                    active_clients: Arc::clone(&self.active_clients),
-                });
+                break;
             }
         }
+        let bucket_ip = stellereum::rpc::budget_bucket_ip(ip);
+        let mut map = self.ip_clients.lock().unwrap_or_else(|e| e.into_inner());
+        let held = map.get(&bucket_ip).copied().unwrap_or(0);
+        if held >= self.max_clients_per_ip {
+            drop(map);
+            self.active_clients.fetch_sub(1, Ordering::AcqRel);
+            return Err(SseAcquireError::PerIpLimit);
+        }
+        map.insert(bucket_ip, held + 1);
+        Ok(SseClientGuard {
+            active_clients: Arc::clone(&self.active_clients),
+            ip_clients: Arc::clone(&self.ip_clients),
+            bucket_ip,
+        })
     }
 
     /// Snapshot replay events strictly after `after_seq`.
@@ -355,9 +433,9 @@ pub struct StreamQuery {
 }
 
 /// Maximum pagination offset (audit B-IDX-4): an unbounded OFFSET forces a
-/// full table scan for an empty page (CPU DoS). Explorer pagination never
-/// legitimately exceeds one million rows deep.
-const MAX_OFFSET: u32 = 1_000_000;
+/// full table scan for an empty page (CPU DoS). Bounded at 100,000 rows;
+/// deeper pagination uses keyset cursors.
+const MAX_OFFSET: u32 = 100_000;
 
 /// Fail-closed offset gate: `Err(response)` on absurd offsets.
 #[allow(clippy::result_large_err)] // GATE: axum Response is the framework's
@@ -367,7 +445,7 @@ fn check_offset(offset: u32) -> Result<u32, axum::response::Response> {
     if offset > MAX_OFFSET {
         Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "offset exceeds cap 1000000"})),
+            Json(json!({"error": "offset exceeds cap 100000"})),
         )
             .into_response())
     } else {
@@ -436,7 +514,111 @@ async fn legacy_api_deprecation(request: Request, next: Next) -> Response {
 /// the historical legacy spellings (`/accounts/:address`, `/transactions/:hash`,
 /// `/blocks/latest`, ...), so both old and new clients keep working during the
 /// migration window.
+#[derive(Clone)]
+struct IndexerRouterGuard {
+    limiter: Arc<stellereum::explorer::RateLimiter>,
+    concurrency: Arc<Semaphore>,
+    request_timeout: Duration,
+}
+
+fn resolve_indexer_client_ip(headers: &HeaderMap, peer: Option<IpAddr>) -> IpAddr {
+    match peer {
+        Some(ip) => stellereum::client_ip::resolve_client_ip(headers, ip).addr,
+        None => stellereum::rpc::LOCAL_BUCKET_IP,
+    }
+}
+
+async fn indexer_guard_middleware(
+    State(guard): State<IndexerRouterGuard>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip());
+    let client_ip = resolve_indexer_client_ip(req.headers(), peer);
+    if !guard.limiter.check(client_ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": "rate limit exceeded"})),
+        )
+            .into_response();
+    }
+    let Ok(_permit) = guard.concurrency.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "server busy: concurrency limit reached"})),
+        )
+            .into_response();
+    };
+    match tokio::time::timeout(guard.request_timeout, next.run(req)).await {
+        Ok(resp) => resp,
+        Err(_) => (
+            StatusCode::REQUEST_TIMEOUT,
+            Json(json!({"error": "request timed out"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn program_accounts_rate_limit_middleware(
+    State(limiter): State<Arc<stellereum::explorer::RateLimiter>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip());
+    let client_ip = resolve_indexer_client_ip(req.headers(), peer);
+    if !limiter.check(client_ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": "program accounts rate limit exceeded"})),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+fn indexer_rate_limit_per_sec() -> u32 {
+    std::env::var("INDEXER_RATE_LIMIT_PER_SEC")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(INDEXER_RATE_LIMIT_PER_SEC_DEFAULT)
+}
+
+fn indexer_program_accounts_rate_limit_per_sec() -> u32 {
+    std::env::var("INDEXER_PROGRAM_ACCOUNTS_RATE_LIMIT_PER_SEC")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(INDEXER_PROGRAM_ACCOUNTS_RATE_LIMIT_DEFAULT)
+}
+
 pub fn create_router(state: AppState) -> Router {
+    create_router_with_limits(
+        state,
+        MAX_INDEXER_CONCURRENT_REQUESTS,
+        Duration::from_secs(INDEXER_REQUEST_TIMEOUT_SECS),
+        indexer_rate_limit_per_sec(),
+        indexer_program_accounts_rate_limit_per_sec(),
+    )
+}
+
+/// Build the API router with explicit concurrency, timeout, and per-IP rate limits.
+pub fn create_router_with_limits(
+    state: AppState,
+    max_concurrency: usize,
+    request_timeout: Duration,
+    rate_limit_per_sec: u32,
+    program_accounts_rate_limit_per_sec: u32,
+) -> Router {
+    let prog_limiter = Arc::new(stellereum::explorer::RateLimiter::new(
+        program_accounts_rate_limit_per_sec,
+    ));
     let api = Router::new()
         // Core network endpoints
         .route("/overview", get(get_overview))
@@ -465,7 +647,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/contract/:address/source", get(get_contract_source))
         // Contracts, program accounts, and LIVE shard topology
         .route("/contracts", get(get_contracts))
-        .route("/program/:program/accounts", get(get_program_accounts))
+        .route(
+            "/program/:program/accounts",
+            get(get_program_accounts).route_layer(middleware::from_fn_with_state(
+                prog_limiter,
+                program_accounts_rate_limit_middleware,
+            )),
+        )
         .route("/shards", get(get_shards))
         // Accounts, tokens, holders & History
         .route("/accounts/:address", get(get_account_info))
@@ -490,9 +678,19 @@ pub fn create_router(state: AppState) -> Router {
         .clone()
         .layer(middleware::from_fn(legacy_api_deprecation));
 
+    let guard = IndexerRouterGuard {
+        limiter: Arc::new(stellereum::explorer::RateLimiter::new(rate_limit_per_sec)),
+        concurrency: Arc::new(Semaphore::new(max_concurrency.max(1))),
+        request_timeout,
+    };
+
     Router::new()
         .nest("/api/v2", api)
         .nest("/api", legacy)
+        .layer(middleware::from_fn_with_state(
+            guard,
+            indexer_guard_middleware,
+        ))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -773,7 +971,6 @@ async fn get_validators(State(state): State<AppState>) -> impl IntoResponse {
             Json(json!({
                 "error": "live validator set is not available from node RPC",
                 "source": "rpc",
-                "rpc_url": state.rpc_url,
                 "validators": [],
             })),
         )
@@ -862,7 +1059,6 @@ async fn get_staking(State(state): State<AppState>) -> impl IntoResponse {
             Json(json!({
                 "error": "live staking state is not available from node RPC",
                 "source": "rpc",
-                "rpc_url": state.rpc_url,
             })),
         )
             .into_response();
@@ -1093,11 +1289,13 @@ async fn get_blocks(
             Ok(c) => c,
             Err(e) => return bad_request(e),
         };
-        match state
-            .db
-            .get_blocks_by_shard_keyset(shard_filter, limit, parsed)
-        {
-            Ok(page) => (
+        let db = state.db.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            db.get_blocks_by_shard_keyset(shard_filter, limit, parsed)
+        })
+        .await;
+        match res {
+            Ok(Ok(page)) => (
                 StatusCode::OK,
                 Json(json!({
                     "blocks": page.items,
@@ -1109,15 +1307,25 @@ async fn get_blocks(
                 })),
             )
                 .into_response(),
-            Err(e) => (
+            Ok(Err(e)) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
             )
                 .into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "blocks query task failed"})),
+            )
+                .into_response(),
         }
     } else {
-        match state.db.get_blocks_by_shard(shard_filter, limit, offset) {
-            Ok(blocks) => {
+        let db = state.db.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            db.get_blocks_by_shard(shard_filter, limit, offset)
+        })
+        .await;
+        match res {
+            Ok(Ok(blocks)) => {
                 let next_cursor = if blocks.len() == limit as usize && limit > 0 {
                     blocks.last().map(|b| {
                         if shard_filter.is_some() {
@@ -1141,9 +1349,14 @@ async fn get_blocks(
                 )
                     .into_response()
             }
-            Err(e) => (
+            Ok(Err(e)) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
+            )
+                .into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "blocks query task failed"})),
             )
                 .into_response(),
         }
@@ -1156,38 +1369,62 @@ async fn get_block(
     Query(q): Query<BlockQuery>,
 ) -> impl IntoResponse {
     let shard_filter = q.shard_id.or(q.shard);
-    let block_opt = if let Some((sid, h)) = parse_shard_height(&param) {
-        state.db.get_block_by_shard_and_height(sid, h)
+    if let Some((_, h)) = parse_shard_height(&param) {
+        if h > i64::MAX as u64 {
+            return bad_request("block height exceeds maximum supported range");
+        }
     } else if let Ok(h) = param.trim().parse::<u64>() {
-        if let Some(sid) = shard_filter {
-            state.db.get_block_by_shard_and_height(sid, h)
-        } else {
-            state.db.get_block_by_height(h)
+        if h > i64::MAX as u64 {
+            return bad_request("block height exceeds maximum supported range");
         }
-    } else {
-        state.db.get_block_by_hash(&param)
-    };
+    }
 
-    match block_opt {
-        Ok(Some(b)) => {
-            let txs = state
-                .db
-                .get_block_txs_for_shard(b.shard_id, b.height)
-                .unwrap_or_default();
-            (
-                StatusCode::OK,
-                Json(json!({ "block": b, "transactions": txs })),
-            )
-                .into_response()
+    let db = state.db.clone();
+    let param_owned = param.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let block_opt = if let Some((sid, h)) = parse_shard_height(&param_owned) {
+            db.get_block_by_shard_and_height(sid, h)
+        } else if let Ok(h) = param_owned.trim().parse::<u64>() {
+            if let Some(sid) = shard_filter {
+                db.get_block_by_shard_and_height(sid, h)
+            } else {
+                db.get_block_by_height(h)
+            }
+        } else {
+            db.get_block_by_hash(&param_owned)
+        };
+        match block_opt {
+            Ok(Some(b)) => {
+                let txs = db
+                    .get_block_txs_for_shard(b.shard_id, b.height)
+                    .unwrap_or_default();
+                Ok(Some((b, txs)))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
         }
-        Ok(None) => (
+    })
+    .await;
+
+    match res {
+        Ok(Ok(Some((b, txs)))) => (
+            StatusCode::OK,
+            Json(json!({ "block": b, "transactions": txs })),
+        )
+            .into_response(),
+        Ok(Ok(None)) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "Block not found"})),
         )
             .into_response(),
-        Err(e) => (
+        Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "block query task failed"})),
         )
             .into_response(),
     }
@@ -1770,12 +2007,15 @@ async fn get_contracts(
             Ok(c) => c,
             Err(e) => return bad_request(e),
         };
-        match state.db.list_contracts_keyset(limit, parsed) {
-            Ok(page) => {
-                let total = state
-                    .db
-                    .count_contracts()
-                    .unwrap_or(page.items.len() as u64);
+        let db = state.db.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            let page = db.list_contracts_keyset(limit, parsed)?;
+            let total = db.count_contracts().unwrap_or(page.items.len() as u64);
+            Ok::<_, rusqlite::Error>((page, total))
+        })
+        .await;
+        match res {
+            Ok(Ok((page, total))) => {
                 let contracts: Vec<Value> = page.items.iter().map(map_summary).collect();
                 (
                     StatusCode::OK,
@@ -1791,16 +2031,27 @@ async fn get_contracts(
                 )
                     .into_response()
             }
-            Err(e) => (
+            Ok(Err(e)) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
             )
                 .into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "contracts query task failed"})),
+            )
+                .into_response(),
         }
     } else {
-        match state.db.list_contracts(limit, offset) {
-            Ok(rows) => {
-                let total = state.db.count_contracts().unwrap_or(rows.len() as u64);
+        let db = state.db.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            let rows = db.list_contracts(limit, offset)?;
+            let total = db.count_contracts().unwrap_or(rows.len() as u64);
+            Ok::<_, rusqlite::Error>((rows, total))
+        })
+        .await;
+        match res {
+            Ok(Ok((rows, total))) => {
                 let contracts: Vec<Value> = rows.iter().map(map_summary).collect();
                 (
                     StatusCode::OK,
@@ -1814,33 +2065,24 @@ async fn get_contracts(
                 )
                     .into_response()
             }
-            Err(e) => (
+            Ok(Err(e)) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
+            )
+                .into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "contracts query task failed"})),
             )
                 .into_response(),
         }
     }
 }
 
-/// `GET /api/v2/shards` — the LIVE shard topology, proxied from the node's
-/// `stell_getShards`.
-///
-/// The topology is a property of the CHAIN, not of the indexer's own
-/// database, so it is read from the node that has the committed heads and
-/// proxied here. The answer carries `source: "rpc"` so a client can tell that
-/// it is the node's view and not a locally reconstructed one; when the node
-/// cannot be reached the endpoint says so explicitly instead of inventing a
-/// topology.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let max_len = a.len().max(b.len());
-    let mut diff: usize = a.len() ^ b.len();
-    for i in 0..max_len {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        diff |= (x ^ y) as usize;
-    }
-    diff == 0
+/// Constant-time comparison using fixed-length SHA-256 digests so token
+/// length or prefix differences do not leak through timing.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    stellereum::rpc::constant_time_eq(a, b)
 }
 
 async fn get_shards(
@@ -1903,7 +2145,6 @@ async fn get_shards(
                     obj.insert("total_shards".to_string(), json!(shard_len));
                 }
                 obj.insert("source".to_string(), json!("rpc"));
-                obj.insert("rpc_url".to_string(), json!(state.rpc_url));
                 if let Some(raw_addr) = q
                     .address
                     .as_deref()
@@ -1943,7 +2184,6 @@ async fn get_shards(
             Json(json!({
                 "error": "the node's shard topology is not available",
                 "source": "rpc",
-                "rpc_url": state.rpc_url,
                 "shards": [],
                 "total_shards": 0,
             })),
@@ -2035,12 +2275,18 @@ async fn verify_contract_source(
 ) -> impl IntoResponse {
     // Audit B-IDX-3: the only state-changing endpoint requires the operator
     // token (anonymous 1MiB writes = DB-fill + node-RPC spend). Default-deny:
-    // unset token refuses everything with 401.
-    let authorized = match state.verify_token.as_deref() {
-        Some(expected) if !expected.is_empty() => headers
+    // unset or empty/whitespace token refuses everything with 401.
+    let authorized = match state
+        .verify_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(expected) => headers
             .get("x-api-key")
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|got| constant_time_eq(got.as_bytes(), expected.as_bytes())),
+            .map(str::trim)
+            .is_some_and(|got| constant_time_eq(got, expected)),
         _ => false,
     };
     if !authorized {
@@ -2142,7 +2388,6 @@ async fn verify_contract_source(
                 Json(json!({
                     "error": "the node is not reachable: verification is decided by the node, never locally",
                     "source": "rpc",
-                    "rpc_url": state.rpc_url,
                 })),
             )
                 .into_response()
@@ -2409,15 +2654,24 @@ async fn get_program_accounts(
                 Ok(c) => c,
                 Err(e) => return bad_request(e),
             };
-            match state.db.query_token_program_accounts_keyset(
-                q.token.as_deref(),
-                q.owner.as_deref(),
-                q.min_balance,
-                q.shard_id,
-                limit,
-                cursor,
-            ) {
-                Ok(page) => (
+            let db = state.db.clone();
+            let token_opt = q.token.clone();
+            let owner_opt = q.owner.clone();
+            let min_bal = q.min_balance;
+            let shard_id = q.shard_id;
+            let res = tokio::task::spawn_blocking(move || {
+                db.query_token_program_accounts_keyset(
+                    token_opt.as_deref(),
+                    owner_opt.as_deref(),
+                    min_bal,
+                    shard_id,
+                    limit,
+                    cursor,
+                )
+            })
+            .await;
+            match res {
+                Ok(Ok(page)) => (
                     StatusCode::OK,
                     Json(json!({
                         "program": "token",
@@ -2431,9 +2685,14 @@ async fn get_program_accounts(
                     })),
                 )
                     .into_response(),
-                Err(e) => (
+                Ok(Err(e)) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": e.to_string()})),
+                )
+                    .into_response(),
+                Err(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "program accounts query task failed"})),
                 )
                     .into_response(),
             }
@@ -2456,14 +2715,22 @@ async fn get_program_accounts(
                 Ok(c) => c,
                 Err(e) => return bad_request(e),
             };
-            match state.db.get_contracts_by_filter_keyset(
-                q.creator.as_deref(),
-                q.contract.as_deref(),
-                q.shard_id,
-                limit,
-                cursor,
-            ) {
-                Ok(page) => (
+            let db = state.db.clone();
+            let creator_opt = q.creator.clone();
+            let contract_opt = q.contract.clone();
+            let shard_id = q.shard_id;
+            let res = tokio::task::spawn_blocking(move || {
+                db.get_contracts_by_filter_keyset(
+                    creator_opt.as_deref(),
+                    contract_opt.as_deref(),
+                    shard_id,
+                    limit,
+                    cursor,
+                )
+            })
+            .await;
+            match res {
+                Ok(Ok(page)) => (
                     StatusCode::OK,
                     Json(json!({
                         "program": "contract",
@@ -2477,9 +2744,14 @@ async fn get_program_accounts(
                     })),
                 )
                     .into_response(),
-                Err(e) => (
+                Ok(Err(e)) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": e.to_string()})),
+                )
+                    .into_response(),
+                Err(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "program accounts query task failed"})),
                 )
                     .into_response(),
             }
@@ -2570,7 +2842,6 @@ async fn proxy_program_accounts_rpc(
             Json(json!({
                 "error": "node RPC unavailable for stell_getProgramAccounts",
                 "source": "rpc",
-                "rpc_url": state.rpc_url,
             })),
         )
             .into_response(),
@@ -2704,6 +2975,8 @@ type IndexerSseStream =
 /// `GET /api/v2/stream?topics=newHeads,newTxs,events&contract=&address=&shard_id=&after_seq=`
 async fn stream_events(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    peer: Option<ConnectInfo<SocketAddr>>,
     Query(q): Query<StreamQuery>,
 ) -> impl IntoResponse {
     let filter = match StreamFilter::from_query(&q) {
@@ -2711,15 +2984,29 @@ async fn stream_events(
         Err(e) => return bad_request(e),
     };
 
-    let Some(guard) = state.stream_hub.try_acquire_client() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "error": "stream client limit reached",
-                "max_clients": state.stream_hub.max_clients(),
-            })),
-        )
-            .into_response();
+    let client_ip = resolve_indexer_client_ip(&headers, peer.map(|ConnectInfo(a)| a.ip()));
+    let guard = match state.stream_hub.try_acquire_client_for_ip(client_ip) {
+        Ok(g) => g,
+        Err(SseAcquireError::GlobalLimit) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "stream client limit reached",
+                    "max_clients": state.stream_hub.max_clients(),
+                })),
+            )
+                .into_response();
+        }
+        Err(SseAcquireError::PerIpLimit) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": "per-IP stream client limit reached",
+                    "max_clients_per_ip": state.stream_hub.max_clients_per_ip(),
+                })),
+            )
+                .into_response();
+        }
     };
 
     // Subscribe BEFORE snapshotting replay so no live event is missed in between.

@@ -287,6 +287,26 @@ export interface HttpSignerOptions {
   fetch?: typeof fetch;
   timeoutMs?: number;
   address?: string;
+  /**
+   * Explicitly allow plain `http://` to a non-loopback host. Off by default
+   * because bearer tokens and signing requests travel in cleartext.
+   */
+  allowInsecureHttp?: boolean;
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  const lower = hostname.toLowerCase();
+  if (lower === "localhost" || lower === "[::1]" || lower === "::1") {
+    return true;
+  }
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(lower);
+  if (m) {
+    const octets = m.slice(1).map((x) => Number(x));
+    if (octets.every((o) => o >= 0 && o <= 255) && octets[0] === 127) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** POST the same JSON to a local `stellereum-sdk-cli serve` helper. */
@@ -298,6 +318,25 @@ export class HttpFalconSigner implements FalconSigner {
   private readonly timeoutMs: number;
 
   constructor(options: HttpSignerOptions) {
+    let parsed: URL;
+    try {
+      parsed = new URL(options.url);
+    } catch {
+      throw new SignerError("invalid_url", `invalid signer URL: ${options.url}`);
+    }
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      throw new SignerError("invalid_url", `unsupported signer URL scheme: ${parsed.protocol}`);
+    }
+    if (
+      parsed.protocol === "http:" &&
+      !isLoopbackHostname(parsed.hostname) &&
+      options.allowInsecureHttp !== true
+    ) {
+      throw new SignerError(
+        "insecure_transport",
+        `refusing plain http:// to non-loopback signer host ${parsed.hostname}; pass allowInsecureHttp: true to override`,
+      );
+    }
     this.url = options.url.replace(/\/+$/, "");
     this.token = options.token;
     this.fetchImpl = options.fetch ?? fetch;

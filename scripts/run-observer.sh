@@ -6,7 +6,25 @@
 # ==============================================================================
 set -euo pipefail
 
-NODE_DIR="${1:-$HOME/stell-observer}"
+REQUIRE_SHA256="${STELL_REQUIRE_SHA256:-0}"
+NODE_DIR=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --require-sha256) REQUIRE_SHA256=1; shift ;;
+        -h|--help) echo "Usage: $0 [NODE_DIR] [--require-sha256]"; exit 0 ;;
+        -*) echo "Unknown flag: $1" >&2; exit 2 ;;
+        *)
+            if [[ -z "$NODE_DIR" ]]; then
+                NODE_DIR="$1"
+            else
+                echo "Unexpected argument: $1" >&2
+                exit 2
+            fi
+            shift
+            ;;
+    esac
+done
+NODE_DIR="${NODE_DIR:-$HOME/stell-observer}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_PATH="${STELL_BIN:-}"
 
@@ -113,7 +131,42 @@ chmod 600 "$NODE_DIR/env.observer"
 
 if [[ ! -d "$NODE_DIR/data/store" ]]; then
     echo -e "\033[1;34m[stell-observer]\033[0m Initializing state from live HTTP snapshot..."
-    curl -fsSL "https://rpc.stellereum.org/snapshot/latest.tar.zst" | tar -I 'zstd -d' -xf - -C "$NODE_DIR/data/"
+    snap_url="${STELL_SNAPSHOT_URL:-https://rpc.stellereum.org/snapshot/latest.tar.zst}"
+    snap_tmp="$(mktemp "$NODE_DIR/data/.snapshot.XXXXXX.tar.zst")"
+    cleanup_snap() { rm -f "$snap_tmp"; }
+    trap cleanup_snap EXIT
+
+    if ! curl -fsSL "$snap_url" -o "$snap_tmp"; then
+        echo -e "\033[1;31m[ERROR]\033[0m Failed to download snapshot from $snap_url" >&2
+        exit 1
+    fi
+    if ! zstd -t "$snap_tmp"; then
+        echo -e "\033[1;31m[ERROR]\033[0m Snapshot archive failed zstd integrity check" >&2
+        exit 1
+    fi
+    sha_body="$(curl -fsSL "${snap_url}.sha256" 2>/dev/null || true)"
+    if [[ -n "$sha_body" ]]; then
+        expected_sha="$(printf '%s\n' "$sha_body" | awk 'NR==1 {print tolower($1)}')"
+        if [[ ! "$expected_sha" =~ ^[0-9a-f]{64}$ ]]; then
+            echo -e "\033[1;31m[ERROR]\033[0m Malformed .sha256 manifest from ${snap_url}.sha256" >&2
+            exit 1
+        fi
+        actual_sha="$(sha256sum "$snap_tmp" | awk '{print tolower($1)}')"
+        if [[ "$actual_sha" != "$expected_sha" ]]; then
+            echo -e "\033[1;31m[ERROR]\033[0m Snapshot sha256 mismatch: expected=$expected_sha actual=$actual_sha" >&2
+            exit 1
+        fi
+        echo -e "\033[1;32m[OK]\033[0m Verified snapshot sha256 ($actual_sha)"
+    elif [[ "$REQUIRE_SHA256" = "1" ]]; then
+        echo -e "\033[1;31m[ERROR]\033[0m --require-sha256 set, but ${snap_url}.sha256 is unavailable" >&2
+        exit 1
+    else
+        echo -e "\033[1;33m[WARN]\033[0m ${snap_url}.sha256 unavailable; continuing after zstd -t check" >&2
+    fi
+
+    tar -I 'zstd -d' -xf "$snap_tmp" -C "$NODE_DIR/data/"
+    rm -f "$snap_tmp"
+    trap - EXIT
     rm -f "$NODE_DIR/data/store"/snap* "$NODE_DIR/data/store-shard"*"/snap"* 2>/dev/null || true
     if [[ ! -d "$NODE_DIR/data/store" ]]; then
         echo -e "\033[1;31m[ERROR]\033[0m Snapshot extraction did not populate $NODE_DIR/data/store" >&2

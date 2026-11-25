@@ -7,7 +7,7 @@ entries, and `docs/feature_gates.yaml` manifest are green and all four
 validators stage and activate the same binary strictly before the chosen
 activation height `H`.
 
-## 1. Overview of Batch 1 Candidates (A1–A6)
+## 1. Overview of Batch 1 Candidates (A1–A7)
 
 Every change in this batch alters consensus-visible block validity, execution
 gas/fuel, contract-visible state, settlement verdicts, or deterministic validator
@@ -23,6 +23,7 @@ validator-set commitments.
 | A4 | Bridge withdrawal target-address cap | `BRIDGE_TARGET_ADDRESS_CAP_HEIGHT` | `u64::MAX` | `{0}` and `{0,1}` | Cap `BridgeIntent::Withdraw.target_address` at `MAX_BRIDGE_TARGET_ADDRESS_BYTES` (`128` UTF-8 bytes) during `validate_at_height` and `plan_at_height` settlement |
 | A5 | Cross-shard bounce escrow | `XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT` | `u64::MAX` | `{0,1}` only (`{0}` stays `u64::MAX`) | Require committed XSHARD-01 escrow leaf (`status[i] && L(T)`) for produced/outbound/bounce paths, §9 2PC precedence, `runtime/cluster.rs` parity, and deterministic history cleanse |
 | A6 | Downtime miss budget decision | `DOWNTIME_MISS_THRESHOLD` (`42`) / `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` | `42` (frozen) | `{0}` and `{0,1}` | Decision record: keep `42` if C/A/D move to 2 vCPU, or gate efficiency-based jailing / `150`-miss interim behind `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` if 1 vCPU remains |
+| A7 | Actor mailbox hardening | `ACTOR_MAILBOX_HARDENING_HEIGHT` | `u64::MAX` | `{0}` and `{0,1}` | Height-gate hardened actor mailbox invariants: deterministic sorted-recipient FIFO delivery, `MAX_ACTOR_ROUNDS`/`MAX_ACTOR_MSGS_PER_BLOCK` caps, `MessageUndo` atomic rollback + bounce-once refund, and block-level `check_actor_cap` parity |
 
 All height-gated constants follow strict `>= H` activation semantics with the
 `u64::MAX` sentinel meaning "never active" (even at `height == u64::MAX`).
@@ -260,6 +261,52 @@ by CI.
   **must** be height-gated via `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` registered in
   `current_activation_schedule()` and `feature_gates.rs`. Mixed thresholds across
   validators cause deterministic validator-set divergence.
+
+### A7 — `ACTOR_MAILBOX_HARDENING_HEIGHT`
+
+- **Code surface**: `stellereum/src/chain_spec.rs`
+  (`ACTOR_MAILBOX_HARDENING_HEIGHT`, `actor_mailbox_hardening_active_at(h)` —
+  to be wired), `stellereum/src/state_engine/apply/actor.rs`
+  (`apply_actor_messages_at`, `deliver_actor_message`, `try_deliver`),
+  `stellereum/src/state_engine/apply/block.rs` (`apply_block_transition` step 1b),
+  `stellereum/src/state_engine/mod.rs` (`MAX_ACTOR_ROUNDS = 8`,
+  `MAX_ACTOR_MSGS_PER_BLOCK = 4_096`), `stellereum/src/runtime/{apply,mev_sync,consensus_step}.rs`
+  (`check_actor_cap`), `stellereum/src/node/sync.rs` (walk-side `check_actor_cap`),
+  `stellereum/src/feature_gates.rs`.
+- **Threat**:
+  1. Unordered `HashMap` recipient iteration during the mailbox pass causes
+     two validators applying the same block to deliver interdependent actor
+     messages in different orders and diverge on `state_root`.
+  2. Half-applied recipient/third-party mutations on body revert, out-of-gas, or
+     unfunded nested sends leak partial balance state unless rolled back
+     atomically before issuing a single bounce refund.
+  3. Unbounded mailbox recursion or blocks exceeding `MAX_ACTOR_MSGS_PER_BLOCK`
+     leave root-invisible queued messages across block boundaries unless
+     enforced identically at propose, vote/validate, and sync-walk boundaries.
+- **Pre-activation (`height < H`, or `u64::MAX`)**:
+  - Historical blocks keep legacy Ruleset v7 replay semantics byte-for-byte
+    with empty queues at block boundaries and no change to genesis/historical
+    KATs or `AccountState` leaf encoding.
+- **Post-activation (`height >= H`)**:
+  - `apply_actor_messages_at` executes deterministically in sorted recipient
+    address order (`sort_unstable`) with FIFO per-recipient ordering, bounded
+    by `MAX_ACTOR_ROUNDS` (`8`) and `MAX_ACTOR_MSGS_PER_BLOCK` (`4_096`).
+  - Failed deliveries roll back all touched accounts via `MessageUndo` and
+    bounce once as a pure refund (`bounced: true`, body never re-executed).
+  - Propose, consensus validation, and sync walk enforce identical
+    `check_actor_cap` limits (`backlog + block_sends <= MAX_ACTOR_MSGS_PER_BLOCK`)
+    so no node can admit or adopt a block that leaves root-invisible mailbox
+    state across a block boundary.
+  - Any future persistent cross-block inbox state (`ACTORQ1` conditional leaf)
+    remains out of scope and would require its own separate activation gate.
+- **Prerequisites before arming**:
+  1. Wire `ACTOR_MAILBOX_HARDENING_HEIGHT` (compiled default `u64::MAX`) in
+     `chain_spec.rs`, `current_activation_schedule()`, and `feature_gates.rs`.
+  2. Cross-node `apply_block_transition` E2E proving identical `state_root`
+     under multi-recipient / multi-round / revert-and-bounce workloads and
+     uniform rejection of over-cap blocks across propose, consensus, and walk.
+  3. Inert pin test + `docs/feature_gates.yaml` regeneration via
+     `stellereum gates --yaml`.
 
 ---
 

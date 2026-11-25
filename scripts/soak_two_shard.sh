@@ -365,6 +365,8 @@ for role in alpha beta; do wait_ready "$role"; done
 
 # Derive the genesis-funded sender ONCE, without submitting anything, so the
 # balance around each transfer can be read before the source is debited.
+# Note: `stellereum wallet send-pq` (stellereum/src/cli/args.rs) currently only
+# accepts `--falcon-seed` on the CLI (no `--key-file`/env fallback).
 derive_sender() {
     local role="$1" out
     out="$("$BIN" wallet send-pq \

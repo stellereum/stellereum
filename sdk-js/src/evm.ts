@@ -117,6 +117,9 @@ export function keccak256(data: Uint8Array): Uint8Array {
 
 /** `keccak256("STELL_EVM_BIND_V1" || chain_id_be || evm || pq)` (32 bytes). */
 export function bindingMessage(chainId: number, evm: Uint8Array, pq: Uint8Array): Uint8Array {
+  if (!Number.isSafeInteger(chainId) || chainId < 0) {
+    throw new RangeError(`chainId must be a non-negative safe integer, got ${String(chainId)}`);
+  }
   if (evm.length !== 20) throw new Error(`evm address must be 20 bytes, got ${evm.length}`);
   if (pq.length !== 32) throw new Error(`pq address must be 32 bytes, got ${pq.length}`);
   const buf = new Uint8Array(EVM_BINDING_DOMAIN.length + 8 + 20 + 32);

@@ -90,6 +90,32 @@ export interface TransactionFields {
   priorityFeePerGas: number;
 }
 
+const U32_MAX = 0xffff_ffff;
+const U64_MAX = (1n << 64n) - 1n;
+
+function toValidU32(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0 || value > U32_MAX) {
+    throw new RangeError(`u32 out of range [0, 2^32-1]: ${String(value)}`);
+  }
+  return value;
+}
+
+function toValidU64(value: number | bigint): bigint {
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new RangeError(`u64 out of range or not a safe non-negative integer: ${String(value)}`);
+    }
+    return BigInt(value);
+  }
+  if (typeof value === "bigint") {
+    if (value < 0n || value > U64_MAX) {
+      throw new RangeError(`u64 bigint out of range [0, 2^64-1]: ${value.toString()}`);
+    }
+    return value;
+  }
+  throw new RangeError("u64 must be a number or bigint");
+}
+
 class Writer {
   private readonly parts: Uint8Array[] = [];
 
@@ -99,25 +125,25 @@ class Writer {
 
   u32le(value: number): void {
     const out = new Uint8Array(4);
-    new DataView(out.buffer).setUint32(0, value >>> 0, true);
+    new DataView(out.buffer).setUint32(0, toValidU32(value), true);
     this.parts.push(out);
   }
 
   u32be(value: number): void {
     const out = new Uint8Array(4);
-    new DataView(out.buffer).setUint32(0, value >>> 0, false);
+    new DataView(out.buffer).setUint32(0, toValidU32(value), false);
     this.parts.push(out);
   }
 
   u64le(value: number | bigint): void {
     const out = new Uint8Array(8);
-    new DataView(out.buffer).setBigUint64(0, BigInt(value), true);
+    new DataView(out.buffer).setBigUint64(0, toValidU64(value), true);
     this.parts.push(out);
   }
 
   u64be(value: number | bigint): void {
     const out = new Uint8Array(8);
-    new DataView(out.buffer).setBigUint64(0, BigInt(value), false);
+    new DataView(out.buffer).setBigUint64(0, toValidU64(value), false);
     this.parts.push(out);
   }
 
@@ -357,7 +383,7 @@ export function encodePayload(
   return w.finish();
 }
 
-/** `bincode(Transaction)` with an empty signature blob. */
+/** `bincode(Transaction)` with an empty signature blob (plus trailing PRIORITY suffix if non-zero). */
 export function encodeUnsignedTransaction(tx: TransactionFields): Uint8Array {
   if (tx.from.length !== 32 || tx.to.length !== 32) throw new Error("transaction addresses must be 32 bytes");
   const w = new Writer();
@@ -368,7 +394,13 @@ export function encodeUnsignedTransaction(tx: TransactionFields): Uint8Array {
   w.u64le(tx.nonce);
   w.u32le(tx.sourceShard);
   w.u32le(tx.targetShard);
-  w.u64le(0); // empty signature blob
+  if (tx.priorityFeePerGas !== 0) {
+    w.u64le(PRIORITY_FEE_COMMITMENT_TAG.length + 8);
+    w.bytes(PRIORITY_FEE_COMMITMENT_TAG);
+    w.u64be(tx.priorityFeePerGas);
+  } else {
+    w.u64le(0); // empty signature blob
+  }
   w.bytes(tx.payload.length === 0 ? new Uint8Array(8) : tx.payload);
   return w.finish();
 }

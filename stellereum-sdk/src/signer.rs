@@ -391,13 +391,23 @@ pub fn sign_request(
     let signed = match &request.tx {
         TxIntent::Prepared { tx_hex, common } => {
             let bytes = decode_hex(tx_hex, "tx_hex")?;
-            let tx = Transaction::decode(&bytes)?;
+            let mut tx = Transaction::decode(&bytes)?;
+            if common.priority_fee_per_gas != 0 {
+                if tx.priority_fee_per_gas == 0 {
+                    tx.priority_fee_per_gas = common.priority_fee_per_gas;
+                } else if tx.priority_fee_per_gas != common.priority_fee_per_gas {
+                    return Err(SdkError::InvalidArgument(format!(
+                        "prepared tx priority_fee_per_gas ({}) != request priority_fee_per_gas ({})",
+                        tx.priority_fee_per_gas, common.priority_fee_per_gas
+                    )));
+                }
+            }
             let chain_id = if common.unbound {
                 None
             } else {
                 Some(identity.chain_id)
             };
-            crate::tx::sign_unsigned(tx, key, envelope_mode, chain_id)?
+            crate::tx::sign_unsigned_with_identity(tx, key, envelope_mode, identity, chain_id)?
         }
         TxIntent::EvmBinding {
             evm_address,
@@ -714,5 +724,46 @@ mod tests {
         }))
         .unwrap();
         assert!(sign_request(&key, &overflow_req).is_err());
+    }
+
+    #[test]
+    fn prepared_request_preserves_priority_fee_and_custom_chain_id() {
+        let key = FalconKeypair::generate().unwrap();
+        let identity = ProtocolIdentity {
+            chain_id: 2,
+            ..ProtocolIdentity::local()
+        };
+        let unsigned = TxBuilder::transfer([7u8; 32], 55)
+            .nonce(3)
+            .identity(identity)
+            .chain_id(2)
+            .priority_fee_per_gas(17)
+            .unsigned_transaction(key.address());
+        let tx_hex = hex::encode(unsigned.encode());
+        let req: SignRequest = serde_json::from_value(serde_json::json!({
+            "tx": {
+                "kind": "prepared",
+                "tx_hex": tx_hex,
+                "chain_id": 2,
+                "priority_fee_per_gas": 17
+            }
+        }))
+        .unwrap();
+        let (signed, resp) = sign_request(&key, &req).unwrap();
+        signed.verify().unwrap();
+        assert_eq!(signed.chain_id(), Some(2));
+        assert_eq!(resp.chain_id, Some(2));
+        assert_eq!(signed.priority_fee_per_gas(), 17);
+
+        let mismatch_req: SignRequest = serde_json::from_value(serde_json::json!({
+            "tx": {
+                "kind": "prepared",
+                "tx_hex": hex::encode(unsigned.encode()),
+                "chain_id": 2,
+                "priority_fee_per_gas": 99
+            }
+        }))
+        .unwrap();
+        assert!(sign_request(&key, &mismatch_req).is_err());
     }
 }

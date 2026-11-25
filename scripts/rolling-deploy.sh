@@ -216,25 +216,30 @@ guard_unit() {
 }
 
 rpc_cmd() {
-    local url="$1" method="$2" params="$3"
-    printf "curl -sS -m 8 -X POST '%s' -H 'content-type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"%s\",\"params\":%s}'" \
-        "$url" "$method" "$params"
+    local url="$1" method="$2" params="$3" payload
+    payload="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"${method}\",\"params\":${params}}"
+    printf 'curl -sS -m 8 -X POST %s -H %s -d %s' \
+        "$(printf '%q' "$url")" \
+        "$(printf '%q' "content-type: application/json")" \
+        "$(printf '%q' "$payload")"
 }
 
 json_height() {
     local body="$1" result
     result="$(printf '%s' "$body" | jq -r '.result // empty' 2>/dev/null || true)"
-    case "$result" in
-        ''|null) return 1 ;;
-        0x*|0X*) printf '%d' "$((16#${result#0[Xx]}))" ;;
-        *) printf '%d' "$((10#$result))" 2>/dev/null || printf '%s' "$result" ;;
-    esac
+    if [[ "$result" =~ ^0[xX][0-9a-fA-F]+$ ]]; then
+        printf '%d' "$((16#${result:2}))"
+    elif [[ "$result" =~ ^[0-9]+$ ]]; then
+        printf '%d' "$((10#$result))"
+    else
+        return 1
+    fi
 }
 
 rpc_height() {
-    local url="$1" body cmd
-    cmd="$(rpc_cmd "$url" stell_blockNumber '[]')"
-    body="$(bash -c "$cmd" 2>/dev/null || true)"
+    local url="$1" body
+    body="$(curl -sS -m 8 -X POST "$url" -H 'content-type: application/json' \
+        -d '{"jsonrpc":"2.0","id":1,"method":"stell_blockNumber","params":[]}' 2>/dev/null || true)"
     json_height "$body"
 }
 
@@ -248,8 +253,9 @@ node_height() {
 }
 
 remote_sha() {
-    local node="$1" path="$2" out
-    out="$(nrun "$node" "sha256sum '$path' 2>/dev/null | cut -d' ' -f1" || true)"
+    local node="$1" path="$2" out q_path
+    q_path="$(printf '%q' "$path")"
+    out="$(nrun "$node" "sha256sum $q_path 2>/dev/null | cut -d' ' -f1" || true)"
     [ "${#out}" -eq 64 ] || return 1
     printf '%s' "$out"
 }
@@ -285,7 +291,8 @@ cluster_json_ok() {
 fetch_cluster_json() {
     local attempt node url cmd json
     for attempt in 1 2 3 4 5 6; do
-        json="$(bash -c "$(rpc_cmd "$PUBLIC_RPC" stell_getValidators '[]')" 2>/dev/null || true)"
+        json="$(curl -sS -m 8 -X POST "$PUBLIC_RPC" -H 'content-type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"stell_getValidators","params":[]}' 2>/dev/null || true)"
         if cluster_json_ok "$json"; then
             printf '%s' "$json"
             return 0
@@ -312,6 +319,7 @@ cluster_check() {
         return 1
     fi
     count="$(printf '%s' "$json" | jq -r '(.result.validators // .validators) | length')"
+    [[ "$count" =~ ^[0-9]+$ ]] || { warn "invalid validator count from RPC: $count"; return 1; }
     fragile="$(printf '%s' "$json" | jq -r '(.result.fragile // .fragile // false) | tostring')"
     total="$(printf '%s' "$json" | jq -r '(.result.total_power // .total_power // "?") | tostring')"
     note "cluster: ${count}/${CLUSTER_SIZE} validators, total_power=${total}, fragile=${fragile}"
@@ -404,9 +412,15 @@ do_stage() {
         dir="$(node_attr "$node" DIR)"
         final="$dir/stellereum.new.next"
         tmp="$dir/.stellereum.new.next.tmp.$$"
+        local q_dir q_tmp q_final q_digest q_shafile
+        q_dir="$(printf '%q' "$dir")"
+        q_tmp="$(printf '%q' "$tmp")"
+        q_final="$(printf '%q' "$final")"
+        q_digest="$(printf '%q' "$digest")"
+        q_shafile="$(printf '%q' "$dir/stellereum.new.sha256")"
 
         note "[$node] staging -> $final"
-        nrun "$node" "test -d '$dir'" || die "[$node] node dir does not exist: $dir"
+        nrun "$node" "test -d $q_dir" || die "[$node] node dir does not exist: $dir"
 
         if nrun "$node" "command -v ionice >/dev/null 2>&1"; then
             remote_ionice="nice -n 19 ionice -c3"
@@ -418,25 +432,25 @@ do_stage() {
         # Stream while the old binary keeps running. The idle-class copy yields
         # to the consensus thread; the bytes go to a temp name, never to
         # <dir>/stellereum.
-        if ! nrun "$node" "$remote_ionice cat > '$tmp'" <"$binary"; then
-            nrun "$node" "rm -f '$tmp'" || true
+        if ! nrun "$node" "$remote_ionice cat > $q_tmp" <"$binary"; then
+            nrun "$node" "rm -f $q_tmp" || true
             die "[$node] copy failed"
         fi
 
         if ! sum="$(remote_sha "$node" "$tmp")"; then
-            nrun "$node" "rm -f '$tmp'" || true
+            nrun "$node" "rm -f $q_tmp" || true
             die "[$node] could not read the staged digest"
         fi
         if [ "$sum" != "$digest" ]; then
-            nrun "$node" "rm -f '$tmp'" || true
+            nrun "$node" "rm -f $q_tmp" || true
             die "[$node] staged sha256 mismatch: local=$digest remote=$sum"
         fi
 
-        if ! nrun "$node" "chmod 0755 '$tmp' && mv -f '$tmp' '$final' && printf '%s\n' '$digest' > '$dir/stellereum.new.sha256'"; then
-            nrun "$node" "rm -f '$tmp'" || true
+        if ! nrun "$node" "chmod 0755 $q_tmp && mv -f $q_tmp $q_final && printf '%s\n' $q_digest > $q_shafile"; then
+            nrun "$node" "rm -f $q_tmp" || true
             die "[$node] could not install the staged binary"
         fi
-        want="$(nrun "$node" "cat '$dir/stellereum.new.sha256'")"
+        want="$(nrun "$node" "cat $q_shafile")"
         [ "$want" = "$digest" ] || die "[$node] staged digest file is inconsistent"
         note "[$node] staged and verified; running binary untouched"
     done
@@ -498,7 +512,11 @@ report_jail() {
         return 0
     fi
     note "[$node] auto-unjailing as ordered (cold key path: $WITHDRAWAL_KEY_FILE)"
-    if ! nrun "$node" "cd '$dir' && ./stellereum validator unjail --validator-id '$vid' --withdrawal-key-file '$WITHDRAWAL_KEY_FILE'"; then
+    local q_dir q_vid q_key
+    q_dir="$(printf '%q' "$dir")"
+    q_vid="$(printf '%q' "$vid")"
+    q_key="$(printf '%q' "$WITHDRAWAL_KEY_FILE")"
+    if ! nrun "$node" "cd $q_dir && ./stellereum validator unjail --validator-id $q_vid --withdrawal-key-file $q_key"; then
         warn "[$node] auto-unjail command failed; unjail manually"
         return 0
     fi
@@ -535,6 +553,7 @@ check_validator() {
 activate_one() {
     local node="$1" dir unit sysctl rpc expected actual t0 t1 ms
     local start_h tip local_h active=0 caught=0 waited=0 deadline vid fail=0
+    local q_dir q_unit q_guard q_next q_shafile
 
     dir="$(node_attr "$node" DIR)"
     unit="$(node_attr "$node" SERVICE)"
@@ -543,13 +562,18 @@ activate_one() {
     [ -n "$unit" ] || die "[$node] NODE_${node}_SERVICE is empty"
     [ -n "$rpc" ] || die "[$node] NODE_${node}_RPC is empty"
 
+    q_dir="$(printf '%q' "$dir")"
+    q_unit="$(printf '%q' "$unit")"
+    q_next="$(printf '%q' "$dir/stellereum.new.next")"
+    q_shafile="$(printf '%q' "$dir/stellereum.new.sha256")"
+
     # --- 1. preflight: only the staged, verified bytes may be activated ------
     note "[$node] preflight: $dir/stellereum.new.next"
-    nrun "$node" "test -f '$dir/stellereum.new.next'" \
+    nrun "$node" "test -f $q_next" \
         || die "[$node] no staged binary at $dir/stellereum.new.next (run stage first)"
-    nrun "$node" "test ! -L '$dir/stellereum.new.next'" \
+    nrun "$node" "test ! -L $q_next" \
         || die "[$node] staged candidate is a symlink; refusing"
-    expected="$(nrun "$node" "cat '$dir/stellereum.new.sha256' 2>/dev/null" || true)"
+    expected="$(nrun "$node" "cat $q_shafile 2>/dev/null" || true)"
     [ "${#expected}" -eq 64 ] \
         || die "[$node] missing or malformed $dir/stellereum.new.sha256 (re-run stage)"
     if ! actual="$(remote_sha "$node" "$dir/stellereum.new.next")"; then
@@ -568,21 +592,22 @@ activate_one() {
     # Pause the liveness guard so it cannot start a SECOND instance while the
     # unit is coming down (see guard_unit()).
     guard="$(guard_unit)"
-    nrun_long "$node" "$sysctl stop '$guard' >/dev/null 2>&1 || true"
-    if ! nrun_long "$node" "cd '$dir' && cp -f stellereum stellereum.prev && mv -f stellereum.new.next stellereum && $sysctl restart '$unit'"; then
-        nrun_long "$node" "$sysctl start '$guard' >/dev/null 2>&1 || true"
+    q_guard="$(printf '%q' "$guard")"
+    nrun_long "$node" "$sysctl stop $q_guard >/dev/null 2>&1 || true"
+    if ! nrun_long "$node" "cd $q_dir && cp -f stellereum stellereum.prev && mv -f stellereum.new.next stellereum && $sysctl restart $q_unit"; then
+        nrun_long "$node" "$sysctl start $q_guard >/dev/null 2>&1 || true"
         if [ "$CANARY" -eq 1 ]; then
             warn "[$node] swap/restart failed; $dir/stellereum.prev holds the previous binary"
             return 1
         fi
         die "[$node] swap/restart failed; $dir/stellereum.prev holds the previous binary"
     fi
-    nrun_long "$node" "$sysctl start '$guard' >/dev/null 2>&1 || true"
+    nrun_long "$node" "$sysctl start $q_guard >/dev/null 2>&1 || true"
 
     deadline=$(( $(date +%s) + 120 ))
     t_active=""
     while :; do
-        if nrun "$node" "$sysctl is-active --quiet '$unit'" 2>/dev/null; then
+        if nrun "$node" "$sysctl is-active --quiet $q_unit" 2>/dev/null; then
             active=1
             t_active="$(now_ms)"
             break
@@ -603,13 +628,13 @@ activate_one() {
     while :; do
         tip="$(public_tip "$node" || true)"
         local_h="$(node_height "$node" || true)"
-        if [ -n "$local_h" ]; then
-            if [ -n "$tip" ]; then
+        if [[ "$local_h" =~ ^[0-9]+$ ]]; then
+            if [[ "$tip" =~ ^[0-9]+$ ]]; then
                 if [ "$local_h" -ge $((tip - 5)) ]; then
                     caught=1
                     break
                 fi
-            elif [ -n "$start_h" ] && [ "$local_h" -gt "$start_h" ]; then
+            elif [[ "$start_h" =~ ^[0-9]+$ ]] && [ "$local_h" -gt "$start_h" ]; then
                 caught=1
                 break
             fi
@@ -663,24 +688,28 @@ activate_one() {
 }
 
 rollback_canary_node() {
-    local node="$1" dir unit sysctl guard
+    local node="$1" dir unit sysctl guard q_dir q_unit q_guard q_prev
     dir="$(node_attr "$node" DIR)"
     unit="$(node_attr "$node" SERVICE)"
     sysctl="$(sysctl_for "$node")"
     guard="$(guard_unit)"
+    q_dir="$(printf '%q' "$dir")"
+    q_unit="$(printf '%q' "$unit")"
+    q_guard="$(printf '%q' "$guard")"
+    q_prev="$(printf '%q' "$dir/stellereum.prev")"
 
     warn "[$node] CANARY ROLLBACK: restoring $dir/stellereum.prev -> $dir/stellereum and restarting $unit"
-    if ! nrun "$node" "test -f '$dir/stellereum.prev'"; then
+    if ! nrun "$node" "test -f $q_prev"; then
         warn "[$node] cannot rollback: $dir/stellereum.prev is missing"
         return 1
     fi
-    nrun_long "$node" "$sysctl stop '$guard' >/dev/null 2>&1 || true"
-    if ! nrun_long "$node" "cd '$dir' && mv -f stellereum.prev stellereum && $sysctl restart '$unit'"; then
-        nrun_long "$node" "$sysctl start '$guard' >/dev/null 2>&1 || true"
+    nrun_long "$node" "$sysctl stop $q_guard >/dev/null 2>&1 || true"
+    if ! nrun_long "$node" "cd $q_dir && mv -f stellereum.prev stellereum && $sysctl restart $q_unit"; then
+        nrun_long "$node" "$sysctl start $q_guard >/dev/null 2>&1 || true"
         warn "[$node] CANARY ROLLBACK FAILED during restore/restart"
         return 1
     fi
-    nrun_long "$node" "$sysctl start '$guard' >/dev/null 2>&1 || true"
+    nrun_long "$node" "$sysctl start $q_guard >/dev/null 2>&1 || true"
     note "[$node] canary rollback complete; $unit restarted on previous binary"
 }
 
@@ -769,6 +798,7 @@ do_activate() {
         die "cannot read stell_getValidators before the rollout; refusing to start"
     fi
     BASELINE_COUNT="$(printf '%s' "$json" | jq -r '(.result.validators // .validators) | length')"
+    [[ "$BASELINE_COUNT" =~ ^[0-9]+$ ]] || die "invalid baseline validator count from RPC: $BASELINE_COUNT"
     note "baseline cluster: ${BASELINE_COUNT}/${CLUSTER_SIZE} validators, fragile=$(printf '%s' "$json" | jq -r '(.result.fragile // .fragile // false)')"
     if [ "$BASELINE_COUNT" -lt 3 ]; then
         die "cluster already has ${BASELINE_COUNT} validators; fix that before a rolling restart"
@@ -829,6 +859,7 @@ done
 # expected config (or an explicit operator override). Recompute AFTER the
 # conf is sourced so the reported budget matches the live 800 ms fleet.
 BLOCK_MS="${STELL_MIN_BLOCK_MS:-${EXPECT_STELL_MIN_BLOCK_MS:-$BLOCK_MS}}"
+[[ "$BLOCK_MS" =~ ^[0-9]+$ ]] || die "BLOCK_MS must be a non-negative integer: $BLOCK_MS"
 DOWNTIME_WARN_MS=$((JAIL_MISSES * BLOCK_MS * 9 / 10))
 
 command -v jq >/dev/null 2>&1 || die "jq is required (local parsing only; nodes need no jq)"

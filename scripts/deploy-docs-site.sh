@@ -81,15 +81,18 @@ fi
 
 # ---------------------------------------------------------- nginx config
 log "installing nginx block $REMOTE_CONF"
-"${SCP[@]}" "$NGINX_CONF" "$REMOTE:/tmp/stellereum-docs.conf"
+remote_tmp="$("${SSH[@]}" "mktemp /tmp/stellereum-docs.XXXXXX.conf")"
+[[ -n "$remote_tmp" ]] || die "failed to create remote temp file"
+q_remote_tmp="$(printf '%q' "$remote_tmp")"
+"${SCP[@]}" "$NGINX_CONF" "$REMOTE:$remote_tmp"
 "${SSH[@]}" "
   set -e
+  trap 'rm -f $q_remote_tmp' EXIT
   if [ -f '$REMOTE_CONF' ]; then
     cp -a '$REMOTE_CONF' '$REMOTE_CONF.bak.\$(date +%Y%m%d%H%M%S)'
   fi
-  install -m 0644 /tmp/stellereum-docs.conf '$REMOTE_CONF'
+  install -m 0644 $q_remote_tmp '$REMOTE_CONF'
   ln -sfn '$REMOTE_CONF' /etc/nginx/sites-enabled/stellereum-docs
-  rm -f /tmp/stellereum-docs.conf
   nginx -t
 "
 

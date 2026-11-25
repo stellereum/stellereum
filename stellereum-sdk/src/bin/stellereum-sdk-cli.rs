@@ -183,8 +183,19 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     let listen = flag(args, "--listen").unwrap_or_else(|| "127.0.0.1:8787".into());
     let listener = TcpListener::bind(&listen).map_err(|e| format!("bind {listen}: {e}"))?;
     let token = std::env::var("STELL_SDK_SIGNER_TOKEN").ok();
+    let allowed_origins: Vec<String> = std::env::var("STELL_SDK_SIGNER_ALLOWED_ORIGINS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
-    let server = SignerServer::start(listener, key, token).map_err(|e| format!("serve: {e}"))?;
+    let server = SignerServer::start_with_allowed_origins(listener, key, token, allowed_origins)
+        .map_err(|e| format!("serve: {e}"))?;
     eprintln!(
         "signer listening on http://{addr} (address {})",
         server.address()

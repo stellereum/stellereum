@@ -40,7 +40,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONF="${STELL_CONF:-$ROOT_DIR/scripts/cluster-nodes.conf}"
 
-STATE_DIR="${OBS_STATE_DIR:-${TMPDIR:-/tmp}/stell-observe}"
+STATE_DIR="${OBS_STATE_DIR:-${XDG_RUNTIME_DIR:-$HOME/.local/state}/stellereum-observe}"
 OBS_REMOTE_PORT="${OBS_REMOTE_PORT:-8080}"
 OBS_RECONNECT_SECS="${OBS_RECONNECT_SECS:-5}"
 OBS_CHECK_TIMEOUT="${OBS_CHECK_TIMEOUT:-5}"
@@ -209,8 +209,8 @@ stop_one() {
 }
 
 cmd_start() {
-  mkdir -p "$STATE_DIR" || die "cannot create state dir: $STATE_DIR"
-  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  mkdir -p -m 0700 "$STATE_DIR" || die "cannot create state dir: $STATE_DIR"
+  chmod 0700 "$STATE_DIR" 2>/dev/null || true
   local name
   for name in "${NODE_ORDER[@]}"; do
     start_one "$name"

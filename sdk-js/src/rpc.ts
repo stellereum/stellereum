@@ -142,6 +142,14 @@ export class JsonRpcClient {
     if (typeof parsed !== "object" || parsed === null || !("result" in parsed)) {
       throw new RpcError(method, -32603, "response has no result", parsed);
     }
+    if ((parsed as { id?: unknown }).id !== id) {
+      throw new RpcError(
+        method,
+        -32603,
+        `response id mismatch: expected ${id}, got ${String((parsed as { id?: unknown }).id)}`,
+        parsed,
+      );
+    }
     return (parsed as { result: T }).result;
   }
 }

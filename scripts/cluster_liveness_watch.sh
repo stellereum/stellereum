@@ -66,8 +66,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIVENESS_BIN="${STELL_LIVENESS_BIN:-$SCRIPT_DIR/cluster_liveness.sh}"
 
 WATCH_INTERVAL="${STELL_LIVENESS_WATCH_INTERVAL:-60}"
-LOG_FILE="${STELL_LIVENESS_LOG:-/tmp/stell_cluster_liveness.log}"
-TEXTFILE="${STELL_LIVENESS_TEXTFILE:-/tmp/stell_cluster_liveness.prom}"
+DEFAULT_LIVENESS_STATE_DIR="${XDG_RUNTIME_DIR:-$HOME/.local/state}/stellereum-liveness"
+LOG_FILE="${STELL_LIVENESS_LOG:-$DEFAULT_LIVENESS_STATE_DIR/cluster_liveness.log}"
+TEXTFILE="${STELL_LIVENESS_TEXTFILE:-$DEFAULT_LIVENESS_STATE_DIR/cluster_liveness.prom}"
 
 # Tick/clock sampling. The journal window is bounded by time for journalctl
 # commands and by line count for anything else (ssh, cat, a test fixture).
@@ -241,6 +242,8 @@ done
 [[ -f "$LIVENESS_BIN" ]] || die "liveness script not found: $LIVENESS_BIN"
 [[ -n "$LOG_FILE" ]] || die "--log must not be empty"
 [[ -n "$TEXTFILE" ]] || die "--textfile must not be empty"
+mkdir -p -m 0700 "$(dirname "$LOG_FILE")" "$(dirname "$TEXTFILE")" 2>/dev/null || true
+chmod 0700 "$DEFAULT_LIVENESS_STATE_DIR" 2>/dev/null || true
 
 # ---- node names --------------------------------------------------------------
 # Derive the node labels from the same --rpcs / STELL_RPCS value that
@@ -426,8 +429,8 @@ collect_tick_clock() {
 }
 
 write_metrics() { # ok height spread stalled_seconds
-    local ok="$1" height="$2" spread="$3" stalled="$4" n lbl
-    local tmp="${TEXTFILE}.tmp.$$"
+    local ok="$1" height="$2" spread="$3" stalled="$4" n lbl tmp
+    tmp="$(mktemp "${TEXTFILE}.tmp.XXXXXX")" || return 1
     {
         printf '# HELP stell_cluster_liveness_ok 1 when cluster_liveness.sh verdict is OK, else 0\n'
         printf '# TYPE stell_cluster_liveness_ok gauge\n'

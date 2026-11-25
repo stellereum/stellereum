@@ -22,7 +22,8 @@
 set -u
 
 AM_URL="${STELL_ALERTMANAGER_URL:-http://127.0.0.1:9093}"
-STATE="${STELL_ALERT_STATE:-/tmp/stell-alert-notify.state}"
+DEFAULT_STATE_DIR="${XDG_RUNTIME_DIR:-$HOME/.local/state}/stellereum-alert-notify"
+STATE="${STELL_ALERT_STATE:-$DEFAULT_STATE_DIR/state}"
 LOG="${STELL_ALERT_LOG:-/var/log/stell-alerts.log}"
 HOOK="${STELL_ALERT_HOOK:-}"
 LOOP=0
@@ -36,6 +37,9 @@ while [ $# -gt 0 ]; do
         *) echo "alert-notify.sh: unknown argument $1" >&2; exit 2 ;;
     esac
 done
+
+mkdir -p -m 0700 "$(dirname "$STATE")" 2>/dev/null || true
+chmod 0700 "$DEFAULT_STATE_DIR" 2>/dev/null || true
 
 emit() {
     local line="$1"
@@ -53,7 +57,12 @@ pass() {
         emit "ALERTMANAGER_UNREACHABLE $AM_URL"
         return 0
     }
-    local now_f="/tmp/stell-alert-now.$$"
+    local tmp_dir now_f
+    tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/stell-alert.XXXXXX")" || {
+        emit "ALERT_NOTIFY_TMP_ERROR"
+        return 0
+    }
+    now_f="$tmp_dir/now"
     : >"$now_f"
     printf '%s' "$body" | python3 -c '
 import sys, json
@@ -73,24 +82,24 @@ for a in alerts:
     print("%s\t[%s] %s (%s) %s" % (key, sev.upper(), name, node, summary))
 ' >"$now_f"
 
-    cut -f1 "$now_f" | sort -u >"$now_f.keys"
-    : >"$now_f.prev"
-    [ -f "$STATE" ] && sort -u "$STATE" >"$now_f.prev"
+    cut -f1 "$now_f" | sort -u >"$tmp_dir/keys"
+    : >"$tmp_dir/prev"
+    [ -f "$STATE" ] && sort -u "$STATE" >"$tmp_dir/prev"
 
     # NEW: present now, absent from the previous snapshot.
-    comm -23 "$now_f.keys" "$now_f.prev" | while IFS= read -r key; do
+    comm -23 "$tmp_dir/keys" "$tmp_dir/prev" | while IFS= read -r key; do
         [ -n "$key" ] || continue
         line="$(grep -F -- "$key	" "$now_f" | head -n1 | cut -f2-)"
         emit "FIRING $line"
     done
     # RESOLVED: present before, gone now.
-    comm -13 "$now_f.keys" "$now_f.prev" | while IFS= read -r key; do
+    comm -13 "$tmp_dir/keys" "$tmp_dir/prev" | while IFS= read -r key; do
         [ -n "$key" ] || continue
         emit "RESOLVED $key"
     done
 
-    mv -f "$now_f.keys" "$STATE" 2>/dev/null || cp -f "$now_f.keys" "$STATE" 2>/dev/null || true
-    rm -f "$now_f" "$now_f.prev"
+    mv -f "$tmp_dir/keys" "$STATE" 2>/dev/null || cp -f "$tmp_dir/keys" "$STATE" 2>/dev/null || true
+    rm -rf "$tmp_dir"
 }
 
 if [ "$LOOP" -gt 0 ]; then

@@ -29,7 +29,7 @@ set -u
 PUBLIC_RPC="${STELL_PUBLIC_RPC:-https://rpc.stellereum.org}"
 MAX_GAP="${AUTO_UNJAIL_MAX_GAP:-20}"
 COOLDOWN="${AUTO_UNJAIL_COOLDOWN:-300}"
-STATE_DIR="${AUTO_UNJAIL_STATE_DIR:-/tmp/stell-auto-unjail}"
+STATE_DIR="${AUTO_UNJAIL_STATE_DIR:-${XDG_RUNTIME_DIR:-$HOME/.local/state}/stellereum-auto-unjail}"
 DRY=0
 LOOP=0
 
@@ -43,7 +43,12 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-mkdir -p "$STATE_DIR"
+[[ "$LOOP" =~ ^[0-9]+$ ]] || { echo "auto-unjail.sh: --loop must be a non-negative integer" >&2; exit 2; }
+[[ "$MAX_GAP" =~ ^[0-9]+$ ]] || { echo "auto-unjail.sh: AUTO_UNJAIL_MAX_GAP must be a non-negative integer" >&2; exit 2; }
+[[ "$COOLDOWN" =~ ^[0-9]+$ ]] || { echo "auto-unjail.sh: AUTO_UNJAIL_COOLDOWN must be a non-negative integer" >&2; exit 2; }
+
+mkdir -p -m 0700 "$STATE_DIR"
+chmod 0700 "$STATE_DIR" 2>/dev/null || true
 
 # Node table: name | transport (local|ssh) | target | port | node dir | validator id
 NODES=(
@@ -53,8 +58,23 @@ NODES=(
   "D|ssh|root@138.124.102.200|22|/root/nodeD|df3d10f3549f492fa829553f9f0a1fe4e6daaf7a74aa532b5411db6eca6d2ba4"
 )
 
+parse_uint_or_hex() {
+    local val="$1"
+    if [[ "$val" =~ ^0[xX][0-9a-fA-F]+$ ]]; then
+        printf '%d\n' "$((16#${val:2}))"
+    elif [[ "$val" =~ ^[0-9]+$ ]]; then
+        printf '%d\n' "$((10#$val))"
+    else
+        return 1
+    fi
+}
+
 rpc() { curl -s -m 8 -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":$3}" "$1"; }
-tip() { rpc "$PUBLIC_RPC" stell_blockNumber '[]' | sed -n 's/.*"result":"\([^"]*\)".*/\1/p'; }
+tip() {
+    local raw
+    raw="$(rpc "$PUBLIC_RPC" stell_blockNumber '[]' | sed -n 's/.*"result":"\([^"]*\)".*/\1/p' | head -n1)"
+    parse_uint_or_hex "$raw" 2>/dev/null || true
+}
 
 status_field() { # $1 validator, $2 field
     rpc "$PUBLIC_RPC" stell_getValidatorStatus "{\"validator\":\"$1\"}" |
@@ -64,20 +84,27 @@ print(r.get('$2'))" 2>/dev/null
 }
 
 node_height() { # transport target port
-    local transport="$1" target="$2" port="$3"
+    local transport="$1" target="$2" port="$3" raw
     if [ "$transport" = local ]; then
-        rpc "http://127.0.0.1:8546" stell_blockNumber '[]' | sed -n 's/.*"result":"\([^"]*\)".*/\1/p'
+        raw="$(rpc "http://127.0.0.1:8546" stell_blockNumber '[]' | sed -n 's/.*"result":"\([^"]*\)".*/\1/p' | head -n1)"
     else
-        ssh -p "$port" -o ConnectTimeout=8 -o BatchMode=yes "$target" \
+        raw="$(ssh -p "$port" -o ConnectTimeout=8 -o BatchMode=yes "$target" \
             "curl -s -m 4 -H 'content-type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"stell_blockNumber\",\"params\":[]}' http://127.0.0.1:8545" |
-            sed -n 's/.*"result":"\([^"]*\)".*/\1/p'
+            sed -n 's/.*"result":"\([^"]*\)".*/\1/p' | head -n1)"
     fi
+    parse_uint_or_hex "$raw" 2>/dev/null || true
 }
 
 do_unjail() { # transport target port dir validator rpc
     local transport="$1" target="$2" port="$3" dir="$4" vid="$5" rpc_url="$6"
-    local suffix; suffix="$(basename "$dir" | sed 's/^node//')"
-    local cmd="set -a; if [ -f $dir/env.$suffix ]; then . $dir/env.$suffix; elif [ -f $(dirname "$dir")/env.$suffix ]; then . $(dirname "$dir")/env.$suffix; fi; set +a; $dir/stellereum validator unjail --withdrawal-key-file $dir/keys/withdrawal.key --validator-id $vid --rpc $rpc_url"
+    local suffix q_dir q_parent q_suffix q_vid q_rpc cmd
+    suffix="$(basename "$dir" | sed 's/^node//')"
+    q_dir="$(printf '%q' "$dir")"
+    q_parent="$(printf '%q' "$(dirname "$dir")")"
+    q_suffix="$(printf '%q' "$suffix")"
+    q_vid="$(printf '%q' "$vid")"
+    q_rpc="$(printf '%q' "$rpc_url")"
+    cmd="set -a; if [ -f $q_dir/env.$q_suffix ]; then . $q_dir/env.$q_suffix; elif [ -f $q_parent/env.$q_suffix ]; then . $q_parent/env.$q_suffix; fi; set +a; $q_dir/stellereum validator unjail --withdrawal-key-file $q_dir/keys/withdrawal.key --validator-id $q_vid --rpc $q_rpc"
     if [ "$transport" = local ]; then
         bash -c "$cmd" 2>&1 | tail -n 4
     else
@@ -87,37 +114,45 @@ do_unjail() { # transport target port dir validator rpc
 
 pass() {
     local t; t="$(tip)"
-    if [ -z "$t" ]; then
-        echo "[auto-unjail] public RPC unreachable; skipping pass"
+    if [[ ! "$t" =~ ^[0-9]+$ ]]; then
+        echo "[auto-unjail] public RPC unreachable or invalid height; skipping pass"
         return 0
     fi
-    t=$((t))
+    t=$((10#$t))
     for row in "${NODES[@]}"; do
         IFS='|' read -r name transport target port dir vid <<<"$row"
         local jailed rel
         jailed="$(status_field "$vid" jailed)"
         [ "$jailed" = "True" ] || continue
         rel="$(status_field "$vid" release_height)"
-        case "$rel" in ''|None) continue ;; esac
-        rel=$((rel))
+        if [[ "$rel" =~ ^0[xX][0-9a-fA-F]+$ ]]; then
+            rel=$((16#${rel:2}))
+        elif [[ "$rel" =~ ^[0-9]+$ ]]; then
+            rel=$((10#$rel))
+        else
+            continue
+        fi
         if [ "$t" -lt "$rel" ]; then
             echo "[auto-unjail] $name jailed; waiting for release $rel (tip $t, $((rel - t)) blocks)"
             continue
         fi
         local stamp="$STATE_DIR/$name.last"
         if [ -f "$stamp" ]; then
-            local age=$(( $(date +%s) - $(cat "$stamp" 2>/dev/null || echo 0) ))
+            local last_ts age
+            last_ts="$(cat "$stamp" 2>/dev/null || true)"
+            [[ "$last_ts" =~ ^[0-9]+$ ]] || last_ts=0
+            age=$(( $(date +%s) - last_ts ))
             if [ "$age" -lt "$COOLDOWN" ]; then
                 echo "[auto-unjail] $name jailed, release passed, attempted ${age}s ago (cooldown ${COOLDOWN}s)"
                 continue
             fi
         fi
         local h; h="$(node_height "$transport" "$target" "$port")"
-        if [ -z "$h" ]; then
+        if [[ ! "$h" =~ ^[0-9]+$ ]]; then
             echo "[auto-unjail] $name jailed but its local RPC does not answer; not unjailing a dead node"
             continue
         fi
-        h=$((h))
+        h=$((10#$h))
         local gap=$((t - h))
         # A NEGATIVE gap means the node is AHEAD of the public reference tip
         # (the reference lags a little): that is a synced node, not a suspicious

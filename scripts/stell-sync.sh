@@ -24,6 +24,7 @@ set -eo pipefail
 
 SNAPSHOT_HTTP_URL="https://rpc.stellereum.org/snapshot/latest.tar.zst"
 SNAPSHOT_META_URL="https://rpc.stellereum.org/snapshot/meta.json"
+REQUIRE_SHA256="${STELL_REQUIRE_SHA256:-0}"
 
 # The ssh targets, the node dirs and the service names live in
 # cluster-nodes.conf (sourced below) — ONE place, machine-readable, because
@@ -128,10 +129,48 @@ function show_status() {
 
 function http_sync_local() {
     log "Performing HTTP Fast-Sync for local Node B from $SNAPSHOT_HTTP_URL..."
+    mkdir -p "$NODE_B_LOCAL/data"
+    local snap_tmp sha_body expected_sha actual_sha
+    snap_tmp="$(mktemp "$NODE_B_LOCAL/data/.snapshot.XXXXXX.tar.zst")"
+    # Verify archive and optional sha256 BEFORE stopping the service or deleting data/store.
+    if ! curl -fsSL "$SNAPSHOT_HTTP_URL" -o "$snap_tmp"; then
+        rm -f "$snap_tmp"
+        err "Failed to download snapshot from $SNAPSHOT_HTTP_URL"
+        return 1
+    fi
+    if ! zstd -t "$snap_tmp"; then
+        rm -f "$snap_tmp"
+        err "Downloaded snapshot failed zstd -t integrity check; data/store untouched"
+        return 1
+    fi
+    sha_body="$(curl -fsSL "${SNAPSHOT_HTTP_URL}.sha256" 2>/dev/null || true)"
+    if [[ -n "$sha_body" ]]; then
+        expected_sha="$(printf '%s\n' "$sha_body" | awk 'NR==1 {print tolower($1)}')"
+        if [[ ! "$expected_sha" =~ ^[0-9a-f]{64}$ ]]; then
+            rm -f "$snap_tmp"
+            err "Malformed .sha256 manifest from ${SNAPSHOT_HTTP_URL}.sha256"
+            return 1
+        fi
+        actual_sha="$(sha256sum "$snap_tmp" | awk '{print tolower($1)}')"
+        if [[ "$actual_sha" != "$expected_sha" ]]; then
+            rm -f "$snap_tmp"
+            err "Snapshot sha256 mismatch: expected=$expected_sha actual=$actual_sha; data/store untouched"
+            return 1
+        fi
+        success "Verified snapshot sha256 ($actual_sha)"
+    elif [[ "$REQUIRE_SHA256" = "1" ]]; then
+        rm -f "$snap_tmp"
+        err "--require-sha256 set, but ${SNAPSHOT_HTTP_URL}.sha256 is unavailable; data/store untouched"
+        return 1
+    else
+        warn "${SNAPSHOT_HTTP_URL}.sha256 unavailable; continuing after zstd -t check"
+    fi
+
     systemctl --user stop stell-nodeB.service || true
-    rm -rf "$NODE_B_LOCAL/data/store" "$NODE_B_LOCAL/data/store-shard*"
-    curl -sL "$SNAPSHOT_HTTP_URL" | tar -I 'zstd -d' -xf - -C "$NODE_B_LOCAL/data/"
-    rm -f "$NODE_B_LOCAL/data/store"/snap* "$NODE_B_LOCAL/data/store-shard*"/snap* 2>/dev/null || true
+    rm -rf "$NODE_B_LOCAL/data/store" "$NODE_B_LOCAL"/data/store-shard*
+    tar -I 'zstd -d' -xf "$snap_tmp" -C "$NODE_B_LOCAL/data/"
+    rm -f "$snap_tmp"
+    rm -f "$NODE_B_LOCAL/data/store"/snap* "$NODE_B_LOCAL"/data/store-shard*/snap* 2>/dev/null || true
     rm -f "$NODE_B_LOCAL/data/mempool.bin"
     systemctl --user start stell-nodeB.service
     success "Local Node B synced from HTTP snapshot and running!"
@@ -144,9 +183,57 @@ function http_sync_remote() {
     local svc_name="$4"
     # The extra ssh options (e.g. a non-standard port) come from the caller.
     local SSH_OPTS="${5:-}"
+    local q_dir q_svc q_url q_req
+    q_dir="$(printf '%q' "$remote_dir")"
+    q_svc="$(printf '%q' "$svc_name")"
+    q_url="$(printf '%q' "$SNAPSHOT_HTTP_URL")"
+    q_req="$(printf '%q' "$REQUIRE_SHA256")"
 
     log "Performing HTTP Fast-Sync for $node_name..."
-    ssh $SSH_OPTS $ssh_dest "systemctl stop $svc_name && rm -rf $remote_dir/data/store $remote_dir/data/store-shard* && curl -sL $SNAPSHOT_HTTP_URL | tar -I 'zstd -d' -xf - -C $remote_dir/data/ && rm -f $remote_dir/data/store*/snap* 2>/dev/null || true && chown -R root:root $remote_dir/data/store* && rm -f $remote_dir/data/mempool.bin && systemctl start $svc_name"
+    # shellcheck disable=SC2086
+    ssh $SSH_OPTS "$ssh_dest" "bash -s -- $q_dir $q_svc $q_url $q_req" <<'REMOTE_SYNC'
+set -euo pipefail
+rdir="$1"
+svc="$2"
+url="$3"
+req_sha="$4"
+
+mkdir -p "$rdir/data"
+snap_tmp="$(mktemp "$rdir/data/.snapshot.XXXXXX.tar.zst")"
+trap 'rm -f "$snap_tmp"' EXIT
+
+curl -fsSL "$url" -o "$snap_tmp"
+zstd -t "$snap_tmp"
+
+sha_body="$(curl -fsSL "${url}.sha256" 2>/dev/null || true)"
+if [[ -n "$sha_body" ]]; then
+    expected_sha="$(printf '%s\n' "$sha_body" | awk 'NR==1 {print tolower($1)}')"
+    if [[ ! "$expected_sha" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "Malformed .sha256 manifest from ${url}.sha256" >&2
+        exit 1
+    fi
+    actual_sha="$(sha256sum "$snap_tmp" | awk '{print tolower($1)}')"
+    if [[ "$actual_sha" != "$expected_sha" ]]; then
+        echo "Snapshot sha256 mismatch: expected=$expected_sha actual=$actual_sha" >&2
+        exit 1
+    fi
+elif [[ "$req_sha" == "1" ]]; then
+    echo "--require-sha256 set, but ${url}.sha256 is unavailable" >&2
+    exit 1
+else
+    echo "WARN: ${url}.sha256 unavailable; continuing after zstd -t check" >&2
+fi
+
+systemctl stop "$svc"
+rm -rf "$rdir/data/store" "$rdir"/data/store-shard*
+tar -I 'zstd -d' -xf "$snap_tmp" -C "$rdir/data/"
+rm -f "$snap_tmp"
+trap - EXIT
+rm -f "$rdir"/data/store*/snap* 2>/dev/null || true
+chown -R root:root "$rdir"/data/store* 2>/dev/null || true
+rm -f "$rdir/data/mempool.bin"
+systemctl start "$svc"
+REMOTE_SYNC
     success "$node_name synced from HTTP snapshot and running!"
 }
 
@@ -220,9 +307,13 @@ function deploy_binaries() {
     wait
 
     log "Atomic binary swap and service restart..."
-    ssh $NODE_A_SSH "systemctl stop stell-nodeA.service && mv -f $NODE_A_DIR/stellereum.new $NODE_A_DIR/stellereum && chmod +x $NODE_A_DIR/stellereum && systemctl start stell-nodeA.service" &
-    ssh $NODE_D_SSH "systemctl stop stell-nodeD.service && mv -f $NODE_D_DIR/stellereum.new $NODE_D_DIR/stellereum && chmod +x $NODE_D_DIR/stellereum && systemctl start stell-nodeD.service" &
-    ssh $NODE_C_SSH_OPTS $NODE_C_SSH "systemctl stop stell-nodeC.service && mv -f $NODE_C_DIR/stellereum.new $NODE_C_DIR/stellereum && chmod +x $NODE_C_DIR/stellereum && systemctl start stell-nodeC.service" &
+    local q_dir_a q_dir_d q_dir_c
+    q_dir_a="$(printf '%q' "$NODE_A_DIR")"
+    q_dir_d="$(printf '%q' "$NODE_D_DIR")"
+    q_dir_c="$(printf '%q' "$NODE_C_DIR")"
+    ssh "$NODE_A_SSH" "systemctl stop stell-nodeA.service && mv -f $q_dir_a/stellereum.new $q_dir_a/stellereum && chmod +x $q_dir_a/stellereum && systemctl start stell-nodeA.service" &
+    ssh "$NODE_D_SSH" "systemctl stop stell-nodeD.service && mv -f $q_dir_d/stellereum.new $q_dir_d/stellereum && chmod +x $q_dir_d/stellereum && systemctl start stell-nodeD.service" &
+    ssh $NODE_C_SSH_OPTS "$NODE_C_SSH" "systemctl stop stell-nodeC.service && mv -f $q_dir_c/stellereum.new $q_dir_c/stellereum && chmod +x $q_dir_c/stellereum && systemctl start stell-nodeC.service" &
     systemctl --user stop stell-nodeB.service && mv -f "$NODE_B_BIN.new" "$NODE_B_BIN" && chmod +x "$NODE_B_BIN" && systemctl --user start stell-nodeB.service &
     wait
     success "All nodes updated with new binary and running!"
@@ -348,9 +439,10 @@ function node_scp_opts() {
 
 # Read a per-node field out of the cluster conf (NODE_<N>_<field>).
 function node_conf() {
-    local n="$1" f="$2" v
-    eval "v=\${NODE_${n}_${f}:-}"
-    printf '%s' "$v"
+    local n="$1" f="$2" var
+    [[ "$n" =~ ^[A-Za-z0-9_]+$ && "$f" =~ ^[A-Za-z0-9_]+$ ]] || return 1
+    var="NODE_${n}_${f}"
+    printf '%s' "${!var:-}"
 }
 
 # The probe is cached per node for the lifetime of the command: it is one ssh
@@ -380,22 +472,28 @@ function probe_node() {
         return 1
     fi
 
-    local env_prefix
-    env_prefix="STELL_PROBE_NODE=$n STELL_PROBE_DIR=$dir STELL_PROBE_ENV_FILE=$env_file"
-    env_prefix="$env_prefix STELL_PROBE_SERVICE=$service STELL_PROBE_SERVICE_SCOPE=$scope"
-    env_prefix="$env_prefix STELL_PROBE_RPC=$rpc STELL_PROBE_SHARD_ID=$shard_id"
-    env_prefix="$env_prefix STELL_PROBE_ORPHANS=$HEALTH_ORPHANS"
-
     local out
     if [ -z "$ssh_target" ]; then
         # local node
-        out="$(env $env_prefix sh "$NODPROBE" 2>/dev/null || true)"
+        out="$(env \
+            "STELL_PROBE_NODE=$n" \
+            "STELL_PROBE_DIR=$dir" \
+            "STELL_PROBE_ENV_FILE=$env_file" \
+            "STELL_PROBE_SERVICE=$service" \
+            "STELL_PROBE_SERVICE_SCOPE=$scope" \
+            "STELL_PROBE_RPC=$rpc" \
+            "STELL_PROBE_SHARD_ID=$shard_id" \
+            "STELL_PROBE_ORPHANS=$HEALTH_ORPHANS" \
+            sh "$NODPROBE" 2>/dev/null || true)"
     else
         # remote node. `sh -s` reads the probe from stdin; the parameters ride
-        # in as environment assignments so nothing needs quoting twice.
+        # in as escaped environment assignments.
+        local remote_cmd
+        remote_cmd="$(printf 'STELL_PROBE_NODE=%q STELL_PROBE_DIR=%q STELL_PROBE_ENV_FILE=%q STELL_PROBE_SERVICE=%q STELL_PROBE_SERVICE_SCOPE=%q STELL_PROBE_RPC=%q STELL_PROBE_SHARD_ID=%q STELL_PROBE_ORPHANS=%q sh -s' \
+            "$n" "$dir" "$env_file" "$service" "$scope" "$rpc" "$shard_id" "$HEALTH_ORPHANS")"
         # shellcheck disable=SC2086
         out="$(timeout "$PROBE_TIMEOUT" ssh -o BatchMode=yes -o ConnectTimeout=8 $opts "$ssh_target" \
-            "$env_prefix sh -s" < "$NODPROBE" 2>/dev/null || true)"
+            "$remote_cmd" < "$NODPROBE" 2>/dev/null || true)"
     fi
     PROBE_CACHE[$n]="$out"
     printf '%s' "$out"
@@ -822,10 +920,11 @@ function show_preflight() {
         fi
 
         # (c) the consensus timeouts / retention
-        local key val expected
+        local key val expected exp_var
         for key in STELL_ROUND_TIMEOUT_MS STELL_DOWN_PROPOSER_TIMEOUT_MS STELL_MIN_BLOCK_MS STELL_KEEP_BLOCKS; do
             val="$(f "env_$key")"
-            expected="$(eval echo "\$EXPECT_$key")"
+            exp_var="EXPECT_$key"
+            expected="${!exp_var:-}"
             if [[ "$val" != "$expected" ]]; then
                 err "node $n: $key=$val, expected $expected"
                 differences=$((differences + 1))
@@ -1047,10 +1146,15 @@ function do_lockclear() {
         fi
     }
 
+    local q_tool q_store q_svc q_remote_bin
+    q_store="$(printf '%q' "$store")"
+    q_svc="$(printf '%q' "$svc")"
+    q_remote_bin="$(printf '%q' "$STELOPS_REMOTE")"
+
     # The tool must be ON the node: a local node uses the local build, a
     # remote node gets a copy staged at $STELOPS_REMOTE.
     if [[ -n "$ssh_target" ]]; then
-        if ! remote_run "test -x $STELOPS_REMOTE" >/dev/null 2>&1; then
+        if ! remote_run "test -x $q_remote_bin" >/dev/null 2>&1; then
             if [[ ! -x "$tool" ]]; then
                 err "the ops tool is missing: $tool (build it: cargo build --release --manifest-path scripts/tools/stelops/Cargo.toml)"
                 return 1
@@ -1059,7 +1163,7 @@ function do_lockclear() {
             # shellcheck disable=SC2086
             scp -q $(node_scp_opts "$n") "$tool" "$ssh_target:$STELOPS_REMOTE" || {
                 err "could not stage $tool on node $n"; return 1; }
-            remote_run "chmod +x $STELOPS_REMOTE" || true
+            remote_run "chmod +x $q_remote_bin" || true
         fi
         tool="$STELOPS_REMOTE"
     else
@@ -1068,6 +1172,7 @@ function do_lockclear() {
             return 1
         fi
     fi
+    q_tool="$(printf '%q' "$tool")"
 
     # --- 3. the checkpoint, read WITHOUT touching the node if possible ------
     # sled holds an EXCLUSIVE lock on the store while the node runs, so the
@@ -1077,7 +1182,7 @@ function do_lockclear() {
     state="$(probe_field "$n" service_state)"
     # The tool exits non-zero when the store is locked (the node is running);
     # that is a normal answer here, not a script failure.
-    cpout="$(remote_run "$tool checkpoint $store" || true)"
+    cpout="$(remote_run "$q_tool checkpoint $q_store" || true)"
     if [[ "$cpout" != *"height="* ]]; then
         # The store is locked: the node is running. The checkpoint can only be
         # read with the node stopped.
@@ -1090,15 +1195,15 @@ function do_lockclear() {
             return 1
         fi
         log "stopping $svc (the store is locked while the node runs)"
-        remote_run "$sysctl_cmd stop $svc" >/dev/null || true
+        remote_run "$sysctl_cmd stop $q_svc" >/dev/null || true
         sleep 2
-        cpout="$(remote_run "$tool checkpoint $store" || true)"
+        cpout="$(remote_run "$q_tool checkpoint $q_store" || true)"
     fi
 
     echo "  checkpoint: $cpout"
     if [[ "$cpout" == *"NO_CHECKPOINT"* ]]; then
         warn "node $n has no persisted consensus lock — nothing to clear"
-        [[ "$state" != "active" ]] && remote_run "$sysctl_cmd start $svc" >/dev/null
+        [[ "$state" != "active" ]] && remote_run "$sysctl_cmd start $q_svc" >/dev/null
         return 0
     fi
 
@@ -1111,7 +1216,7 @@ function do_lockclear() {
         if (( lock_h <= peer_tip )); then
             err "REFUSING: node $n's lock is at height $lock_h, which is NOT ahead of the peer tip ($peer_tip)."
             err "         A node whose lock is behind its peers is not stuck because of the lock."
-            [[ "$state" != "active" ]] && remote_run "$sysctl_cmd start $svc" >/dev/null
+            [[ "$state" != "active" ]] && remote_run "$sysctl_cmd start $q_svc" >/dev/null
             return 1
         fi
         echo "  the lock is at height $lock_h (round $lock_r) — $((lock_h - peer_tip)) block(s) ahead of the peers"
@@ -1120,22 +1225,22 @@ function do_lockclear() {
     if [[ "$force" != "--force" ]]; then
         warn "REFUSING to clear the lock without --force."
         echo "  Re-run with: $0 lockclear $n --force"
-        [[ "$state" != "active" ]] && remote_run "$sysctl_cmd start $svc" >/dev/null
+        [[ "$state" != "active" ]] && remote_run "$sysctl_cmd start $q_svc" >/dev/null
         return 1
     fi
 
     log "clearing the consensus lock on node $n"
     local out
-    out="$(remote_run "$tool clear-lock $store --force" || true)"
+    out="$(remote_run "$q_tool clear-lock $q_store --force" || true)"
     echo "$out"
     if [[ "$out" != *"CLEARED"* ]]; then
         err "the lock was NOT cleared on node $n"
-        remote_run "$sysctl_cmd start $svc" >/dev/null
+        remote_run "$sysctl_cmd start $q_svc" >/dev/null
         return 1
     fi
 
     log "starting $svc again"
-    remote_run "$sysctl_cmd start $svc" >/dev/null
+    remote_run "$sysctl_cmd start $q_svc" >/dev/null
     sleep 5
     # the cached probe is stale now: the node was stopped and started
     unset "PROBE_CACHE[$n]"
@@ -1177,9 +1282,13 @@ function do_doctor() {
     fi
     # The doctor is piped to the node's shell: it needs no installation there
     # and it cannot be a stale copy on the node.
+    local remote_args="" a
+    for a in --dir "$dir" --service "$svc" --scope "$scope" "${@:2}"; do
+        remote_args+=" $(printf '%q' "$a")"
+    done
     # shellcheck disable=SC2086
     timeout 300 ssh -o BatchMode=yes -o ConnectTimeout=8 $opts "$ssh_target" \
-        "sh -s -- --dir $dir --service $svc --scope $scope ${*:2}" < "$script" 2>&1
+        "sh -s --$remote_args" < "$script" 2>&1
 }
 
 usage() {
@@ -1207,8 +1316,8 @@ COMMANDS
   doctor [node]           single-node diagnosis (config drift, inodes, orphan
                           chunks, consensus checkpoint, topic, binary, key
                           format, chain id). Use --json for machine output.
-  sync [nodeA|nodeC|nodeD|local|all]   fast-sync from the HTTP snapshot
-  auto-heal               re-sync a lagging node from the HTTP snapshot
+  sync [nodeA|nodeC|nodeD|local|all] [--require-sha256]   fast-sync from the HTTP snapshot
+  auto-heal [--require-sha256]                          re-sync a lagging node from the HTTP snapshot
   deploy                  ship a new binary to every node
   restart                 restart every node's service
   help                    this text
@@ -1286,7 +1395,22 @@ case "$1" in
         show_status
         ;;
     push|sync|fast-sync)
-        case "$2" in
+        shift || true
+        sync_target=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --require-sha256) REQUIRE_SHA256=1; shift ;;
+                *)
+                    if [[ -z "$sync_target" ]]; then
+                        sync_target="$1"
+                    else
+                        err "unknown argument for sync: $1"
+                        exit 1
+                    fi
+                    shift ;;
+            esac
+        done
+        case "$sync_target" in
             nodeA|a|A)
                 http_sync_remote "Node A" "$NODE_A_SSH" "$NODE_A_DIR" "stell-nodeA.service"
                 ;;
@@ -1305,12 +1429,19 @@ case "$1" in
                 http_sync_remote "Node D" "$NODE_D_SSH" "$NODE_D_DIR" "stell-nodeD.service" "$NODE_D_SSH_OPTS"
                 ;;
             *)
-                echo "Usage: $0 sync [nodeA | nodeC | nodeD | local | all]"
+                echo "Usage: $0 sync [nodeA | nodeC | nodeD | local | all] [--require-sha256]"
                 exit 1
                 ;;
         esac
         ;;
     auto-heal)
+        shift || true
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --require-sha256) REQUIRE_SHA256=1; shift ;;
+                *) err "unknown option for auto-heal: $1"; exit 2 ;;
+            esac
+        done
         auto_heal
         ;;
     deploy)

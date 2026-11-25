@@ -56,7 +56,8 @@ WATCH_INTERVAL="${WATCH_INTERVAL:-60}"
 WATCH_ONCE=0
 WATCH_HEAL=1
 WATCH_JSON=0
-WATCH_STATE="${WATCH_STATE:-/tmp/stellereum-watchdog.state}"
+DEFAULT_WATCH_STATE_DIR="${XDG_RUNTIME_DIR:-$HOME/.local/state}/stellereum-watchdog"
+WATCH_STATE="${WATCH_STATE:-$DEFAULT_WATCH_STATE_DIR/state}"
 WATCH_PROBE_TIMEOUT="${STELL_PROBE_TIMEOUT:-25}"
 WATCH_ORPHANS=0          # the orphan count is slow; the healer runs it anyway
 HEAL_ORPHAN_THRESHOLD="${HEAL_ORPHAN_THRESHOLD:-50000}"
@@ -355,6 +356,8 @@ run_check() {
     local stalled=0
     if [ "$max_tip" -gt 0 ]; then
         if [ "$max_tip" -gt "$last_tip" ]; then
+            mkdir -p -m 0700 "$(dirname "$WATCH_STATE")" 2>/dev/null || true
+            chmod 0700 "$DEFAULT_WATCH_STATE_DIR" 2>/dev/null || true
             echo "$max_tip $now_t" > "$WATCH_STATE" 2>/dev/null || true
             log "masterchain tip: $max_tip (advanced)"
         else

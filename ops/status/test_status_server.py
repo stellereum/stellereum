@@ -461,6 +461,84 @@ class StatusServerTests(unittest.TestCase):
         self.assertEqual(parsed[0]["rpc_url"], "http://127.0.0.1:8545")
         self.assertEqual(parsed[0]["explorer_url"], "http://127.0.0.1:9080")
 
+    def test_address_string_skips_reverse_dns(self) -> None:
+        from unittest.mock import patch
+
+        handler = status_server.StatusRequestHandler.__new__(status_server.StatusRequestHandler)
+        handler.client_address = ("127.0.0.1", 54321)
+        with patch("socket.getfqdn", side_effect=AssertionError("reverse DNS must not run")):
+            self.assertEqual(handler.address_string(), "127.0.0.1")
+
+    def test_http_redirects_disabled_and_response_size_capped(self) -> None:
+        from unittest.mock import patch
+
+        target_hits = 0
+
+        class _RedirectAndHugeHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                return
+
+            def do_GET(self) -> None:  # noqa: N802
+                nonlocal target_hits
+                if self.path == "/redir":
+                    self.send_response(302)
+                    self.send_header("Location", f"http://127.0.0.1:{srv.server_port}/secret")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                elif self.path == "/secret":
+                    target_hits += 1
+                    body = b"secret"
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path == "/huge":
+                    body = b"x" * 2048
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                _ = self.rfile.read(length)
+                if self.path == "/rpc-redir":
+                    self.send_response(302)
+                    self.send_header("Location", f"http://127.0.0.1:{srv.server_port}/secret")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                elif self.path == "/rpc-huge":
+                    body = b"y" * 2048
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _RedirectAndHugeHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            base = f"http://127.0.0.1:{srv.server_port}"
+            code, _ = status_server._http_get_text(f"{base}/redir", 2.0)
+            self.assertEqual(code, 302)
+            self.assertEqual(target_hits, 0)
+
+            res, err = status_server._rpc_call(f"{base}/rpc-redir", "eth_blockNumber", [], 2.0)
+            self.assertIsNone(res)
+            self.assertIn("HTTP 302", err or "")
+            self.assertEqual(target_hits, 0)
+
+            self.assertEqual(status_server.MAX_HTTP_BYTES, 8 * 1024 * 1024)
+            with patch.object(status_server, "MAX_HTTP_BYTES", 1024):
+                with self.assertRaises(ValueError):
+                    status_server._http_get_text(f"{base}/huge", 2.0)
+                res, err = status_server._rpc_call(f"{base}/rpc-huge", "eth_blockNumber", [], 2.0)
+                self.assertIsNone(res)
+                self.assertIn("exceeded 1024 bytes", err or "")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

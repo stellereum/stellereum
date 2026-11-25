@@ -147,39 +147,48 @@ if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
 
     # --- chunk files (the DHT blob store: <data>/chunks/<bucket>/<id>)
     if [ -d "$DATA_DIR/chunks" ]; then
-        # ONE find pass: the raw list gives the file count (the inode cost),
-        # the sorted-unique list gives the orphan candidates.
-        find "$DATA_DIR/chunks" -type f ! -name '.*' -printf '%f\n' 2>/dev/null > /tmp/.stel-raw.$$ 2>/dev/null || : > /tmp/.stel-raw.$$
-        chunk_files=$(wc -l < /tmp/.stel-raw.$$ | tr -d ' ')
-        chunk_hidden=$(find "$DATA_DIR/chunks" -type f -name '.*' 2>/dev/null | wc -l | tr -d ' ')
-        emit chunk_files "${chunk_files:-0}"
-        emit chunk_hidden_files "${chunk_hidden:-0}"
-        if [ "$ORPHANS" = "1" ]; then
-            # The referenced set = every chunk id mentioned by any manifest in
-            # kv.json. Deliberately CONSERVATIVE: an expired manifest's chunks
-            # count as referenced too, so the sweeper never removes a chunk a
-            # manifest (even a dying one) still points at.
-            if [ -r "$DATA_DIR/kv.json" ]; then
-                sort -u /tmp/.stel-raw.$$ > /tmp/.stel-have.$$ 2>/dev/null || cp /tmp/.stel-raw.$$ /tmp/.stel-have.$$
-                # The manifest is a JSON STRING inside kv.json: its quotes are
-                # escaped (\"id\":\"<64 hex>\"). Strip the backslashes first.
-                tr -d '\\' < "$DATA_DIR/kv.json" 2>/dev/null \
-                    | grep -o '"id"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]\{64\}"' \
-                    | sed 's/^"id"[[:space:]]*:[[:space:]]*"//; s/"$//' | sort -u > /tmp/.stel-ref.$$ 2>/dev/null || : > /tmp/.stel-ref.$$
-                chunk_ref=$(wc -l < /tmp/.stel-ref.$$ | tr -d ' ')
-                chunk_orph=$(comm -23 /tmp/.stel-have.$$ /tmp/.stel-ref.$$ 2>/dev/null | wc -l | tr -d ' ')
-                rm -f /tmp/.stel-ref.$$ /tmp/.stel-have.$$
-                emit chunk_referenced "${chunk_ref:-0}"
-                emit chunk_orphans "${chunk_orph:-0}"
+        if stel_tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/stel-probe.XXXXXX" 2>/dev/null); then
+            stel_raw="$stel_tmp_dir/raw"
+            stel_have="$stel_tmp_dir/have"
+            stel_ref="$stel_tmp_dir/ref"
+            # ONE find pass: the raw list gives the file count (the inode cost),
+            # the sorted-unique list gives the orphan candidates.
+            find "$DATA_DIR/chunks" -type f ! -name '.*' -printf '%f\n' 2>/dev/null > "$stel_raw" 2>/dev/null || : > "$stel_raw"
+            chunk_files=$(wc -l < "$stel_raw" | tr -d ' ')
+            chunk_hidden=$(find "$DATA_DIR/chunks" -type f -name '.*' 2>/dev/null | wc -l | tr -d ' ')
+            emit chunk_files "${chunk_files:-0}"
+            emit chunk_hidden_files "${chunk_hidden:-0}"
+            if [ "$ORPHANS" = "1" ]; then
+                # The referenced set = every chunk id mentioned by any manifest in
+                # kv.json. Deliberately CONSERVATIVE: an expired manifest's chunks
+                # count as referenced too, so the sweeper never removes a chunk a
+                # manifest (even a dying one) still points at.
+                if [ -r "$DATA_DIR/kv.json" ]; then
+                    sort -u "$stel_raw" > "$stel_have" 2>/dev/null || cp "$stel_raw" "$stel_have"
+                    # The manifest is a JSON STRING inside kv.json: its quotes are
+                    # escaped (\"id\":\"<64 hex>\"). Strip the backslashes first.
+                    tr -d '\\' < "$DATA_DIR/kv.json" 2>/dev/null \
+                        | grep -o '"id"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]\{64\}"' \
+                        | sed 's/^"id"[[:space:]]*:[[:space:]]*"//; s/"$//' | sort -u > "$stel_ref" 2>/dev/null || : > "$stel_ref"
+                    chunk_ref=$(wc -l < "$stel_ref" | tr -d ' ')
+                    chunk_orph=$(comm -23 "$stel_have" "$stel_ref" 2>/dev/null | wc -l | tr -d ' ')
+                    emit chunk_referenced "${chunk_ref:-0}"
+                    emit chunk_orphans "${chunk_orph:-0}"
+                else
+                    emit chunk_referenced "?"
+                    emit chunk_orphans "?"
+                fi
             else
-                emit chunk_referenced "?"
-                emit chunk_orphans "?"
+                emit chunk_referenced "skipped"
+                emit chunk_orphans "skipped"
             fi
+            rm -rf "$stel_tmp_dir"
         else
-            emit chunk_referenced "skipped"
-            emit chunk_orphans "skipped"
+            emit chunk_files "?"
+            emit chunk_hidden_files "?"
+            emit chunk_referenced "?"
+            emit chunk_orphans "?"
         fi
-        rm -f /tmp/.stel-raw.$$
     else
         emit chunk_files "0"
         emit chunk_hidden_files "0"

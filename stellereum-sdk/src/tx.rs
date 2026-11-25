@@ -334,16 +334,33 @@ fn split_priority_envelope(blob: &[u8]) -> (Vec<u8>, u64) {
     (blob.to_vec(), 0)
 }
 
-/// Attach a `PQ1` envelope to an UNSIGNED transaction.
+/// Attach a `PQ1` envelope to an UNSIGNED transaction, validating against
+/// [`ProtocolIdentity::local`].
+///
+/// Used when the caller targets the compiled-in default chain identity; see
+/// [`sign_unsigned_with_identity`] when an explicit [`ProtocolIdentity`] is
+/// supplied.
+pub fn sign_unsigned(
+    tx: Transaction,
+    key: &FalconKeypair,
+    mode: EnvelopeMode,
+    chain_id: Option<u64>,
+) -> Result<SignedTx> {
+    sign_unsigned_with_identity(tx, key, mode, ProtocolIdentity::local(), chain_id)
+}
+
+/// Attach a `PQ1` envelope to an UNSIGNED transaction, validating against the
+/// caller-supplied [`ProtocolIdentity`].
 ///
 /// Used by the signer sidecar's `sign_prepared` arm: the TypeScript package
 /// builds the unsigned transaction bytes, the Rust process owns the Falcon
 /// key and produces the envelope. Refuses an `SF1` payload here (session
 /// grants need the grant object, not a bare envelope).
-pub fn sign_unsigned(
+pub fn sign_unsigned_with_identity(
     mut tx: Transaction,
     key: &FalconKeypair,
     mode: EnvelopeMode,
+    identity: ProtocolIdentity,
     chain_id: Option<u64>,
 ) -> Result<SignedTx> {
     if !tx.signature.is_empty() {
@@ -358,8 +375,9 @@ pub fn sign_unsigned(
             hex::encode(key.address())
         )));
     }
+    identity.verify()?;
     if let Some(cid) = chain_id {
-        ProtocolIdentity::local().verify_for_chain(cid)?;
+        identity.verify_chain_id(cid)?;
     }
     let msg = match chain_id {
         Some(cid) => tx.signing_message_for_chain(cid),
@@ -1141,5 +1159,35 @@ mod tests {
         );
         let decoded = Transaction::decode(&resaved.to_bytes()).unwrap();
         assert_eq!(decoded, *resaved.transaction());
+    }
+
+    #[test]
+    fn sign_unsigned_with_identity_respects_custom_chain_and_priority_fee() {
+        let key = FalconKeypair::generate().unwrap();
+        let identity = crate::protocol::ProtocolIdentity {
+            chain_id: 2,
+            ..crate::protocol::ProtocolIdentity::local()
+        };
+        let mut unsigned = TxBuilder::transfer([7u8; 32], 42)
+            .nonce(5)
+            .identity(identity)
+            .chain_id(2)
+            .priority_fee_per_gas(11)
+            .unsigned_transaction(key.address());
+        let encoded_unsigned = unsigned.encode();
+        unsigned = Transaction::decode(&encoded_unsigned).unwrap();
+        assert_eq!(unsigned.priority_fee_per_gas, 11);
+
+        let signed = crate::tx::sign_unsigned_with_identity(
+            unsigned,
+            &key,
+            EnvelopeMode::Explicit,
+            identity,
+            Some(2),
+        )
+        .unwrap();
+        signed.verify().unwrap();
+        assert_eq!(signed.chain_id(), Some(2));
+        assert_eq!(signed.priority_fee_per_gas(), 11);
     }
 }

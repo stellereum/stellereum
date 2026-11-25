@@ -89,23 +89,24 @@ block_height() {
   body="$(rpc stell_blockNumber '[]')"
   [ -n "$body" ] || return 1
   result="$(json_str result "$body")"
-  [ -n "$result" ] || return 1
-  case "$result" in
-    0x*|0X*)
-      result="${result#0[Xx]}"
-      printf '%d\n' "$((16#$result))"
-      ;;
-    *) printf '%s\n' "$result" ;;
-  esac
+  if [[ "$result" =~ ^0[xX][0-9a-fA-F]+$ ]]; then
+    printf '%d\n' "$((16#${result:2}))"
+  elif [[ "$result" =~ ^[0-9]+$ ]]; then
+    printf '%d\n' "$((10#$result))"
+  else
+    return 1
+  fi
 }
 
 ensure_state_dir() {
-  if mkdir -p "$STATE_DIR" 2>/dev/null && [ -w "$STATE_DIR" ]; then
+  if mkdir -p -m 0700 "$STATE_DIR" 2>/dev/null && [ -w "$STATE_DIR" ]; then
+    chmod 0700 "$STATE_DIR" 2>/dev/null || true
     return 0
   fi
-  # Non-root run / read-only /var: keep the throttles working out of /tmp.
-  STATE_DIR="${TMPDIR:-/tmp}/stell-node-guard-$(id -u)"
-  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  # Non-root run / read-only /var: keep the throttles in a private user state dir.
+  STATE_DIR="${XDG_RUNTIME_DIR:-$HOME/.local/state}/stellereum-node-guard"
+  mkdir -p -m 0700 "$STATE_DIR" 2>/dev/null || true
+  chmod 0700 "$STATE_DIR" 2>/dev/null || true
 }
 
 alert_throttled() {
@@ -165,9 +166,10 @@ guard_validator() {
 
   jailed="$(json_bool jailed "$body")"
   release="$(json_num release_height "$body")"
+  [[ "$release" =~ ^[0-9]+$ ]] || release=""
   [ "$jailed" = "true" ] || return 0
 
-  if ! height="$(block_height)" || [ -z "$height" ]; then
+  if ! height="$(block_height)" || [[ ! "$height" =~ ^[0-9]+$ ]]; then
     log "WARN validator $VALIDATOR is jailed but the current height is unavailable"
     return 0
   fi

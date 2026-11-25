@@ -50,6 +50,7 @@ DEFAULT_HISTORY_LEN = 40  # 40 * 15s = 10 minutes
 DEFAULT_EXPECTED_VALIDATORS = 4
 DEFAULT_STALL_WINDOW_SECS = 120.0
 DEFAULT_HEIGHT_LAG_WARN = 5
+MAX_HTTP_BYTES = 8 * 1024 * 1024
 
 DEFAULT_TARGETS: list[dict[str, Any]] = [
     {
@@ -329,20 +330,54 @@ def _ssl_context() -> ssl.SSLContext | None:
     return ssl.create_default_context()
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            f"HTTP redirect disabled ({code} -> {newurl})",
+            headers,
+            fp,
+        )
+
+
+def _build_opener(url: str) -> urllib.request.OpenerDirector:
+    handlers: list[urllib.request.BaseHandler] = [_NoRedirectHandler()]
+    if url.startswith("https://"):
+        handlers.append(urllib.request.HTTPSHandler(context=_ssl_context()))
+    return urllib.request.build_opener(*handlers)
+
+
+def _read_bounded(fp: Any, max_bytes: int | None = None) -> bytes:
+    limit = MAX_HTTP_BYTES if max_bytes is None else max_bytes
+    data = fp.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f"HTTP response exceeded {limit} bytes")
+    return data
+
+
 def _http_get_text(url: str, timeout: float) -> tuple[int, str]:
     req = urllib.request.Request(
         url,
         method="GET",
         headers={"Accept": "application/json, text/plain, */*", "User-Agent": "stell-status/1.0"},
     )
-    ctx = _ssl_context() if url.startswith("https://") else None
+    opener = _build_opener(url)
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
+        with opener.open(req, timeout=timeout) as resp:
+            body = _read_bounded(resp).decode("utf-8", errors="replace")
             return int(resp.status), body
     except urllib.error.HTTPError as exc:
         try:
-            body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+            body = _read_bounded(exc).decode("utf-8", errors="replace") if exc.fp else ""
             return int(exc.code), body
         finally:
             exc.close()
@@ -362,10 +397,10 @@ def _rpc_call(rpc_url: str, method: str, params: list[Any] | None, timeout: floa
             "User-Agent": "stell-status/1.0",
         },
     )
-    ctx = _ssl_context() if rpc_url.startswith("https://") else None
+    opener = _build_opener(rpc_url)
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
+        with opener.open(req, timeout=timeout) as resp:
+            raw = _read_bounded(resp).decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         code = int(exc.code)
         exc.close()
@@ -485,7 +520,7 @@ def probe_target(target: dict[str, Any], timeout: float) -> dict[str, Any]:
 
         try:
             code, body = _http_get_text(f"{explorer_url}/readyz", timeout)
-            if body:
+            if not (300 <= code < 400) and body:
                 readyz = json.loads(body)
                 if isinstance(readyz, dict) and "ready" in readyz:
                     result["ready"] = bool(readyz["ready"])
@@ -1525,6 +1560,9 @@ class StatusHTTPServer(ThreadingHTTPServer):
 
 class StatusRequestHandler(BaseHTTPRequestHandler):
     server: StatusHTTPServer
+
+    def address_string(self) -> str:
+        return str(self.client_address[0])
 
     def log_message(self, format: str, *args: Any) -> None:
         LOG.info("%s - %s", self.address_string(), format % args)

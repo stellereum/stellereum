@@ -104,11 +104,23 @@ pub(crate) async fn push_committed(
 /// without breaking a hash link. (Pinning the walk to the locally-derived genesis
 /// header would be stronger still and is noted in PROTOCOL.md as the next step; it
 /// requires the genesis header to be published by every node, which is now done.)
+#[allow(dead_code)]
+// GATE: 4-arg compatibility wrapper used by integration tests via #[path = "../src/node/sync.rs"].
 pub(crate) async fn try_snapshot_sync(
     adapter: &Arc<P2pNetworkAdapter>,
     rt: &mut ValidatorRuntime,
     shard: u32,
     peer_height: u64,
+) -> Option<u64> {
+    try_snapshot_sync_with_persistence(adapter, rt, shard, peer_height, None).await
+}
+
+pub(crate) async fn try_snapshot_sync_with_persistence(
+    adapter: &Arc<P2pNetworkAdapter>,
+    rt: &mut ValidatorRuntime,
+    shard: u32,
+    peer_height: u64,
+    persistence: Option<&std::sync::Arc<stellereum::storage::AsyncPersistence>>,
 ) -> Option<u64> {
     let our_height = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
     if peer_height <= our_height + 1 {
@@ -495,6 +507,50 @@ pub(crate) async fn try_snapshot_sync(
                 stellereum::consensus::sync_committed_pq_registry(&pq_reg, active);
             }
         }
+        // Fetch the boundary block before persisting/advancing so it can be
+        // made durable alongside the snapshot and also reused for light-client
+        // re-anchoring below without a duplicate network fetch.
+        let fetched_boundary_block = adapter
+            .fetch_block(&boundary_hash)
+            .await
+            .filter(|blk| blk.height == boundary && blk.compute_hash() == boundary_hash);
+        // Persist the verified snapshot state, domains, boundary block (if
+        // fetched), and finalized pointer BEFORE advancing `rt.safety` /
+        // `rt.finalized` (`advance_to_verified_snapshot`), so a crash right
+        // after snapshot sync never leaves `safety_record_v1` ahead of disk.
+        if let Some(ap) = persistence {
+            if let Some(ref blk) = fetched_boundary_block {
+                ap.enqueue_block(blk.clone());
+            }
+            ap.snapshot_state(&rt.state, boundary).await;
+            let (staking, governance) = {
+                let s = rt.state.staking_read().await.clone();
+                let g = rt.state.governance_read().await.clone();
+                (s, g)
+            };
+            ap.snapshot_domains(&rt.state, &staking, &governance, boundary)
+                .await;
+            let _ = ap.storage().put_finalized_post_root(boundary, trusted_root);
+            ap.enqueue_finalized(boundary, boundary_hash);
+            ap.request_flush();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let drained = ap.pending() == 0
+                    && ap.storage().get_state(boundary).ok().flatten().is_some()
+                    && ap.storage().domain_at(boundary).ok().flatten().is_some()
+                    && ap
+                        .storage()
+                        .finalized()
+                        .ok()
+                        .flatten()
+                        .is_some_and(|(h, _)| h >= boundary);
+                if drained || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            let _ = ap.storage().flush();
+        }
         //
         // Safety invariant (W1 §2.6): snapshot sync NEVER clears, overwrites, or
         // resets `safety_record_v1`, `ConsensusCheckpoint`, or `VoteWatermark`;
@@ -529,17 +585,11 @@ pub(crate) async fn try_snapshot_sync(
         // tail and a jumped node never closes its final gap. Re-anchor AT
         // the verified boundary from the boundary block's own QC
         // (fail-closed: a fetch miss or mismatch keeps today's behavior).
-        if let Some(blk) = adapter.fetch_block(&boundary_hash).await {
-            if blk.height == boundary && blk.compute_hash() == boundary_hash {
-                rt.reanchor_light_client_at_snapshot(boundary, &blk);
-            } else {
-                eprintln!(
-                    "[sync] light-client re-anchor skipped: boundary block mismatch at {boundary}"
-                );
-            }
+        if let Some(ref blk) = fetched_boundary_block {
+            rt.reanchor_light_client_at_snapshot(boundary, blk);
         } else {
             eprintln!(
-                "[sync] light-client re-anchor skipped: boundary block {boundary} not served by peers"
+                "[sync] light-client re-anchor skipped: boundary block {boundary} missing or mismatched"
             );
         }
         info!(
@@ -881,8 +931,14 @@ pub(crate) async fn try_catch_up_with_lanes(
                         eprintln!(
                             "[sync] no peer head/hash available, but a verified peer named height {named_peer_height} (ours={our_height}): trying snapshot-first"
                         );
-                        if let Some(b) =
-                            try_snapshot_sync(adapter, rt, shard, named_peer_height).await
+                        if let Some(b) = try_snapshot_sync_with_persistence(
+                            adapter,
+                            rt,
+                            shard,
+                            named_peer_height,
+                            persist,
+                        )
+                        .await
                         {
                             return Some(b);
                         }
@@ -955,7 +1011,9 @@ pub(crate) async fn try_catch_up_with_lanes(
     }
     let mut snapshotted_boundary = None;
     if peer_height - our_height > 100 {
-        if let Some(b) = try_snapshot_sync(adapter, rt, shard, peer_height).await {
+        if let Some(b) =
+            try_snapshot_sync_with_persistence(adapter, rt, shard, peer_height, persist).await
+        {
             snapshotted_boundary = Some(b);
         }
     }
@@ -984,7 +1042,9 @@ pub(crate) async fn try_catch_up_with_lanes(
     if snapshotted_boundary.is_none() {
         let our_now = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
         if peer_height > our_now && peer_height - our_now > 100 {
-            if let Some(b) = try_snapshot_sync(adapter, rt, shard, peer_height).await {
+            if let Some(b) =
+                try_snapshot_sync_with_persistence(adapter, rt, shard, peer_height, persist).await
+            {
                 if let Some(h) = walk_chain_with_lanes(
                     adapter,
                     rt,

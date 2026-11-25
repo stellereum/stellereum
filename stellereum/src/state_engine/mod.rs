@@ -576,6 +576,11 @@ pub struct InMemoryStateEngine {
     /// `commitment_generation`). CONDITIONAL in the commitment (0 bytes while
     /// empty, preserving `COMMITMENT_VERSION = 5` and genesis KATs).
     pq_registry: Arc<RwLock<crate::pq_registry::PqRegistry>>,
+    /// Deterministic set of settled EVM carrier intent digests whose
+    /// `STELL_EVM_SETTLED_V1 || digest -> [1u8]` leaves live in `state_trie`.
+    /// Persisted in its own storage tree (`"evm_settled_state"`) without
+    /// changing `StateSnapshotV2` or `DomainSnapshot` bincode layouts.
+    evm_settled: Arc<RwLock<std::collections::BTreeSet<[u8; 32]>>>,
     /// Test/debug per-engine activation height override for CN-VRF v3
     /// (initialized to `u64::MAX`, keeping frozen `CNVRF_V3_ACTIVATION_HEIGHT` untouched).
     #[cfg(any(test, debug_assertions))]

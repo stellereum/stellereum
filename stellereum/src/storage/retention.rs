@@ -167,9 +167,9 @@ impl Storage {
                 // forever-tree.
                 meta_rows.remove(&receipt_meta_v2_key(&r.tx_hash)[..]);
             }
-            self.receipts.apply_batch(bodies)?;
             self.receipts_by_height.apply_batch(index_rows)?;
             self.receipt_meta_v2.apply_batch(meta_rows)?;
+            self.receipts.apply_batch(bodies)?;
             removed += stale.len();
             if removed >= PRUNE_BATCH * 4 {
                 break; // one pass drains 80k; the rest next cadence
@@ -293,9 +293,32 @@ impl Storage {
         self.blocks.len() + self.by_height.len()
     }
 
+    /// Highest height present in BOTH `state` and `domains`.
+    fn max_paired_snapshot_height(&self) -> Option<u64> {
+        let state_heights: std::collections::BTreeSet<u64> = self
+            .state
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .filter(|k| k.len() == 8)
+            .map(|k| u64::from_be_bytes(k.as_ref().try_into().unwrap()))
+            .collect();
+        self.domains
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .filter(|k| k.len() == 8)
+            .map(|k| u64::from_be_bytes(k.as_ref().try_into().unwrap()))
+            .filter(|h| state_heights.contains(h))
+            .max()
+    }
+
     /// Drop state snapshots older than `keep_from` (retain the last few for reorgs).
-    /// Never drops the latest snapshot (max height) to guarantee bootability across retentions.
+    /// Never drops the latest snapshot (`max_h`) or the newest paired
+    /// `(state ∩ domains)` height (`max_paired`) so `state@H` is never deleted
+    /// while `domains@(H+interval)` has not landed yet.
     pub fn prune_state_below(&self, keep_from: u64) -> Result<usize> {
+        let max_paired = self.max_paired_snapshot_height();
         let max_h = self
             .state
             .iter()
@@ -315,7 +338,7 @@ impl Storage {
                     return false;
                 }
                 let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
-                h < keep_from && Some(h) != max_h
+                h < keep_from && Some(h) != max_h && Some(h) != max_paired
             })
             .collect();
         for k in keys {
@@ -328,8 +351,10 @@ impl Storage {
     // ---------- Domain snapshots (tokens/contracts/orderbooks/PMM/staking/gov) ----------
 
     /// Drop domain snapshots older than `keep_from`.
-    /// Never drops the latest snapshot (max height) to preserve bootability.
+    /// Never drops the latest snapshot (`max_h`) or the newest paired
+    /// `(state ∩ domains)` height (`max_paired`) to preserve bootability.
     pub fn prune_domains_below(&self, keep_from: u64) -> Result<usize> {
+        let max_paired = self.max_paired_snapshot_height();
         let max_h = self
             .domains
             .iter()
@@ -349,7 +374,7 @@ impl Storage {
                     return false;
                 }
                 let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
-                h < keep_from && Some(h) != max_h
+                h < keep_from && Some(h) != max_h && Some(h) != max_paired
             })
             .collect();
         for k in keys {
@@ -363,6 +388,7 @@ impl Storage {
         self.prune_cnvrf_v3_below(keep_from)?;
         self.prune_evm_bindings_state_below(keep_from)?;
         self.prune_pq_registry_below(keep_from)?;
+        self.prune_evm_settled_state_below(keep_from)?;
         Ok(removed)
     }
 
@@ -581,6 +607,32 @@ impl Storage {
             .collect();
         for k in keys {
             self.pq_registry.remove(k)?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// Drop `evm_settled_state` snapshots older than `keep_from`. Called from
+    /// `prune_domains_below`. Never drops a row at a retained snapshot height:
+    /// see [`Self::aux_retained_heights`].
+    pub fn prune_evm_settled_state_below(&self, keep_from: u64) -> Result<usize> {
+        let keep = self.aux_retained_heights();
+        let mut removed = 0;
+        let keys: Vec<sled::IVec> = self
+            .evm_settled_state
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .filter(|k| {
+                if k.len() != 8 {
+                    return false;
+                }
+                let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
+                h < keep_from && !keep.contains(&h)
+            })
+            .collect();
+        for k in keys {
+            self.evm_settled_state.remove(k)?;
             removed += 1;
         }
         Ok(removed)

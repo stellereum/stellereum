@@ -325,6 +325,11 @@ impl Storage {
                 .await
                 .map_err(|e| anyhow!("restore pq_registry at height {height}: {e}"))?;
         }
+        if let Some(bytes) = self.evm_settled_state_at(height)? {
+            tmp.restore_evm_settled(&bytes)
+                .await
+                .map_err(|e| anyhow!("restore evm_settled_state at height {height}: {e}"))?;
+        }
 
         // Anchor the recomputed root: the header at height+1 commits to the
         // post-`height` state. At the tip (no successor yet) check

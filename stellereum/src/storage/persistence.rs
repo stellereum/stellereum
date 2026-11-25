@@ -58,6 +58,10 @@ pub enum PersistJob {
         height: u64,
         bytes: Vec<u8>,
     },
+    EvmSettledState {
+        height: u64,
+        bytes: Vec<u8>,
+    },
     /// Complete cross-shard finalized-header registry snapshot (latest shard
     /// heads + bounded anchor window). Latest-state, so a later job replaces an
     /// earlier one; enqueued from the registry's finalize path, never read from
@@ -137,6 +141,7 @@ pub fn persist_job_label(job: &PersistJob) -> &'static str {
         PersistJob::CnVrfV3 { .. } => "CN-VRF v3 snapshot",
         PersistJob::EvmBindingsState { .. } => "EVM bindings state snapshot",
         PersistJob::PqRegistry { .. } => "PQ registry snapshot",
+        PersistJob::EvmSettledState { .. } => "EVM settled nullifiers snapshot",
         PersistJob::XshardHeaders { .. } => "cross-shard header registry",
         PersistJob::ValidatorSetHistory(_) => "Validator-set activation history",
         PersistJob::Consensus(_) => "Consensus safety checkpoint",
@@ -173,6 +178,7 @@ pub fn persist_drop_consequence(job: &PersistJob) -> &'static str {
         PersistJob::CnVrfV3 { .. }
         | PersistJob::EvmBindingsState { .. }
         | PersistJob::PqRegistry { .. }
+        | PersistJob::EvmSettledState { .. }
         | PersistJob::XshardHeaders { .. }
         | PersistJob::ValidatorSetHistory(_)
         | PersistJob::Flush => {
@@ -295,6 +301,9 @@ impl AsyncPersistence {
                         st.put_evm_bindings_state(height, &bytes)
                     }
                     PersistJob::PqRegistry { height, bytes } => st.put_pq_registry(height, &bytes),
+                    PersistJob::EvmSettledState { height, bytes } => {
+                        st.put_evm_settled_state(height, &bytes)
+                    }
                     PersistJob::XshardHeaders { bytes } => st.put_xshard_headers(&bytes),
                     PersistJob::ValidatorSetHistory(history) => {
                         st.put_validator_set_history(&history)
@@ -568,6 +577,12 @@ impl AsyncPersistence {
         self.push(PersistJob::PqRegistry { height, bytes });
     }
 
+    /// Non-blocking: enqueue settled EVM carrier nullifiers (`STELL_EVM_SETTLED_V1`)
+    /// for `height`.
+    pub fn enqueue_evm_settled_state(&self, height: u64, bytes: Vec<u8>) {
+        self.push(PersistJob::EvmSettledState { height, bytes });
+    }
+
     /// Non-blocking: enqueue a complete cross-shard finalized-header registry
     /// snapshot. Latest-state (a later job replaces an earlier one), so the
     /// queue-under-pressure drop of one snapshot is recovered by the next
@@ -615,6 +630,7 @@ impl AsyncPersistence {
         let cnvrf_v3 = bincode::serialize(&engine.cnvrf_v3_snapshot().await).unwrap_or_default();
         let evm_bindings = engine.evm_bindings_snapshot().await;
         let pq_registry = engine.pq_registry_snapshot().await;
+        let evm_settled = engine.evm_settled_snapshot().await;
         // Cross-shard replay, engine half (audit F-I): the runtime mirrors are
         // empty wherever this runs (startup healing with a fresh runtime, or
         // tests) - and that is CORRECT here, because there is nothing live to
@@ -652,6 +668,7 @@ impl AsyncPersistence {
             self.enqueue_cnvrf_v3(height, cnvrf_v3);
             self.enqueue_evm_bindings_state(height, evm_bindings);
             self.enqueue_pq_registry(height, pq_registry);
+            self.enqueue_evm_settled_state(height, evm_settled);
             self.enqueue_domains(
                 height,
                 bytes,

@@ -325,6 +325,22 @@ impl Storage {
             .map(|v| v.to_vec()))
     }
 
+    // ---------- Settled EVM carrier nullifier snapshots (`STELL_EVM_SETTLED_V1`) ----------
+
+    pub fn put_evm_settled_state(&self, height: u64, bytes: &[u8]) -> Result<()> {
+        self.evm_settled_state.insert(height.to_be_bytes(), bytes)?;
+        Ok(())
+    }
+
+    /// The settled EVM intent nullifier set as it stood after `height`, when stored.
+    /// `None` (or empty bytes) on older directories means empty set.
+    pub fn evm_settled_state_at(&self, height: u64) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .evm_settled_state
+            .get(height.to_be_bytes())?
+            .map(|v| v.to_vec()))
+    }
+
     // ---------- Non-consensus crash-safe EVM bindings index (`"evm_bindings"`) ----------
     //
     // Key layout:
@@ -840,6 +856,13 @@ impl Storage {
                 let snap: crate::state_engine::CnVrfV3EngineSnapshot = bincode::deserialize(&bytes)
                     .map_err(|e| anyhow!("restore cnvrf_v3 at height {snapshot_height}: {e}"))?;
                 engine.restore_cnvrf_v3_snapshot(&snap).await;
+            }
+        }
+        if let Some(bytes) = self.evm_settled_state_at(snapshot_height)? {
+            if !bytes.is_empty() {
+                engine.restore_evm_settled(&bytes).await.map_err(|e| {
+                    anyhow!("restore evm_settled_state at height {snapshot_height}: {e}")
+                })?;
             }
         }
         let computed = engine.get_state_root().await;
@@ -2504,6 +2527,7 @@ pub async fn load_full_state_into(
     let cnvrf_snap: Option<crate::state_engine::CnVrfV3EngineSnapshot>;
     let evm_bindings_opt: Option<Vec<u8>>;
     let pq_registry_opt: Option<Vec<u8>>;
+    let evm_settled_opt: Option<Vec<u8>>;
 
     // Phase 1 (throwaway): restore + verify without touching live state. The
     // verification is MANDATORY whenever an anchor exists: a snapshot labeled H whose
@@ -2595,6 +2619,12 @@ pub async fn load_full_state_into(
                 .await
                 .map_err(|e| anyhow!("restore pq_registry: {e}"))?;
         }
+        evm_settled_opt = storage.evm_settled_state_at(height)?;
+        if let Some(bytes) = &evm_settled_opt {
+            tmp.restore_evm_settled(bytes)
+                .await
+                .map_err(|e| anyhow!("restore evm_settled_state: {e}"))?;
+        }
         storage.verify_restored_root(&tmp, height).await?;
     }
 
@@ -2644,6 +2674,12 @@ pub async fn load_full_state_into(
             .restore_pq_registry(bytes)
             .await
             .map_err(|e| anyhow!("restore pq_registry: {e}"))?;
+    }
+    if let Some(bytes) = &evm_settled_opt {
+        engine
+            .restore_evm_settled(bytes)
+            .await
+            .map_err(|e| anyhow!("restore evm_settled_state: {e}"))?;
     }
     match domains_opt {
         Some(bytes) => {
@@ -2705,6 +2741,11 @@ pub async fn load_state_into(
                     .await
                     .map_err(|e| anyhow!("restore bridge domain: {e}"))?;
             }
+            if let Some(bytes) = storage.evm_settled_state_at(height)? {
+                tmp.restore_evm_settled(&bytes)
+                    .await
+                    .map_err(|e| anyhow!("restore evm_settled_state: {e}"))?;
+            }
             let domains_paired = matches!(storage.latest_domains()?, Some((dh, _)) if dh == height);
             if !domains_paired {
                 storage.verify_restored_root(&tmp, height).await?;
@@ -2724,6 +2765,12 @@ pub async fn load_state_into(
                     .restore_bridge(&bytes)
                     .await
                     .map_err(|e| anyhow!("restore bridge domain: {e}"))?;
+            }
+            if let Some(bytes) = storage.evm_settled_state_at(height)? {
+                engine
+                    .restore_evm_settled(&bytes)
+                    .await
+                    .map_err(|e| anyhow!("restore evm_settled_state: {e}"))?;
             }
             Ok(Some(height))
         }

@@ -2072,7 +2072,7 @@ impl InMemoryStateEngine {
     ///
     /// Namespaced and hashed so it can never collide with an account address,
     /// a token balance/supply leaf, a contract leaf or a HashPool nullifier.
-    fn evm_settled_key(digest: &[u8; 32]) -> [u8; 32] {
+    pub(super) fn evm_settled_key(digest: &[u8; 32]) -> [u8; 32] {
         let mut buf = Vec::with_capacity(24 + 32);
         buf.extend_from_slice(b"STELL_EVM_SETTLED_V1");
         buf.extend_from_slice(digest);
@@ -2083,6 +2083,9 @@ impl InMemoryStateEngine {
     /// COMMITTED block. Consensus-visible (the trie is part of the state
     /// root), so a restart/catch-up derives the same answer.
     pub async fn evm_intent_is_settled(&self, digest: &[u8; 32]) -> bool {
+        if self.evm_settled.read().await.contains(digest) {
+            return true;
+        }
         let key = Self::evm_settled_key(digest);
         self.state_trie.read().await.get(&key).is_some()
     }
@@ -2092,12 +2095,52 @@ impl InMemoryStateEngine {
     /// consumes the nullifier and a retry can still settle.
     pub async fn mark_evm_intent_settled(&self, digest: &[u8; 32]) {
         let key = Self::evm_settled_key(digest);
+        let mut settled = self.evm_settled.write().await;
         let mut trie = self.state_trie.write().await;
         trie.insert(&key, &[1u8]);
+        settled.insert(*digest);
         drop(trie);
+        drop(settled);
         // The trie is folded into the state root; invalidate the cached
         // commitment exactly like any other committed-domain write.
         self.bump_commitment_generation();
+    }
+
+    /// Serialize the committed settled-EVM-intent nullifier digests for
+    /// persistence. Returns an empty `Vec` when empty (0 bytes invariant).
+    pub async fn evm_settled_snapshot(&self) -> Vec<u8> {
+        let guard = self.evm_settled.read().await;
+        if guard.is_empty() {
+            return Vec::new();
+        }
+        bincode::serialize(&*guard).unwrap_or_default()
+    }
+
+    /// Install a persisted set of settled EVM intent digests into
+    /// `self.evm_settled` and synchronize their `STELL_EVM_SETTLED_V1` leaves
+    /// in `self.state_trie`. Empty bytes install an empty set.
+    pub async fn restore_evm_settled(&self, bytes: &[u8]) -> Result<(), String> {
+        let new_set: std::collections::BTreeSet<[u8; 32]> = if bytes.is_empty() {
+            std::collections::BTreeSet::new()
+        } else {
+            super::types::bincode_deserialize_exact(bytes, super::MAX_SNAPSHOT_DECODE_BYTES)
+                .map_err(|e| format!("restore evm_settled failed: {e:?}"))?
+        };
+        let mut settled = self.evm_settled.write().await;
+        let mut trie = self.state_trie.write().await;
+        for old in settled.iter() {
+            if !new_set.contains(old) {
+                trie.remove(&Self::evm_settled_key(old));
+            }
+        }
+        for digest in &new_set {
+            trie.insert(&Self::evm_settled_key(digest), &[1u8]);
+        }
+        *settled = new_set;
+        drop(trie);
+        drop(settled);
+        self.bump_commitment_generation();
+        Ok(())
     }
 
     /// Feed ONE committed-and-applied transaction into the deterministic

@@ -107,6 +107,7 @@ impl InMemoryStateEngine {
             cnvrf_freeze_inputs: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             evm_bindings: Arc::new(RwLock::new(super::EvmBindingsState::default())),
             pq_registry: Arc::new(RwLock::new(crate::pq_registry::PqRegistry::default())),
+            evm_settled: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
             #[cfg(any(test, debug_assertions))]
             cnvrf_v3_activation_override: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
         }
@@ -141,6 +142,7 @@ impl InMemoryStateEngine {
         let cnvrf_freeze_inputs = self.cnvrf_freeze_inputs.read().await.clone();
         let evm_bindings = self.evm_bindings.read().await.clone();
         let pq_registry = self.pq_registry.read().await.clone();
+        let evm_settled = self.evm_settled.read().await.clone();
 
         let pq_tree = self
             .pq_tree
@@ -248,6 +250,7 @@ impl InMemoryStateEngine {
             cnvrf_freeze_inputs: Arc::new(RwLock::new(cnvrf_freeze_inputs)),
             evm_bindings: Arc::new(RwLock::new(evm_bindings)),
             pq_registry: Arc::new(RwLock::new(pq_registry)),
+            evm_settled: Arc::new(RwLock::new(evm_settled)),
             #[cfg(any(test, debug_assertions))]
             cnvrf_v3_activation_override: Arc::new(std::sync::atomic::AtomicU64::new(
                 self.cnvrf_v3_activation_override
@@ -454,6 +457,11 @@ impl InMemoryStateEngine {
         } else {
             Default::default()
         };
+        let evm_settled = if need_evm_bindings {
+            self.evm_settled.read().await.clone()
+        } else {
+            std::collections::BTreeSet::new()
+        };
         let pq_registry = if need_pq_registry {
             self.pq_registry.read().await.clone()
         } else {
@@ -551,6 +559,7 @@ impl InMemoryStateEngine {
             cnvrf_freeze_inputs: Arc::new(RwLock::new(Default::default())),
             evm_bindings: Arc::new(RwLock::new(evm_bindings)),
             pq_registry: Arc::new(RwLock::new(pq_registry)),
+            evm_settled: Arc::new(RwLock::new(evm_settled)),
             #[cfg(any(test, debug_assertions))]
             cnvrf_v3_activation_override: Arc::new(std::sync::atomic::AtomicU64::new(
                 self.cnvrf_v3_activation_override
@@ -2618,7 +2627,12 @@ impl InMemoryStateEngine {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    if next != current {
+                        self.bump_commitment_generation();
+                    }
+                    return Ok(());
+                }
                 Err(actual) => current = actual,
             }
         }
@@ -2638,8 +2652,11 @@ impl InMemoryStateEngine {
 
     /// Undo a reservation when the balance credit it paid for failed.
     pub(super) fn release_mint_nano(&self, amount: u64) {
-        self.total_minted_nano
-            .fetch_sub(amount, std::sync::atomic::Ordering::AcqRel);
+        if amount != 0 {
+            self.total_minted_nano
+                .fetch_sub(amount, std::sync::atomic::Ordering::AcqRel);
+            self.bump_commitment_generation();
+        }
     }
 
     /// Credit a balance against an ALREADY-RESERVED mint.
@@ -3059,6 +3076,7 @@ impl InMemoryStateEngine {
         self.cross_shard_xpc.write().await.clear();
         *self.evm_bindings.write().await = super::EvmBindingsState::default();
         *self.pq_registry.write().await = crate::pq_registry::PqRegistry::default();
+        self.evm_settled.write().await.clear();
 
         // Consistent lock order: accounts -> tokens -> trie
         let mut map = self.accounts.write().await;
@@ -3117,6 +3135,7 @@ impl InMemoryStateEngine {
             .values()
             .cloned()
             .collect();
+        let evm_settled: Vec<[u8; 32]> = self.evm_settled.read().await.iter().copied().collect();
 
         // Consistent lock order: accounts -> tokens -> trie
         let mut map = self.accounts.write().await;
@@ -3131,14 +3150,18 @@ impl InMemoryStateEngine {
             map.insert(acc.address, acc);
         }
 
-        // CRITICAL: rebuilding the trie must not drop token or 2PC entries,
-        // otherwise token balances or 2PC phase proofs become SPV-unprovable
-        // after a restore.
+        // CRITICAL: rebuilding the trie must not drop token, 2PC, or settled EVM
+        // intent entries, otherwise token balances, 2PC phase proofs, or
+        // nullifier leaves become missing/unprovable after a restore.
         write_token_trie_entries(&mut trie, &tokens);
         for rec in &xpc_records {
             let key = crate::xshard2pc::xpc_state_key(&rec.tx_hash);
             let value = crate::xshard2pc::xpc_state_value(rec.phase, &rec.tx_hash);
             trie.insert(&key, &value);
+        }
+        for digest in &evm_settled {
+            let key = Self::evm_settled_key(digest);
+            trie.insert(&key, &[1u8]);
         }
 
         Ok(())

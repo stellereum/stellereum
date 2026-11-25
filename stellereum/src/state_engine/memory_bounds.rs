@@ -588,6 +588,7 @@ impl super::InMemoryStateEngine {
         // was reorged away - a latent double-mint.
         // (The `_preserve_replay_sets` twin below deliberately keeps them.)
         self.cross_shard_xpc.write().await.clear();
+        self.evm_settled.write().await.clear();
         // The penalty travels with the state; install it BEFORE the
         // accounts lock (documented lock order: penalty -> accounts).
         *self.consensus_penalty.write().await = penalty;
@@ -636,6 +637,8 @@ impl super::InMemoryStateEngine {
         // The penalty travels with the state (see `create_snapshot`).
         *self.consensus_penalty.write().await = penalty;
 
+        let evm_settled: Vec<[u8; 32]> = self.evm_settled.read().await.iter().copied().collect();
+
         let mut map = self.accounts.write().await;
         let tokens = self.tokens.read().await;
         let mut trie = self.state_trie.write().await;
@@ -651,6 +654,10 @@ impl super::InMemoryStateEngine {
         }
 
         super::types::write_token_trie_entries(&mut trie, &tokens);
+        for digest in &evm_settled {
+            let key = super::InMemoryStateEngine::evm_settled_key(digest);
+            trie.insert(&key, &[1u8]);
+        }
         Ok(())
     }
 }

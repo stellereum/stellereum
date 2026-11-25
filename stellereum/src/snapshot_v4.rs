@@ -2162,7 +2162,9 @@ impl SnapStateV4 {
             .await
             .map_err(SnapV4Error::EngineRestore)?;
 
-        // R3-D wires engine.restore_pq_registry(&self.pq_registry) here.
+        engine
+            .restore_pq_registry_state(self.pq_registry.clone())
+            .await;
 
         Ok((staking, governance))
     }
@@ -2172,26 +2174,6 @@ impl SnapStateV4 {
     pub async fn compute_state_root(&self) -> Result<[u8; 32], SnapV4Error> {
         let throwaway = InMemoryStateEngine::new();
         self.apply_to_engine(&throwaway).await?;
-        if !self.pq_registry.is_empty() {
-            let snapshot = throwaway.commitment_snapshot().await;
-            let zkml_models = throwaway.zkml_models_read().await.clone();
-            let cnvrf_snap = throwaway.cnvrf_v3_snapshot().await;
-            let evm_bindings = throwaway.evm_bindings_read().await.clone();
-            let digest = crate::commitment::commitment_digest_with_all_domains(
-                &snapshot,
-                &zkml_models,
-                &cnvrf_snap,
-                throwaway.total_minted_nano(),
-                &evm_bindings,
-                &self.pq_registry,
-            );
-            throwaway
-                .state_trie
-                .write()
-                .await
-                .insert(&crate::commitment::commitment_key(), &digest);
-            return Ok(throwaway.state_trie.read().await.root_hash());
-        }
         Ok(throwaway.get_state_root().await)
     }
 

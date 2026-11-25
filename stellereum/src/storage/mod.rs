@@ -31,6 +31,7 @@
 //!   "evm_bindings_state": height(8B BE) -> bincode(EvmBindingsSnapshot) [additive root-committed domain]
 //!   "evm_bindings": b"e:"||evm(20)->pq(32), b"p:"||pq(32)->evm(20), b"meta:cursor"->u64 BE [never pruned]
 //!   "pq_registry" : height(8B BE) -> bincode(PqRegistry) [additive root-committed domain]
+//!   "evm_settled_state": height(8B BE) -> bincode(BTreeSet<[u8; 32]>) [additive settled EVM intent nullifier set]
 //!   "snap_units"  : unit_hash(32B) -> raw SnapV4 unit/chunk bytes
 //!   "snap_manifests": height(8B BE) -> canonical SnapshotManifestV1 bytes
 //!   "snap_committed": height(8B BE) -> bincode(SnapCommitMarker)
@@ -189,6 +190,9 @@ pub struct Storage {
     pub(super) evm_bindings: sled::Tree,
     /// Canonical `Domain::PqRegistry` snapshot tree, keyed by height.
     pub(super) pq_registry: sled::Tree,
+    /// Committed settled EVM carrier intent digests (`STELL_EVM_SETTLED_V1`),
+    /// keyed by height.
+    pub(super) evm_settled_state: sled::Tree,
     /// W1 SnapV4 content-addressed unit/chunk store (`unit_hash -> bytes`).
     pub(super) snap_units: sled::Tree,
     /// W1 SnapV4 manifests keyed by height (`height_be -> canonical bytes`).
@@ -343,6 +347,7 @@ impl Storage {
         let evm_bindings_state = db.open_tree("evm_bindings_state")?;
         let evm_bindings = db.open_tree("evm_bindings")?;
         let pq_registry = db.open_tree("pq_registry")?;
+        let evm_settled_state = db.open_tree("evm_settled_state")?;
         let snap_units = db.open_tree("snap_units")?;
         let snap_manifests = db.open_tree("snap_manifests")?;
         let snap_committed = db.open_tree("snap_committed")?;
@@ -371,6 +376,7 @@ impl Storage {
             evm_bindings_state,
             evm_bindings,
             pq_registry,
+            evm_settled_state,
             snap_units,
             snap_manifests,
             snap_committed,

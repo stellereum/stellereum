@@ -174,6 +174,7 @@ fi
 if [[ -z "$BINARY" ]]; then
     for cand in \
         "$HOME_DIR/stellereum" \
+        "$ROOT_DIR/target/release/stellereum" \
         "./stellereum/target/release/stellereum" \
         "$ROOT_DIR/stellereum/target/release/stellereum" \
         "$(command -v stellereum 2>/dev/null || true)"; do

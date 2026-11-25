@@ -30,6 +30,8 @@ BIN_PATH="${STELL_BIN:-}"
 
 if [[ -z "$BIN_PATH" ]]; then
     for cand in \
+        "$ROOT_DIR/target/release/stellereum" \
+        "$ROOT_DIR/target/debug/stellereum" \
         "$ROOT_DIR/stellereum/target/release/stellereum" \
         "$ROOT_DIR/stellereum/target/debug/stellereum" \
         "$(command -v stellereum 2>/dev/null || true)"; do

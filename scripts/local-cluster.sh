@@ -48,10 +48,10 @@ resolve_bin() {
         return 0
     fi
     for cand in \
-        "$ROOT/stellereum/target/debug/stellereum" \
-        "$ROOT/stellereum/target/release/stellereum" \
+        "$ROOT/target/release/stellereum" \
         "$ROOT/target/debug/stellereum" \
-        "$ROOT/target/release/stellereum"; do
+        "$ROOT/stellereum/target/debug/stellereum" \
+        "$ROOT/stellereum/target/release/stellereum"; do
         if [[ -x "$cand" ]]; then
             echo "$cand"
             return 0

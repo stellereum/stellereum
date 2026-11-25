@@ -238,7 +238,11 @@ source_env_safely() {
     source "$file"
     set +a
     (( was_x )) && set -x
-    log "sourced env file $file (STELL_CHAIN_ID=${STELL_CHAIN_ID:-unset}, passphrase=${STELL_KEY_PASSPHRASE:+set}${STELL_KEY_PASSPHRASE:-unset})"
+    local p_state="unset"
+    if [[ -n "${STELL_KEY_PASSPHRASE:-}" ]]; then
+        p_state="set"
+    fi
+    log "sourced env file $file (STELL_CHAIN_ID=${STELL_CHAIN_ID:-unset}, passphrase=$p_state)"
 }
 
 # Validate keys directory
@@ -417,7 +421,7 @@ cleanup() {
     if [[ "$rc" -ne 0 && "$DATA_MUTATED" == "0" ]]; then
         # Safe rollback of service/guard state if we never touched data/
         if [[ "$UNIT_MASKED_BY_US" == "1" ]]; then
-            stctl unmask "$SYSTEMD_UNIT" >/dev/null 2>&1 || true
+            stctl unmask --runtime "$SYSTEMD_UNIT" >/dev/null 2>&1 || stctl unmask "$SYSTEMD_UNIT" >/dev/null 2>&1 || true
         fi
         if [[ "$GUARD_PAUSED_BY_US" == "1" && "$GUARD_WAS_ACTIVE" == "1" ]]; then
             stctl start "$GUARD_TIMER" >/dev/null 2>&1 || true
@@ -482,8 +486,9 @@ if [[ -n "$SYSTEMD_UNIT" ]]; then
         fi
         log "masking and stopping $SYSTEMD_UNIT..."
         if [[ "$unit_load" != "masked" ]]; then
-            stctl mask "$SYSTEMD_UNIT"
-            UNIT_MASKED_BY_US=1
+            if stctl mask --runtime "$SYSTEMD_UNIT" >/dev/null 2>&1; then
+                UNIT_MASKED_BY_US=1
+            fi
         fi
         stctl stop "$SYSTEMD_UNIT"
 
@@ -582,7 +587,7 @@ ok "safety record initialized for $STORE_DIR (shard=$SHARD)"
 if [[ "$SYSTEMD_ACTIVE" == "1" ]]; then
     if [[ "$UNIT_MASKED_BY_US" == "1" ]]; then
         log "unmasking $SYSTEMD_UNIT..."
-        stctl unmask "$SYSTEMD_UNIT"
+        stctl unmask --runtime "$SYSTEMD_UNIT" >/dev/null 2>&1 || stctl unmask "$SYSTEMD_UNIT" >/dev/null 2>&1 || true
         UNIT_MASKED_BY_US=0
     fi
     log "starting $SYSTEMD_UNIT..."

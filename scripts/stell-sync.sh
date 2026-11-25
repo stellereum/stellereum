@@ -29,7 +29,7 @@ REQUIRE_SHA256="${STELL_REQUIRE_SHA256:-0}"
 # The ssh targets, the node dirs and the service names live in
 # cluster-nodes.conf (sourced below) — ONE place, machine-readable, because
 # the topology is exactly what drifted during the deployment attempt.
-BIN_SRC="${BIN_SRC:-/home/imm/stellereum-project/stellereum/target/release/stellereum}"
+BIN_SRC="${BIN_SRC:-/home/imm/stellereum-project/target/release/stellereum}"
 
 # --- the cluster topology (node list, env files, units, expected values) ---
 # Sourced FIRST so its values win over the defaults below.

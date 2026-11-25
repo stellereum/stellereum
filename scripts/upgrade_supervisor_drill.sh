@@ -65,10 +65,10 @@ find_bin() {
         return
     fi
     for cand in \
-        "$ROOT/stellereum/target/debug/$name" \
-        "$ROOT/stellereum/target/release/$name" \
+        "$ROOT/target/release/$name" \
         "$ROOT/target/debug/$name" \
-        "$ROOT/target/release/$name"; do
+        "$ROOT/stellereum/target/release/$name" \
+        "$ROOT/stellereum/target/debug/$name"; do
         if [[ -x "$cand" ]]; then printf '%s' "$cand"; return; fi
     done
     command -v "$name" 2>/dev/null || true

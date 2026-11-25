@@ -95,7 +95,7 @@ RCA (2026-11-25, диагноз закрыт; код стейкинга/конс
   восстановимо (journald ротирован, store на B без заголовков той высоты);
   механизм от числа членов не зависит — достаточно `n != 4`.
 
-P0-READINESS-DEAD (FIXED в дереве, выкат — ближайшим rolling deploy, 2026-11-24).
+P0-READINESS-DEAD (DEPLOYED на A/B/C/D в 7bc1bf56, 2026-11-25).
 `GatewayState::set_ready_peers` / `note_ready_finalized` не имели ни одного вызова,
 поэтому `/readyz` и `stell_ready` всегда отдавали 0 — любой health-check снял бы
 живую ноду из ротации. Исправлено: readiness-хэндл публикуется процесс-глобально
@@ -119,42 +119,28 @@ one hiccup = 20+ minutes below 4/4). При `STELL_MIN_BLOCK_MS=400` бюдже�
 тяжёлых сборок при наборе < 4/4» остаётся в силе; сборки идут `taskset -c 8-11
 nice -n 19`.
 
-P0-PEER-SNAPSHOT-ANCHOR (OPEN, 2026-11-23, liveness: catch-up blocked).
-Отставший узел не может догнать цепь через снапшот, полученный от пира. Живые
-наблюдения (`nodeB` на 155 243, `nodeC` на 171 697) дают два независимых отказа
-проверки `snapshot anchor (tail)` в `src/sync.rs`:
+P0-PEER-SNAPSHOT-ANCHOR (FIXED в дереве, ожидает выката `cf054343`, 2026-11-25).
+Исправлено в Волне 2 (`e7246c5c2`) и Волне 7 (`ae493a270`):
+1. `verify_snapshot_anchor_with_sets_and_schedule` + строгий `validator_set_for_height_strict`
+   (без тихого фоллбека в конфиг-набор 4×1); `validator_set_history_v1` сохраняется и
+   восстанавливается через `Storage`, а at-tip restore сеет bonded-набор на высоте `ledger_height`.
+2. `retro_publish_blocks` публикует неизменяемые заголовки (`_h_`, `_h2_`, `_hi_`) в полосе
+   `Pointer` до `_hq_` без сдвига `shard_head`, глубина расширена до snapshot span.
+3. `try_snapshot_sync_with_persistence` сохраняет граничный блок, снапшоты и `finalized` до
+   `advance_to_verified_snapshot`.
+Тесты: `tests/w2_snapshot_anchor_tests.rs` (12/12), `tests/rca_degenerate_validator_set.rs` (3/3,
+ранее `#[ignore]` разблокирован), `tests/w7_storage_recovery_fixes.rs::w6_a2_3`.
 
-1. `no header published at height <boundary-1>; cannot prove linkage` — заголовок
-   на границе обязан быть в DHT, но публикация заголовков ограничена по глубине,
-   поэтому «прогулка» от нашего anchor до границы снапшота недоказуема;
-2. `finality: header proposer at height <h> held no schedule slot in rounds 0..=r`
-   — исторический набор валидаторов, которым проверяется расписание пропозера,
-   не совпадает с набором, действовавшим на той высоте (набор менялся на каждом
-   джейле/разджейле `nodeC` в тот период).
-
-Оба отказа — fail-closed и это правильно; дефект в том, что штатного пути
-восстановления нет и узел висит до ручного вмешательства. Обход, применённый
-дважды: восстановление из ПУБЛИЧНОГО HTTP-снапшота
-(`https://rpc.stellereum.org/snapshot/latest.tar.zst` → `data/`) + `safety-reset`
-+ `safety-init` (см. `ops/safety_recovery_runbook.md`). Требуется: (а) глубина
-публикации заголовков ≥ максимального span снапшота, либо снапшот, несущий
-собственный проверяемый префикс заголовков; (б) разрешение набора строго через
-`validator_set_history` с отказом при отсутствии записи (сейчас возможен
-«соседний» набор). Fail-before тесты: снапшот на границе, у которой заголовок
-не опубликован; и снапшот, чей anchor-пропозер не входит в исторический набор.
-
-P0-SAFETY-BOOT-ONE-BLOCK (MITIGATED — root cause found, 2026-11-23, availability:
-restart -> Observer). После рестарта `safety_record_v1.finalized_height` может
-превышать сохранённый finalized/state ровно на 1 блок, и узел уходит в
-fail-closed Observer. **Корень не в консенсусе**: указатель finalized пишется
-через очередь `PersistJob::Finalized`, а graceful shutdown дренирует её с
-верхним пределом 240 с (`src/node/bootstrap.rs`). Дефолтный systemd
-`TimeoutStopSec=90s` убивал процесс SIGKILL посреди этого дренажа — отсюда
-запись на блок впереди стора. Исправлено drop-in'ом `20-stop-timeout.conf`
-(`TimeoutStopSec=300`) на A/B/C/D; проверено: `systemctl show … -p
-TimeoutStopUSec` = 5min на всех. Остаётся (не блокер): автоматический reconcile
-на boot для случая принудительного SIGKILL — сейчас лечится
-`safety-reset` + `safety-init` по `ops/safety_recovery_runbook.md`.
+P0-SAFETY-BOOT-ONE-BLOCK (FIXED в дереве, ожидает выката `cf054343`, 2026-11-25).
+Закрыто полностью (graceful + hard-`SIGKILL`):
+- `TimeoutStopSec=300` (`20-stop-timeout.conf`) для graceful drain (до 240 с);
+- Write-ahead `put_block` + `set_finalized` **до** `safety.advance_height` на всех путях
+  финализации, adoption (`adopt_committed_with_write_ahead`) и `walk_chain_once_with_lanes`;
+- Proof-carrying `reconcile_boot_sigkill_gap` (`src/safety.rs`) при старте: если `safety_record_v1`
+  опережает `storage.finalized()`, проверяет локальные блоки, связку `prev_hash` и встроенные
+  `precommit_qc`, допроигрывает состояние вперёд без ослабления safety (при отсутствии или
+  подделке блока/QC по-прежнему уходит в карантин).
+Тесты: `tests/w2_safety_boot_reconcile_tests.rs` (3/3), `adopt::w7_adopt_tests` (2/2).
 
 ## P1 — высокий риск
 
@@ -395,3 +381,23 @@ TimeoutStopUSec` = 5min на всех. Остаётся (не блокер): а�
 | SYS-SPLIT-MERGE | Динамический split/merge шардов | Текущий канон — фиксированная пара `{0,1}`; динамика меняет validator-set, state routing и cross-shard 2PC одновременно. |
 | SYS-SECOND-CLIENT | Второй клиент | Нужен независимый консенсус-клиент и его спека для differential-тестов; вне текущего скоупа. |
 | SYS-WALLET-CONNECT | wallet/connect | Внешний кошелёк и connector-протокол — продуктовый слой; на консенсус и state root не влияет. |
+
+## Сплошной аудит Волны 6 и фиксы Волны 7 (2026-11-25)
+
+Волна 6 (8 read-only агентов) + Волна 7 (6 фикс-агентов + независимый аудит диффов):
+
+* **Закрыто в коде (с регрессионными тестами, `clippy --workspace -D warnings` 0/0, `cargo-audit` 0 уязвимостей):**
+  * **Консенсус / Safety / PQ:** `W6-A1-1` (Critical: UTF-8 срез в `adopt.rs`), `W6-A1-2` (`finalize_restore_qc_verified`), `W6-A2-4` (write-ahead до `adopt_committed`), `W6-A1-3/5` (`RemoteSigner` v2 `/v2/set_lock` + cross-kind + `https_only`), `W6-A1-6`, `W6-A7-5/6/8` (`LightHeader` PQ без отката в Ed25519, `explicit_pinned` в `FALCON_PUBKEY_CACHE`, FIPS-203 проверка ML-KEM-768) → `tests/w7_consensus_crypto_fixes.rs`.
+  * **Storage / State / Recovery:** `W6-A2-1` (Critical: персистентность `STELL_EVM_SETTLED_V1` в `evm_settled_state`), `W6-A2-2` (`SnapStateV4` `restore_pq_registry`), `W6-A2-3`, `W6-A2-5/6/7` (`prune_state_below` по paired-высотам, `bump_commitment_generation` на mint/release, индекс-первое удаление чеков) → `tests/w7_storage_recovery_fixes.rs`.
+  * **P2P / `infnode`:** `W6-A3-1..10` (`MAX_PUBSUB_DATA_LEN = 16 MiB`, пост-auth `CHALLENGE`, `MAX_UNSEALED_BLOB_BYTES = 64 MiB`, проверка подписи в `CompactReceiver`, защита `dht.lookup` от циклов, LRU маршрутов и чанкование gossip, ACL `m:`/`f:` + fail-closed TOFU, подписанные `infmail` `acct:`, `reorder` по `(src, origin)` + `(topic, msg_id)`) → `tests/w7_p2p_hardening_fixes.rs`.
+  * **SVM / Контракты:** `W6-A4-3/4` (немедленный table-cap и `FUEL_FALCON512_VERIFY_V2` в `stell_runGetMethod`), `W6-A4-5` (фиксы в `sts20-token`, `liquidity-pool`, `account-object`, `stl-dns`, `e2e-tests` 7/7 + `wasm32`) → `tests/w7_svm_and_contracts_fixes.rs`.
+  * **RPC / SSE / Индексатор / Ключи / SDK / Ops:** `W6-A5-1..8`, `W6-A6-3/4/6/9/12`, `W6-A8-1/2/4..15` → `tests/w7_rpc_indexer_keys_fixes.rs`, `stellereum-indexer/tests/w7_indexer_hardening.rs`, `sdk-js` 33/33, `ops/status` 8/8.
+* **За высотными гейтами (`u64::MAX`, `INERT`, ждут активационной волны):**
+  * `W6-A4-1/2`: `ACTOR_MAILBOX_HARDENING_HEIGHT` (запрет несанкционированных `Transfer`/дебитов в чужом `inbox` и биллинг `host.send_message` `gas_budget`).
+  * `W6-A7-1` / `W6-A1-4`: персистентность `cnvrf_freeze_inputs` и догонка `epoch_vdf` при `CNVRF_V3_ACTIVATION_HEIGHT`.
+  * `W6-A7-2/3/4`: паркованный `mev_epoch.rs` (`OrderCommitment`/`ShareRelease`/`EpochKeyAnnouncement`).
+  * `W6-A7-7`: modulo-bias в `sortition`.
+* **Вне кодового скоупа (зафиксировано, не правлено):**
+  * `W6-A6-1,2,5,7,8,10,11` в `stell-wallet/` (отложенные пользовательские правки — SPV leaf-decode, `pq-transfer` chain-binding, stealth plaintext fallback, `faucet_token` HTTP check, zeroization, fake `aa` commands, local sim overflow/permissions).
+  * `W6-A8-3`: пинование сторонних GitHub Actions к 40-hex commit SHA в `.github/workflows/*.yml` (требует онлайн-получения SHA).
+

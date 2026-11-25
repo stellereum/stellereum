@@ -363,7 +363,7 @@ fn partial_mesh_failure_is_not_covered_by_one_overlay_success() {
         !delivery.delivered(),
         "one overlay success must never be treated as coverage for a failed direct copy"
     );
-    let src = include_str!("../src/consensus_net.rs");
+    let src = include_str!("../src/consensus_net/gossip.rs");
     assert!(
         src.contains("if delivery.delivered() {"),
         "the broadcast path must gate on the strict direct-coverage proof"
@@ -425,7 +425,7 @@ fn resolved_peer_ids_are_cached_for_the_frame_path() {
     // Both consensus and tx gossip used to walk `cfg.peers` and decode every
     // PQ hex on EVERY message (the mesh check and the per-peer send each did
     // their own resolution). At ~4 blocks/s that is pure per-frame overhead.
-    let src = include_str!("../src/consensus_net.rs");
+    let src = include_str!("../src/consensus_net/gossip.rs");
     assert_eq!(
         src.matches("peer_ids_cache.get()").count(),
         2,

@@ -229,48 +229,100 @@ pub extern "C" fn withdraw(packed: i64) -> i64 {
     payout_a
 }
 
-/// Calculate swap quote Token A -> Token B using safe u128 math
+/// Calculate swap quote Token A -> Token B using checked u128 math
 #[no_mangle]
 pub extern "C" fn swap_quote(dx: i64) -> i64 {
     if dx <= 0 {
         return 0;
     }
-    let x = sload(SLOT_RESERVE_A) as u128;
-    let y = sload(SLOT_RESERVE_B) as u128;
-    let fee_bps = sload(SLOT_FEE_BPS) as u128;
+    let x_i64 = sload(SLOT_RESERVE_A);
+    let y_i64 = sload(SLOT_RESERVE_B);
+    let fee_i64 = sload(SLOT_FEE_BPS);
+    if x_i64 < 0 || y_i64 < 0 || !(0..10_000).contains(&fee_i64) {
+        return ERR_INVALID_ARGUMENT;
+    }
+    let x = x_i64 as u128;
+    let y = y_i64 as u128;
+    let fee_bps = fee_i64 as u128;
 
     let multiplier = 10_000 - fee_bps;
     let dx_u128 = dx as u128;
 
-    let numerator = y * dx_u128 * multiplier;
-    let denominator = (x * 10_000) + (dx_u128 * multiplier);
+    let numerator = match y
+        .checked_mul(dx_u128)
+        .and_then(|v| v.checked_mul(multiplier))
+    {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
+    let x_scaled = match x.checked_mul(10_000) {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
+    let dx_scaled = match dx_u128.checked_mul(multiplier) {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
+    let denominator = match x_scaled.checked_add(dx_scaled) {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
 
     if denominator == 0 {
         return 0;
     }
-    (numerator / denominator) as i64
+    match i64::try_from(numerator / denominator) {
+        Ok(v) => v,
+        Err(_) => ERR_OVERFLOW,
+    }
 }
 
-/// Calculate reverse swap quote Token B -> Token A using safe u128 math
+/// Calculate reverse swap quote Token B -> Token A using checked u128 math
 #[no_mangle]
 pub extern "C" fn swap_quote_b_for_a(dy: i64) -> i64 {
     if dy <= 0 {
         return 0;
     }
-    let x = sload(SLOT_RESERVE_A) as u128;
-    let y = sload(SLOT_RESERVE_B) as u128;
-    let fee_bps = sload(SLOT_FEE_BPS) as u128;
+    let x_i64 = sload(SLOT_RESERVE_A);
+    let y_i64 = sload(SLOT_RESERVE_B);
+    let fee_i64 = sload(SLOT_FEE_BPS);
+    if x_i64 < 0 || y_i64 < 0 || !(0..10_000).contains(&fee_i64) {
+        return ERR_INVALID_ARGUMENT;
+    }
+    let x = x_i64 as u128;
+    let y = y_i64 as u128;
+    let fee_bps = fee_i64 as u128;
 
     let multiplier = 10_000 - fee_bps;
     let dy_u128 = dy as u128;
 
-    let numerator = x * dy_u128 * multiplier;
-    let denominator = (y * 10_000) + (dy_u128 * multiplier);
+    let numerator = match x
+        .checked_mul(dy_u128)
+        .and_then(|v| v.checked_mul(multiplier))
+    {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
+    let y_scaled = match y.checked_mul(10_000) {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
+    let dy_scaled = match dy_u128.checked_mul(multiplier) {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
+    let denominator = match y_scaled.checked_add(dy_scaled) {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
 
     if denominator == 0 {
         return 0;
     }
-    (numerator / denominator) as i64
+    match i64::try_from(numerator / denominator) {
+        Ok(v) => v,
+        Err(_) => ERR_OVERFLOW,
+    }
 }
 
 /// Execute Swap Token A -> Token B: swap_a_for_b(dx) -> dy
@@ -280,6 +332,9 @@ pub extern "C" fn swap_a_for_b(dx: i64) -> i64 {
         return ERR_UNAUTHORIZED;
     }
     let dy = swap_quote(dx);
+    if dy == ERR_OVERFLOW {
+        return ERR_OVERFLOW;
+    }
     if dy <= 0 {
         return ERR_INVALID_ARGUMENT;
     }
@@ -312,6 +367,9 @@ pub extern "C" fn swap_b_for_a(dy: i64) -> i64 {
         return ERR_UNAUTHORIZED;
     }
     let dx = swap_quote_b_for_a(dy);
+    if dx == ERR_OVERFLOW {
+        return ERR_OVERFLOW;
+    }
     if dx <= 0 {
         return ERR_INVALID_ARGUMENT;
     }

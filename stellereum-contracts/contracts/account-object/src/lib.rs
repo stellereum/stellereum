@@ -48,6 +48,7 @@ const SLOT_RECOVERY_TIMESTAMP: i64 = 9;
 const SESSION_BASE_OFFSET: i64 = 10_000;
 const SESSION_STRIDE: i64 = 16;
 const MAX_SESSIONS: i64 = 1_000_000;
+const MAX_OWNER_ID: i64 = 922_337_203;
 const RECOVERY_TIMELOCK_SECS: i64 = 259_200; // 72-hour timelock
 
 // Event Topics
@@ -85,11 +86,11 @@ fn require_owner(caller_id: i64) {
 /// Initialize Account Object for Owner
 #[no_mangle]
 pub extern "C-unwind" fn init(owner_id: i64) -> i64 {
-    if owner_id <= 0 {
-        return ERR_INVALID_ARGUMENT;
-    }
     if sload(SLOT_INITIALIZED) != 0 {
         panic!("account already initialized");
+    }
+    if owner_id <= 0 || owner_id > MAX_OWNER_ID {
+        return ERR_INVALID_ARGUMENT;
     }
 
     sstore(SLOT_INITIALIZED, 1);
@@ -133,7 +134,7 @@ pub extern "C-unwind" fn transfer_ownership(packed: i64) -> i64 {
     let new_owner = packed % 10_000_000_000;
 
     require_owner(caller_id);
-    if new_owner <= 0 {
+    if new_owner <= 0 || new_owner > MAX_OWNER_ID {
         panic!("invalid new owner");
     }
 
@@ -182,7 +183,7 @@ pub extern "C-unwind" fn initiate_recovery(packed: i64) -> i64 {
     if guardian <= 0 || caller_id != guardian || !caller_is(caller_id) {
         panic!("unauthorized: caller is not designated guardian");
     }
-    if new_owner <= 0 {
+    if new_owner <= 0 || new_owner > MAX_OWNER_ID {
         panic!("invalid recovery owner");
     }
 
@@ -300,6 +301,9 @@ pub extern "C-unwind" fn is_rental_active(_now_timestamp: i64) -> i64 {
 /// packed: (session_id * 10_000_000_000) + (service_id * 100_000) + budget
 #[no_mangle]
 pub extern "C-unwind" fn create_session(packed: i64) -> i64 {
+    if sload(SLOT_INITIALIZED) == 0 {
+        panic!("account not initialized");
+    }
     if packed <= 0 {
         panic!("invalid packed argument");
     }

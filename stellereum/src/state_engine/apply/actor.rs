@@ -272,7 +272,14 @@ impl InMemoryStateEngine {
                         None => break, // this recipient's queue is empty
                     };
                     processed += 1;
-                    Self::deliver_actor_message(&mut map, &mut touched, recipient, msg, &dctx);
+                    Self::deliver_actor_message(
+                        &mut map,
+                        &mut touched,
+                        recipient,
+                        msg,
+                        &dctx,
+                        block.height,
+                    );
                 }
             }
         }
@@ -303,6 +310,7 @@ impl InMemoryStateEngine {
         owner: [u8; 32],
         msg: ActorMessage,
         dctx: &DeliveryCtx,
+        chain_height: u64,
     ) {
         // Invariant: every enqueue path pushes a message into ITS RECIPIENT's
         // inbox (settlement, `send_message`, and this pass's own bounces all
@@ -332,7 +340,7 @@ impl InMemoryStateEngine {
         }
 
         let mut undo = MessageUndo::default();
-        if Self::try_deliver(map, &mut undo, touched, owner, &msg, dctx).is_err() {
+        if Self::try_deliver(map, &mut undo, touched, owner, &msg, dctx, chain_height).is_err() {
             undo.rollback(map);
             // Reversed message, queued in the SENDER's inbox (which is its
             // own `recipient` field, so the pass will deliver it below) -
@@ -352,6 +360,24 @@ impl InMemoryStateEngine {
         }
     }
 
+    fn is_allowed_non_self_actor_opcode(op: &crate::svm::OpCode) -> bool {
+        matches!(
+            op,
+            crate::svm::OpCode::Nop
+                | crate::svm::OpCode::Push(_)
+                | crate::svm::OpCode::Pop
+                | crate::svm::OpCode::Add
+                | crate::svm::OpCode::Sub
+                | crate::svm::OpCode::Mul
+                | crate::svm::OpCode::Div
+                | crate::svm::OpCode::LoadBalance
+                | crate::svm::OpCode::Halt
+                | crate::svm::OpCode::SysCallVerifyPqSignature { .. }
+                | crate::svm::OpCode::SysCallCallContract { .. }
+                | crate::svm::OpCode::SysCallCallContractArgs { .. }
+        )
+    }
+
     /// The success path of one delivery: credit, run the prepaid body, settle
     /// its transfers and its sends. ANY `Err` means "the message failed" -
     /// the caller undoes the snapshot and bounces it; nothing here is allowed
@@ -363,6 +389,7 @@ impl InMemoryStateEngine {
         owner: [u8; 32],
         msg: &ActorMessage,
         dctx: &DeliveryCtx,
+        chain_height: u64,
     ) -> Result<(), String> {
         // A message queued outside its recipient's inbox cannot be delivered
         // (and has no inbox to be put back into either). Unreachable by the
@@ -390,20 +417,32 @@ impl InMemoryStateEngine {
         // 2. The prepaid program + fuel the sender packed into the body.
         let body = decode_actor_body(&msg.body)?;
 
-        // 3. Run it in the RECIPIENT's context: `ctx.sender` is the original
-        //    sender (so a body can see who wrote to it), `ctx.balance` is the
-        //    recipient's post-credit balance (a body spends the account it is
-        //    delivered TO). Deliberately NO registries wired in - tokens,
-        //    books, staking, PMM, oracle, shielded ledger are all `None`, so
-        //    a body that touches them reverts the way a direct `Svm::execute`
-        //    caller's would. That is v1 scope: a delivered body's entire
-        //    effect set is `transfers` plus the sends it enqueues, both
-        //    settled below, and the VM's own clone-commit discards anything
-        //    it did internally on a revert or out-of-gas.
+        let actor_hardening = crate::chain_spec::actor_mailbox_hardening_active_at(chain_height);
+        if actor_hardening
+            && msg.sender != owner
+            && !body
+                .program
+                .iter()
+                .all(Self::is_allowed_non_self_actor_opcode)
+        {
+            return Err(
+                "actor body contains unauthorized opcode for non-self delivery".to_string(),
+            );
+        }
+
+        // 3. Run the body. Below ACTOR_MAILBOX_HARDENING_HEIGHT, preserve
+        //    100% byte-identical legacy behavior. At/above the gate, a non-self
+        //    sender (`msg.sender != owner`) only sees `msg.value` (never
+        //    `owner`'s pre-existing balance) and cannot produce transfers or
+        //    outbound sends on behalf of `owner`.
         let mut sends: Vec<crate::svm::ActorSendRequest> = Vec::new();
         let mut ctx = crate::svm::VmContext {
             sender: msg.sender,
-            balance,
+            balance: if actor_hardening && msg.sender != owner {
+                msg.value
+            } else {
+                balance
+            },
             orderbooks: None,
             patricia_trie: None,
             session_auth: None,
@@ -426,13 +465,28 @@ impl InMemoryStateEngine {
         // particular `zkml_models` is `None`, so a delivered body can never
         // register or verify a model - all four zkML opcodes fail closed
         // there (both re-execution halves and both succinct halves).
-        let res = crate::svm::Svm::execute_with_confidential_and_sends(
-            &body.program,
-            body.gas_budget,
-            &mut ctx,
-            &mut sends,
-            None,
-        );
+        let res = if actor_hardening {
+            let opts = crate::svm::VmExecOptions {
+                chain_height,
+                ..Default::default()
+            };
+            crate::svm::Svm::execute_with_confidential_and_sends_at(
+                &body.program,
+                body.gas_budget,
+                &mut ctx,
+                &mut sends,
+                None,
+                &opts,
+            )
+        } else {
+            crate::svm::Svm::execute_with_confidential_and_sends(
+                &body.program,
+                body.gas_budget,
+                &mut ctx,
+                &mut sends,
+                None,
+            )
+        };
         let (transfers, payouts) = match res {
             crate::svm::VmExecutionResult::Success {
                 transfers, payouts, ..
@@ -444,6 +498,13 @@ impl InMemoryStateEngine {
                 return Err(format!("actor body reverted: {e}"))
             }
         };
+
+        if actor_hardening && msg.sender != owner && !transfers.is_empty() {
+            return Err("actor body cannot debit recipient on non-self delivery".to_string());
+        }
+        if actor_hardening && msg.sender != owner && !sends.is_empty() {
+            return Err("actor body cannot enqueue sends on non-self delivery".to_string());
+        }
 
         // 4. Settle the body's own value movements. The acting account pays;
         //    a recipient that does not exist yet is created, exactly like

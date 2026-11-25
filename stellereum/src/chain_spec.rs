@@ -175,6 +175,24 @@ pub const WASM_TABLE_ELEMENTS_CAP_HEIGHT: u64 = u64::MAX;
 ///   actual `(start)` fuel consumed from `state.gas_remaining`.
 pub const FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT: u64 = u64::MAX;
 
+/// Actor mailbox hardening activation height (`u64::MAX` = disabled,
+/// the compiled default).
+///
+/// Below this gate, actor message delivery (`try_deliver`) and contract
+/// outbound message routing (`route_contract_messages_hardened` /
+/// `SysCallCallContract` / `SysCallCallContractArgs`) keep 100%
+/// byte-identical legacy behavior.
+///
+/// At/above this gate:
+/// - `try_deliver` rejects any `ActorSendBody` containing asset-debiting or
+///   state-mutating opcodes when `msg.sender != owner` (non-self send) and
+///   restricts non-self delivery `ctx.balance` to `msg.value`;
+/// - `SysCallCallContract` / `SysCallCallContractArgs` and
+///   `route_contract_messages_hardened` bound `body.gas_budget` at
+///   [`crate::svm::MAX_CONTRACT_ACTOR_GAS_BUDGET`] and bill
+///   `GAS_ACTOR_DELIVER + body.gas_budget` against the caller's remaining gas.
+pub const ACTOR_MAILBOX_HARDENING_HEIGHT: u64 = u64::MAX;
+
 #[cfg(any(test, debug_assertions))]
 thread_local! {
     static EXEC_HARDENING_V1_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
@@ -192,6 +210,8 @@ thread_local! {
     static WASM_TABLE_ELEMENTS_CAP_OVERRIDE: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
     static FALCON_HOST_FUEL_V2_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    static ACTOR_MAILBOX_HARDENING_OVERRIDE: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -403,6 +423,32 @@ pub fn falcon_host_fuel_v2_activation_height() -> u64 {
 /// effective gate is `u64::MAX` (`GatedOff`, the compiled default).
 pub fn falcon_host_fuel_v2_active_at(height: u64) -> bool {
     let gate = falcon_host_fuel_v2_activation_height();
+    gate != u64::MAX && height >= gate
+}
+
+/// Set (or clear with `None`) the TEST/DEBUG-ONLY `ACTOR_MAILBOX_HARDENING`
+/// activation height override for the calling thread. Absent from release
+/// builds.
+#[cfg(any(test, debug_assertions))]
+pub fn set_actor_mailbox_hardening_override(activation: Option<u64>) {
+    ACTOR_MAILBOX_HARDENING_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// Effective `ACTOR_MAILBOX_HARDENING_HEIGHT` for the calling thread.
+pub fn actor_mailbox_hardening_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(h) = ACTOR_MAILBOX_HARDENING_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    ACTOR_MAILBOX_HARDENING_HEIGHT
+}
+
+/// True iff `ACTOR_MAILBOX_HARDENING` is active at `height`.
+///
+/// Strictly returns `false` for EVERY height (including `u64::MAX`) when the
+/// effective gate is `u64::MAX` (`GatedOff`, the compiled default).
+pub fn actor_mailbox_hardening_active_at(height: u64) -> bool {
+    let gate = actor_mailbox_hardening_height();
     gate != u64::MAX && height >= gate
 }
 
@@ -766,6 +812,12 @@ pub fn current_activation_schedule() -> ChainActivationSchedule {
                 crate::tokenomics::SUB_NANO_STRICT_ACTIVATION_HEIGHT,
                 "Ruleset v7 sub-nano exactness: EVM wei carrier boundary, reward-accumulator rescale carry, Q0.64 emission carry",
             ),
+            ActivationGate::new(
+                "ACTOR_MAILBOX_HARDENING_HEIGHT",
+                "stellereum::chain_spec",
+                actor_mailbox_hardening_height(),
+                "Hardens non-self actor mailbox delivery against debiting opcodes and bounds/bills contract host.send_message ActorSendBody gas_budget (compiled default u64::MAX: legacy behavior unchanged)",
+            ),
         ],
     }
 }
@@ -953,6 +1005,10 @@ mod tests {
             (
                 "SUB_NANO_STRICT_ACTIVATION_HEIGHT",
                 crate::tokenomics::SUB_NANO_STRICT_ACTIVATION_HEIGHT,
+            ),
+            (
+                "ACTOR_MAILBOX_HARDENING_HEIGHT",
+                ACTOR_MAILBOX_HARDENING_HEIGHT,
             ),
         ];
 

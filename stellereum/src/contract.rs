@@ -1622,13 +1622,86 @@ impl ContractRegistry {
         events: &mut Vec<ContractEvent>,
         outbound_messages: &mut Vec<ContractMessage>,
     ) -> Result<ContractOutcome, ContractError> {
+        self.execute_subcall_hardened_with_gates(
+            address,
+            method,
+            args,
+            calldata,
+            fuel,
+            opts,
+            call_depth,
+            events,
+            outbound_messages,
+            false,
+            false,
+        )
+    }
+
+    /// Height-aware [`Self::execute_subcall_hardened`]: enforces
+    /// [`crate::chain_spec::WASM_TABLE_ELEMENTS_CAP_HEIGHT`] and
+    /// [`crate::chain_spec::FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT`] at `height`.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: height-gated sub-call isolation forwards target, inputs, depth, options, accumulators, and chain height.
+    pub fn execute_subcall_hardened_at(
+        &mut self,
+        address: &[u8; 32],
+        method: &str,
+        args: &[i64],
+        calldata: &[u8],
+        fuel: u64,
+        opts: &ContractCallOptions,
+        call_depth: usize,
+        events: &mut Vec<ContractEvent>,
+        outbound_messages: &mut Vec<ContractMessage>,
+        height: u64,
+    ) -> Result<ContractOutcome, ContractError> {
+        self.execute_subcall_hardened_with_gates(
+            address,
+            method,
+            args,
+            calldata,
+            fuel,
+            opts,
+            call_depth,
+            events,
+            outbound_messages,
+            crate::chain_spec::wasm_table_elements_cap_active_at(height),
+            crate::chain_spec::falcon_host_fuel_v2_active_at(height),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    // GATE: shared sub-call isolation implementation parameterized by activation gate flags.
+    fn execute_subcall_hardened_with_gates(
+        &mut self,
+        address: &[u8; 32],
+        method: &str,
+        args: &[i64],
+        calldata: &[u8],
+        fuel: u64,
+        opts: &ContractCallOptions,
+        call_depth: usize,
+        events: &mut Vec<ContractEvent>,
+        outbound_messages: &mut Vec<ContractMessage>,
+        enforce_table_cap: bool,
+        falcon_fuel_v2: bool,
+    ) -> Result<ContractOutcome, ContractError> {
         let snap =
             SubCallSnapshot::capture(self, &[*address], events.len(), outbound_messages.len());
         if call_depth > MAX_CALL_DEPTH {
             snap.rollback(self, events, outbound_messages);
             return Err(ContractError::Trapped);
         }
-        match self.call_with_options(address, method, args, calldata, fuel, opts) {
+        match self.call_with_options_with_gates(
+            address,
+            method,
+            args,
+            calldata,
+            fuel,
+            opts,
+            enforce_table_cap,
+            falcon_fuel_v2,
+        ) {
             Ok(outcome) => {
                 events.extend(outcome.events.iter().cloned());
                 outbound_messages.extend(outcome.outbound_messages.iter().cloned());
@@ -1813,7 +1886,7 @@ impl ContractRegistry {
         };
 
         let host = HostState {
-            limits: store_limits(),
+            limits: store_limits_with_table_cap(true),
             contract_addr: *address,
             balance: contract.balance,
             storage: contract.storage.clone(),
@@ -1822,7 +1895,7 @@ impl ContractRegistry {
             caller: [0u8; 32],
             origin: [0u8; 32],
             hardened: false,
-            falcon_fuel_v2: false,
+            falcon_fuel_v2: true,
             value: 0,
             block_time: 0,
             block_hash: [0u8; 32],
@@ -2243,11 +2316,6 @@ impl HostState {
             .ok_or_else(|| wasmi::Error::new("host operation out of fuel"))?;
         caller.set_fuel(left)
     }
-}
-
-/// The resource limits every contract store runs under.
-fn store_limits() -> StoreLimits {
-    store_limits_with_table_cap(false)
 }
 
 /// Resource limits for a contract store, optionally bounding table element

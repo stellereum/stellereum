@@ -135,6 +135,17 @@ pub fn table() -> Vec<Gate> {
             test: Some("tests/upgrade_exec_gate_tests.rs"),
             note: "Governance-driven binary upgrade execution (exit 42 path).",
         },
+        Gate {
+            id: "actor-mailbox-hardening",
+            symbol: "ACTOR_MAILBOX_HARDENING_HEIGHT",
+            value: chain_spec::ACTOR_MAILBOX_HARDENING_HEIGHT,
+            test: Some("tests/w7_svm_and_contracts_fixes.rs"),
+            note: "Hardens actor mailbox delivery (rejects asset-debiting/state-mutating \
+                   opcodes in non-self ActorSendBody deliveries and restricts ctx.balance to \
+                   msg.value) and bounds/bills contract host.send_message ActorSendBody \
+                   gas_budget <= MAX_CONTRACT_ACTOR_GAS_BUDGET (1_000_000) + GAS_ACTOR_DELIVER. \
+                   INERT at u64::MAX for byte-identical legacy replay below H.",
+        },
     ]
 }
 

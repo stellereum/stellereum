@@ -163,6 +163,10 @@ pub const GAS_ACTOR_SEND: u64 = 900;
 /// Deliberately NOT part of `opcode_gas`: it varies per execution context, so
 /// the handler charges it on top of the fixed table entry.
 pub const GAS_ACTOR_DELIVER: u64 = 800;
+/// Maximum `ActorSendBody::gas_budget` a WASM contract may request via
+/// `host.send_message` once [`crate::chain_spec::ACTOR_MAILBOX_HARDENING_HEIGHT`]
+/// is active.
+pub const MAX_CONTRACT_ACTOR_GAS_BUDGET: u64 = 1_000_000;
 
 /// §2 zkML. Micro-gas for the SOUND verify opcode, `SysCallVerifyZkMlReexec`.
 ///
@@ -1623,6 +1627,53 @@ pub fn contract_recipient_is_cross_shard(
     ) != local_shard
 }
 
+/// Validate and bill outbound contract messages produced by `host.send_message`
+/// when [`crate::chain_spec::actor_mailbox_hardening_active_at`] is true.
+///
+/// - Empty payloads normalize to an empty `ActorSendBody` (`gas_budget = 0`)
+///   and bill `GAS_ACTOR_DELIVER`.
+/// - Payloads decoding as [`crate::state_engine::ActorSendBody`] must satisfy
+///   `body.gas_budget <= MAX_CONTRACT_ACTOR_GAS_BUDGET` and bill
+///   `GAS_ACTOR_DELIVER + body.gas_budget` against `gas_remaining`.
+/// - Non-empty payloads that fail to decode as `ActorSendBody` are dropped by
+///   `route_contract_messages_hardened` and therefore enqueue no delivery.
+#[allow(clippy::result_large_err)]
+// GATE: returns VmExecutionResult directly on actor-send billing failure so callers mirror VM revert/OOG without boxing.
+fn bill_outbound_actor_messages(
+    outbound: &[crate::contract::ContractMessage],
+    gas_remaining: &mut u64,
+) -> Result<(), VmExecutionResult> {
+    use bincode::Options;
+    for msg in outbound {
+        if msg.payload.is_empty() {
+            if *gas_remaining < GAS_ACTOR_DELIVER {
+                return Err(VmExecutionResult::OutOfGas);
+            }
+            *gas_remaining -= GAS_ACTOR_DELIVER;
+            continue;
+        }
+        if let Ok(body) = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(16 * 1024 * 1024)
+            .deserialize::<crate::state_engine::ActorSendBody>(&msg.payload)
+        {
+            if body.gas_budget > MAX_CONTRACT_ACTOR_GAS_BUDGET {
+                return Err(VmExecutionResult::Reverted(format!(
+                    "actor send gas_budget {} exceeds MAX_CONTRACT_ACTOR_GAS_BUDGET ({MAX_CONTRACT_ACTOR_GAS_BUDGET})",
+                    body.gas_budget
+                )));
+            }
+            let prepay = GAS_ACTOR_DELIVER.saturating_add(body.gas_budget);
+            if *gas_remaining < prepay {
+                return Err(VmExecutionResult::OutOfGas);
+            }
+            *gas_remaining -= prepay;
+        }
+    }
+    Ok(())
+}
+
 impl Svm {
     /// Execute `instructions` against every domain wired into `ctx`.
     ///
@@ -2478,6 +2529,16 @@ impl Svm {
                                 return VmExecutionResult::OutOfGas;
                             }
                             state.gas_remaining -= outcome.fuel_used;
+                            if crate::chain_spec::actor_mailbox_hardening_active_at(
+                                opts.chain_height,
+                            ) {
+                                if let Err(vm_err) = bill_outbound_actor_messages(
+                                    &outcome.outbound_messages,
+                                    &mut state.gas_remaining,
+                                ) {
+                                    return vm_err;
+                                }
+                            }
                             state.stack.push(outcome.result as u64);
                             outbound_messages.extend(outcome.outbound_messages);
                             contract_events.extend(outcome.events);
@@ -2588,6 +2649,16 @@ impl Svm {
                                 return VmExecutionResult::OutOfGas;
                             }
                             state.gas_remaining -= outcome.fuel_used;
+                            if crate::chain_spec::actor_mailbox_hardening_active_at(
+                                opts.chain_height,
+                            ) {
+                                if let Err(vm_err) = bill_outbound_actor_messages(
+                                    &outcome.outbound_messages,
+                                    &mut state.gas_remaining,
+                                ) {
+                                    return vm_err;
+                                }
+                            }
                             state.stack.push(outcome.result as u64);
                             outbound_messages.extend(outcome.outbound_messages);
                             contract_events.extend(outcome.events);
@@ -4474,6 +4545,8 @@ impl Svm {
         use bincode::Options;
         let refuse_cross_shard =
             crate::chain_spec::wasm_xshard_contract_send_refusal_active_at(chain_height);
+        let harden_actor_mailbox =
+            crate::chain_spec::actor_mailbox_hardening_active_at(chain_height);
         let mut debited_senders = Vec::new();
         for msg in messages {
             let body_bytes = if msg.payload.is_empty() {
@@ -4483,13 +4556,15 @@ impl Svm {
                 })
                 .unwrap_or_default()
             } else {
-                let valid_body = bincode::DefaultOptions::new()
+                let Ok(body) = bincode::DefaultOptions::new()
                     .with_fixint_encoding()
                     .allow_trailing_bytes()
                     .with_limit(16 * 1024 * 1024)
                     .deserialize::<crate::state_engine::ActorSendBody>(&msg.payload)
-                    .is_ok();
-                if !valid_body {
+                else {
+                    continue;
+                };
+                if harden_actor_mailbox && body.gas_budget > MAX_CONTRACT_ACTOR_GAS_BUDGET {
                     continue;
                 }
                 msg.payload.clone()

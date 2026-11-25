@@ -41,6 +41,7 @@ setup_wasm_panic_handler!();
 const SLOT_TREASURY: i64 = 0;
 const SLOT_DOMAIN_COUNT: i64 = 1;
 const SLOT_INITIALIZED: i64 = 2;
+const MAX_TREASURY_ACCOUNT: i64 = 100_000;
 
 // Offset domain slots above global slots to eliminate slot 0 collisions
 const DOMAIN_SLOT_OFFSET: i64 = 1000;
@@ -88,11 +89,11 @@ pub extern "C" fn get_min_bid(name_len: i64) -> i64 {
 /// Initialize registry once with treasury address and auto-register system & protocol domains
 #[no_mangle]
 pub extern "C" fn init(treasury_account: i64) -> i64 {
-    if treasury_account <= 0 {
-        return ERR_INVALID_ARGUMENT;
-    }
     if sload(SLOT_INITIALIZED) != 0 {
         panic!("already initialized");
+    }
+    if treasury_account <= 0 || treasury_account >= MAX_TREASURY_ACCOUNT {
+        return ERR_INVALID_ARGUMENT;
     }
 
     sstore(SLOT_INITIALIZED, 1);
@@ -135,6 +136,9 @@ pub extern "C" fn get_hue(domain_id: i64) -> i64 {
 /// packed_arg: domain_id * 10_000_000_000 + bidder_id * 100_000 + length
 #[no_mangle]
 pub extern "C" fn start_auction(packed_arg: i64) -> i64 {
+    if sload(SLOT_INITIALIZED) != 1 {
+        return ERR_UNAUTHORIZED;
+    }
     if packed_arg <= 0 {
         return ERR_INVALID_ARGUMENT;
     }
@@ -178,6 +182,9 @@ pub extern "C" fn start_auction(packed_arg: i64) -> i64 {
 /// packed_arg: domain_id * 10_000_000_000 + bidder_id * 10_000 + step
 #[no_mangle]
 pub extern "C" fn place_bid(packed_arg: i64) -> i64 {
+    if sload(SLOT_INITIALIZED) != 1 {
+        return ERR_UNAUTHORIZED;
+    }
     if packed_arg <= 0 {
         return ERR_INVALID_ARGUMENT;
     }
@@ -216,6 +223,9 @@ pub extern "C" fn place_bid(packed_arg: i64) -> i64 {
 /// Finalize auction and transfer domain ownership to winning bidder
 #[no_mangle]
 pub extern "C" fn finalize_auction(domain_id: i64) -> i64 {
+    if sload(SLOT_INITIALIZED) != 1 {
+        return ERR_UNAUTHORIZED;
+    }
     if domain_id <= 0 {
         return ERR_INVALID_ARGUMENT;
     }
@@ -262,6 +272,9 @@ pub extern "C" fn resolve(domain_id: i64) -> i64 {
 /// packed_arg: domain_id * 10_000_000_000 + caller_id * 100_000 + new_target
 #[no_mangle]
 pub extern "C" fn set_target(packed_arg: i64) -> i64 {
+    if sload(SLOT_INITIALIZED) != 1 {
+        return ERR_UNAUTHORIZED;
+    }
     if packed_arg <= 0 {
         return ERR_INVALID_ARGUMENT;
     }
@@ -309,6 +322,9 @@ pub extern "C" fn set_target(packed_arg: i64) -> i64 {
 /// packed_arg: domain_id * 10_000_000_000 + caller_id * 100_000 + new_owner
 #[no_mangle]
 pub extern "C" fn transfer(packed_arg: i64) -> i64 {
+    if sload(SLOT_INITIALIZED) != 1 {
+        return ERR_UNAUTHORIZED;
+    }
     if packed_arg <= 0 {
         return ERR_INVALID_ARGUMENT;
     }

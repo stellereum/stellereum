@@ -40,7 +40,8 @@ const TAX_BPS: i64 = 50; // 0.5%
 const BPS_DENOMINATOR: i64 = 10_000;
 
 const BALANCE_OFFSET: i64 = 1_000_000;
-const ALLOWANCE_OFFSET: i64 = 10_000_000;
+const MAX_ACCOUNT_ID: i64 = 1_000_000_000_000;
+const ALLOWANCE_OFFSET: i64 = 1i64 << 60;
 
 // Event Topics
 const TOPIC_TRANSFER: i64 = 2001;
@@ -50,7 +51,9 @@ const TOPIC_APPROVAL: i64 = 2004;
 
 #[inline(always)]
 fn balance_slot(account: i64) -> i64 {
-    BALANCE_OFFSET + account
+    BALANCE_OFFSET
+        .checked_add(account)
+        .expect("balance slot overflow")
 }
 
 #[inline(always)]
@@ -110,7 +113,7 @@ pub extern "C" fn total_supply(_arg: i64) -> i64 {
 /// Query account balance
 #[no_mangle]
 pub extern "C" fn balance_of(account: i64) -> i64 {
-    if account <= 0 {
+    if account <= 0 || account >= MAX_ACCOUNT_ID {
         return 0;
     }
     sload(balance_slot(account))
@@ -119,9 +122,12 @@ pub extern "C" fn balance_of(account: i64) -> i64 {
 /// Query allowance: packed_arg: owner_id * 1_000_000 + spender_id
 #[no_mangle]
 pub extern "C" fn allowance(packed_arg: i64) -> i64 {
+    if packed_arg <= 0 {
+        return 0;
+    }
     let owner = packed_arg / 1_000_000;
     let spender = packed_arg % 1_000_000;
-    if owner <= 0 || spender <= 0 {
+    if owner <= 0 || owner >= MAX_ACCOUNT_ID || spender <= 0 {
         return 0;
     }
     sload(allowance_slot(owner, spender))
@@ -130,12 +136,15 @@ pub extern "C" fn allowance(packed_arg: i64) -> i64 {
 /// Approve spender: packed_arg: owner_id * 10_000_000_000 + spender_id * 100_000 + amount
 #[no_mangle]
 pub extern "C" fn approve(packed_arg: i64) -> i64 {
+    if packed_arg <= 0 {
+        return ERR_INVALID_ARGUMENT;
+    }
     let owner = packed_arg / 10_000_000_000;
     let rem1 = packed_arg % 10_000_000_000;
     let spender = rem1 / 100_000;
     let amount = rem1 % 100_000;
 
-    if owner <= 0 || spender <= 0 || amount < 0 {
+    if owner <= 0 || owner >= MAX_ACCOUNT_ID || spender <= 0 || amount < 0 {
         return ERR_INVALID_ARGUMENT;
     }
     // CT-P0: only the owner (authenticated via host.caller) may grant an
@@ -221,7 +230,7 @@ pub extern "C" fn transfer_from(packed_arg: i64) -> i64 {
 }
 
 fn execute_transfer(from: i64, to: i64, amount: i64) -> i64 {
-    if from <= 0 || amount <= 0 {
+    if from <= 0 || from >= MAX_ACCOUNT_ID || !(0..MAX_ACCOUNT_ID).contains(&to) || amount <= 0 {
         return ERR_INVALID_ARGUMENT;
     }
 

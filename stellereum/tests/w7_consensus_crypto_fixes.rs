@@ -431,7 +431,7 @@ fn w6_a1_3_c_legacy_v1_safety_state_bincode_still_decodes() {
     assert_eq!(snap.height, 42);
     assert_eq!(snap.locked_round, Some(3));
     assert_eq!(snap.locked_value_id, Some([0x7Au8; 32]));
-    assert_eq!(snap.last_non_nil_prevote, None);
+    assert_eq!(snap.last_non_nil_prevote, snap.last_prevote);
 
     drop(guard);
     drop(storage);

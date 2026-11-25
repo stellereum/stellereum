@@ -17,19 +17,29 @@ pub const TS_WINDOW_MS: i64 = 600_000;
 /// mesh-wide amplification.
 pub const MAX_DHT_KEY_LEN: usize = 512;
 pub const MAX_DHT_VALUE_LEN: usize = 1024 * 1024;
-pub const MAX_PUBSUB_DATA_LEN: usize = 1024 * 1024;
+/// Maximum `data` string length on pubsub services (16 MiB). Fits well inside
+/// the 32 MiB `MAX_FRAME` envelope even after JSON framing, escaping, and AEAD
+/// overhead, while accommodating hex-encoded `MAX_TX_MSG` (2 MiB) and
+/// `MAX_CROSS_SHARD_MSG` (8 MiB) payloads.
+pub const MAX_PUBSUB_DATA_LEN: usize = 16 * 1024 * 1024;
 pub const MAX_STORAGE_CHUNK_LEN: usize = 2 * 1024 * 1024;
 pub const MAX_NONCE_LEN: usize = 1024;
 pub const MAX_TOPIC_LEN: usize = 256;
 pub const MAX_ENDPOINTS_PER_NODE: usize = 8;
 pub const MAX_ENDPOINT_LEN: usize = 256;
 pub const MAX_ROUTES_PER_UPDATE: usize = 512;
-pub const MAX_DHT_LOOKUP_TTL: u64 = 8;
+pub const MAX_DHT_LOOKUP_TTL: u64 = 4;
+pub const MAX_DHT_LOOKUP_VISITED: usize = 32;
 pub const MAX_PUBSUB_TTL: u64 = 16;
 pub const MAX_DHT_SYNC_LIMIT: usize = 10_000;
 pub const MAX_REMOTE_TTL_SECS: u64 = 30 * 24 * 3600;
 pub const MAX_SEEN_IDS: usize = 200_000;
 pub const MAX_OUTBOX_PER_PEER: usize = 1024;
+
+const _: () = assert!(
+    MAX_PUBSUB_DATA_LEN <= MAX_FRAME / 2,
+    "MAX_PUBSUB_DATA_LEN must fit inside MAX_FRAME with JSON/AEAD headroom"
+);
 
 pub fn topic_ok(topic: &str) -> bool {
     !topic.is_empty() && topic.len() <= MAX_TOPIC_LEN

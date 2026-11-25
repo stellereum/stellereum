@@ -1,6 +1,7 @@
 use super::compact_prop;
 use super::framing::{
-    compact_gossip_admits, open_compact_proposal, short_id_index_for, ConsensusMsg,
+    compact_gossip_admits, open_compact_proposal, open_compact_proposal_verified,
+    short_id_index_for, ConsensusMsg,
 };
 use super::limiter::epoch_ms;
 use crate::sharding::Block;
@@ -557,11 +558,20 @@ impl CompactReceiver {
         local_txs: impl IntoIterator<Item = crate::sharding::Transaction>,
     ) -> CompactInbound {
         let hash = proposal.block_hash;
-        if let Some(parked) = self.take(&hash) {
-            let mut resolver = parked.resolver;
-            let index = short_id_index_for(&resolver.proposal().header, local_txs);
-            let result = resolver.resolve_against(&index);
-            return self.settle(hash, resolver, result);
+        if let Some(parked) = self.parked.get_mut(&hash) {
+            let round = parked.resolver.proposal().round;
+            let index = short_id_index_for(&parked.resolver.proposal().header, local_txs);
+            return match parked.resolver.resolve_cached_replay(&index) {
+                Ok(Some(compact_prop::Resolution::Complete(block))) => {
+                    self.take(&hash);
+                    CompactInbound::Ready { round, block }
+                }
+                Ok(Some(_)) => unreachable!("resolve_cached_replay only yields Complete"),
+                Ok(None) => CompactInbound::Refused(
+                    "compact proposal: duplicate parked proposal".to_string(),
+                ),
+                Err(refusal) => CompactInbound::Refused(format!("compact proposal: {refusal}")),
+            };
         }
         let mut resolver = match open_compact_proposal(proposal) {
             Ok(resolver) => resolver,
@@ -572,24 +582,60 @@ impl CompactReceiver {
         self.settle(hash, resolver, result)
     }
 
+    /// Signature-verified counterpart of [`Self::on_proposal`]: verifies the
+    /// proposer's signature against `(proposal.header, proposal.block_hash)`
+    /// BEFORE building a mempool index or parking/evicting parked state.
+    pub fn on_proposal_verified(
+        &mut self,
+        proposal: compact_prop::CompactProposal,
+        local_txs: impl IntoIterator<Item = crate::sharding::Transaction>,
+    ) -> CompactInbound {
+        if !crate::consensus::verify_proposer_signature_with_hash(
+            &proposal.header,
+            &proposal.block_hash,
+        ) {
+            return CompactInbound::Refused(
+                "compact proposal: invalid proposer signature".to_string(),
+            );
+        }
+        self.on_proposal(proposal, local_txs)
+    }
+
     /// [`Self::on_proposal`] with a caller-supplied (cached) index.
     ///
-    /// The index salt must equal the parked/announced header's salt; a mismatch
-    /// is a fail-closed refusal, never a wrong resolution. A re-announcement
-    /// keeps the EXISTING resolver, so its attempt counter cannot be reset by
-    /// repeating the same announcement.
+    /// Verifies the proposer's signature FIRST (before touching or evicting
+    /// parked proposals, or advancing attempt counters). A re-announcement
+    /// keeps the EXISTING resolver AND its attempt counter untouched on a
+    /// no-progress replay, completing only if `index` now resolves all misses.
     pub fn on_proposal_indexed(
         &mut self,
         proposal: compact_prop::CompactProposal,
         index: &compact_prop::ShortIdIndex,
     ) -> CompactInbound {
-        let hash = proposal.block_hash;
-        if let Some(parked) = self.take(&hash) {
-            let mut resolver = parked.resolver;
-            let result = resolver.resolve_against(index);
-            return self.settle(hash, resolver, result);
+        if !crate::consensus::verify_proposer_signature_with_hash(
+            &proposal.header,
+            &proposal.block_hash,
+        ) {
+            return CompactInbound::Refused(
+                "compact proposal: invalid proposer signature".to_string(),
+            );
         }
-        let mut resolver = match open_compact_proposal(proposal) {
+        let hash = proposal.block_hash;
+        if let Some(parked) = self.parked.get_mut(&hash) {
+            let round = parked.resolver.proposal().round;
+            return match parked.resolver.resolve_cached_replay(index) {
+                Ok(Some(compact_prop::Resolution::Complete(block))) => {
+                    self.take(&hash);
+                    CompactInbound::Ready { round, block }
+                }
+                Ok(Some(_)) => unreachable!("resolve_cached_replay only yields Complete"),
+                Ok(None) => CompactInbound::Refused(
+                    "compact proposal: duplicate parked proposal".to_string(),
+                ),
+                Err(refusal) => CompactInbound::Refused(format!("compact proposal: {refusal}")),
+            };
+        }
+        let mut resolver = match open_compact_proposal_verified(proposal) {
             Ok(resolver) => resolver,
             Err(e) => return CompactInbound::Refused(e),
         };
@@ -780,6 +826,9 @@ pub struct CompactBodyServer {
     served: VecDeque<ServedKey>,
     served_set: HashSet<ServedKey>,
     rates: HashMap<String, (u64, u32)>,
+    /// Per-requester sliding cooldown for `BodyPull::full_request` replies
+    /// (`now_ms` of the last served full block across any block hash/round).
+    full_cooldowns: HashMap<String, u64>,
     served_total: u64,
 }
 
@@ -957,14 +1006,46 @@ impl CompactBodyServer {
         Ok(Some(body))
     }
 
+    fn full_cooldown_active(&self, requester: &str, now_ms: u64) -> bool {
+        self.full_cooldowns
+            .get(requester)
+            .is_some_and(|&last_ms| now_ms.saturating_sub(last_ms) < COMPACT_FULL_REPLY_COOLDOWN_MS)
+    }
+
+    fn record_full_cooldown(&mut self, requester: &str, now_ms: u64) {
+        if !self.full_cooldowns.contains_key(requester)
+            && self.full_cooldowns.len() >= COMPACT_PULL_RATE_MAX_PEERS
+        {
+            self.full_cooldowns
+                .retain(|_, ts| now_ms.saturating_sub(*ts) < COMPACT_FULL_REPLY_COOLDOWN_MS);
+            if self.full_cooldowns.len() >= COMPACT_PULL_RATE_MAX_PEERS {
+                if let Some(oldest) = self
+                    .full_cooldowns
+                    .iter()
+                    .min_by_key(|(_, ts)| *ts)
+                    .map(|(k, _)| k.clone())
+                {
+                    self.full_cooldowns.remove(&oldest);
+                }
+            }
+        }
+        self.full_cooldowns.insert(requester.to_string(), now_ms);
+    }
+
     /// Answer a FULL-proposal request (`BodyPull::is_full_request`) with the
     /// exact block this node announced at `(height, round, hash)`.
     ///
     /// This is the F-6/H3 fallback: the resolver could not complete from
     /// bounded pulls (cold/divergent mempool, or more misses than three pages),
-    /// so the proposer re-sends the full body it already cached. Same
-    /// served-once and rate bounds as a normal pull; `Ok(None)` on replay or
-    /// when the block is no longer cached.
+    /// so the proposer re-sends the full body it already cached. Enforces a
+    /// strict per-requester sliding cooldown (`COMPACT_FULL_REPLY_COOLDOWN_MS`,
+    /// across all cached blocks and bucket boundaries) in addition to the
+    /// served-once and rate bounds.
+    ///
+    /// **Caller contract (W6-A3-7):** callers MUST dispatch full-block replies
+    /// through [`dispatch_compact_body_reply`] (unicast to the requester when
+    /// known, bounded fallback otherwise) — NEVER directly to an all-peer
+    /// broadcast outbox, to prevent full-block amplification.
     pub fn serve_full_for(
         &mut self,
         requester: &str,
@@ -975,15 +1056,36 @@ impl CompactBodyServer {
         if !pull.is_full_request() || !compact_gossip_admits(pull.height) {
             return Ok(None);
         }
+        if self.full_cooldown_active(requester, now_ms) {
+            return Ok(None);
+        }
         let Some(pos) = self.cached(pull) else {
             return Ok(None);
         };
         if !self.admit_request(requester, pull, now_ms) {
             return Ok(None);
         }
+        self.record_full_cooldown(requester, now_ms);
         let block = self.recent[pos].block.clone();
         self.served_total = self.served_total.saturating_add(1);
         Ok(Some(block))
+    }
+
+    /// Convenience wrapper around [`Self::serve_full_for`] returning the ready
+    /// [`ConsensusMsg::Proposal`] for dispatch via [`dispatch_compact_body_reply`].
+    pub fn serve_full_msg_for(
+        &mut self,
+        requester: &str,
+        pull: &compact_prop::BodyPull,
+        now_ms: u64,
+    ) -> Result<Option<ConsensusMsg>, compact_prop::CompactRefusal> {
+        Ok(self
+            .serve_full_for(requester, pull, now_ms)?
+            .map(|block| ConsensusMsg::Proposal {
+                height: block.height,
+                round: pull.round,
+                block,
+            }))
     }
 }
 

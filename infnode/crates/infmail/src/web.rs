@@ -1325,11 +1325,68 @@ async fn set_private_perms(path: &std::path::Path) {
     }
 }
 
-/// Репликация аккаунтов в DHT-хранилище (профили БЕЗ секретов: pw_hash, smtp_pass,
-/// e2e_secret, backup_codes не реплицируются). Ключ `acct:{email}` доступен по сети —
-/// позволяет восстановить профили/квоты/подписки при потере валидатора.
-fn account_public_profile(a: &Account) -> serde_json::Value {
-    json!({
+pub const ACCT_PROFILE_AUTH_V1: &str = "infmail-acct-v1";
+
+fn acct_profile_digest(p: &Value) -> Option<[u8; 32]> {
+    let acct_key = p.get("acct_key")?.as_str()?;
+    let signer_pq_pub = p.get("signer_pq_pub")?.as_str()?;
+    let email_exists = p.get("email_exists")?.as_bool()?;
+    let created_ms = p.get("created_ms")?.as_i64()?;
+    let quota_limit = p.get("quota_limit")?.as_u64()?;
+    let bytes_used = p.get("bytes_used")?.as_u64()?;
+    let file_quota_limit = p.get("file_quota_limit")?.as_u64()?;
+    let files_used = p.get("files_used")?.as_u64()?;
+    let plan = p.get("plan")?.as_str()?;
+    let paid_until_ms = p.get("paid_until_ms")?.as_i64()?;
+    let totp_enabled = p.get("totp_enabled")?.as_bool()?;
+    let session_epoch = p.get("session_epoch")?.as_u64()?;
+
+    let mut h = blake3::Hasher::new();
+    let push_str = |h: &mut blake3::Hasher, s: &str| {
+        h.update(&(s.len() as u32).to_le_bytes());
+        h.update(s.as_bytes());
+    };
+    let push_opt_str = |h: &mut blake3::Hasher, v: Option<&str>| match v {
+        Some(s) => {
+            h.update(&[1]);
+            push_str(h, s);
+        }
+        None => {
+            h.update(&[0]);
+        }
+    };
+    push_str(&mut h, ACCT_PROFILE_AUTH_V1);
+    push_str(&mut h, acct_key);
+    push_str(&mut h, signer_pq_pub);
+    h.update(&[u8::from(email_exists)]);
+    h.update(&created_ms.to_le_bytes());
+    h.update(&quota_limit.to_le_bytes());
+    h.update(&bytes_used.to_le_bytes());
+    h.update(&file_quota_limit.to_le_bytes());
+    h.update(&files_used.to_le_bytes());
+    push_str(&mut h, plan);
+    h.update(&paid_until_ms.to_le_bytes());
+    push_opt_str(&mut h, p.get("wallet").and_then(|v| v.as_str()));
+    push_opt_str(&mut h, p.get("x_pub").and_then(|v| v.as_str()));
+    push_opt_str(&mut h, p.get("ed_pub").and_then(|v| v.as_str()));
+    h.update(&[u8::from(totp_enabled)]);
+    h.update(&session_epoch.to_le_bytes());
+    let aliases = p.get("aliases").and_then(|v| v.as_array())?;
+    h.update(&(aliases.len() as u32).to_le_bytes());
+    for a in aliases {
+        push_str(&mut h, a.as_str()?);
+    }
+    Some(*h.finalize().as_bytes())
+}
+
+/// Sign an account public profile with this node's Falcon-512 identity key and
+/// bind it to `acct_dht_key(email)` so remote untrusted nodes cannot forge or
+/// overwrite `acct:` records.
+pub fn account_public_profile_signed(node: &Node, email: &str, a: &Account) -> serde_json::Value {
+    let mut profile = json!({
+        "auth": ACCT_PROFILE_AUTH_V1,
+        "acct_key": acct_dht_key(email),
+        "signer_pq_pub": node.pq.pq_pub_hex(),
         "email_exists": true,
         "created_ms": a.created_ms,
         "aliases": a.aliases,
@@ -1344,7 +1401,64 @@ fn account_public_profile(a: &Account) -> serde_json::Value {
         "ed_pub": a.ed_pub,
         "totp_enabled": a.totp_enabled,
         "session_epoch": a.session_epoch,
-    })
+    });
+    if let Some(digest) = acct_profile_digest(&profile) {
+        let sig = node.pq.sign_digest(&digest);
+        profile["sig"] = json!(hex::encode(sig));
+    }
+    profile
+}
+
+/// Verify an `acct:` profile: requires `ACCT_PROFILE_AUTH_V1`, exact binding to
+/// `acct_dht_key(email)`, a valid Falcon-512 signature, and a trusted signer
+/// (either this node itself, an operator-pinned static peer, or a configured
+/// validator).
+pub fn verify_acct_profile(node: &Node, email: &str, p: &Value) -> bool {
+    if p.get("auth").and_then(|v| v.as_str()) != Some(ACCT_PROFILE_AUTH_V1) {
+        return false;
+    }
+    if p.get("acct_key").and_then(|v| v.as_str()) != Some(acct_dht_key(email).as_str()) {
+        return false;
+    }
+    if p.get("email_exists").and_then(|v| v.as_bool()) != Some(true) {
+        return false;
+    }
+    let Some(pq_hex) = p.get("signer_pq_pub").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let Ok(pk) = hex::decode(pq_hex) else {
+        return false;
+    };
+    if pk.len() != proto::PQ_FALCON_PK_LEN {
+        return false;
+    }
+    let signer_id = proto::pq_id_from_pub(&pk);
+    let signer_hex = format!("inf1:{}", hex::encode(signer_id));
+    let trusted_signer = signer_id == node.id
+        || node.cfg.validators.contains(&signer_hex)
+        || node.cfg.peers.iter().any(|peer| {
+            peer.primary_id().ok() == Some(signer_id)
+                && peer
+                    .pq_bytes()
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map(|b| b.as_slice())
+                    == Some(pk.as_slice())
+        });
+    if !trusted_signer {
+        return false;
+    }
+    let Some(sig_hex) = p.get("sig").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let Ok(sig) = hex::decode(sig_hex) else {
+        return false;
+    };
+    let Some(digest) = acct_profile_digest(p) else {
+        return false;
+    };
+    proto::pq_falcon_verify(&pk, &digest, &sig)
 }
 
 /// DHT-ключ профиля: непрозрачный (blake3 от email). Адрес НЕ светится в имени
@@ -1370,7 +1484,7 @@ pub async fn replicate_accounts_loop(node: &Arc<infnode::node::Node>, db: &Arc<M
         let snapshot = db.lock().await.clone();
         let mut ok = 0usize;
         for (email, acc) in snapshot.accounts.iter() {
-            let profile = account_public_profile(acc).to_string();
+            let profile = account_public_profile_signed(node, email, acc).to_string();
             if kv_set(node, &acct_dht_key(email), &profile).await > 0 {
                 ok += 1;
             }
@@ -1406,7 +1520,8 @@ pub async fn restore_account_on_demand(
         Ok(v) => v,
         Err(_) => return false,
     };
-    if p["email_exists"].as_bool() != Some(true) {
+    if !verify_acct_profile(node, &email, &p) {
+        eprintln!("[web] refused unauthenticated or untrusted acct profile for {email}");
         return false;
     }
     let mut acc = Account {
@@ -1874,7 +1989,7 @@ async fn register(
     {
         let node = st.node.clone();
         let email_c = email.clone();
-        let profile_json = account_public_profile(&acc).to_string();
+        let profile_json = account_public_profile_signed(&node, &email_c, &acc).to_string();
         tokio::spawn(async move {
             let _ = kv_set(&node, &acct_dht_key(&email_c), &profile_json).await;
         });
@@ -7308,5 +7423,115 @@ mod files_key_tests {
             files_owner_ek(&a, email).len(),
             infnode::mailbox::KEM_EK_LEN * 2
         );
+    }
+}
+
+#[cfg(test)]
+mod acct_auth_tests {
+    use super::*;
+    use infnode::config::NodeConfig;
+    use infnode::keyring::{NodeKeys, PqKeys};
+
+    fn test_cfg(name: &str) -> NodeConfig {
+        NodeConfig {
+            name: name.to_string(),
+            listen: "127.0.0.1:0".to_string(),
+            client_listen: None,
+            advertise: None,
+            peers: Vec::new(),
+            allow_unknown: false,
+            unknown_allow: Vec::new(),
+            metrics_listen: None,
+            log_level: Some(0),
+            roles: Default::default(),
+            outbox_ttl_secs: 3600,
+            storage_roles: Vec::new(),
+            validators: Vec::new(),
+            domain: None,
+            web_listen: None,
+            wallet: None,
+            web_static: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn w6_a3_9_acct_profiles_require_valid_trusted_signature() {
+        let dir = std::env::temp_dir().join(format!("infmail-acct-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let keys = NodeKeys::generate();
+        let pq = PqKeys::from_seed([0x42u8; 32]);
+        let node = Node::new(test_cfg("self"), keys, pq, dir.join("self"), PathBuf::new())
+            .await
+            .expect("node");
+
+        let attacker_dir = dir.join("attacker");
+        let attacker = Node::new(
+            test_cfg("attacker"),
+            NodeKeys::generate(),
+            PqKeys::from_seed([0x52u8; 32]),
+            attacker_dir,
+            PathBuf::new(),
+        )
+        .await
+        .expect("attacker node");
+
+        let email = "alice@infmail.org";
+        let acc = Account {
+            quota_limit: 1024,
+            plan: "paid".to_string(),
+            paid_until_ms: 9_999_999,
+            ..Account::default()
+        };
+
+        // 1. Self-signed profile verifies and restores cleanly.
+        let signed = account_public_profile_signed(&node, email, &acc);
+        assert!(verify_acct_profile(&node, email, &signed));
+
+        let db_path = dir.join("accounts.json");
+        let db = Arc::new(Mutex::new(AccountsDb::default()));
+        node.kv_store_local(&acct_dht_key(email), &signed.to_string())
+            .await;
+        assert!(restore_account_on_demand(&node, &db, &db_path, email).await);
+        assert!(db.lock().await.accounts.contains_key(email));
+
+        // 2. Unauthenticated legacy profile is refused.
+        let unsigned = json!({
+            "email_exists": true,
+            "created_ms": 1,
+            "aliases": [],
+            "quota_limit": 999999,
+            "bytes_used": 0,
+            "file_quota_limit": 0,
+            "files_used": 0,
+            "plan": "paid",
+            "paid_until_ms": 999999,
+            "totp_enabled": false,
+            "session_epoch": 0,
+        });
+        let bob = "bob@infmail.org";
+        node.kv_store_local(&acct_dht_key(bob), &unsigned.to_string())
+            .await;
+        assert!(!verify_acct_profile(&node, bob, &unsigned));
+        assert!(!restore_account_on_demand(&node, &db, &db_path, bob).await);
+        assert!(!db.lock().await.accounts.contains_key(bob));
+
+        // 3. Tampered signed profile is refused.
+        let mut tampered = signed.clone();
+        tampered["plan"] = json!("enterprise");
+        assert!(!verify_acct_profile(&node, email, &tampered));
+
+        // 4. Profile signed for another email (key substitution) is refused.
+        assert!(!verify_acct_profile(&node, bob, &signed));
+
+        // 5. Profile signed by an untrusted remote key is refused.
+        let forged = account_public_profile_signed(&attacker, bob, &acc);
+        node.kv_store_local(&acct_dht_key(bob), &forged.to_string())
+            .await;
+        assert!(!verify_acct_profile(&node, bob, &forged));
+        assert!(!restore_account_on_demand(&node, &db, &db_path, bob).await);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

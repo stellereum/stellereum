@@ -178,6 +178,11 @@ pub const MAX_BLOB_BYTES: usize = crate::snapshot_v4::MAX_SNAPSHOT_DECODE_BYTES 
 /// Hard bound on raw JSON manifest string size (`4 MiB`).
 pub const MAX_SNAPSHOT_JSON_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 
+const _: () = assert!(
+    MAX_WIRE_BLOCK_BYTES as usize <= infnode::node::MAX_UNSEALED_BLOB_BYTES,
+    "MAX_WIRE_BLOCK_BYTES must fit within infnode MAX_UNSEALED_BLOB_BYTES"
+);
+
 /// One chunk entry of a snapshot manifest, resolved for resumable fetch.
 ///
 /// `id` addresses the chunk bytes (`fetch_chunk_net`); `hash` is the mandatory

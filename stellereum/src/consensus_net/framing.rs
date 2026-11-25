@@ -58,6 +58,19 @@ pub const MAX_CONSENSUS_MSG: usize = 32 * 1024 * 1024;
 /// Max accepted transaction gossip message size (a single tx is small).
 pub const MAX_TX_MSG: usize = 1024 * 1024;
 
+/// Maximum raw consensus payload bytes that fit inside one `infnode` pubsub
+/// message after hex-encoding (`MAX_PUBSUB_DATA_LEN / 2`).
+pub const MAX_CONSENSUS_PUBSUB_BYTES: usize = infnode::proto::MAX_PUBSUB_DATA_LEN / 2;
+
+const _: () = assert!(
+    MAX_TX_MSG * 2 <= infnode::proto::MAX_PUBSUB_DATA_LEN,
+    "MAX_TX_MSG hex encoding must fit within infnode MAX_PUBSUB_DATA_LEN"
+);
+const _: () = assert!(
+    infnode::proto::MAX_PUBSUB_DATA_LEN < infnode::proto::MAX_FRAME,
+    "infnode MAX_PUBSUB_DATA_LEN must fit inside MAX_FRAME"
+);
+
 /// Max consensus messages carried in one batch (P3-H4 gossip batching).
 ///
 /// Safety role (DoS bound + liveness): bounds per-batch verify work so one
@@ -550,9 +563,33 @@ pub fn encode_broadcast_payload(
     };
     let encoded_len = bytes.len();
     let data = hex::encode(bytes);
+    if !infnode::proto::pubsub_data_ok(&data) {
+        let err = format!(
+            "consensus pubsub data {} bytes exceeds infnode MAX_PUBSUB_DATA_LEN ({})",
+            data.len(),
+            infnode::proto::MAX_PUBSUB_DATA_LEN,
+        );
+        return Err(if is_batch {
+            BroadcastEncodeError::Batch(err)
+        } else {
+            BroadcastEncodeError::Single(err)
+        });
+    }
     let payload = serde_json::json!({ "topic": topic, "data": &data })
         .to_string()
         .into_bytes();
+    if payload.len().saturating_add(16) > infnode::proto::MAX_FRAME {
+        let err = format!(
+            "consensus pubsub frame {} bytes exceeds infnode MAX_FRAME ({})",
+            payload.len().saturating_add(16),
+            infnode::proto::MAX_FRAME,
+        );
+        return Err(if is_batch {
+            BroadcastEncodeError::Batch(err)
+        } else {
+            BroadcastEncodeError::Single(err)
+        });
+    }
     Ok(BroadcastFrame {
         payload,
         data,
@@ -1175,15 +1212,32 @@ pub fn compact_proposal_from_block_with_full(
         .map(|proposal| ConsensusMsg::CompactProposal { proposal })
 }
 
-/// Receiver: open the resolver for a decoded announcement.
-///
-/// Checks the activation gate again (defense in depth: `ConsensusMsg::decode`
-/// already refuses compact frames below the gate) and every structural bound.
+/// Receiver: open the resolver for a decoded announcement (structural bounds
+/// + activation gate). Live network paths must call
+///   [`open_compact_proposal_verified`] (or [`CompactReceiver::on_proposal_indexed`])
+///   so proposer signatures are verified before parking or mempool work.
 pub fn open_compact_proposal(
     proposal: compact_prop::CompactProposal,
 ) -> Result<compact_prop::CompactResolver, String> {
     if !compact_gossip_admits(proposal.height) {
         return Err("compact gossip inactive".to_string());
+    }
+    compact_prop::CompactResolver::new(proposal).map_err(|e| format!("compact proposal: {e}"))
+}
+
+/// Receiver: verify the proposer's signature against `(proposal.header,
+/// proposal.block_hash)` BEFORE opening/parking the compact resolver.
+pub fn open_compact_proposal_verified(
+    proposal: compact_prop::CompactProposal,
+) -> Result<compact_prop::CompactResolver, String> {
+    if !compact_gossip_admits(proposal.height) {
+        return Err("compact gossip inactive".to_string());
+    }
+    if !crate::consensus::verify_proposer_signature_with_hash(
+        &proposal.header,
+        &proposal.block_hash,
+    ) {
+        return Err("compact proposal: invalid proposer signature".to_string());
     }
     compact_prop::CompactResolver::new(proposal).map_err(|e| format!("compact proposal: {e}"))
 }

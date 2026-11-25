@@ -17,6 +17,11 @@ pub use publish::*;
 pub use retention::*;
 pub use xshard_transport::*;
 
+const _: () = assert!(
+    MAX_CROSS_SHARD_MSG * 2 <= infnode::proto::MAX_PUBSUB_DATA_LEN,
+    "MAX_CROSS_SHARD_MSG hex encoding must fit within infnode MAX_PUBSUB_DATA_LEN"
+);
+
 #[cfg(test)]
 mod tests;
 
@@ -653,6 +658,29 @@ impl InfnodeMeshTransport {
             .to_string()
             .into_bytes()
     }
+
+    /// Pre-flight check ensuring a pubsub payload and its serialized envelope
+    /// respect `infnode`'s topic, `MAX_PUBSUB_DATA_LEN`, and `MAX_FRAME` limits.
+    pub fn validate_pubsub_frame(topic: &str, data: &str, frame_len: usize) -> Result<(), String> {
+        if !infnode::proto::topic_ok(topic) {
+            return Err(format!("invalid pubsub topic length ({})", topic.len()));
+        }
+        if !infnode::proto::pubsub_data_ok(data) {
+            return Err(format!(
+                "pubsub data {} bytes exceeds infnode MAX_PUBSUB_DATA_LEN ({})",
+                data.len(),
+                infnode::proto::MAX_PUBSUB_DATA_LEN
+            ));
+        }
+        if frame_len.saturating_add(16) > infnode::proto::MAX_FRAME {
+            return Err(format!(
+                "pubsub frame {} bytes exceeds infnode MAX_FRAME ({})",
+                frame_len.saturating_add(16),
+                infnode::proto::MAX_FRAME
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl ValidatorMeshTransport for InfnodeMeshTransport {
@@ -664,6 +692,15 @@ impl ValidatorMeshTransport for InfnodeMeshTransport {
     ) -> MeshFuture<'a, Result<(), String>> {
         Box::pin(async move {
             let payload = Self::envelope(topic, data);
+            if let Err(why) = Self::validate_pubsub_frame(topic, data, payload.len()) {
+                tracing::warn!(
+                    peer = %hex::encode(peer),
+                    len = payload.len(),
+                    err = %why,
+                    "[mesh] direct send rejected by transport budget"
+                );
+                return Err(why);
+            }
             match tokio::time::timeout(
                 std::time::Duration::from_millis(mesh_send_timeout_ms()),
                 self.node.send_to(peer, "pubsub.msg", payload),
@@ -671,7 +708,14 @@ impl ValidatorMeshTransport for InfnodeMeshTransport {
             .await
             {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(e.to_string()),
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        peer = %hex::encode(peer),
+                        err = %e,
+                        "[mesh] direct send rejected by infnode"
+                    );
+                    Err(e.to_string())
+                }
                 Err(_) => Err("mesh direct send timeout".to_string()),
             }
         })
@@ -680,11 +724,20 @@ impl ValidatorMeshTransport for InfnodeMeshTransport {
     fn deliver_direct_frame<'a>(
         &'a self,
         peer: [u8; 20],
-        _topic: &'a str,
-        _data: &'a str,
+        topic: &'a str,
+        data: &'a str,
         frame: &'a [u8],
     ) -> MeshFuture<'a, Result<(), String>> {
         Box::pin(async move {
+            if let Err(why) = Self::validate_pubsub_frame(topic, data, frame.len()) {
+                tracing::warn!(
+                    peer = %hex::encode(peer),
+                    len = frame.len(),
+                    err = %why,
+                    "[mesh] direct frame rejected by transport budget"
+                );
+                return Err(why);
+            }
             let payload = frame.to_vec();
             match tokio::time::timeout(
                 std::time::Duration::from_millis(mesh_send_timeout_ms()),
@@ -693,7 +746,15 @@ impl ValidatorMeshTransport for InfnodeMeshTransport {
             .await
             {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(e.to_string()),
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        peer = %hex::encode(peer),
+                        len = frame.len(),
+                        err = %e,
+                        "[mesh] direct frame rejected by infnode"
+                    );
+                    Err(e.to_string())
+                }
                 Err(_) => Err("mesh direct send timeout".to_string()),
             }
         })
@@ -989,9 +1050,8 @@ impl P2pNetworkAdapter {
         topic: &str,
         data_hex: &str,
     ) -> Result<UnicastPath, String> {
-        let payload = serde_json::json!({ "topic": topic, "data": data_hex })
-            .to_string()
-            .into_bytes();
+        let payload = InfnodeMeshTransport::envelope(topic, data_hex);
+        InfnodeMeshTransport::validate_pubsub_frame(topic, data_hex, payload.len())?;
         let node = Arc::clone(&self.node);
         let timeout = std::time::Duration::from_millis(mesh_send_timeout_ms());
         deliver_unicast(&self.mesh, peer, topic, data_hex, move || async move {

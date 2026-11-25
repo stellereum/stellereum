@@ -193,8 +193,8 @@ pub struct SessionKeys {
 
 #[derive(Default)]
 struct SeenWindow {
-    map: HashMap<u64, i64>,
-    order: VecDeque<(i64, u64)>,
+    map: HashMap<(String, u64), i64>,
+    order: VecDeque<(i64, (String, u64))>,
 }
 
 fn parse_peer_pq(
@@ -261,6 +261,31 @@ pub struct Route {
     /// validated to derive `pid` when present).
     #[serde(default)]
     pub pq_hex: String,
+}
+
+/// Partition route gossip entries into chunks of at most `max_per_update`
+/// (typically `proto::MAX_ROUTES_PER_UPDATE` = 512) so route gossip continues
+/// to function past 512 entries without triggering receiver-side cap refusals.
+pub fn chunk_routes_for_gossip(
+    entries: Vec<(String, Route)>,
+    max_per_update: usize,
+) -> Vec<HashMap<String, Route>> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let cap = max_per_update.max(1);
+    let mut chunks = Vec::new();
+    let mut cur = HashMap::with_capacity(entries.len().min(cap));
+    for (k, v) in entries {
+        cur.insert(k, v);
+        if cur.len() >= cap {
+            chunks.push(std::mem::replace(&mut cur, HashMap::with_capacity(cap)));
+        }
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
 }
 
 /// Подписка узла на топик: время + текущие живые соединения (может быть несколько).
@@ -596,8 +621,10 @@ pub struct Node {
     mail_dir: PathBuf,
     /// pubsub: топик -> (узел -> SubState{время, живые соединения}) — подписки persistent
     subs: RwLock<HashMap<String, HashMap<[u8; NODEID_LEN], SubState>>>,
-    /// pubsub: dedup сообщений (msg_id -> ts), O(1) amortized window
+    /// pubsub: dedup сообщений ((topic, msg_id) -> ts), O(1) amortized window
     seen: std::sync::Mutex<SeenWindow>,
+    /// pubsub.msg: dedup ретранслированных сообщений ((topic, msg_id) -> ts)
+    msg_seen: std::sync::Mutex<SeenWindow>,
     /// Anti-replay для CHALLENGE-рукопожатий (O(1) amortized paired map + queue).
     challenge_nonces: Mutex<proto::NonceWindow>,
     /// pubsub: outbox ненадёжной доставки (узел -> очередь) — переживает рестарты
@@ -630,6 +657,8 @@ pub struct Node {
     peer_evictions: AtomicU64,
     /// маршруты для discovery (node_id -> Route)
     routes: RwLock<HashMap<[u8; NODEID_LEN], Route>>,
+    /// Insertion/touch order for `routes` LRU eviction of non-static entries at MAX_ROUTES_TOTAL.
+    route_order: std::sync::Mutex<VecDeque<[u8; NODEID_LEN]>>,
     /// каталог для персистентности (routes.json и пр.)
     pub data_dir: PathBuf,
     /// время старта (для core.health)
@@ -686,6 +715,8 @@ pub struct Node {
     subs_last_flush_ms: AtomicI64,
     /// Short-TTL dedup cache for remote `dht.lookup` queries (target -> (ts_ms, endpoints, pq_pub)).
     lookup_cache: std::sync::Mutex<HashMap<[u8; NODEID_LEN], LookupCacheEntry>>,
+    /// In-flight remote `dht.lookup` target IDs (deduplicates concurrent lookups for the same key).
+    inflight_lookups: std::sync::Mutex<std::collections::HashSet<[u8; NODEID_LEN]>>,
     /// Rate limit for network-facing diagnostic log events.
     net_log_last_ms: AtomicI64,
     /// F8: per-IP handshake token-buckets (source IP -> bucket).
@@ -941,6 +972,7 @@ impl Node {
                 }
             }
         }
+        let route_order: VecDeque<[u8; NODEID_LEN]> = routes.keys().copied().collect();
         let outbox_ttl = cfg.outbox_ttl_secs.max(60);
         let unknown_allow_init = cfg.unknown_allow.clone();
         let node = Arc::new(Node {
@@ -960,6 +992,7 @@ impl Node {
             mail_dir,
             subs: RwLock::new(HashMap::new()),
             seen: std::sync::Mutex::new(SeenWindow::default()),
+            msg_seen: std::sync::Mutex::new(SeenWindow::default()),
             challenge_nonces: Mutex::new(proto::NonceWindow::new()),
             outbox: RwLock::new(HashMap::new()),
             app_subs: RwLock::new(HashMap::new()),
@@ -978,6 +1011,7 @@ impl Node {
             ),
             peer_evictions: AtomicU64::new(0),
             routes: RwLock::new(routes),
+            route_order: std::sync::Mutex::new(route_order),
             data_dir: data_dir.clone(),
             started_at: Instant::now(),
             mail_key: load_or_create_mail_key(&data_dir),
@@ -1007,6 +1041,7 @@ impl Node {
             subs_dirty: AtomicBool::new(false),
             subs_last_flush_ms: AtomicI64::new(0),
             lookup_cache: std::sync::Mutex::new(HashMap::new()),
+            inflight_lookups: std::sync::Mutex::new(std::collections::HashSet::new()),
             net_log_last_ms: AtomicI64::new(0),
             handshake_buckets: Mutex::new(HashMap::new()),
             auth_failures: Mutex::new(HashMap::new()),
@@ -1661,6 +1696,35 @@ impl Node {
     ) -> Option<Vec<u8>> {
         let v = json!({ "node": node, "ttl": crate::proto::MAX_DHT_LOOKUP_TTL });
         self.handle_dht_lookup(&v, from).await
+    }
+
+    /// Feed a raw `dht.lookup` JSON payload through `handle_dht_lookup` (test hook).
+    pub async fn bp_handle_dht_lookup_raw(
+        self: &Arc<Self>,
+        v: serde_json::Value,
+        from: [u8; NODEID_LEN],
+    ) -> Option<Vec<u8>> {
+        self.handle_dht_lookup(&v, from).await
+    }
+
+    /// Feed a `dht.find_value` query through the REAL handler (test hook).
+    pub async fn bp_handle_dht_find_value(
+        self: &Arc<Self>,
+        key: &str,
+        from: [u8; NODEID_LEN],
+    ) -> Option<Vec<u8>> {
+        let v = json!({ "key": key });
+        self.handle_dht_find_value(&v, from).await
+    }
+
+    /// Register a dynamic/TOFU peer directly (test hook for role-scoped ACLs).
+    pub async fn bp_add_dynamic_peer(&self, pid: [u8; NODEID_LEN], pcfg: PeerConfig) -> Result<()> {
+        self.add_dynamic_peer(pid, pcfg).await
+    }
+
+    /// Expose `(topic, msg_id)` dedup window check (test hook).
+    pub async fn bp_mark_seen(&self, topic: &str, msg_id: u64) -> bool {
+        self.mark_seen(topic, msg_id).await
     }
 
     /// Run one explicit suspected-peer recovery pass (test hook; the live
@@ -3520,6 +3584,51 @@ impl Node {
         Ok(())
     }
 
+    fn touch_route_order(&self, pid: [u8; NODEID_LEN]) {
+        let mut order = self.route_order.lock().unwrap_or_else(|e| e.into_inner());
+        if order.back() == Some(&pid) {
+            return;
+        }
+        order.retain(|id| *id != pid);
+        order.push_back(pid);
+    }
+
+    fn evict_oldest_route(
+        &self,
+        routes: &mut HashMap<[u8; NODEID_LEN], Route>,
+        pinned: Option<&HashMap<[u8; NODEID_LEN], Vec<String>>>,
+    ) -> bool {
+        let is_protected = |id: &[u8; NODEID_LEN]| {
+            self.static_peers.contains(id) || pinned.is_some_and(|p| p.contains_key(id))
+        };
+        let mut order = self.route_order.lock().unwrap_or_else(|e| e.into_inner());
+        let mut skipped: Vec<[u8; NODEID_LEN]> = Vec::new();
+        let mut evicted = false;
+        while let Some(candidate) = order.pop_front() {
+            if !routes.contains_key(&candidate) {
+                continue;
+            }
+            if is_protected(&candidate) {
+                skipped.push(candidate);
+                continue;
+            }
+            routes.remove(&candidate);
+            evicted = true;
+            break;
+        }
+        for id in skipped.into_iter().rev() {
+            order.push_front(id);
+        }
+        if !evicted {
+            if let Some(victim) = routes.keys().find(|id| !is_protected(id)).copied() {
+                routes.remove(&victim);
+                order.retain(|id| *id != victim);
+                evicted = true;
+            }
+        }
+        evicted
+    }
+
     /// Учёт известного эндпоинта пира + персистентность.
     async fn add_route(&self, pid: [u8; NODEID_LEN], endpoint: String, pq_hex: &str) {
         if !crate::dht::endpoint_ok(&endpoint) {
@@ -3528,13 +3637,20 @@ impl Node {
         let mut write_now = false;
         {
             let mut routes = self.routes.write().await;
-            if !routes.contains_key(&pid) && routes.len() >= MAX_ROUTES_TOTAL {
+            if !routes.contains_key(&pid)
+                && routes.len() >= MAX_ROUTES_TOTAL
+                && !self.evict_oldest_route(&mut routes, None)
+            {
                 return;
             }
+            let is_new = !routes.contains_key(&pid);
             let route = routes.entry(pid).or_insert(Route {
                 endpoints: Vec::new(),
                 pq_hex: pq_hex.to_string(),
             });
+            if is_new {
+                write_now = true;
+            }
             if route.pq_hex.is_empty() && !pq_hex.is_empty() {
                 route.pq_hex = pq_hex.to_string();
                 write_now = true;
@@ -3545,6 +3661,7 @@ impl Node {
                 route.endpoints.push(endpoint);
                 write_now = true;
             }
+            self.touch_route_order(pid);
         }
         // запись на диск ВНЕ блокировки — иначе блокируем всех ждущих routes
         if write_now {
@@ -3892,7 +4009,7 @@ impl Node {
             let ttl = req.ttl.unwrap_or(3).min(crate::proto::MAX_PUBSUB_TTL);
             let seq = self.next_topic_seq(topic).await;
             let origin = self.id_hex.clone();
-            if self.mark_seen(msg_id).await {
+            if self.mark_seen(topic, msg_id).await {
                 return Some(
                     json!({ "ok": true, "op": "published", "dup": true, "msg_id": msg_id })
                         .to_string()
@@ -3944,7 +4061,7 @@ impl Node {
             let msg_id = req.msg_id.unwrap_or_else(rand_u64);
             let ttl = req.ttl.unwrap_or(0).min(crate::proto::MAX_PUBSUB_TTL);
             let seq = req.seq.unwrap_or(0);
-            if self.mark_seen(msg_id).await {
+            if self.mark_seen(topic, msg_id).await {
                 return Some(
                     json!({ "ok": true, "op": "relayed", "dup": true, "msg_id": msg_id })
                         .to_string()
@@ -3952,8 +4069,11 @@ impl Node {
                 );
             }
             let exclude_conn = conn.stable_id();
+            // A relay is not `origin`: clear origin/seq on subscriber `pubsub.msg`
+            // delivery so receivers bind non-empty `req.origin` strictly to the
+            // authenticated sender while `(topic, msg_id)` dedup absorbs duplicates.
             let n = self
-                .deliver_local(topic, data, msg_id, seq, origin, Some(exclude_conn))
+                .deliver_local(topic, data, msg_id, 0, "", Some(exclude_conn))
                 .await;
             self.forward(topic, data, msg_id, seq, origin, ttl, Some(from))
                 .await;
@@ -3977,14 +4097,20 @@ impl Node {
                 );
             }
             let origin = req.origin.as_deref().unwrap_or("");
-            if origin.len() > MAX_ORIGIN_LEN {
+            let src = hex::encode(from);
+            let origin_hex = origin.strip_prefix("inf1:").unwrap_or(origin);
+            let origin_looks_like_node_id = origin.starts_with("inf1:")
+                || ((origin_hex.len() == 40 || origin_hex.len() == 64)
+                    && origin_hex.bytes().all(|b| b.is_ascii_hexdigit()));
+            if origin.len() > MAX_ORIGIN_LEN
+                || (origin_looks_like_node_id && !origin_hex.eq_ignore_ascii_case(&src))
+            {
                 return Some(
                     json!({ "ok": false, "err": "bad origin" })
                         .to_string()
                         .into_bytes(),
                 );
             }
-            let src = hex::encode(from);
             let seq = req.seq.unwrap_or(0);
             let data = req.data.as_deref().unwrap_or("");
             if !crate::proto::pubsub_data_ok(data) {
@@ -3994,17 +4120,40 @@ impl Node {
                         .into_bytes(),
                 );
             }
+            let msg_id_u64 = req.msg_id.as_ref().and_then(|v| v.as_u64());
             let mut ordered: Vec<String> = Vec::new();
             if origin.is_empty() || seq == 0 {
+                if let Some(mid) = msg_id_u64 {
+                    if self.mark_msg_seen(topic, mid).await {
+                        return Some(
+                            json!({ "ok": true, "op": "msg", "dup": true, "topic": topic })
+                                .to_string()
+                                .into_bytes(),
+                        );
+                    }
+                }
                 let mid = req.msg_id.unwrap_or(serde_json::Value::Null);
                 ordered.push(
                     json!({ "topic": topic, "data": data, "msg_id": mid, "src": src }).to_string(),
                 );
             } else {
+                // Namespace reorder buffer by authenticated `src` so a peer can
+                // never advance another sender's `seq` counter (`W6-A3-10`).
+                // Run `reorder_offer` BEFORE `mark_msg_seen` so `seq=1` still
+                // advances `next` to 2 even if a `pubsub.relay` copy arrived first;
+                // then drop already-seen emitted items on `d_seq == seq`.
+                let scoped_origin = format!("{src}\0{origin}");
                 for (d, d_src, d_seq) in self
-                    .reorder_offer(origin, topic, seq, data.to_string(), src)
+                    .reorder_offer(&scoped_origin, topic, seq, data.to_string(), src)
                     .await
                 {
+                    if d_seq == seq {
+                        if let Some(mid) = msg_id_u64 {
+                            if self.mark_msg_seen(topic, mid).await {
+                                continue;
+                            }
+                        }
+                    }
                     ordered.push(
                         json!({ "topic": topic, "data": d, "seq": d_seq, "origin": origin, "src": d_src })
                             .to_string(),
@@ -4136,6 +4285,9 @@ impl Node {
             json!({ "topic": topic, "data": data, "msg_id": msg_id, "seq": seq, "origin": origin })
                 .to_string()
                 .into_bytes();
+        if payload.len().saturating_add(16) > crate::proto::MAX_FRAME {
+            return 0;
+        }
         let mut n = 0usize;
         for (sub_pid, st) in &subs {
             let eligible: Vec<(usize, Connection)> = st
@@ -4538,6 +4690,9 @@ impl Node {
         })
         .to_string()
         .into_bytes();
+        if payload.len().saturating_add(16) > crate::proto::MAX_FRAME {
+            return;
+        }
         let n = targets.len();
         let mut payload = Some(payload);
         for (i, pid) in targets.into_iter().enumerate() {
@@ -4574,10 +4729,12 @@ impl Node {
         1
     }
 
-    /// Dedup: возвращает true, если сообщение уже видели.
-    /// O(1) amortized paired HashMap + VecDeque expiry window.
-    async fn mark_seen(&self, msg_id: u64) -> bool {
-        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+    fn mark_seen_in_window(
+        window: &std::sync::Mutex<SeenWindow>,
+        topic: &str,
+        msg_id: u64,
+    ) -> bool {
+        let mut seen = window.lock().unwrap_or_else(|e| e.into_inner());
         let now = now_ms();
         let expire = now - crate::dht::DEDUP_TTL_MS;
         while let Some((ts, _)) = seen.order.front() {
@@ -4590,7 +4747,8 @@ impl Node {
                 }
             }
         }
-        if seen.map.contains_key(&msg_id) {
+        let key = (topic.to_string(), msg_id);
+        if seen.map.contains_key(&key) {
             return true;
         }
         if seen.map.len() >= crate::proto::MAX_SEEN_IDS {
@@ -4609,9 +4767,20 @@ impl Node {
                 }
             }
         }
-        seen.map.insert(msg_id, now);
-        seen.order.push_back((now, msg_id));
+        seen.map.insert(key.clone(), now);
+        seen.order.push_back((now, key));
         false
+    }
+
+    /// Dedup: возвращает true, если сообщение `(topic, msg_id)` уже видели.
+    /// O(1) amortized paired HashMap + VecDeque expiry window.
+    async fn mark_seen(&self, topic: &str, msg_id: u64) -> bool {
+        Self::mark_seen_in_window(&self.seen, topic, msg_id)
+    }
+
+    /// Dedup доставки `pubsub.msg`: возвращает true, если `(topic, msg_id)` уже доставлено.
+    async fn mark_msg_seen(&self, topic: &str, msg_id: u64) -> bool {
+        Self::mark_seen_in_window(&self.msg_seen, topic, msg_id)
     }
 
     /// Discovery: ищем node_id в локальной таблице маршрутов, иначе спрашиваем пиров (TTL).
@@ -4667,6 +4836,48 @@ impl Node {
                     .into_bytes(),
             );
         }
+        // Parse visited peers for cycle detection & hop deduplication.
+        let mut visited: Vec<[u8; NODEID_LEN]> = Vec::new();
+        let mut visited_set: std::collections::HashSet<[u8; NODEID_LEN]> =
+            std::collections::HashSet::new();
+        if let Some(arr) = v.get("visited").and_then(|x| x.as_array()) {
+            if arr.len() > crate::proto::MAX_DHT_LOOKUP_VISITED {
+                return Some(
+                    json!({ "ok": true, "found": false, "node": target_hex })
+                        .to_string()
+                        .into_bytes(),
+                );
+            }
+            for item in arr {
+                if let Some(hex_str) = item.as_str() {
+                    let bare = hex_str.strip_prefix("inf1:").unwrap_or(hex_str);
+                    if let Ok(raw) = hex::decode(bare) {
+                        if raw.len() == NODEID_LEN {
+                            let mut pid = [0u8; NODEID_LEN];
+                            pid.copy_from_slice(&raw);
+                            if visited_set.insert(pid) {
+                                visited.push(pid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Reject cyclic hops: if our own ID is already in incoming visited, stop immediately.
+        if visited_set.contains(&self.id) {
+            return Some(
+                json!({ "ok": true, "found": false, "node": target_hex })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        if visited_set.insert(self.id) {
+            visited.push(self.id);
+        }
+        if visited_set.insert(from) {
+            visited.push(from);
+        }
+
         const LOOKUP_CACHE_TTL_MS: i64 = 2_000;
         {
             let now = now_ms();
@@ -4690,18 +4901,63 @@ impl Node {
                 cache.remove(&target);
             }
         }
+        // Deduplicate concurrent in-flight lookups for the same target key.
+        struct InflightLookupGuard<'a> {
+            set: &'a std::sync::Mutex<std::collections::HashSet<[u8; NODEID_LEN]>>,
+            target: [u8; NODEID_LEN],
+        }
+        impl Drop for InflightLookupGuard<'_> {
+            fn drop(&mut self) {
+                let mut g = self.set.lock().unwrap_or_else(|e| e.into_inner());
+                g.remove(&self.target);
+            }
+        }
+        {
+            let mut inflight = self
+                .inflight_lookups
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !inflight.insert(target) {
+                return Some(
+                    json!({ "ok": true, "found": false, "node": target_hex })
+                        .to_string()
+                        .into_bytes(),
+                );
+            }
+        }
+        let _inflight_guard = InflightLookupGuard {
+            set: &self.inflight_lookups,
+            target,
+        };
         // рекурсивный опрос пиров, BOUNDED: one inbound lookup fans out to at
-        // most ALPHA closest peers (Kademlia), never to every connection.
+        // most ALPHA closest peers (Kademlia), excluding already-visited hops.
         let candidates: Vec<[u8; NODEID_LEN]> = {
             let peers = self.peers.read().await;
             peers
                 .keys()
                 .copied()
-                .filter(|p| self.routing_target_allowed(p))
+                .filter(|p| !visited_set.contains(p) && self.routing_target_allowed(p))
                 .collect()
         };
         let peers = crate::dht::lookup_fanout(candidates, &target, &from, crate::dht::ALPHA);
-        let payload = json!({ "node": target_hex, "ttl": ttl - 1 })
+        if peers.is_empty() {
+            return Some(
+                json!({ "ok": true, "found": false, "node": target_hex })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        for pid in &peers {
+            if visited.len() < crate::proto::MAX_DHT_LOOKUP_VISITED && visited_set.insert(*pid) {
+                visited.push(*pid);
+            }
+        }
+        let visited_hex: Vec<String> = visited
+            .iter()
+            .take(crate::proto::MAX_DHT_LOOKUP_VISITED)
+            .map(hex::encode)
+            .collect();
+        let payload = json!({ "node": target_hex, "ttl": ttl - 1, "visited": visited_hex })
             .to_string()
             .into_bytes();
         let mut merged: Vec<String> = Vec::new();
@@ -4812,11 +5068,6 @@ impl Node {
                     }
                     let mut pid = [0u8; NODEID_LEN];
                     pid.copy_from_slice(&b);
-                    // Backpressure: fail-closed total cap (unknown nodes
-                    // beyond it are ignored; existing entries still merge).
-                    if !mine.contains_key(&pid) && mine.len() >= MAX_ROUTES_TOTAL {
-                        continue;
-                    }
                     let pq_hex = rv["pq_pub"].as_str().unwrap_or("").to_string();
                     // Отравление таблицы (FULL-PQ): PQ pin MUST derive `pid`
                     // (fail-closed, no empty-unknown merge — otherwise anyone
@@ -4828,6 +5079,14 @@ impl Node {
                         continue;
                     }
                     if crate::proto::pq_id_from_pub(&pq) != pid {
+                        continue;
+                    }
+                    // Evict oldest non-static/non-pinned route when at MAX_ROUTES_TOTAL
+                    // so valid dynamic discovery keeps progressing without unbounded growth.
+                    if !mine.contains_key(&pid)
+                        && mine.len() >= MAX_ROUTES_TOTAL
+                        && !self.evict_oldest_route(&mut mine, Some(&pinned_endpoints))
+                    {
                         continue;
                     }
                     let mut endpoints: Vec<String> = rv["endpoints"]
@@ -4874,6 +5133,7 @@ impl Node {
                         mine.insert(pid, route);
                         changed = true;
                     }
+                    self.touch_route_order(pid);
                 }
             }
             drop(mine);
@@ -4898,25 +5158,28 @@ impl Node {
         )
     }
 
-    /// Рассылает свои маршруты пирам (самообучение сети).
+    /// Рассылает свои маршруты пирам (самообучение сети), чанками по `MAX_ROUTES_PER_UPDATE`.
     async fn gossip_routes(self: &Arc<Self>) {
         let routes = self.routes.read().await;
-        let map: HashMap<String, Route> = routes
+        let entries: Vec<(String, Route)> = routes
             .iter()
             .map(|(k, v)| (format!("inf1:{}", hex::encode(k)), v.clone()))
             .collect();
         drop(routes);
-        if map.is_empty() {
+        let chunks = chunk_routes_for_gossip(entries, crate::proto::MAX_ROUTES_PER_UPDATE);
+        if chunks.is_empty() {
             return;
         }
         let peers: Vec<[u8; NODEID_LEN]> = self.peers.read().await.keys().copied().collect();
-        let payload = json!({ "routes": map }).to_string().into_bytes();
-        for pid in peers {
-            let node = self.clone();
-            let payload = payload.clone();
-            tokio::spawn(async move {
-                let _ = node.request_to(pid, "dht.update", payload).await;
-            });
+        for chunk in chunks {
+            let payload = json!({ "routes": chunk }).to_string().into_bytes();
+            for &pid in &peers {
+                let node = self.clone();
+                let payload = payload.clone();
+                tokio::spawn(async move {
+                    let _ = node.request_to(pid, "dht.update", payload).await;
+                });
+            }
         }
     }
 
@@ -5825,14 +6088,18 @@ impl Node {
                     .into_bytes(),
             );
         }
-        if key.starts_with("mail:") && !self.peer_allows(&from, "mail").await {
+        if (key.starts_with("mail:") || key.starts_with("m:"))
+            && !self.peer_allows(&from, "mail").await
+        {
             return Some(
                 json!({ "ok": true, "found": false })
                     .to_string()
                     .into_bytes(),
             );
         }
-        if key.starts_with("files:") && !self.peer_allows(&from, "files").await {
+        if (key.starts_with("files:") || key.starts_with("f:"))
+            && !self.peer_allows(&from, "files").await
+        {
             return Some(
                 json!({ "ok": true, "found": false })
                     .to_string()
@@ -6333,20 +6600,19 @@ impl Node {
         self.cfg.validators.contains(&hex_id)
     }
 
-    /// Роль пира: хранит ли он этот бакет (неизвестный пир/TOFU = оба бакета).
+    /// Роль пира: хранит ли он этот бакет.
     ///
-    /// Reads the role straight out of the peers map under its READ guard: the
-    /// old form cloned the whole `PeerLink` (quinn `ClientConfig`, endpoints,
-    /// Falcon key, ...) on every chunk store/fetch/delete just to inspect
-    /// `storage_roles`. No await happens while the guard is held, so the hold
-    /// time is a single field check.
+    /// Fail-closed for unknown or dynamically-admitted TOFU peers with empty
+    /// `storage_roles`: only operator-pinned static peers (`static_peers`) treat
+    /// empty `storage_roles` as unrestricted; unknown/TOFU peers must explicitly
+    /// declare a role.
     pub async fn peer_allows(&self, pid: &[u8; NODEID_LEN], bucket: &str) -> bool {
         let peers = self.peers.read().await;
         let Some(peer) = peers.get(pid) else {
-            return true;
+            return false;
         };
         if peer.cfg.storage_roles.is_empty() {
-            return true;
+            return self.static_peers.contains(pid);
         }
         peer.cfg.storage_roles.iter().any(|r| r == bucket)
     }
@@ -6856,7 +7122,7 @@ impl Node {
         let msg_id = rand_u64();
         let seq = self.next_topic_seq(topic).await;
         let origin = self.id_hex.clone();
-        if self.mark_seen(msg_id).await {
+        if self.mark_seen(topic, msg_id).await {
             return 0;
         }
         let n = self
@@ -8338,12 +8604,18 @@ impl Node {
             k.copy_from_slice(&key);
             (k, Vec::new(), None)
         };
-        // Manifest bounds (M4): a tiny manifest must not name tens of
-        // thousands of chunks. Validate the chunk table (count, contiguity,
-        // lengths, hash shape) BEFORE any network lookup, and require the
-        // declared `size` to be consistent with the ciphertext length
-        // (`size + 16` for the single AEAD tag).
-        let size = manifest["size"].as_u64()? as usize;
+        // Manifest bounds (M4 + W6-A3-3): a tiny manifest must not name tens of
+        // thousands of chunks or force multi-GiB unauthenticated assembly.
+        // Validate declared `size`, aggregate unsealed byte cap
+        // (`MAX_UNSEALED_BLOB_BYTES`), chunk count, contiguity, and lengths
+        // BEFORE any allocation or network lookup.
+        let size = usize::try_from(manifest["size"].as_u64()?).ok()?;
+        if !sealed && size > MAX_UNSEALED_BLOB_BYTES {
+            eprintln!(
+                "[node] fetch_blob {bucket}/{name}: unsealed manifest size {size} exceeds MAX_UNSEALED_BLOB_BYTES ({MAX_UNSEALED_BLOB_BYTES}); refusing"
+            );
+            return None;
+        }
         let chunks = manifest["chunks"].as_array()?;
         let max_by_size = size.div_ceil(BLOB_CHUNK_BYTES).saturating_add(2);
         if chunks.is_empty() || chunks.len() > MAX_BLOB_CHUNKS || chunks.len() > max_by_size {
@@ -8361,8 +8633,8 @@ impl Node {
             if !self.valid_chunk_id(cid) {
                 return None;
             }
-            let off = c["off"].as_u64()? as usize;
-            let len = c["len"].as_u64()? as usize;
+            let off = usize::try_from(c["off"].as_u64()?).ok()?;
+            let len = usize::try_from(c["len"].as_u64()?).ok()?;
             if off != expected_off || len == 0 || len > BLOB_CHUNK_BYTES {
                 eprintln!("[node] fetch_blob {bucket}/{name}: non-contiguous chunk table");
                 return None;
@@ -8378,6 +8650,12 @@ impl Node {
                 return None;
             }
             expected_off = expected_off.checked_add(len)?;
+            if !sealed && expected_off > MAX_UNSEALED_BLOB_BYTES.saturating_add(16) {
+                eprintln!(
+                    "[node] fetch_blob {bucket}/{name}: unsealed chunk table {expected_off} exceeds MAX_UNSEALED_BLOB_BYTES ({MAX_UNSEALED_BLOB_BYTES}); refusing"
+                );
+                return None;
+            }
         }
         // A sealed writer emits the whole ciphertext (plaintext + one AEAD
         // tag); legacy manifests written by `store_blob` do too. Synthetic /
@@ -8389,6 +8667,9 @@ impl Node {
                 "[node] fetch_blob {bucket}/{name}: manifest size {size} inconsistent with \
                  {expected_off} ciphertext bytes"
             );
+            return None;
+        }
+        if !sealed && expected_off > MAX_UNSEALED_BLOB_BYTES.saturating_add(16) {
             return None;
         }
         // Assemble the ciphertext with ONE capacity decision instead of
@@ -8405,13 +8686,18 @@ impl Node {
         let mut buf: Vec<u8> = Vec::with_capacity(expected_off.min(ASSEMBLY_RESERVE_CAP));
         for c in chunks {
             let cid = c["id"].as_str().unwrap_or("");
-            let mut got = self.local_chunk_get_async(bucket, cid).await;
+            let expected_len = usize::try_from(c["len"].as_u64()?).ok()?;
+            let bounded_limit = expected_len.min(BLOB_CHUNK_BYTES);
+            let mut got = self
+                .local_chunk_get_bounded_async(bucket, cid, bounded_limit)
+                .await;
             if got.is_none() {
                 // таргет = blake3("{bucket}:{cid}") — совпадает с записью (store_chunk_replicated)
                 let h = blake3::hash(format!("{bucket}:{cid}").as_bytes());
                 let mut target = [0u8; NODEID_LEN];
                 target.copy_from_slice(&h.as_bytes()[..NODEID_LEN]);
                 let closest = self.dht_find_node(&target).await;
+                let max_b64_len = bounded_limit.div_ceil(3) * 4 + 4;
                 // ДВА ПРОХОДА (см. fetch_mail_inner): живые соединения первыми.
                 for pass in 0..2u8 {
                     if got.is_some() {
@@ -8439,17 +8725,28 @@ impl Node {
                                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
                                     if v["ok"].as_bool().unwrap_or(false) {
                                         if let Some(b64) = v["data"].as_str() {
-                                            got = base64::Engine::decode(
-                                                &base64::engine::general_purpose::STANDARD,
-                                                b64,
-                                            )
-                                            .ok();
+                                            if b64.len() <= max_b64_len {
+                                                got = base64::Engine::decode(
+                                                    &base64::engine::general_purpose::STANDARD,
+                                                    b64,
+                                                )
+                                                .ok();
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                     }
+                }
+            }
+            if let Some(g) = &got {
+                if g.len() != expected_len || g.len() > BLOB_CHUNK_BYTES {
+                    eprintln!(
+                        "[node] fetch_blob {bucket}/{name}: chunk {cid} len {} != expected {expected_len}; discarding",
+                        g.len()
+                    );
+                    got = None;
                 }
             }
             // проверка целостности: хэш чанка должен совпасть с манифестом (подмена?)
@@ -8462,7 +8759,17 @@ impl Node {
                     }
                 }
             }
-            buf.extend_from_slice(&got?);
+            let g = got?;
+            let new_total = buf.len().checked_add(g.len())?;
+            if new_total > expected_off
+                || (!sealed && new_total > MAX_UNSEALED_BLOB_BYTES.saturating_add(16))
+            {
+                eprintln!(
+                    "[node] fetch_blob {bucket}/{name}: assembled bytes {new_total} exceed bound; rejecting"
+                );
+                return None;
+            }
+            buf.extend_from_slice(&g);
         }
         let plain = e2e_decrypt_aad(&dk, &nonce, &aad, &buf).ok()?;
         if let Some(want) = want_hash {
@@ -9182,7 +9489,7 @@ async fn frame_loop(
 /// at most `n - 1` times: the LAST receiver takes ownership of the original.
 ///
 /// Hot path: each inbound `pubsub.msg` carries one JSON string that can be as
-/// large as `MAX_PUBSUB_DATA_LEN` (1 MiB); the old loop cloned that whole
+/// large as `MAX_PUBSUB_DATA_LEN`; the old loop cloned that whole
 /// string once per subscriber even when there was exactly one (the common
 /// case: one local websocket/aggregator per node). Bytes handed to every
 /// subscriber are identical — only the ownership of the final copy differs.
@@ -9318,6 +9625,25 @@ async fn handle_stream(
     };
 
     if f.kind == proto::kind::CHALLENGE {
+        if let Some(pid) = authed {
+            if f.src != pid {
+                node.rep_record_protocol_violation(&pid).await;
+                conn.close(
+                    quinn::VarInt::from(0u32),
+                    b"post-auth challenge src mismatch",
+                );
+                bail!("post-auth challenge src mismatch");
+            }
+            if let Some(peer) = node.peers.read().await.get(&pid).cloned() {
+                let rate = peer.cfg.rate_limit_per_sec;
+                if !peer.rate.lock().await.allow(rate) {
+                    node.rep_record_rate_violation(&pid).await;
+                }
+            }
+            node.rep_record_protocol_violation(&pid).await;
+            conn.close(quinn::VarInt::from(0u32), b"post-auth challenge rejected");
+            bail!("unexpected post-auth challenge");
+        }
         let claimed = f.src;
         // F8-rep identity gate (extends the IP accept hardening): a banned
         // or soft-throttled identity is refused here even from a fresh IP, so
@@ -10007,6 +10333,11 @@ pub const MAX_BLOB_CHUNKS: usize = 4096;
 
 /// Ciphertext chunk size used by [`Node::store_blob_boxed_with_ttl`].
 pub const BLOB_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Aggregate byte limit on unauthenticated / unsealed blob manifests fetched
+/// via [`Node::fetch_blob`] (64 MiB). Sealed owner-authenticated blobs
+/// (`BLOB_SEAL_V1`) are authenticated by MAC/Falcon before chunk download.
+pub const MAX_UNSEALED_BLOB_BYTES: usize = 64 * 1024 * 1024;
 
 /// Outcome of a sealed bucket write.
 ///

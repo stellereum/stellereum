@@ -923,6 +923,38 @@ impl CompactResolver {
         }))
     }
 
+    /// Re-check a replayed `CompactProposal` against `index` WITHOUT
+    /// incrementing `self.attempts` on a miss.
+    ///
+    /// Prevents a duplicate/replayed compact announcement from burning through
+    /// `COMPACT_PULL_MAX_ATTEMPTS` and forcing a spurious `FullProposal`
+    /// fallback while the receiver is still waiting for a `Body`.
+    pub fn resolve_cached_replay(
+        &mut self,
+        index: &ShortIdIndex,
+    ) -> Result<Option<Resolution>, CompactRefusal> {
+        if index.salt() != &self.salt {
+            return Err(CompactRefusal::IndexSaltMismatch);
+        }
+        let mut any_missing = false;
+        for id in &self.proposal.short_ids {
+            if self.resolved.contains_key(id) {
+                continue;
+            }
+            if let Some(tx) = index.resolve(id) {
+                self.resolved.insert(*id, tx.clone());
+            } else {
+                any_missing = true;
+            }
+        }
+        if !any_missing {
+            self.complete()
+                .map(|b| Some(Resolution::Complete(Box::new(b))))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Accept a `Body` response and continue resolution.
     ///
     /// Fail-closed: a duplicate/mismatched entry, an id the proposal never

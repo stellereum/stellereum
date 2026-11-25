@@ -274,9 +274,10 @@ async fn audit_oversized_messages_refused() {
     );
 
     // Pubsub payload 2 MiB over the 1 MiB cap.
-    let p = serde_json::json!({ "topic": "audit", "data": "d".repeat(2 * 1024 * 1024) })
-        .to_string()
-        .into_bytes();
+    let p =
+        serde_json::json!({ "topic": "audit", "data": "d".repeat(proto::MAX_PUBSUB_DATA_LEN + 1) })
+            .to_string()
+            .into_bytes();
     let r = tokio::time::timeout(
         Duration::from_secs(20),
         a.request_to(b_id, "pubsub.publish", p),
@@ -912,5 +913,7 @@ fn audit_no_privilege_inflation() {
     assert!(!proto::dht_key_ok(""));
     assert!(!proto::dht_key_ok(&"k".repeat(600)));
     assert!(!proto::dht_value_ok(&"v".repeat(2 * 1024 * 1024)));
-    assert!(!proto::pubsub_data_ok(&"d".repeat(2 * 1024 * 1024)));
+    assert!(!proto::pubsub_data_ok(
+        &"d".repeat(proto::MAX_PUBSUB_DATA_LEN + 1)
+    ));
 }

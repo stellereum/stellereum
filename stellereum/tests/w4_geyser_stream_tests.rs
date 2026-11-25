@@ -356,7 +356,7 @@ async fn stream_seq_replay_and_lagged_notice() {
     .await
     .expect("sse handler");
     let mut body = resp.into_body().into_data_stream();
-    const SSES_OVERFLOW: usize = 2048;
+    const SSES_OVERFLOW: usize = stellereum::rpc::STREAM_BROADCAST_CAPACITY + 1024;
     for i in 0..SSES_OVERFLOW {
         hub().publish(
             &SubscriptionTopic::NewTxs,
@@ -394,7 +394,7 @@ async fn stream_seq_replay_and_lagged_notice() {
     let _ = ws_call(&mut ws, 3, "stell_subscribe", json!(["newTxs"])).await;
     // No `.await` below: on the single-threaded test runtime the session task
     // cannot drain, so the broadcast queue overflows deterministically.
-    for i in 0..3_000u64 {
+    for i in 0..(stellereum::rpc::STREAM_BROADCAST_CAPACITY as u64 + 1024) {
         hub().publish(
             &SubscriptionTopic::NewTxs,
             json!({"hash": hex32([0xD2u8; 32]), "n": i, "pad": "x".repeat(1024)}),

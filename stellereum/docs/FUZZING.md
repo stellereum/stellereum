@@ -173,3 +173,23 @@ crash fails the job and uploads `fuzz/artifacts/**`. The existing `ci.yml`
 smoke job builds the harness and replays a small number of runs on pull
 requests; it is a compile/regression check, not a substitute for the nightly
 run.
+
+## Initial verified run (2026-11-25)
+
+All 10 targets ran sequentially under `cargo +nightly fuzz run` with
+`-rss_limit_mb=3072`, `taskset -c 8-11 nice -n 19`: **23,550,124 total
+executions, 0 crashes, 0 panics, 0 OOMs**.
+
+| Target | Duration | Executed units | Avg exec/s | Peak RSS (MiB) | Result |
+| --- | --- | --- | --- | --- | --- |
+| `consensus_msg_decode` | 61s | 707,605 | 11,600 | 126 | 0 crashes |
+| `block_decode` | 21s | 144,160 | 6,864 | 94 | 0 crashes |
+| `cert_envelope_decode` | 21s | 8,242,876 | 392,517 | 559 | 0 crashes |
+| `evm_raw_tx_decode` | 21s | 2,367,585 | 112,742 | 471 | 0 crashes |
+| `falcon_sig_decode` | 21s | 938,658 | 44,698 | 605 | 0 crashes |
+| `frame_decode` | 21s | 8,540,334 | 406,682 | 486 | 0 crashes |
+| `peer_msg_decode` | 21s | 179,811 | 8,562 | 97 | 0 crashes |
+| `rpc_json_decode` | 21s | 1,996,878 | 95,089 | 531 | 0 crashes |
+| `transaction_decode` | 21s | 217,166 | 10,341 | 95 | 0 crashes |
+| `vote_qc_decode` | 21s | 215,051 | 10,240 | 94 | 0 crashes |
+

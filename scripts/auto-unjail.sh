@@ -76,8 +76,8 @@ node_height() { # transport target port
 
 do_unjail() { # transport target port dir validator rpc
     local transport="$1" target="$2" port="$3" dir="$4" vid="$5" rpc_url="$6"
-    local envf="$dir/env.$(basename "$dir" | sed 's/^node//')"
-    local cmd="set -a; . $envf; set +a; $dir/stellereum validator unjail --withdrawal-key-file $dir/keys/withdrawal.key --validator-id $vid --rpc $rpc_url"
+    local suffix; suffix="$(basename "$dir" | sed 's/^node//')"
+    local cmd="set -a; if [ -f $dir/env.$suffix ]; then . $dir/env.$suffix; elif [ -f $(dirname "$dir")/env.$suffix ]; then . $(dirname "$dir")/env.$suffix; fi; set +a; $dir/stellereum validator unjail --withdrawal-key-file $dir/keys/withdrawal.key --validator-id $vid --rpc $rpc_url"
     if [ "$transport" = local ]; then
         bash -c "$cmd" 2>&1 | tail -n 4
     else

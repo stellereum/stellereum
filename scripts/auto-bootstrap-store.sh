@@ -466,6 +466,9 @@ if [[ -n "$SHA256_URL" ]]; then
     fi
 fi
 
+log "verifying downloaded archive integrity (zstd -t)..."
+zstd -t "$ARCHIVE_FILE" >/dev/null 2>&1 || die "downloaded snapshot failed zstd integrity check (truncated/corrupt)"
+
 # 2. Stop/mask systemd unit and pause guard if requested and systemctl is active
 if [[ -n "$SYSTEMD_UNIT" ]]; then
     if systemd_is_active_bus; then

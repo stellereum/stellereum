@@ -1,20 +1,19 @@
 [Unit]
-Description=Stellereum RPC load-balancer tunnels (D:8551, C:8552)
-Documentation=file:/root/stellereum/scripts/rpc-lb-tunnels.sh
+Description=Stellereum RPC load-balancer reverse SSH tunnels (nodeA:8551->B, nodeA:8552->D)
+Documentation=file:/home/imm/stellereum-project/scripts/rpc-lb-tunnels.sh
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# The script spawns two ssh -N tunnels and waits; systemd restarts it if either
-# drops, which also re-creates both forwards.
-ExecStart=/usr/local/bin/rpc-lb-tunnels.sh
+# Runs from mainserver (which holds SSH keys + local node B on 127.0.0.1:8546)
+# and opens reverse tunnels to node A so node A never holds private SSH keys.
+ExecStart=/bin/sh /home/imm/stellereum-project/scripts/rpc-lb-tunnels.sh --reverse
 Restart=always
 RestartSec=5
-# SSH keys live for root; the tunnel needs nothing else.
-User=root
-NoNewPrivileges=yes
-ProtectSystem=full
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stell-rpc-tunnels
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

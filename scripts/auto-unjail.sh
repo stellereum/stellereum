@@ -26,6 +26,7 @@
 # local CLI there (or on this host for nodeB), it never copies key material.
 set -u
 
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PUBLIC_RPC="${STELL_PUBLIC_RPC:-https://rpc.stellereum.org}"
 MAX_GAP="${AUTO_UNJAIL_MAX_GAP:-20}"
 COOLDOWN="${AUTO_UNJAIL_COOLDOWN:-300}"
@@ -104,7 +105,11 @@ do_unjail() { # transport target port dir validator rpc
     q_suffix="$(printf '%q' "$suffix")"
     q_vid="$(printf '%q' "$vid")"
     q_rpc="$(printf '%q' "$rpc_url")"
-    cmd="set -a; if [ -f $q_dir/env.$q_suffix ]; then . $q_dir/env.$q_suffix; elif [ -f $q_parent/env.$q_suffix ]; then . $q_parent/env.$q_suffix; fi; set +a; $q_dir/stellereum validator unjail --withdrawal-key-file $q_dir/keys/withdrawal.key --validator-id $q_vid --rpc $q_rpc"
+    local cli="$q_dir/stellereum"
+    if [ "$transport" = local ] && [ -x "$ROOT_DIR/target/release/stellereum" ]; then
+        cli="$(printf '%q' "$ROOT_DIR/target/release/stellereum")"
+    fi
+    cmd="set -a; if [ -f $q_dir/env.$q_suffix ]; then . $q_dir/env.$q_suffix; elif [ -f $q_parent/env.$q_suffix ]; then . $q_parent/env.$q_suffix; fi; set +a; $cli validator unjail --withdrawal-key-file $q_dir/keys/withdrawal.key --validator-id $q_vid --rpc $q_rpc"
     if [ "$transport" = local ]; then
         bash -c "$cmd" 2>&1 | tail -n 4
     else

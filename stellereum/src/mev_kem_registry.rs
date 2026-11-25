@@ -477,11 +477,16 @@ fn truncate_history(history: &mut Vec<SupersededMevKemKey>) {
 }
 
 /// Fail-closed KEM admission: the bytes must be EXACTLY the ML-KEM-768
-/// encapsulation size ([`MEV_KEM_EK_LEN`]) — a removed classical X25519 key
-/// or any other shape is refused here, never silently encapsulated to.
+/// encapsulation size ([`MEV_KEM_EK_LEN`]) and a valid FIPS-203 ML-KEM-768
+/// encapsulation key (`ml_kem::EncapsulationKey768::new`) — a removed classical
+/// X25519 key or non-canonical/malformed encoding is refused here, never
+/// silently accepted or encapsulated to.
 fn validate_ek_bytes(ek: &[u8]) -> Result<(), MevKemRegistryError> {
     if ek.len() != MEV_KEM_EK_LEN {
         return Err(MevKemRegistryError::MalformedKey);
     }
+    let key = ml_kem::kem::Key::<ml_kem::EncapsulationKey768>::try_from(ek)
+        .map_err(|_| MevKemRegistryError::MalformedKey)?;
+    ml_kem::EncapsulationKey768::new(&key).map_err(|_| MevKemRegistryError::MalformedKey)?;
     Ok(())
 }

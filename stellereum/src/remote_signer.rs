@@ -136,6 +136,8 @@ pub const DEFAULT_SIGN_PATH: &str = "/sign";
 pub const DEFAULT_V2_PUBLIC_KEY_PATH: &str = "/v2/public_key";
 /// Default v2 path (relative to the base URL) signing a structured consensus request.
 pub const DEFAULT_V2_SIGN_PATH: &str = "/v2/sign";
+/// Default v2 path (relative to the base URL) durably recording a consensus lock update.
+pub const DEFAULT_V2_SET_LOCK_PATH: &str = "/v2/set_lock";
 
 // ============================================================================
 // Errors
@@ -695,14 +697,15 @@ impl HttpSignerTransport {
             base_url.pop();
         }
         let timeout = DEFAULT_TIMEOUT;
+        let https_only = !is_loopback_base_url(&base_url);
         Self {
             base_url,
             public_key_path: DEFAULT_PUBLIC_KEY_PATH.to_string(),
             sign_path: DEFAULT_SIGN_PATH.to_string(),
             auth: None,
             timeout,
-            https_only: false,
-            agent: build_agent(timeout, false),
+            https_only,
+            agent: build_agent(timeout, https_only),
         }
     }
 
@@ -758,10 +761,27 @@ impl HttpSignerTransport {
         self
     }
 
+    pub fn is_https_only(&self) -> bool {
+        self.https_only
+    }
+
     /// The configured base URL. Public because it is not a secret, unlike the
     /// auth header.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    fn check_scheme_policy(&self) -> Result<(), SignerError> {
+        if self.https_only
+            && self
+                .base_url
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("http://")
+        {
+            return Err(SignerError::PlainHttpForbiddenOnNonLoopback);
+        }
+        Ok(())
     }
 
     fn request(&self, method: &str, path: &str) -> ureq::Request {
@@ -866,6 +886,7 @@ impl fmt::Debug for HttpSignerTransport {
 
 impl SignerTransport for HttpSignerTransport {
     fn public_key(&self) -> Result<[u8; PUBLIC_KEY_LEN], SignerError> {
+        self.check_scheme_policy()?;
         let body = self.finish(self.request("GET", &self.public_key_path).call())?;
         let parsed: PublicKeyResponseBody = serde_json::from_slice(&body).map_err(|e| {
             // `classify` only, never `e`: a serde error Display quotes the
@@ -892,6 +913,7 @@ impl SignerTransport for HttpSignerTransport {
     }
 
     fn sign(&self, msg: &[u8]) -> Result<[u8; SIGNATURE_LEN], SignerError> {
+        self.check_scheme_policy()?;
         let hex_msg = hex::encode(msg);
         let request_body = serde_json::to_string(&SignRequestBody { message: &hex_msg })
             // Unreachable: a `&str` always serialises. Kept explicit so the
@@ -1039,7 +1061,8 @@ pub fn remote_signer_from_config(
     let Some(url) = url.filter(|u| !u.trim().is_empty()) else {
         return Ok(None);
     };
-    let mut transport = HttpSignerTransport::new(url);
+    let enforce_https = !is_loopback_base_url(&url);
+    let mut transport = HttpSignerTransport::new(url).https_only(enforce_https);
     if let Some(token) = token.filter(|t| !t.trim().is_empty()) {
         transport = transport.with_bearer_token(token);
     }
@@ -1217,6 +1240,23 @@ pub struct ConsensusSafetyState {
     pub last_prevote: Option<SignedVoteStamp>,
     pub last_precommit: Option<SignedVoteStamp>,
     pub last_proposal: Option<SignedProposalStamp>,
+    /// Highest non-nil prevote at `height`: a subsequent `Prevote(r, None)`
+    /// advances `last_prevote` without erasing the earlier non-nil prevote's
+    /// target for cross-kind equivocation checks (W6-A1-3).
+    #[serde(default)]
+    pub last_non_nil_prevote: Option<SignedVoteStamp>,
+}
+
+/// Legacy pre-`last_non_nil_prevote` persisted layout for backwards-compatible
+/// bincode decoding of existing [`SafetyRecordStore`] entries.
+#[derive(Deserialize, Serialize)]
+struct LegacyConsensusSafetyStateV1 {
+    height: u64,
+    locked_round: Option<u32>,
+    locked_value_id: Option<[u8; 32]>,
+    last_prevote: Option<SignedVoteStamp>,
+    last_precommit: Option<SignedVoteStamp>,
+    last_proposal: Option<SignedProposalStamp>,
 }
 
 impl ConsensusSafetyState {
@@ -1238,6 +1278,7 @@ impl ConsensusSafetyState {
                 last_prevote: None,
                 last_precommit: None,
                 last_proposal: None,
+                last_non_nil_prevote: None,
             }
         } else {
             self.clone()
@@ -1272,11 +1313,15 @@ impl ConsensusSafetyState {
                         }
                     }
                 }
-                next.last_prevote = Some(SignedVoteStamp {
+                let stamp = SignedVoteStamp {
                     height: next.height,
                     round: *round,
                     target: *block_hash,
-                });
+                };
+                next.last_prevote = Some(stamp);
+                if block_hash.is_some() {
+                    next.last_non_nil_prevote = Some(stamp);
+                }
             }
             ConsensusSignRequest::Vote {
                 round,
@@ -1296,14 +1341,21 @@ impl ConsensusSafetyState {
                             _ => return Err(SignerError::SafetyViolation),
                         }
                     }
-                    if let Some(last_pv) = next.last_prevote {
-                        if last_pv.round >= *round {
-                            if let Some(pv_bh) = last_pv.target {
+                    for prevote_stamp in [next.last_prevote, next.last_non_nil_prevote]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if prevote_stamp.round >= *round {
+                            if let Some(pv_bh) = prevote_stamp.target {
                                 if Some(pv_bh) != *block_hash {
                                     return Err(SignerError::SafetyViolation);
                                 }
                             }
                         }
+                    }
+                    if value_id.is_some() && next.locked_round.is_none_or(|lr| *round >= lr) {
+                        next.locked_round = Some(*round);
+                        next.locked_value_id = value_id;
                     }
                 }
                 next.last_precommit = Some(SignedVoteStamp {
@@ -1343,8 +1395,24 @@ fn decode_safety_state(bytes: &[u8]) -> Result<ConsensusSafetyState, SignerError
     if bytes.len() < SAFETY_V2_MAGIC.len() || &bytes[..SAFETY_V2_MAGIC.len()] != SAFETY_V2_MAGIC {
         return Err(SignerError::SafetyStoreQuarantined);
     }
-    bincode::deserialize(&bytes[SAFETY_V2_MAGIC.len()..])
-        .map_err(|_| SignerError::SafetyStoreQuarantined)
+    let body = &bytes[SAFETY_V2_MAGIC.len()..];
+    if let Ok(state) = bincode::deserialize::<ConsensusSafetyState>(body) {
+        return Ok(state);
+    }
+    if let Ok(legacy) = bincode::deserialize::<LegacyConsensusSafetyStateV1>(body) {
+        if bincode::serialized_size(&legacy).ok() == Some(body.len() as u64) {
+            return Ok(ConsensusSafetyState {
+                height: legacy.height,
+                locked_round: legacy.locked_round,
+                locked_value_id: legacy.locked_value_id,
+                last_prevote: legacy.last_prevote,
+                last_precommit: legacy.last_precommit,
+                last_proposal: legacy.last_proposal,
+                last_non_nil_prevote: None,
+            });
+        }
+    }
+    Err(SignerError::SafetyStoreQuarantined)
 }
 
 struct SafetyGuardInner {
@@ -1438,6 +1506,17 @@ impl ConsensusSafetyGuard {
 
     /// Record a lock update durably (advancing generation before returning).
     pub fn set_lock(&self, height: u64, round: u32, value_id: [u8; 32]) -> Result<(), SignerError> {
+        self.set_lock_with_generation(height, round, value_id)
+            .map(|_| ())
+    }
+
+    /// Record a lock update durably and return the resulting safety generation.
+    pub fn set_lock_with_generation(
+        &self,
+        height: u64,
+        round: u32,
+        value_id: [u8; 32],
+    ) -> Result<u64, SignerError> {
         let mut g = self
             .inner
             .lock()
@@ -1447,6 +1526,12 @@ impl ConsensusSafetyGuard {
         }
         if height < g.state.height {
             return Err(SignerError::SafetyViolation);
+        }
+        if height == g.state.height
+            && g.state.locked_round == Some(round)
+            && g.state.locked_value_id == Some(value_id)
+        {
+            return Ok(g.generation);
         }
         let mut next = if height > g.state.height {
             ConsensusSafetyState {
@@ -1477,7 +1562,7 @@ impl ConsensusSafetyGuard {
             g.generation = g.generation.saturating_add(1);
             g.state = next;
         }
-        Ok(())
+        Ok(g.generation)
     }
 
     /// Serialized check-persist-then-sign:
@@ -1582,6 +1667,21 @@ impl SignRequestV2 {
     }
 }
 
+/// JSON payload sent to `POST /v2/set_lock`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetLockRequestV2 {
+    pub validator_id: [u8; 32],
+    pub height: u64,
+    pub round: u32,
+    pub value_id: [u8; 32],
+}
+
+/// JSON payload returned by `POST /v2/set_lock`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetLockResponseV2 {
+    pub generation: u64,
+}
+
 /// JSON payload returned by `POST /v2/sign`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignResponseV2 {
@@ -1667,6 +1767,9 @@ pub trait PqSignerTransport: Send + Sync {
         &self,
         req: &SignRequestV2,
     ) -> Result<([u8; FALCON_SIGNATURE_LEN], u64), SignerError>;
+    fn set_lock(&self, _req: &SetLockRequestV2) -> Result<u64, SignerError> {
+        Ok(0)
+    }
 }
 
 /// In-process Falcon-512 consensus signer with anti-oracle preimage
@@ -1709,6 +1812,16 @@ impl LocalPqSigner {
 
     pub fn safety_guard(&self) -> &ConsensusSafetyGuard {
         &self.safety
+    }
+
+    pub fn set_lock_with_generation(
+        &self,
+        height: u64,
+        round: u32,
+        value_id: [u8; 32],
+    ) -> Result<u64, SignerError> {
+        self.safety
+            .set_lock_with_generation(height, round, value_id)
     }
 
     pub fn sign_consensus_with_generation(
@@ -1897,6 +2010,26 @@ impl PqSigner for RemotePqSigner {
         round: u32,
         value_id: [u8; 32],
     ) -> Result<(), SignerError> {
+        let snap = self.safety.state_snapshot()?;
+        if height < snap.height {
+            return Err(SignerError::SafetyViolation);
+        }
+        if height == snap.height
+            && snap.locked_round == Some(round)
+            && snap.locked_value_id == Some(value_id)
+        {
+            return Ok(());
+        }
+        if height == snap.height && snap.locked_round.is_some_and(|lr| round <= lr) {
+            return Err(SignerError::SafetyViolation);
+        }
+        let wire_req = SetLockRequestV2 {
+            validator_id: self.validator_id,
+            height,
+            round,
+            value_id,
+        };
+        let _remote_gen = self.transport.set_lock(&wire_req)?;
         self.safety.set_lock(height, round, value_id)
     }
 }
@@ -1922,13 +2055,15 @@ pub fn is_loopback_base_url(base_url: &str) -> bool {
     false
 }
 
-/// HTTP v2 client transport speaking `/v2/public_key` and `/v2/sign` with
-/// Falcon-512 payloads, `MAX_RESPONSE_BYTES` (`8192`) cap, no redirects, no
-/// env proxy discovery, and automatic `https_only(true)` on non-loopback URLs.
+/// HTTP v2 client transport speaking `/v2/public_key`, `/v2/sign`, and
+/// `/v2/set_lock` with Falcon-512 payloads, `MAX_RESPONSE_BYTES` (`8192`) cap,
+/// no redirects, no env proxy discovery, and automatic `https_only(true)` on
+/// non-loopback URLs.
 pub struct HttpPqSignerTransport {
     base_url: String,
     public_key_path: String,
     sign_path: String,
+    set_lock_path: String,
     auth: Option<(String, String)>,
     timeout: Duration,
     https_only: bool,
@@ -1947,6 +2082,7 @@ impl HttpPqSignerTransport {
             base_url,
             public_key_path: DEFAULT_V2_PUBLIC_KEY_PATH.to_string(),
             sign_path: DEFAULT_V2_SIGN_PATH.to_string(),
+            set_lock_path: DEFAULT_V2_SET_LOCK_PATH.to_string(),
             auth: None,
             timeout,
             https_only,
@@ -1961,6 +2097,11 @@ impl HttpPqSignerTransport {
     ) -> Self {
         self.public_key_path = public_key_path.into();
         self.sign_path = sign_path.into();
+        self
+    }
+
+    pub fn with_set_lock_path(mut self, set_lock_path: impl Into<String>) -> Self {
+        self.set_lock_path = set_lock_path.into();
         self
     }
 
@@ -2054,6 +2195,7 @@ impl fmt::Debug for HttpPqSignerTransport {
             .field("base_url", &self.base_url)
             .field("public_key_path", &self.public_key_path)
             .field("sign_path", &self.sign_path)
+            .field("set_lock_path", &self.set_lock_path)
             .field("timeout", &self.timeout)
             .field("https_only", &self.https_only)
             .field("auth_header", &self.auth.as_ref().map(|(name, _)| name))
@@ -2072,6 +2214,11 @@ struct RawPublicKeyResponseV2 {
 struct RawSignResponseV2 {
     scheme_id: Option<u8>,
     signature: Option<String>,
+    generation: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct RawSetLockResponseV2 {
     generation: Option<u64>,
 }
 
@@ -2162,6 +2309,37 @@ impl PqSignerTransport for HttpPqSignerTransport {
         ))?;
         Ok((signature, generation))
     }
+
+    fn set_lock(&self, req: &SetLockRequestV2) -> Result<u64, SignerError> {
+        self.check_scheme_policy()?;
+        let request_body = serde_json::to_string(req)
+            .map_err(|_| SignerError::Transport(TransportErrorKind::Request))?;
+        let body = self
+            .finish(
+                self.request("POST", &self.set_lock_path)
+                    .set("Content-Type", "application/json")
+                    .send_string(&request_body),
+            )
+            .map_err(|e| match e {
+                SignerError::Transport(TransportErrorKind::Rejected { status: 409 }) => {
+                    SignerError::SafetyViolation
+                }
+                SignerError::Transport(TransportErrorKind::Rejected { status: 503 }) => {
+                    SignerError::SafetyStoreQuarantined
+                }
+                other => other,
+            })?;
+        let parsed: RawSetLockResponseV2 = serde_json::from_slice(&body).map_err(|e| {
+            tracing::debug!(
+                "[remote-signer-v2] set_lock response is not valid json ({:?})",
+                e.classify()
+            );
+            SignerError::MalformedResponse(MalformedResponseKind::BadJson)
+        })?;
+        parsed.generation.ok_or(SignerError::MalformedResponse(
+            MalformedResponseKind::MissingField,
+        ))
+    }
 }
 
 /// Reference HTTP v2 remote signer service enforcing anti-oracle preimage
@@ -2234,6 +2412,21 @@ impl PqSignerService {
                         r#"{"error":"invalid_consensus_request"}"#.to_string(),
                     );
                 }
+                // Anti-spoof consistency (W6-A1-3): nil votes and proposals carry
+                // no block-vote value_id; reject malformed/spoofed value_id tags.
+                let spurious_value_id = match &req.request {
+                    ConsensusSignRequest::Vote {
+                        block_hash: None, ..
+                    }
+                    | ConsensusSignRequest::Proposal { .. } => req.value_id.is_some(),
+                    ConsensusSignRequest::Vote {
+                        block_hash: Some(_),
+                        ..
+                    } => false,
+                };
+                if spurious_value_id {
+                    return (400, r#"{"error":"invalid_consensus_request"}"#.to_string());
+                }
                 match self
                     .signer
                     .sign_consensus_with_generation(&req.request, req.value_id)
@@ -2256,6 +2449,34 @@ impl PqSignerService {
                         (503, r#"{"error":"safety_store_quarantined"}"#.to_string())
                     }
                     Err(_) => (500, r#"{"error":"signing_failed"}"#.to_string()),
+                }
+            }
+            ("POST", DEFAULT_V2_SET_LOCK_PATH) => {
+                let req: SetLockRequestV2 = match serde_json::from_slice(body) {
+                    Ok(r) => r,
+                    Err(_) => return (400, r#"{"error":"bad_json"}"#.to_string()),
+                };
+                if req.validator_id != self.signer.validator_id() {
+                    return (400, r#"{"error":"validator_id_mismatch"}"#.to_string());
+                }
+                match self
+                    .signer
+                    .set_lock_with_generation(req.height, req.round, req.value_id)
+                {
+                    Ok(generation) => {
+                        let resp = SetLockResponseV2 { generation };
+                        match serde_json::to_string(&resp) {
+                            Ok(json) => (200, json),
+                            Err(_) => (500, r#"{"error":"serialization_failed"}"#.to_string()),
+                        }
+                    }
+                    Err(SignerError::SafetyViolation) => {
+                        (409, r#"{"error":"safety_violation"}"#.to_string())
+                    }
+                    Err(SignerError::SafetyStoreQuarantined) => {
+                        (503, r#"{"error":"safety_store_quarantined"}"#.to_string())
+                    }
+                    Err(_) => (500, r#"{"error":"set_lock_failed"}"#.to_string()),
                 }
             }
             _ => (404, r#"{"error":"not_found"}"#.to_string()),

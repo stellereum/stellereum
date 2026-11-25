@@ -2187,33 +2187,40 @@ struct FalconPubkeyCache {
     /// FIFO ring of keys inserted into `lru`, in insertion order. Promotion to
     /// the pinned tier leaves stale keys here; eviction skips them.
     order: std::collections::VecDeque<[u8; 32]>,
-    /// Never-evict tier: consensus-grade keys, bounded by
-    /// [`FALCON_PUBKEY_PINNED_CAP`] (its own ring, so even this tier evicts
-    /// one oldest entry instead of being unbounded).
+    /// Never-evict tier for tx-promoted keys, bounded by
+    /// `FALCON_PUBKEY_PINNED_CAP.saturating_sub(explicit_pinned.len())`.
     pinned: HashMap<[u8; 32], [u16; 512]>,
     pinned_order: std::collections::VecDeque<[u8; 32]>,
+    /// Dedicated never-evict tier for explicitly pinned validator consensus
+    /// keys (`pin_falcon_pubkey`). Traffic-driven `note_verified` promotions
+    /// can NEVER evict keys from this map (W6-A7-8).
+    explicit_pinned: HashMap<[u8; 32], [u16; 512]>,
+    explicit_pinned_order: std::collections::VecDeque<[u8; 32]>,
 }
 
 impl FalconPubkeyCache {
     fn len(&self) -> usize {
-        self.lru.len() + self.pinned.len()
+        self.lru.len() + self.pinned.len() + self.explicit_pinned.len()
     }
 
     #[cfg(test)]
     fn contains_key(&self, key: &[u8; 32]) -> bool {
-        self.pinned.contains_key(key) || self.lru.contains_key(key)
+        self.explicit_pinned.contains_key(key)
+            || self.pinned.contains_key(key)
+            || self.lru.contains_key(key)
     }
 
     fn get(&self, key: &[u8; 32]) -> Option<[u16; 512]> {
-        self.pinned
+        self.explicit_pinned
             .get(key)
             .copied()
+            .or_else(|| self.pinned.get(key).copied())
             .or_else(|| self.lru.get(key).map(|e| e.h_ntt))
     }
 
     /// Insert a freshly decoded key, evicting at most ONE oldest LRU entry.
     fn insert(&mut self, key: [u8; 32], h_ntt: [u16; 512]) {
-        if self.pinned.contains_key(&key) {
+        if self.explicit_pinned.contains_key(&key) || self.pinned.contains_key(&key) {
             return;
         }
         if let Some(entry) = self.lru.get_mut(&key) {
@@ -2240,9 +2247,9 @@ impl FalconPubkeyCache {
     }
 
     /// Record a SUCCESSFUL verification and promote repeatedly-good keys to the
-    /// never-evict tier.
+    /// auto-pinned tier (never evicting `explicit_pinned` validator keys).
     fn note_verified(&mut self, key: &[u8; 32]) {
-        if self.pinned.contains_key(key) {
+        if self.explicit_pinned.contains_key(key) || self.pinned.contains_key(key) {
             return;
         }
         let Some(entry) = self.lru.get_mut(key) else {
@@ -2257,13 +2264,43 @@ impl FalconPubkeyCache {
         self.pin(*key, h_ntt);
     }
 
-    /// Move a key into the never-evict tier. When the tier is full the OLDEST
-    /// pin is dropped (one entry, never a wholesale clear).
+    /// Move a key into the auto-pinned tier. When the tier is full the OLDEST
+    /// auto-pinned entry is dropped (never touching `explicit_pinned`).
     fn pin(&mut self, key: [u8; 32], h_ntt: [u16; 512]) {
+        if self.explicit_pinned.contains_key(&key) {
+            return;
+        }
+        let max_auto_pinned = FALCON_PUBKEY_PINNED_CAP.saturating_sub(self.explicit_pinned.len());
+        if max_auto_pinned == 0 {
+            return;
+        }
         if self.pinned.insert(key, h_ntt).is_none() {
             self.pinned_order.push_back(key);
         }
-        while self.pinned.len() > FALCON_PUBKEY_PINNED_CAP {
+        while self.pinned.len() > max_auto_pinned {
+            let Some(oldest) = self.pinned_order.pop_front() else {
+                break;
+            };
+            self.pinned.remove(&oldest);
+        }
+    }
+
+    /// Explicitly pin a consensus validator key in the dedicated
+    /// `explicit_pinned` map so ordinary tx traffic can never evict it.
+    fn pin_explicit(&mut self, key: [u8; 32], h_ntt: [u16; 512]) {
+        self.lru.remove(&key);
+        self.pinned.remove(&key);
+        if self.explicit_pinned.insert(key, h_ntt).is_none() {
+            self.explicit_pinned_order.push_back(key);
+        }
+        while self.explicit_pinned.len() > FALCON_PUBKEY_PINNED_CAP {
+            let Some(oldest) = self.explicit_pinned_order.pop_front() else {
+                break;
+            };
+            self.explicit_pinned.remove(&oldest);
+        }
+        let max_auto_pinned = FALCON_PUBKEY_PINNED_CAP.saturating_sub(self.explicit_pinned.len());
+        while self.pinned.len() > max_auto_pinned {
             let Some(oldest) = self.pinned_order.pop_front() else {
                 break;
             };
@@ -2275,10 +2312,11 @@ impl FalconPubkeyCache {
 static FALCON_PUBKEY_CACHE: std::sync::LazyLock<RwLock<FalconPubkeyCache>> =
     std::sync::LazyLock::new(|| RwLock::new(FalconPubkeyCache::default()));
 
-/// Pin a Falcon-512 public key into the never-evict tier.
+/// Pin a Falcon-512 public key into the dedicated never-evict consensus tier.
 ///
 /// Consensus PQ-key registration (validator keys) SHOULD call this so a burst
-/// of attacker-supplied transaction pubkeys can never evict a consensus key.
+/// of attacker-supplied transaction pubkeys (including `note_falcon_pubkey_verified`
+/// promotions) can never evict a consensus key.
 /// Returns `false` for a non-canonical or undecodable key (nothing is pinned).
 pub fn pin_falcon_pubkey(pubkey: &[u8]) -> bool {
     if pubkey.len() != FALCON512_PUBKEY_LEN || pubkey[0] != 0x09 {
@@ -2293,7 +2331,7 @@ pub fn pin_falcon_pubkey(pubkey: &[u8]) -> bool {
     FALCON_PUBKEY_CACHE
         .write()
         .unwrap_or_else(|e| e.into_inner())
-        .pin(key, h_ntt);
+        .pin_explicit(key, h_ntt);
     true
 }
 
@@ -3795,6 +3833,35 @@ mod tests {
             "a repeatedly-verified consensus key must be pinned"
         );
         assert_eq!(global.get(&consensus_key), Some(expected));
+    }
+
+    #[test]
+    fn test_explicit_pinned_validator_keys_never_evicted_by_tx_note_verified_flood() {
+        let mut cache = FalconPubkeyCache::default();
+        let validator_key = [0xAAu8; 32];
+        cache.pin_explicit(validator_key, [42u16; 512]);
+        assert!(cache.explicit_pinned.contains_key(&validator_key));
+
+        // Flood with > FALCON_PUBKEY_PINNED_CAP distinct verified tx keys.
+        for i in 0..(FALCON_PUBKEY_PINNED_CAP + 200) {
+            let mut tx_key = [0u8; 32];
+            tx_key[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            tx_key[8] = 0x77;
+            cache.insert(tx_key, [9u16; 512]);
+            for _ in 0..FALCON_PUBKEY_PIN_AFTER_SUCCESSES {
+                cache.note_verified(&tx_key);
+            }
+        }
+
+        assert!(
+            cache.explicit_pinned.contains_key(&validator_key),
+            "explicitly pinned validator key must never be evicted by tx verification traffic"
+        );
+        assert_eq!(cache.get(&validator_key), Some([42u16; 512]));
+        assert!(
+            cache.len() <= FALCON_PUBKEY_CACHE_CAP + FALCON_PUBKEY_PINNED_CAP,
+            "cache capacity bound must still hold"
+        );
     }
 
     #[test]

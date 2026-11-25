@@ -656,8 +656,12 @@ impl ValidatorRuntime {
         // schedule is (re)installed here, right before the producer runs
         // (review F2).
         self.install_committee_schedule();
-        let bh = self.hc.try_precommit_quorum()?;
-        let height = self.hc.height;
+        // Probe on a clone first so missing-body or validation refusals never
+        // mutate `self.hc.step = Step::Commit` / `self.hc.decided` / `self.hc.locked`
+        // (W6-A1-6).
+        let mut hc_probe = self.hc.clone();
+        let bh = hc_probe.try_precommit_quorum()?;
+        let height = hc_probe.height;
         // The block must actually be here.
         //
         // This used to be `if let Some(block) = ... { apply }` followed by
@@ -744,78 +748,58 @@ impl ValidatorRuntime {
             tracing::warn!(height, "{e}; refusing to finalize");
             return None;
         }
-        // Attach the precommit QC that decided this block, so the decision travels
-        // with the block. A block otherwise carries only the PROPOSER's signature,
-        // and every other validator's agreement exists only as a vote -- which is over
-        // `vote_sign_bytes`, a different message from the block hash, so those
-        // signatures can never verify as block signatures and grafting them was
-        // wrong. Block sync verifies the attached QC (kind, height, quorum) instead.
-        let mut finalized_block = block;
-        finalized_block.precommit_qc = self.hc.precommit_qc.clone();
-        // Replace the proposal-only version so what we serve and republish carries
-        // the decision proof and can be verified by anyone.
-        self.blocks.insert(bh, finalized_block.clone());
-        // Stash the decision proof for the commit broadcast: `try_finalize`
-        // resets `hc` below, so reading `hc.precommit_qc` afterwards (as the
-        // main loop once did) always finds None and the broadcast silently
-        // never fires -- lagging peers then never learn outcomes.
-        if let Some(qc) = self.hc.precommit_qc.clone() {
-            self.last_decision = Some((height, finalized_block.clone(), qc));
-            // The decision proof for this height is now known, so a failed
-            // boot reconstruction (DOWNTIME-RESTORE) no longer blocks proposal.
-            self.parent_evidence_missing = false;
-        }
-        // W10.5 HARDENING (fail LOUD, never finalize unilaterally): the QC
-        // that decided this block must carry quorum power under the set IN
-        // FORCE AT THIS HEIGHT. `try_precommit_quorum` already enforces
-        // quorum, so a failure here means the in-force set moved mid-flight
-        // (the activation-boundary bug) or the QC was assembled against a
-        // foreign set — either way finalizing would fork the chain, so the
-        // decision is refused with the exact shortfall attached. A node with
-        // only its own vote in a multi-validator set can never pass this.
-        {
-            let in_force = self.validator_set_for_height(height);
-            let Some(qc) = self.hc.precommit_qc.as_ref() else {
-                tracing::error!(
-                    height,
-                    "REFUSING to finalize: decided without a precommit QC (unilateral finalization is never allowed)"
-                );
-                eprintln!(
-                    "[quorum] REFUSING to finalize height {height}: decided without a precommit QC — unilateral finalization is never allowed"
-                );
-                crate::metrics::global().inc_weak_qc_refused();
-                return None;
-            };
-            let signed = self.qc_signed_power_for_height(&in_force, qc);
-            let required = in_force.quorum_power();
-            if signed < required {
-                tracing::error!(
-                    height,
-                    signed,
-                    required,
-                    total = in_force.total_power(),
-                    "REFUSING to finalize: deciding QC carries {signed} of {required} required power (total {}) — unilateral/weak finalization is never allowed",
-                    in_force.total_power(),
-                );
-                eprintln!(
-                    "[quorum] REFUSING to finalize height {height}: deciding QC carries {signed} of {required} required power — unilateral/weak finalization is never allowed"
-                );
-                crate::metrics::global().inc_weak_qc_refused();
-                return None;
-            }
-            let votes = self.hc.precommit_set(qc.round).cloned().unwrap_or_default();
-            self.decided_parent_votes = Some(DecidedParentVotes {
+        // W10.5 HARDENING (fail LOUD, never finalize unilaterally): validate the
+        // deciding QC against the set IN FORCE AT THIS HEIGHT before committing
+        // `hc_probe`, `blocks`, or `last_decision`.
+        let in_force = self.validator_set_for_height(height);
+        let Some(qc) = hc_probe.precommit_qc.clone() else {
+            tracing::error!(
                 height,
-                round: qc.round,
-                block_hash: bh,
-                shard_id: qc.shard_id,
-                validators: in_force,
-                parent_hash: self.hc.sortition_parent().copied(),
-                schedule: self.hc.committee_schedule,
-                votes,
-                decision_block_hash: bh,
-            });
+                "REFUSING to finalize: decided without a precommit QC (unilateral finalization is never allowed)"
+            );
+            eprintln!(
+                "[quorum] REFUSING to finalize height {height}: decided without a precommit QC — unilateral finalization is never allowed"
+            );
+            crate::metrics::global().inc_weak_qc_refused();
+            return None;
+        };
+        let signed = self.qc_signed_power_for_height(&in_force, &qc);
+        let required = in_force.quorum_power();
+        if signed < required {
+            tracing::error!(
+                height,
+                signed,
+                required,
+                total = in_force.total_power(),
+                "REFUSING to finalize: deciding QC carries {signed} of {required} required power (total {}) — unilateral/weak finalization is never allowed",
+                in_force.total_power(),
+            );
+            eprintln!(
+                "[quorum] REFUSING to finalize height {height}: deciding QC carries {signed} of {required} required power — unilateral/weak finalization is never allowed"
+            );
+            crate::metrics::global().inc_weak_qc_refused();
+            return None;
         }
+        // All checks passed: commit the probed consensus state and attach the
+        // precommit QC that decided this block.
+        self.hc = hc_probe;
+        let mut finalized_block = block;
+        finalized_block.precommit_qc = Some(qc.clone());
+        self.blocks.insert(bh, finalized_block.clone());
+        self.last_decision = Some((height, finalized_block.clone(), qc.clone()));
+        self.parent_evidence_missing = false;
+        let votes = self.hc.precommit_set(qc.round).cloned().unwrap_or_default();
+        self.decided_parent_votes = Some(DecidedParentVotes {
+            height,
+            round: qc.round,
+            block_hash: bh,
+            shard_id: qc.shard_id,
+            validators: in_force,
+            parent_hash: self.hc.sortition_parent().copied(),
+            schedule: self.hc.committee_schedule,
+            votes,
+            decision_block_hash: bh,
+        });
         let block = finalized_block;
         Some((height, bh, block))
     }

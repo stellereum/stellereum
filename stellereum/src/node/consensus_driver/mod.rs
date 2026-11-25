@@ -319,6 +319,13 @@ pub(super) fn should_publish_header_now(
 /// hash of the finalized block at `S`; `None` means the local store cannot
 /// prove it, and the caller must fail closed rather than propose above an
 /// unfinalized parent.
+/// True ONLY when `restore_last_decision_from_finalized_block` actually
+/// verified and retained a precommit QC for `fh` (not when it degraded to
+/// `last_decision = None` on a missing/forged/degenerate QC).
+pub(super) fn finalize_restore_qc_verified(rt: &ValidatorRuntime, fh: u64) -> bool {
+    rt.last_decision.as_ref().is_some_and(|(h, _, _)| *h == fh)
+}
+
 pub(super) async fn write_ahead_finalized_block(
     ap: &stellereum::storage::AsyncPersistence,
     height: u64,
@@ -1264,12 +1271,22 @@ pub(crate) async fn run_consensus_node(
                     Ok(Some(block)) => {
                         match rt.restore_last_decision_from_finalized_block(&block) {
                             Ok(()) => {
-                                restored_finalized_qc_verified = true;
-                                info!(
-                                    "[storage] DOWNTIME-RESTORE: rebuilt the parent decision evidence \
-                                     for finalized height {fh} ({}) from the persisted block",
-                                    hex::encode(fhash)
-                                );
+                                restored_finalized_qc_verified =
+                                    finalize_restore_qc_verified(&rt, fh);
+                                if restored_finalized_qc_verified {
+                                    info!(
+                                        "[storage] DOWNTIME-RESTORE: rebuilt the parent decision evidence \
+                                         for finalized height {fh} ({}) from the persisted block",
+                                        hex::encode(fhash)
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        height = fh,
+                                        hash = %hex::encode(fhash),
+                                        "DOWNTIME-RESTORE: finalized block lacks a verifiable precommit QC; \
+                                         degraded to no-decision state (restored_finalized_qc_verified=false)"
+                                    );
+                                }
                             }
                             Err(e) => {
                                 eprintln!(
@@ -1856,4 +1873,109 @@ pub(crate) async fn run_consensus_node(
     };
 
     tick::run_tick_loop(&cfg, &mut st).await;
+}
+
+#[cfg(test)]
+mod w7_mod_tests {
+    use super::*;
+
+    #[test]
+    fn degraded_restore_sets_restored_finalized_qc_verified_false_and_quarantines() {
+        let sk = SigningKey::from_bytes(&[0x31u8; 32]);
+        let vid = sk.verifying_key().to_bytes();
+        let vset = ValidatorSet::from_list(vec![(vid, 10)]);
+        let engine = Arc::new(InMemoryStateEngine::new());
+        let mut rt = ValidatorRuntime::new(sk, vset, engine, 0);
+
+        let mut b1 = stellereum::sharding::Block {
+            height: 1,
+            prev_hash: [0u8; 32],
+            proposer: vid,
+            timestamp: 1_700_000_001,
+            precommit_qc: None,
+            ..Default::default()
+        };
+        let bh1 = b1.compute_hash();
+        // Deliberately forged/empty QC: restore_last_decision_from_finalized_block
+        // degrades to last_decision = None and returns Ok(()).
+        b1.precommit_qc = Some(stellereum::consensus::QuorumCertificate {
+            height: 1,
+            round: 0,
+            kind: stellereum::consensus::VoteKind::Precommit,
+            block_hash: Some(bh1),
+            signatures: vec![],
+            shard_id: 0,
+        });
+        rt.finalized.push((1, bh1));
+        rt.hc.height = 2;
+
+        rt.restore_last_decision_from_finalized_block(&b1)
+            .expect("degrades to Ok(())");
+        assert!(rt.last_decision.is_none());
+        let qc_verified = finalize_restore_qc_verified(&rt, 1);
+        assert!(
+            !qc_verified,
+            "degraded restore without a valid QC must keep restored_finalized_qc_verified=false"
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "stell_w6_a1_2_driver_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Arc::new(stellereum::storage::Storage::open(&dir).expect("open storage"));
+        let identity = stellereum::storage::SafetyRecordIdentity {
+            validator: vid,
+            chain: [0x55u8; 32],
+            shard: 0,
+        };
+        // Seed safety_record_v1 at finalized_height=0, height=1.
+        let init_ctx = stellereum::safety::SafetyBootContext {
+            is_validator: true,
+            is_observer_env: false,
+            new_chain_explicit: true,
+            restored_finalized: None,
+            restored_state_height: Some(0),
+            restored_finalized_qc_verified: true,
+            legacy_checkpoint: None,
+            legacy_watermark: None,
+        };
+        let auth0 = stellereum::safety::SafetyAuthority::open_from_storage(
+            storage.clone(),
+            identity.clone(),
+            init_ctx,
+        );
+        assert_eq!(auth0.mode(), stellereum::safety::AuthorityMode::Active);
+        drop(auth0);
+
+        // Reboot with restored_fh=1 > safety.finalized_height=0 and qc_verified=false: MUST quarantine!
+        let reboot_ctx = stellereum::safety::SafetyBootContext {
+            is_validator: true,
+            is_observer_env: false,
+            new_chain_explicit: false,
+            restored_finalized: Some((1, bh1)),
+            restored_state_height: Some(1),
+            restored_finalized_qc_verified: qc_verified,
+            legacy_checkpoint: None,
+            legacy_watermark: None,
+        };
+        let auth1 = stellereum::safety::SafetyAuthority::open_from_storage(
+            storage.clone(),
+            identity,
+            reboot_ctx,
+        );
+        assert!(
+            matches!(
+                auth1.mode(),
+                stellereum::safety::AuthorityMode::Quarantined(_)
+            ),
+            "must quarantine when restored_fh > safety.finalized_height without verified QC"
+        );
+        drop(auth1);
+        drop(storage);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

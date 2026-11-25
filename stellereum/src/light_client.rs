@@ -928,8 +928,8 @@ impl LightHeader {
                 continue; // membership first: a valid signature is not evidence
             }
             if let Some((scheme, pk)) = crate::consensus::pq_key_at_height(pubkey, self.height) {
-                if pure_pq && (!scheme.is_post_quantum() || scheme.is_disabled()) {
-                    continue; // classical/disabled registration lends no power in pure-PQ
+                if !scheme.is_post_quantum() || scheme.is_disabled() {
+                    continue; // classical/disabled registration lends no power
                 }
                 if crate::post_quantum::verify_pq_signature(
                     scheme,
@@ -939,13 +939,10 @@ impl LightHeader {
                 ) {
                     members += 1;
                     power = power.saturating_add(vp);
-                    continue;
                 }
-                if pure_pq {
-                    continue; // registered key but bad PQ signature: no ed fallthrough in pure-PQ
-                }
-                // Not enforced: fall through to the classical check below so a
-                // validator mid-rotation still counts its ed attestation.
+                // Registered PQ key present: NEVER silently fall through to
+                // classical Ed25519 if PQ signature verification fails (W6-A7-5).
+                continue;
             } else if pure_pq {
                 continue; // no registered PQ key: classical attestation refused in pure-PQ
             }

@@ -11,6 +11,263 @@ use stellereum::consensus::VoteKind;
 use stellereum::consensus_net::{parse_incoming_with_peer_key, ConsensusMsg};
 use stellereum::runtime::ValidatorRuntime;
 
+/// Safe UTF-8 prefix truncation at a character boundary (never splits a
+/// multi-byte UTF-8 sequence).
+pub(super) fn truncate_utf8_prefix(raw: &str, max_bytes: usize) -> &str {
+    &raw[..raw.floor_char_boundary(max_bytes)]
+}
+
+/// Pre-verify every check `ValidatorRuntime::adopt_committed` enforces before
+/// `apply_and_advance` advances `SafetyAuthority`, returning `Some(block_hash)`
+/// iff the commit is valid to write-ahead persist.
+///
+/// Never returns `Some` for an invalid/forged certificate, wrong proposer,
+/// mismatched state root, lock conflict, or invalid downtime evidence.
+pub(super) async fn preverify_committed_for_write_ahead(
+    rt: &ValidatorRuntime,
+    height: u64,
+    block: &stellereum::sharding::Block,
+    certificate: &stellereum::consensus::QuorumCertificate,
+) -> Option<stellereum::cell::CellHash> {
+    if rt.has_pending_apply() || height != rt.hc.height || block.height != height {
+        return None;
+    }
+    if rt.shard_registry.is_sharded()
+        && (block.shard_id != rt.shard_id
+            || block
+                .transactions
+                .iter()
+                .any(|t| !stellereum::sharding::tx_belongs_to_shard(t, rt.shard_id)))
+    {
+        return None;
+    }
+    if certificate.kind != VoteKind::Precommit || certificate.height != height {
+        return None;
+    }
+    if certificate.round != rt.hc.round {
+        let behind = rt.hc.round.saturating_sub(certificate.round);
+        if behind as u64 > stellereum::consensus::MAX_SCAN_SPAN as u64 {
+            return None;
+        }
+    }
+    let bh = block.compute_hash();
+    if certificate.block_hash != Some(bh)
+        || certificate.signatures.len() > stellereum::runtime::MAX_COMMIT_CERT_SIGNERS
+    {
+        return None;
+    }
+    let validators = rt.validator_set_for_height(height);
+    let schedule = rt.committee_schedule_at(height);
+    if Some(block.proposer)
+        != validators.proposer_for_with_schedule(height, certificate.round, schedule)
+    {
+        return None;
+    }
+    if block.round > certificate.round {
+        return None;
+    }
+    let expected_prev = rt.finalized.last().map(|(_, h)| *h).unwrap_or([0u8; 32]);
+    if block.prev_hash != expected_prev {
+        return None;
+    }
+    if block.transactions.len() > stellereum::runtime::MAX_BLOCK_TXS {
+        return None;
+    }
+    let total_gas = block
+        .transactions
+        .iter()
+        .fold(0u64, |acc, t| acc.saturating_add(t.gas_limit));
+    if total_gas > stellereum::runtime::MAX_BLOCK_GAS {
+        return None;
+    }
+    let mut wire = 0usize;
+    let mut proofs = 0usize;
+    for t in &block.transactions {
+        wire = wire.saturating_add(stellereum::mempool::Mempool::estimate_tx_wire_bytes(t));
+        proofs = proofs.saturating_add(stellereum::mempool::Mempool::count_tx_proof_units(t));
+    }
+    if wire > stellereum::mempool::Mempool::MAX_BLOCK_WIRE_BYTES
+        || proofs > stellereum::mempool::Mempool::MAX_BLOCK_PROOF_UNITS
+    {
+        return None;
+    }
+    if !ValidatorRuntime::cross_shard_record_cap_ok(block) {
+        return None;
+    }
+    if !stellereum::consensus::verify_proposer_signature_with_hash(block, &bh) {
+        return None;
+    }
+    if !certificate.binds_to_parent(&block.prev_hash) {
+        return None;
+    }
+    let (quorum_ok, signed) =
+        certificate.verify_and_signed_power_with_schedule(&validators, schedule);
+    if !quorum_ok || signed < validators.quorum_power() {
+        return None;
+    }
+    if let Some((locked_block, locked_round)) = rt.hc.locked {
+        let val_id = block.value_id();
+        let same_value = locked_block == bh
+            || rt
+                .hc
+                .value_id_of(&locked_block)
+                .is_some_and(|v| v == val_id);
+        let lock_matches_restamp = rt.hc.value_id_of(&locked_block).is_none() && {
+            let mut candidate = block.clone();
+            candidate.round = locked_round;
+            candidate.compute_hash() == locked_block
+        };
+        let own_precommit = certificate.round < locked_round
+            && !rt
+                .hc
+                .has_decidable_precommit_quorum_after(certificate.round)
+            && rt
+                .hc
+                .precommit_set(certificate.round)
+                .and_then(|s| s.vote_by(&rt.id))
+                .is_some_and(|v| v.kind == VoteKind::Precommit && v.block_hash == Some(bh));
+        if certificate.round <= locked_round
+            && !same_value
+            && !lock_matches_restamp
+            && !own_precommit
+        {
+            return None;
+        }
+    }
+    if let Some(set) = rt.hc.prevote_set(certificate.round) {
+        if let Some(local_target) = set.quorum_target(&validators) {
+            if local_target != Some(bh) {
+                return None;
+            }
+        }
+    }
+    let root_before = rt.state.get_state_root().await;
+    if block.state_root != root_before {
+        return None;
+    }
+    if !stellereum::sharding::Transaction::verify_signatures_batch_parallel(&block.transactions) {
+        return None;
+    }
+    if rt.check_actor_cap(block).await.is_err() {
+        return None;
+    }
+    if block.order_merkle_root != stellereum::mev::compute_order_merkle_root(&block.transactions) {
+        return None;
+    }
+    // Mirror `check_block_timestamp`.
+    if block.height > 0 {
+        if block.timestamp == 0 {
+            return None;
+        }
+        let mut from_genesis_anchor = false;
+        let parent_ts = rt
+            .blocks
+            .get(&block.prev_hash)
+            .map(|b| b.timestamp)
+            .or_else(|| {
+                rt.last_decision.as_ref().and_then(|(h, b, _)| {
+                    let dec_bh = rt
+                        .decided_parent_votes
+                        .as_ref()
+                        .filter(|dpv| dpv.height == *h)
+                        .map(|dpv| dpv.decision_block_hash)
+                        .unwrap_or_else(|| b.compute_hash());
+                    if *h + 1 == block.height && dec_bh == block.prev_hash {
+                        Some(b.timestamp)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .or_else(|| {
+                if block.height == 1 && block.prev_hash == [0u8; 32] {
+                    from_genesis_anchor = true;
+                    Some(0)
+                } else {
+                    None
+                }
+            })?;
+        if block.timestamp < parent_ts {
+            return None;
+        }
+        if !from_genesis_anchor
+            && !stellereum::protocol::timestamp_within_bounds(parent_ts, block.timestamp)
+        {
+            return None;
+        }
+    }
+    // Mirror `check_last_qc_evidence_with_hash`.
+    if let Some(parent_h) = block.height.checked_sub(1) {
+        match &block.last_qc {
+            None => {
+                let knows_parent_decision = rt.last_decision.as_ref().is_some_and(|(h, b, _)| {
+                    let dec_bh = rt
+                        .decided_parent_votes
+                        .as_ref()
+                        .filter(|dpv| dpv.height == *h)
+                        .map(|dpv| dpv.decision_block_hash)
+                        .unwrap_or_else(|| b.compute_hash());
+                    *h == parent_h && dec_bh == block.prev_hash
+                });
+                if knows_parent_decision {
+                    return None;
+                }
+            }
+            Some(qc) => {
+                if qc.height != parent_h
+                    || qc.block_hash != Some(block.prev_hash)
+                    || qc.kind != VoteKind::Precommit
+                    || qc.shard_id != block.shard_id
+                    || qc.shard_id != rt.shard_id
+                {
+                    return None;
+                }
+                let parent_set = rt.validator_set_for_height(parent_h);
+                let parent_schedule = rt.committee_schedule_at(parent_h);
+                if !qc.verify_with_schedule(&parent_set, parent_schedule) {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(bh)
+}
+
+/// Write-ahead persist a verified QC-carrying committed block and finalized
+/// tip BEFORE `adopt_committed` executes `apply_and_advance` ->
+/// `safety.advance_height` (closing the W6-A2-4 crash-ordering gap).
+pub(super) async fn adopt_committed_with_write_ahead(
+    rt: &mut ValidatorRuntime,
+    persistence: Option<&stellereum::storage::AsyncPersistence>,
+    height: u64,
+    block: stellereum::sharding::Block,
+    certificate: stellereum::consensus::QuorumCertificate,
+) -> Result<(stellereum::cell::CellHash, bool), String> {
+    let mut wrote_ahead = false;
+    if let Some(ap) = persistence {
+        if let Some(bh) =
+            preverify_committed_for_write_ahead(rt, height, &block, &certificate).await
+        {
+            let mut block_with_qc = block.clone();
+            block_with_qc.precommit_qc = Some(certificate.clone());
+            match write_ahead_finalized_block(ap, height, bh, block_with_qc, true).await {
+                Ok(()) => {
+                    wrote_ahead = true;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        height,
+                        error = %e,
+                        "[storage] committed adopt write-ahead put_block/set_finalized failed before safety advance"
+                    );
+                }
+            }
+        }
+    }
+    let bh = rt.adopt_committed(height, block, certificate).await?;
+    Ok((bh, wrote_ahead))
+}
+
 /// Re-enter the inbound drain as a FULL proposal.
 ///
 /// A compact proposal resolves into a complete `Block`. Handing it straight to
@@ -292,7 +549,7 @@ pub(super) async fn drain_inbound_messages(
                     "[consensus] dropped {} unparseable inbound message(s); last len {} head {:?}",
                     st.parse_fail_count,
                     raw.len(),
-                    &raw[..raw.len().min(120)],
+                    truncate_utf8_prefix(&raw, 120),
                 );
             }
             continue;
@@ -1238,18 +1495,21 @@ pub(super) async fn drain_inbound_messages(
                             );
                             continue;
                         }
-                        // A peer already committed this height. Adopt it (after
-                        // checking the certificate) so a node that missed the
-                        // deciding vote does not stall behind the network.
-                        // `adopt_committed` checks the certificate against our own
-                        // validator set internally, so a peer cannot nominate the
-                        // quorum it is measured against.
-                        match st
-                            .rt
-                            .adopt_committed(height, block.clone(), certificate)
-                            .await
+                        // A peer already committed this height. Write-ahead the
+                        // QC-verified block and finalized pointer BEFORE
+                        // `adopt_committed` advances `safety_record_v1` so a
+                        // SIGKILL cannot leave `safety_record_v1` ahead of disk
+                        // without the block body (W6-A2-4).
+                        match adopt_committed_with_write_ahead(
+                            &mut st.rt,
+                            cfg.persistence.as_deref(),
+                            height,
+                            block.clone(),
+                            certificate,
+                        )
+                        .await
                         {
-                            Ok(bh) => {
+                            Ok((bh, wrote_ahead)) => {
                                 // QC verified inside adopt and the block
                                 // applied: any `_hq_` miss cooldown for
                                 // this height is obsolete.
@@ -1422,27 +1682,36 @@ pub(super) async fn drain_inbound_messages(
                                 // (live: 269ms from adopt to view change).
                                 st.round_started = std::time::Instant::now();
                                 // Persist adopted bodies + finalized pointer synchronously
-                                // (with embedded precommit QC from `rt.blocks` and flush)
-                                // instead of queuing an async `Finalized` job: eliminates
-                                // multi-block lag and prevents out-of-order queue writes
-                                // from regressing `storage.finalized()` behind `safety_record_v1`.
+                                // if write-ahead did not already persist them before
+                                // `safety.advance_height` (fallback parity with tick.rs).
                                 if let Some(ap) = &cfg.persistence {
-                                    let adopted_block =
-                                        st.rt.blocks.get(&bh).cloned().unwrap_or(block);
-                                    if let Err(e) = write_ahead_finalized_block(
-                                        ap,
-                                        height,
-                                        bh,
-                                        adopted_block,
-                                        true,
-                                    )
-                                    .await
-                                    {
-                                        tracing::error!(
-                                            height,
-                                            error = %e,
-                                            "[storage] adopted block synchronous persist failed"
-                                        );
+                                    if !wrote_ahead {
+                                        let already_persisted = ap
+                                            .storage()
+                                            .finalized()
+                                            .ok()
+                                            .flatten()
+                                            == Some((height, bh))
+                                            && ap.storage().get_block(&bh).ok().flatten().is_some();
+                                        if !already_persisted {
+                                            let adopted_block =
+                                                st.rt.blocks.get(&bh).cloned().unwrap_or(block);
+                                            if let Err(e) = write_ahead_finalized_block(
+                                                ap,
+                                                height,
+                                                bh,
+                                                adopted_block,
+                                                true,
+                                            )
+                                            .await
+                                            {
+                                                tracing::error!(
+                                                    height,
+                                                    error = %e,
+                                                    "[storage] adopted block synchronous persist failed"
+                                                );
+                                            }
+                                        }
                                     }
                                     if height.is_multiple_of(25) {
                                         ap.enqueue_validator_set_history(
@@ -1463,4 +1732,197 @@ pub(super) async fn drain_inbound_messages(
     }
     // SEC-06: deferred messages already reside in `inbound_deferred` with
     // their scheduled `wake_at` times; no re-parking needed.
+}
+
+#[cfg(test)]
+mod w7_adopt_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use stellereum::consensus::{FalconKeypair, QuorumCertificate, ValidatorSet};
+    use stellereum::post_quantum::PqScheme;
+    use stellereum::safety::{AuthorityMode, SafetyAuthority, SafetyBootContext};
+    use stellereum::state_engine::InMemoryStateEngine;
+    use stellereum::storage::{AsyncPersistence, SafetyRecordIdentity, Storage};
+
+    #[test]
+    fn non_hex_consensus_frame_with_multibyte_utf8_at_byte_120_does_not_panic() {
+        // 118 ASCII bytes + 4-byte UTF-8 char '🦀' spanning bytes 118..122 + tail.
+        let mut raw = "a".repeat(118);
+        raw.push('🦀');
+        raw.push_str("tail_non_hex_frame");
+        assert!(raw.len() > 120);
+        assert!(!raw.is_char_boundary(120));
+        assert!(parse_incoming_with_peer_key(&raw).is_none());
+
+        let head = truncate_utf8_prefix(&raw, 120);
+        assert_eq!(head.len(), 118);
+        assert_eq!(head, "a".repeat(118));
+    }
+
+    #[tokio::test]
+    async fn committed_adopt_write_aheads_block_and_finalized_before_safety_advance() {
+        let sk = SigningKey::from_bytes(&[0x44u8; 32]);
+        let vid = sk.verifying_key().to_bytes();
+        let fk = FalconKeypair::generate_from_seed(0x45);
+        let vset = ValidatorSet::from_list(vec![(vid, 10)]);
+
+        let prod_engine = Arc::new(InMemoryStateEngine::new());
+        stellereum::runtime::fund_genesis(&prod_engine, &vset, 1_000_000).await;
+        {
+            let mut ledger = prod_engine.staking_write().await;
+            let mut pq_reg = prod_engine.pq_registry_write().await;
+            ledger
+                .validator_pq_keys
+                .insert(vid, (PqScheme::Falcon512, fk.public_key.clone()));
+            let _ = pq_reg.adopt_legacy_key_at(
+                vid,
+                PqScheme::Falcon512,
+                fk.public_key.clone(),
+                0,
+                true,
+            );
+            stellereum::consensus::sync_committed_pq_registry(&pq_reg, true);
+        }
+        let mut prod = ValidatorRuntime::new(sk.clone(), vset.clone(), prod_engine, 1)
+            .with_falcon_key(fk.clone());
+        prod.hc.set_parent_hash([0u8; 32]);
+        let finalized_block = prod.propose(1_700_000_001).await.expect("propose h=1");
+        let pv = prod.make_prevote().expect("make_prevote");
+        prod.on_prevote(pv).expect("on_prevote");
+        let pc = prod.make_precommit().expect("make_precommit");
+        prod.on_precommit(pc).expect("on_precommit");
+        let bh = prod.try_finalize().await.expect("try_finalize h=1");
+        let (_, decided_block, qc) = prod.last_decision.clone().expect("last_decision");
+        assert_eq!(decided_block.compute_hash(), bh);
+
+        // Simulate wire block where precommit_qc is stripped (`None`).
+        let mut wire_block = finalized_block;
+        wire_block.precommit_qc = None;
+
+        // Adopter runtime with Durable SafetyAuthority + AsyncPersistence.
+        let dir = std::env::temp_dir().join(format!(
+            "stell_w6_a2_4_adopt_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Arc::new(Storage::open(&dir).expect("open storage"));
+        let ap = Arc::new(AsyncPersistence::start(storage.clone()));
+
+        let adopt_engine = Arc::new(InMemoryStateEngine::new());
+        stellereum::runtime::fund_genesis(&adopt_engine, &vset, 1_000_000).await;
+        {
+            let mut ledger = adopt_engine.staking_write().await;
+            let mut pq_reg = adopt_engine.pq_registry_write().await;
+            ledger
+                .validator_pq_keys
+                .insert(vid, (PqScheme::Falcon512, fk.public_key.clone()));
+            let _ = pq_reg.adopt_legacy_key_at(
+                vid,
+                PqScheme::Falcon512,
+                fk.public_key.clone(),
+                0,
+                true,
+            );
+            stellereum::consensus::sync_committed_pq_registry(&pq_reg, true);
+        }
+        let identity = SafetyRecordIdentity {
+            validator: vid,
+            chain: [0x77u8; 32],
+            shard: 0,
+        };
+        let safety = SafetyAuthority::open_from_storage(
+            storage.clone(),
+            identity,
+            SafetyBootContext {
+                is_validator: true,
+                is_observer_env: false,
+                new_chain_explicit: true,
+                restored_finalized: None,
+                restored_state_height: Some(0),
+                restored_finalized_qc_verified: true,
+                legacy_checkpoint: None,
+                legacy_watermark: None,
+            },
+        );
+        assert_eq!(safety.mode(), AuthorityMode::Active);
+        let mut adopter = ValidatorRuntime::new(sk, vset, adopt_engine, 1)
+            .with_falcon_key(fk)
+            .with_safety_authority(safety);
+        adopter.hc.set_parent_hash([0u8; 32]);
+
+        // 1) Forged / invalid certificate MUST NOT be write-ahead persisted.
+        let forged_qc = QuorumCertificate {
+            shard_id: 0,
+            height: 1,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: Some(bh),
+            signatures: vec![],
+        };
+        assert!(
+            preverify_committed_for_write_ahead(&adopter, 1, &wire_block, &forged_qc)
+                .await
+                .is_none()
+        );
+        assert!(adopt_committed_with_write_ahead(
+            &mut adopter,
+            Some(&ap),
+            1,
+            wire_block.clone(),
+            forged_qc,
+        )
+        .await
+        .is_err());
+        assert_eq!(storage.finalized().unwrap(), None);
+        assert!(storage.get_block(&bh).unwrap().is_none());
+
+        // 2) Valid commit passes preverify, and `adopt_committed_with_write_ahead`
+        //    write-aheads put_block(with_qc) + set_finalized BEFORE `adopt_committed`
+        //    advances `safety_record_v1`.
+        let pre_bh = preverify_committed_for_write_ahead(&adopter, 1, &wire_block, &qc)
+            .await
+            .expect("valid commit must pass preverify");
+        assert_eq!(pre_bh, bh);
+        assert_eq!(storage.finalized().unwrap(), None);
+        assert_eq!(
+            adopter
+                .safety
+                .current_state()
+                .expect("safety state")
+                .finalized_height,
+            0
+        );
+
+        let (adopted_bh, wrote_ahead) =
+            adopt_committed_with_write_ahead(&mut adopter, Some(&ap), 1, wire_block, qc.clone())
+                .await
+                .expect("adopt_committed_with_write_ahead");
+        assert_eq!(adopted_bh, bh);
+        assert!(wrote_ahead);
+        assert_eq!(storage.finalized().unwrap(), Some((1, bh)));
+        assert_eq!(
+            storage
+                .get_block(&bh)
+                .unwrap()
+                .expect("block persisted")
+                .precommit_qc,
+            Some(qc)
+        );
+        assert_eq!(
+            adopter
+                .safety
+                .current_state()
+                .expect("safety state")
+                .finalized_height,
+            1
+        );
+
+        drop(adopter);
+        drop(ap);
+        drop(storage);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

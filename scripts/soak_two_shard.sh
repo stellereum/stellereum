@@ -137,9 +137,8 @@ if [[ -z "${STELL_FAUCET_KEY:-}" && -z "${STELL_FAUCET_KEY_FILE:-}" ]]; then
 fi
 FAUCET_SOURCE_FILE=""
 if [[ -n "${STELL_FAUCET_KEY_FILE:-}" && -z "${STELL_FAUCET_KEY:-}" ]]; then
-    # The node accepts a 0600 file; the wallet CLI accepts the seed value. Read
-    # it once here (never echo it) and keep the file reference for the node
-    # env so the seed never lands in a process environment on a real run.
+    # The node and wallet CLI both accept a seed file (`--falcon-seed-file`),
+    # so keep the file reference and avoid exposing the seed on CLI argv.
     [[ -r "$STELL_FAUCET_KEY_FILE" ]] || { echo "[soak] cannot read STELL_FAUCET_KEY_FILE" >&2; exit 2; }
     FAUCET_SOURCE_FILE="$(cd "$(dirname "$STELL_FAUCET_KEY_FILE")" && pwd)/$(basename "$STELL_FAUCET_KEY_FILE")"
     STELL_FAUCET_KEY="$(tr -d '[:space:]' < "$STELL_FAUCET_KEY_FILE")"
@@ -261,8 +260,13 @@ stop_all() {
     for role in "${ROLES[@]}"; do stop_role "$role"; done
 }
 
+WALLET_SEED_FILE=""
+
 on_exit() {
     local st=$?
+    if [[ -n "${WALLET_SEED_FILE:-}" && -f "$WALLET_SEED_FILE" ]]; then
+        rm -f "$WALLET_SEED_FILE"
+    fi
     if ((st != 0)); then tail_logs; fi
     if [[ "$KEEP" == "1" ]]; then
         log "keeping processes and data under $RUN_DIR (SOAK_KEEP=1)"
@@ -272,6 +276,15 @@ on_exit() {
     exit "$st"
 }
 trap on_exit EXIT
+
+# Write the faucet seed to a 0600 temp file (cleaned on EXIT) when no
+# `FAUCET_SOURCE_FILE` exists so `wallet send-pq` never receives the secret
+# via argv or process env.
+if [[ -z "$FAUCET_SOURCE_FILE" ]]; then
+    WALLET_SEED_FILE="$(umask 077 && mktemp)"
+    chmod 600 "$WALLET_SEED_FILE"
+    printf '%s\n' "$STELL_FAUCET_KEY" > "$WALLET_SEED_FILE"
+fi
 
 # --- keygen + config ---------------------------------------------------------
 log "binary: $BIN"
@@ -363,14 +376,18 @@ wait_ready() {
 
 for role in alpha beta; do wait_ready "$role"; done
 
+# Invoke `wallet send-pq` without exposing the Falcon seed in process argv or env:
+# always pass `--falcon-seed-file` (`FAUCET_SOURCE_FILE` or 0600 temp file).
+wallet_send_pq() {
+    local seed_file="${FAUCET_SOURCE_FILE:-$WALLET_SEED_FILE}"
+    "$BIN" wallet send-pq --falcon-seed-file "$seed_file" "$@"
+}
+
 # Derive the genesis-funded sender ONCE, without submitting anything, so the
 # balance around each transfer can be read before the source is debited.
-# Note: `stellereum wallet send-pq` (stellereum/src/cli/args.rs) currently only
-# accepts `--falcon-seed` on the CLI (no `--key-file`/env fallback).
 derive_sender() {
     local role="$1" out
-    out="$("$BIN" wallet send-pq \
-        --falcon-seed "$STELL_FAUCET_KEY" \
+    out="$(wallet_send_pq \
         --to "$RECIPIENT" \
         --amount 1 \
         --target-shard 1 \
@@ -390,8 +407,7 @@ FAUCET_ADDR="$(derive_sender alpha)"
 # takes. Reusing those bytes across clusters makes the state inputs identical.
 submit_wallet_tx() { # role target_shard -> "<tx_hash> <sender>"
     local role="$1" target="$2" out hash sender
-    out="$("$BIN" wallet send-pq \
-        --falcon-seed "$STELL_FAUCET_KEY" \
+    out="$(wallet_send_pq \
         --to "$RECIPIENT" \
         --amount "$AMOUNT" \
         --target-shard "$target" \

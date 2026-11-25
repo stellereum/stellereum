@@ -393,16 +393,42 @@ fn build_bridge_intent_tx_inner(
 ///
 /// Gas is priced PER OPCODE and floored by the admission base fee, exactly
 /// like `build_bridge_intent_tx`.
+/// Default declared gas limit for an unjail transaction (with optional self-bond top-up).
+pub(crate) fn unjail_default_gas(top_up: Option<u64>) -> u64 {
+    let mut opcode_gas = stellereum::svm::GAS_STAKE_UNBOND;
+    if let Some(amount) = top_up {
+        assert!(
+            amount > 0,
+            "a top-up must be positive; omit --top-up instead of passing zero"
+        );
+        opcode_gas = opcode_gas.saturating_add(stellereum::svm::GAS_STAKE_BOND);
+    }
+    cli_tx_gas(opcode_gas).saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS)
+}
+
+#[allow(dead_code)] // GATE: convenience wrapper pinned by cli_chain_binding_tests and unit tests.
 pub(crate) fn build_unjail_tx(
     signer: &stellereum::post_quantum::FalconKeypair,
     validator: [u8; 32],
     top_up: Option<u64>,
     nonce: u64,
 ) -> Transaction {
-    build_unjail_tx_inner(signer, validator, top_up, nonce, None)
+    build_unjail_tx_inner(signer, validator, top_up, nonce, None, None)
+}
+
+/// Variant of [`build_unjail_tx`] allowing an explicit gas override (`gas = default_gas.max(gas_override.unwrap_or(0))`).
+pub(crate) fn build_unjail_tx_with_gas(
+    signer: &stellereum::post_quantum::FalconKeypair,
+    validator: [u8; 32],
+    top_up: Option<u64>,
+    nonce: u64,
+    gas_override: Option<u64>,
+) -> Transaction {
+    build_unjail_tx_inner(signer, validator, top_up, nonce, None, gas_override)
 }
 
 /// Chain-bound variant of [`build_unjail_tx`].
+#[allow(dead_code)] // GATE: convenience wrapper pinned by cli_chain_binding_tests and unit tests.
 pub(crate) fn build_unjail_tx_with_chain(
     signer: &stellereum::post_quantum::FalconKeypair,
     validator: [u8; 32],
@@ -410,7 +436,27 @@ pub(crate) fn build_unjail_tx_with_chain(
     nonce: u64,
     chain_id: u64,
 ) -> Transaction {
-    build_unjail_tx_inner(signer, validator, top_up, nonce, Some(chain_id))
+    build_unjail_tx_inner(signer, validator, top_up, nonce, Some(chain_id), None)
+}
+
+/// Chain-bound variant of [`build_unjail_tx`] with an explicit gas override
+/// (`gas = default_gas.max(gas_override.unwrap_or(0))`) for elevated D2 fee floors.
+pub(crate) fn build_unjail_tx_with_chain_and_gas(
+    signer: &stellereum::post_quantum::FalconKeypair,
+    validator: [u8; 32],
+    top_up: Option<u64>,
+    nonce: u64,
+    chain_id: u64,
+    gas_override: Option<u64>,
+) -> Transaction {
+    build_unjail_tx_inner(
+        signer,
+        validator,
+        top_up,
+        nonce,
+        Some(chain_id),
+        gas_override,
+    )
 }
 
 fn build_unjail_tx_inner(
@@ -419,21 +465,20 @@ fn build_unjail_tx_inner(
     top_up: Option<u64>,
     nonce: u64,
     chain_id: Option<u64>,
+    gas_override: Option<u64>,
 ) -> Transaction {
     let from = falcon_pq_address(signer);
     let mut payload = Vec::new();
-    let mut opcode_gas = stellereum::svm::GAS_STAKE_UNBOND;
     if let Some(amount) = top_up {
         assert!(
             amount > 0,
             "a top-up must be positive; omit --top-up instead of passing zero"
         );
         payload.push(stellereum::svm::OpCode::SysCallStake { validator, amount });
-        opcode_gas = opcode_gas.saturating_add(stellereum::svm::GAS_STAKE_BOND);
     }
     payload.push(stellereum::svm::OpCode::SysCallUnjail { validator });
-    let gas =
-        cli_tx_gas(opcode_gas).saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    let default_gas = unjail_default_gas(top_up);
+    let gas = default_gas.max(gas_override.unwrap_or(0));
     let master = stellereum::sharding::MASTERCHAIN_SHARD;
     match chain_id {
         Some(cid) => sign_pq_explicit_payload_with_chain(
@@ -454,10 +499,45 @@ fn build_unjail_tx_inner(
 /// Parse a 32-byte hex seed (optional `0x` prefix).
 pub(crate) fn parse_wallet_seed(raw: &str, what: &str) -> anyhow::Result<[u8; 32]> {
     let clean = raw.strip_prefix("0x").unwrap_or(raw);
-    let bytes = hex::decode(clean).map_err(|e| anyhow::anyhow!("Invalid {what} hex: {e}"))?;
+    let bytes = zeroize::Zeroizing::new(
+        hex::decode(clean).map_err(|e| anyhow::anyhow!("Invalid {what} hex: {e}"))?,
+    );
     bytes
+        .as_slice()
         .try_into()
-        .map_err(|b: Vec<u8>| anyhow::anyhow!("{what} must be 32 bytes, got {} bytes", b.len()))
+        .map_err(|_| anyhow::anyhow!("{what} must be 32 bytes, got {} bytes", bytes.len()))
+}
+
+/// Resolve a 32-byte Falcon-512 hex seed from `--falcon-seed-file`, `--falcon-seed`,
+/// or the `STELL_FALCON_SEED` environment variable, zeroizing all read buffers.
+pub(crate) fn resolve_falcon_seed(
+    falcon_seed: Option<String>,
+    falcon_seed_file: Option<PathBuf>,
+) -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>> {
+    use zeroize::{Zeroize, Zeroizing};
+    if let Some(path) = falcon_seed_file {
+        let mut raw = Zeroizing::new(std::fs::read_to_string(&path).map_err(|e| {
+            anyhow::anyhow!("cannot read falcon seed file {}: {e}", path.display())
+        })?);
+        let trimmed = Zeroizing::new(raw.trim().to_string());
+        raw.zeroize();
+        return Ok(Zeroizing::new(parse_wallet_seed(&trimmed, "falcon seed")?));
+    }
+    if let Some(mut raw) = falcon_seed {
+        let trimmed = Zeroizing::new(raw.trim().to_string());
+        raw.zeroize();
+        return Ok(Zeroizing::new(parse_wallet_seed(&trimmed, "falcon seed")?));
+    }
+    if let Ok(mut env_val) = std::env::var("STELL_FALCON_SEED") {
+        let trimmed = Zeroizing::new(env_val.trim().to_string());
+        env_val.zeroize();
+        if !trimmed.is_empty() {
+            return Ok(Zeroizing::new(parse_wallet_seed(&trimmed, "falcon seed")?));
+        }
+    }
+    anyhow::bail!(
+        "missing falcon seed: pass --falcon-seed-file <path>, --falcon-seed <hex>, or set STELL_FALCON_SEED"
+    );
 }
 
 /// Parse a 32-byte hex address (optional `0x` prefix).
@@ -1465,5 +1545,62 @@ mod unjail_builder_tests {
             claim_del_tx.payload[0],
             stellereum::svm::OpCode::SysCallClaimDelegatorRewards { validator: v } if v == validator
         ));
+    }
+
+    #[test]
+    fn unjail_tx_gas_override_floors_at_default_and_respects_higher_budget() {
+        let kp = stellereum::post_quantum::FalconKeypair::generate_from_seed(0x91);
+        let validator = [0x55u8; 32];
+        let cid = stellereum::consensus::consensus_chain_id();
+        let default_gas = unjail_default_gas(None);
+
+        let tx_default = build_unjail_tx_with_chain_and_gas(&kp, validator, None, 1, cid, None);
+        assert_eq!(tx_default.gas_limit, default_gas);
+        assert!(tx_default.verify_signature_for_chain(cid, true));
+
+        let tx_low = build_unjail_tx_with_chain_and_gas(&kp, validator, None, 1, cid, Some(100));
+        assert_eq!(tx_low.gas_limit, default_gas);
+
+        let tx_high =
+            build_unjail_tx_with_chain_and_gas(&kp, validator, None, 2, cid, Some(1_300_000));
+        assert_eq!(tx_high.gas_limit, 1_300_000);
+        assert!(tx_high.verify_signature_for_chain(cid, true));
+
+        let tx_unbound_high =
+            build_unjail_tx_with_gas(&kp, validator, Some(5_000_000_000), 3, Some(650_000));
+        assert_eq!(tx_unbound_high.gas_limit, 650_000);
+        assert!(tx_unbound_high.verify_signature());
+    }
+
+    #[test]
+    fn resolve_falcon_seed_supports_file_cli_and_env() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let prev = std::env::var_os("STELL_FALCON_SEED");
+        std::env::remove_var("STELL_FALCON_SEED");
+
+        let seed_hex = "22".repeat(32);
+        let dir = std::env::temp_dir().join(format!("stell-seed-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("falcon.seed");
+        std::fs::write(&path, format!("  {seed_hex}\n")).expect("write seed");
+
+        let from_file = resolve_falcon_seed(None, Some(path.clone())).expect("from file");
+        assert_eq!(*from_file, [0x22u8; 32]);
+
+        let from_cli = resolve_falcon_seed(Some(seed_hex.clone()), None).expect("from cli");
+        assert_eq!(*from_cli, [0x22u8; 32]);
+
+        std::env::set_var("STELL_FALCON_SEED", &seed_hex);
+        let from_env = resolve_falcon_seed(None, None).expect("from env");
+        assert_eq!(*from_env, [0x22u8; 32]);
+
+        std::env::remove_var("STELL_FALCON_SEED");
+        assert!(resolve_falcon_seed(None, None).is_err());
+
+        if let Some(v) = prev {
+            std::env::set_var("STELL_FALCON_SEED", v);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

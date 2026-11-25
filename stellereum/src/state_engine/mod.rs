@@ -561,6 +561,8 @@ pub struct InMemoryStateEngine {
     epoch_vdf_beacons: Arc<RwLock<std::collections::BTreeMap<u64, [u8; 48]>>>,
     /// Per-epoch `(freeze_block_hash, rolling_mix_at_freeze)` captured at
     /// `H_freeze = epoch * EPOCH_LEN - V3_COMMIT_LOOKAHEAD_BLOCKS`.
+    /// Persisted in its own storage tree (`"cnvrf_freeze_inputs"`) so
+    /// `CnVrfV3EngineSnapshot` bincode decoding stays 100% backwards-compatible.
     cnvrf_freeze_inputs: Arc<RwLock<std::collections::BTreeMap<u64, ([u8; 32], [u8; 48])>>>,
     /// Canonical on-chain EVM ↔ PQ address bijection (`Domain::EvmBindings`).
     ///

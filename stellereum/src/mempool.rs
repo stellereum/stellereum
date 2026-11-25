@@ -3467,6 +3467,24 @@ impl Mempool {
         self.txs.values().cloned().collect()
     }
 
+    /// Pending transactions matching `account` (`t.from == *account || t.to == *account`),
+    /// returning `(total_matching, top_matching)` sorted by `nonce` descending and
+    /// cloning at most `limit` transactions (zero clones of unrelated transactions).
+    pub fn matching_account(&self, account: &[u8; 32], limit: usize) -> (usize, Vec<Transaction>) {
+        let mut refs: Vec<&Transaction> = self
+            .txs
+            .values()
+            .filter(|t| t.from == *account || t.to == *account)
+            .collect();
+        let total = refs.len();
+        if total == 0 || limit == 0 {
+            return (total, Vec::new());
+        }
+        refs.sort_by(|x, y| y.nonce.cmp(&x.nonce));
+        let txs = refs.into_iter().take(limit).cloned().collect();
+        (total, txs)
+    }
+
     /// Distinct senders with pending transactions, in deterministic order.
     ///
     /// The proposer filter needs exactly this set (to snapshot each sender's

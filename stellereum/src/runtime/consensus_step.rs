@@ -3239,14 +3239,6 @@ impl ValidatorRuntime {
         // weak-CPU verifier time. Previously the QC verify ran before the linkage
         // checks and every stale commit paid full crypto cost.
         //
-        // SECURITY: the proposer must be the one the schedule names for this
-        // height/round, not merely a key that signed. Otherwise a peer names an
-        // address it controls, and `apply_block_fees_rewards` credits the fees to
-        // it with no membership test.
-        if Some(block.proposer) != self.expected_proposer_at(&validators, height, certificate.round)
-        {
-            return Err("committed block's proposer is not the expected proposer".to_string());
-        }
         // SIGNED ROUND (ruleset v4, adopt side): the block header commits the
         // round it was SIGNED under, and the certificate commits the round the
         // quorum voted in. Normally they are the same round.
@@ -3302,188 +3294,220 @@ impl ValidatorRuntime {
         if !certificate.binds_to_parent(&block.prev_hash) {
             return Err("commit certificate was elected with a different parent block".to_string());
         }
-        // ONE attribution pass: `verify_qc_for_height` followed by
-        // `validators.qc_signed_power(&certificate)` used to verify every
-        // Falcon signature twice (once for the verdict, once for the power).
-        // The fused call reaches the SAME verdict and the SAME union-of-
-        // verified-signers power in a single pass.
-        let (quorum_ok, signed) = self.verify_qc_for_height_with_power(&certificate, &validators);
-        if !quorum_ok {
-            return Err("commit certificate does not carry a validator quorum".to_string());
+        // W6-A1-4: when CN-VRF v3 is active, extract & verify `block.cnvrf_v3.epoch_vdf`
+        // into `ready_vdf_beacons` BEFORE consulting `committee_schedule_at(height)`
+        // via `expected_proposer_at` / `verify_qc_for_height_with_power`.
+        // Below `CNVRF_V3_ACTIVATION_HEIGHT` this is skipped (100% byte-identical).
+        let mut staged_vdf_epoch: Option<u64> = None;
+        if self.cnvrf_v3_is_active_at(height) {
+            self.validate_cnvrf_v3_payload(&block)?;
+            staged_vdf_epoch = self.extract_and_verify_epoch_vdf_from_block(&block)?;
         }
-        // W10.5 HARDENING (fail LOUD): the power behind the certificate must
-        // reach the quorum of the set in force at THIS height — with the
-        // numbers attached, not just a boolean. `verify` above already
-        // enforces quorum, so this fires only when the two disagree (a bug),
-        // or names the exact shortfall for the operator when a peer serves a
-        // weak certificate (e.g. a unilateral finalization carrying only the
-        // joiner's power after the set already moved on). Either way it is
-        // unmissable: error log + metric + refusal.
-        {
-            let required = validators.quorum_power();
-            if signed < required {
-                tracing::error!(
-                    height,
-                    signed,
-                    required,
-                    total = validators.total_power(),
-                    "REFUSING weak commit certificate: carries {signed} of {required} required power (total {}) — unilateral finalization is never adopted",
-                    validators.total_power(),
-                );
-                eprintln!(
-                    "[quorum] REFUSING weak commit certificate at height {height}: carries {signed} of {required} required power — unilateral finalization is never adopted"
-                );
-                crate::metrics::global().inc_weak_qc_refused();
-                return Err(format!(
-                    "commit certificate carries only {signed} of {required} required power at height {height}"
-                ));
-            }
-        }
-        // SECURITY: do not let the adopt path decide a block that contradicts a lock
-        // we already took.
-        //
-        // The lock is taken on a polka at round `locked_round`. A commit
-        // certificate for a DIFFERENT block is only acceptable when it comes
-        // from a STRICTLY LATER round: that is the proof that the network moved
-        // on without us, so the lock is superseded and must be followed (the
-        // old `locked_round <= certificate.round` test refused exactly that and
-        // partitioned the node from every canonical commit after a single
-        // lost vote).
-        //
-        // A certificate at the SAME round as the lock (or earlier) that names a
-        // different block is a genuine safety conflict - two conflicting
-        // polkas in one round need more than 1/3 Byzantine power - so it is
-        // refused. A certificate for the SAME block is always fine: that is
-        // our own lock being confirmed.
-        //
-        // ROUND-FREE VALUE IDENTITY BEFORE THE LOCK CHECK (ruleset v6): the
-        // incoming commit body may be the OTHER signed round of a value this
-        // node locked on (the QC carries the round-0 hash, our lock names a
-        // later re-stamp). This node need not have held that exact signed body
-        // before — the commit is the first place it sees it — so register the
-        // identity FIRST. Otherwise `same_value` sees an unknown hash, refuses
-        // the commit as conflicting, and the node never adopts the height it
-        // already locked (the late-polka liveness shape). Registration is
-        // exact: `value_id` is the round-free hash of THIS body, so a genuinely
-        // different value still fails the comparison below.
-        self.hc.note_value_id(bh, block.value_id());
-        if let Some((locked_block, locked_round)) = self.hc.locked {
-            // OUR OWN EARLIER PRECOMMIT OUTRANKS A LATER LOCK (ruleset v6
-            // liveness). A commit certificate for a round BEFORE our lock can
-            // only be adopted when it is our value — unless WE already
-            // precommitted exactly this block in that round. Then the
-            // certificate merely confirms our own signed statement; the later
-            // lock was taken after a higher polka for another value and says
-            // nothing about the round that was already committed. Refusing
-            // here parked the height on the very nodes whose precommits made
-            // the certificate (the late-polka shape: a node unlocks on a
-            // higher polka while a valid earlier commit is still in flight).
-            // The same-round case stays refused below, a NEWER locally
-            // decidable precommit quorum wins (never prefer an older commit
-            // over a newer decision this node can already make), and a lock
-            // whose value identity matches still adopts without this escape.
-            // A hash-only lock (we saw the polka's votes but never its body)
-            // has no registered value identity, so `same_value` cannot equate
-            // it with the commit body. Rebuild the commit value at the lock's
-            // signed round: if its hash is exactly the locked hash, the lock
-            // names THIS value at another round. Hash equality proves it; a
-            // genuinely different value cannot collide.
-            let lock_matches_restamp = self.hc.value_id_of(&locked_block).is_none() && {
-                let mut candidate = block.clone();
-                candidate.round = locked_round;
-                candidate.compute_hash() == locked_block
-            };
-            let own_precommit = certificate.round < locked_round
-                && !self
-                    .hc
-                    .has_decidable_precommit_quorum_after(certificate.round)
-                && self
-                    .hc
-                    .precommit_set(certificate.round)
-                    .and_then(|s| s.vote_by(&self.id))
-                    .is_some_and(|v| v.kind == VoteKind::Precommit && v.block_hash == Some(bh));
-            // LOCK COMPARISON (ruleset v6, site 7): a re-stamped round of the
-            // locked value does not contradict the lock; a different value
-            // still does.
-            if certificate.round <= locked_round
-                && !self.hc.same_value(locked_block, bh)
-                && !lock_matches_restamp
-                && !own_precommit
+        // Run all remaining schedule-dependent and state-root checks; roll back
+        // any temporarily staged beacon on Err so rejected commits leave no state.
+        let post_stage_res: Result<(), String> = async {
+            // SECURITY: the proposer must be the one the schedule names for this
+            // height/round, not merely a key that signed. Otherwise a peer names an
+            // address it controls, and `apply_block_fees_rewards` credits the fees to
+            // it with no membership test.
+            if Some(block.proposer)
+                != self.expected_proposer_at(&validators, height, certificate.round)
             {
-                return Err("refusing to adopt a block that contradicts our lock".to_string());
+                return Err("committed block's proposer is not the expected proposer".to_string());
             }
-        }
-        // PREVOTE-QUORUM CONSISTENCY (parity with `try_precommit_quorum`):
-        // the local path refuses to decide a block unless a prevote quorum for
-        // the SAME block exists in the same round. The adopt path receives only
-        // the precommit QC on the wire, so full parity is IMPOSSIBLE without a
-        // wire change: the peer would have to ship a prevote QC for
-        // (height, round, block) alongside the commit certificate (new param or
-        // envelope field), and we would `verify` it against `self.validators`
-        // exactly like the precommit QC above. The signature is deliberately
-        // unchanged (main.rs + tests call `adopt_committed(height, block,
-        // certificate)`), so what we CAN do soundly is consult `self.hc`'s
-        // recorded prevotes for `certificate.round`: if we observed a quorum
-        // for a DIFFERENT target (another block, or nil), adopting this block
-        // contradicts evidence we already hold and is refused. If we observed
-        // nothing -- the normal catching-up node -- the check is VACUOUS and
-        // the precommit QC is trusted transitively (honest validators only
-        // precommit after a prevote quorum, so 2/3 precommits imply one
-        // existed). Residual gap, stated plainly: a Byzantine quorum (or key
-        // compromise reaching quorum power) can fabricate precommits for a
-        // block nobody prevoted, and a lagging node with empty prevote sets
-        // cannot tell; closing it requires the wire change above, not a
-        // stricter local check (refusing on empty local prevotes would make
-        // catch-up impossible by construction).
-        if let Some(set) = self.hc.prevote_set(certificate.round) {
-            if let Some(local_target) = set.quorum_target(&validators) {
-                if local_target != Some(bh) {
-                    return Err("refusing to adopt: our prevote quorum for this round is for a different block".to_string());
+            // ONE attribution pass: `verify_qc_for_height` followed by
+            // `validators.qc_signed_power(&certificate)` used to verify every
+            // Falcon signature twice (once for the verdict, once for the power).
+            // The fused call reaches the SAME verdict and the SAME union-of-
+            // verified-signers power in a single pass.
+            let (quorum_ok, signed) =
+                self.verify_qc_for_height_with_power(&certificate, &validators);
+            if !quorum_ok {
+                return Err("commit certificate does not carry a validator quorum".to_string());
+            }
+            // W10.5 HARDENING (fail LOUD): the power behind the certificate must
+            // reach the quorum of the set in force at THIS height — with the
+            // numbers attached, not just a boolean. `verify` above already
+            // enforces quorum, so this fires only when the two disagree (a bug),
+            // or names the exact shortfall for the operator when a peer serves a
+            // weak certificate (e.g. a unilateral finalization carrying only the
+            // joiner's power after the set already moved on). Either way it is
+            // unmissable: error log + metric + refusal.
+            {
+                let required = validators.quorum_power();
+                if signed < required {
+                    tracing::error!(
+                        height,
+                        signed,
+                        required,
+                        total = validators.total_power(),
+                        "REFUSING weak commit certificate: carries {signed} of {required} required power (total {}) — unilateral finalization is never adopted",
+                        validators.total_power(),
+                    );
+                    eprintln!(
+                        "[quorum] REFUSING weak commit certificate at height {height}: carries {signed} of {required} required power — unilateral finalization is never adopted"
+                    );
+                    crate::metrics::global().inc_weak_qc_refused();
+                    return Err(format!(
+                        "commit certificate carries only {signed} of {required} required power at height {height}"
+                    ));
                 }
             }
+            // SECURITY: do not let the adopt path decide a block that contradicts a lock
+            // we already took.
+            //
+            // The lock is taken on a polka at round `locked_round`. A commit
+            // certificate for a DIFFERENT block is only acceptable when it comes
+            // from a STRICTLY LATER round: that is the proof that the network moved
+            // on without us, so the lock is superseded and must be followed (the
+            // old `locked_round <= certificate.round` test refused exactly that and
+            // partitioned the node from every canonical commit after a single
+            // lost vote).
+            //
+            // A certificate at the SAME round as the lock (or earlier) that names a
+            // different block is a genuine safety conflict - two conflicting
+            // polkas in one round need more than 1/3 Byzantine power - so it is
+            // refused. A certificate for the SAME block is always fine: that is
+            // our own lock being confirmed.
+            //
+            // ROUND-FREE VALUE IDENTITY BEFORE THE LOCK CHECK (ruleset v6): the
+            // incoming commit body may be the OTHER signed round of a value this
+            // node locked on (the QC carries the round-0 hash, our lock names a
+            // later re-stamp). This node need not have held that exact signed body
+            // before — the commit is the first place it sees it — so register the
+            // identity FIRST. Otherwise `same_value` sees an unknown hash, refuses
+            // the commit as conflicting, and the node never adopts the height it
+            // already locked (the late-polka liveness shape). Registration is
+            // exact: `value_id` is the round-free hash of THIS body, so a genuinely
+            // different value still fails the comparison below.
+            self.hc.note_value_id(bh, block.value_id());
+            if let Some((locked_block, locked_round)) = self.hc.locked {
+                // OUR OWN EARLIER PRECOMMIT OUTRANKS A LATER LOCK (ruleset v6
+                // liveness). A commit certificate for a round BEFORE our lock can
+                // only be adopted when it is our value — unless WE already
+                // precommitted exactly this block in that round. Then the
+                // certificate merely confirms our own signed statement; the later
+                // lock was taken after a higher polka for another value and says
+                // nothing about the round that was already committed. Refusing
+                // here parked the height on the very nodes whose precommits made
+                // the certificate (the late-polka shape: a node unlocks on a
+                // higher polka while a valid earlier commit is still in flight).
+                // The same-round case stays refused below, a NEWER locally
+                // decidable precommit quorum wins (never prefer an older commit
+                // over a newer decision this node can already make), and a lock
+                // whose value identity matches still adopts without this escape.
+                // A hash-only lock (we saw the polka's votes but never its body)
+                // has no registered value identity, so `same_value` cannot equate
+                // it with the commit body. Rebuild the commit value at the lock's
+                // signed round: if its hash is exactly the locked hash, the lock
+                // names THIS value at another round. Hash equality proves it; a
+                // genuinely different value cannot collide.
+                let lock_matches_restamp = self.hc.value_id_of(&locked_block).is_none() && {
+                    let mut candidate = block.clone();
+                    candidate.round = locked_round;
+                    candidate.compute_hash() == locked_block
+                };
+                let own_precommit = certificate.round < locked_round
+                    && !self
+                        .hc
+                        .has_decidable_precommit_quorum_after(certificate.round)
+                    && self
+                        .hc
+                        .precommit_set(certificate.round)
+                        .and_then(|s| s.vote_by(&self.id))
+                        .is_some_and(|v| v.kind == VoteKind::Precommit && v.block_hash == Some(bh));
+                // LOCK COMPARISON (ruleset v6, site 7): a re-stamped round of the
+                // locked value does not contradict the lock; a different value
+                // still does.
+                if certificate.round <= locked_round
+                    && !self.hc.same_value(locked_block, bh)
+                    && !lock_matches_restamp
+                    && !own_precommit
+                {
+                    return Err("refusing to adopt a block that contradicts our lock".to_string());
+                }
+            }
+            // PREVOTE-QUORUM CONSISTENCY (parity with `try_precommit_quorum`):
+            // the local path refuses to decide a block unless a prevote quorum for
+            // the SAME block exists in the same round. The adopt path receives only
+            // the precommit QC on the wire, so full parity is IMPOSSIBLE without a
+            // wire change: the peer would have to ship a prevote QC for
+            // (height, round, block) alongside the commit certificate (new param or
+            // envelope field), and we would `verify` it against `self.validators`
+            // exactly like the precommit QC above. The signature is deliberately
+            // unchanged (main.rs + tests call `adopt_committed(height, block,
+            // certificate)`), so what we CAN do soundly is consult `self.hc`'s
+            // recorded prevotes for `certificate.round`: if we observed a quorum
+            // for a DIFFERENT target (another block, or nil), adopting this block
+            // contradicts evidence we already hold and is refused. If we observed
+            // nothing -- the normal catching-up node -- the check is VACUOUS and
+            // the precommit QC is trusted transitively (honest validators only
+            // precommit after a prevote quorum, so 2/3 precommits imply one
+            // existed). Residual gap, stated plainly: a Byzantine quorum (or key
+            // compromise reaching quorum power) can fabricate precommits for a
+            // block nobody prevoted, and a lagging node with empty prevote sets
+            // cannot tell; closing it requires the wire change above, not a
+            // stricter local check (refusing on empty local prevotes would make
+            // catch-up impossible by construction).
+            if let Some(set) = self.hc.prevote_set(certificate.round) {
+                if let Some(local_target) = set.quorum_target(&validators) {
+                    if local_target != Some(bh) {
+                        return Err("refusing to adopt: our prevote quorum for this round is for a different block".to_string());
+                    }
+                }
+            }
+            // SECURITY: bind the block to the state it builds on. A block header commits
+            // to the state root BEFORE it is applied, and the linkage check above already
+            // forces the block to extend our own finalized head -- so the parent state IS
+            // ours and our live root is the right thing to compare against. Without this
+            // the adopt path applied blocks to a state the network never committed to,
+            // and computed a root nobody else had.
+            // (Linkage, size/gas and proposer-signature checks ran above, before the QC
+            // verify — not repeated here: the hot path verifies each once.)
+            let root_before = self.state.get_state_root().await;
+            if block.state_root != root_before {
+                return Err(format!(
+                    "committed block claims parent state root {} but our state is {}",
+                    hex::encode(block.state_root),
+                    hex::encode(root_before)
+                ));
+            }
+            // PERF_PROFILE §6.2: parallel intake batch — byte-identical verdict
+            // to the serial batch (see sharding.rs: same primitive apply uses).
+            if !crate::sharding::Transaction::verify_signatures_batch_parallel(&block.transactions)
+            {
+                return Err("committed block contains a bad transaction signature".to_string());
+            }
+            // Actor-mailbox cap (adopt side): the same deterministic refusal as
+            // propose/finalize, so a Byzantine commit carrying an over-cap block
+            // cannot smuggle a root-invisible leftover past the decision boundary.
+            self.check_actor_cap(&block).await?;
+            // TRANSACTION-ORDER COMMITMENT (adopt side): the same rule the
+            // proposal and finalize paths apply. The quorum certificate already
+            // binds the block hash (which contains the order root), so on an
+            // upgraded network this can only fire for a body whose order was
+            // never committed — refused, never applied.
+            self.check_order_commitment_with_hash(&block, &bh)?;
+            // Timestamp gate (adopt side, A3): the same fail-closed parent check
+            // the proposal path runs, so a commit cannot smuggle a timestamp no
+            // proposer could publish. Runs BEFORE the body is stored: the check
+            // reads the parent out of `blocks`/`last_decision`, and storing first
+            // would let a block vouch for itself.
+            self.check_block_timestamp(&block)?;
+            // CANONICAL DOWNTIME EVIDENCE (adopt side, W10.5): the same rule the
+            // proposal path applies. The transition attributes downtime from the
+            // embedded parent QC, so an adopted block must carry evidence the
+            // network actually decided — verified against the set in force at H-1.
+            self.check_last_qc_evidence_with_hash(&block, &bh)?;
+            Ok(())
         }
-        // SECURITY: bind the block to the state it builds on. A block header commits
-        // to the state root BEFORE it is applied, and the linkage check above already
-        // forces the block to extend our own finalized head -- so the parent state IS
-        // ours and our live root is the right thing to compare against. Without this
-        // the adopt path applied blocks to a state the network never committed to,
-        // and computed a root nobody else had.
-        // (Linkage, size/gas and proposer-signature checks ran above, before the QC
-        // verify — not repeated here: the hot path verifies each once.)
-        let root_before = self.state.get_state_root().await;
-        if block.state_root != root_before {
-            return Err(format!(
-                "committed block claims parent state root {} but our state is {}",
-                hex::encode(block.state_root),
-                hex::encode(root_before)
-            ));
+        .await;
+        if let Err(e) = post_stage_res {
+            if let Some(ep) = staged_vdf_epoch {
+                self.ready_vdf_beacons.remove(&ep);
+            }
+            return Err(e);
         }
-        // PERF_PROFILE §6.2: parallel intake batch — byte-identical verdict
-        // to the serial batch (see sharding.rs: same primitive apply uses).
-        if !crate::sharding::Transaction::verify_signatures_batch_parallel(&block.transactions) {
-            return Err("committed block contains a bad transaction signature".to_string());
-        }
-        // Actor-mailbox cap (adopt side): the same deterministic refusal as
-        // propose/finalize, so a Byzantine commit carrying an over-cap block
-        // cannot smuggle a root-invisible leftover past the decision boundary.
-        self.check_actor_cap(&block).await?;
-        // TRANSACTION-ORDER COMMITMENT (adopt side): the same rule the
-        // proposal and finalize paths apply. The quorum certificate already
-        // binds the block hash (which contains the order root), so on an
-        // upgraded network this can only fire for a body whose order was
-        // never committed — refused, never applied.
-        self.check_order_commitment_with_hash(&block, &bh)?;
-        // Timestamp gate (adopt side, A3): the same fail-closed parent check
-        // the proposal path runs, so a commit cannot smuggle a timestamp no
-        // proposer could publish. Runs BEFORE the body is stored: the check
-        // reads the parent out of `blocks`/`last_decision`, and storing first
-        // would let a block vouch for itself.
-        self.check_block_timestamp(&block)?;
-        // CANONICAL DOWNTIME EVIDENCE (adopt side, W10.5): the same rule the
-        // proposal path applies. The transition attributes downtime from the
-        // embedded parent QC, so an adopted block must carry evidence the
-        // network actually decided — verified against the set in force at H-1.
-        self.check_last_qc_evidence_with_hash(&block, &bh)?;
 
         // DOWNTIME PARITY with the local path: the transition reads its slash
         // evidence from `block.last_qc` (canonical, proposer-chosen — see

@@ -1614,6 +1614,25 @@ async fn walk_chain_once_with_lanes(
         return None;
     }
 
+    // W6-A1-4: when CN-VRF v3 is active at any walked height, extract & verify
+    // `block.cnvrf_v3.epoch_vdf` into `rt.ready_vdf_beacons` BEFORE calling
+    // `validate_sync_chain_*` (which consults `rt.committee_schedule_at(h)`).
+    // Below `CNVRF_V3_ACTIVATION_HEIGHT` this is a complete no-op.
+    let mut staged_vdf_epochs: Vec<u64> = Vec::new();
+    for b in &blocks {
+        match rt.extract_and_verify_epoch_vdf_from_block(b) {
+            Ok(Some(ep)) => staged_vdf_epochs.push(ep),
+            Ok(None) => {}
+            Err(e) => {
+                for ep in staged_vdf_epochs {
+                    rt.remove_ready_vdf_beacon(ep);
+                }
+                eprintln!("[sync] rejecting peer chain: {e}");
+                return None;
+            }
+        }
+    }
+
     // Shard-aware: a peer must not feed another shard's blocks under our anchor.
     //
     // Validate against the runtime's OWN block shard (`rt.shard_id`), not the
@@ -1646,6 +1665,9 @@ async fn walk_chain_once_with_lanes(
         ) {
             Ok(h) => h,
             Err(e) => {
+                for ep in staged_vdf_epochs {
+                    rt.remove_ready_vdf_beacon(ep);
+                }
                 eprintln!("[sync] rejecting peer chain: {e}");
                 return None;
             }
@@ -1704,6 +1726,9 @@ async fn walk_chain_once_with_lanes(
             ) {
                 Ok(r) => Some(r),
                 Err(e) => {
+                    for ep in staged_vdf_epochs {
+                        rt.remove_ready_vdf_beacon(ep);
+                    }
                     eprintln!("[sync] rejecting peer chain: light-client anchor: {e}");
                     return None;
                 }
@@ -1738,6 +1763,9 @@ async fn walk_chain_once_with_lanes(
         // against the root before applying, not after.
         let root_before = rt.state.get_state_root().await;
         if root_before != b.state_root {
+            for ep in &staged_vdf_epochs {
+                rt.remove_ready_vdf_beacon(*ep);
+            }
             eprintln!(
                 "[sync] rejecting peer chain: block {} commits to parent root {} but our state is {}",
                 b.height,
@@ -1753,6 +1781,9 @@ async fn walk_chain_once_with_lanes(
         // the class of bug this wiring exists to catch.)
         if let Some(anchored) = anchored_root {
             if b.height == tail_height && anchored != root_before {
+                for ep in &staged_vdf_epochs {
+                    rt.remove_ready_vdf_beacon(*ep);
+                }
                 eprintln!(
                     "[sync] rejecting peer chain: the light-client anchor commits to root {} but our state is {}",
                     hex::encode(anchored),
@@ -1782,10 +1813,16 @@ async fn walk_chain_once_with_lanes(
         // over-cap is refused like an adopted one, so a peer cannot smuggle a
         // root-invisible leftover past the decision boundary via the walk.
         if let Err(e) = rt.check_actor_cap(&b).await {
+            for ep in &staged_vdf_epochs {
+                rt.remove_ready_vdf_beacon(*ep);
+            }
             eprintln!("[sync] rejecting peer chain: block {} {e}", b.height);
             return None;
         }
         let Some(qc) = b.precommit_qc.clone() else {
+            for ep in &staged_vdf_epochs {
+                rt.remove_ready_vdf_beacon(*ep);
+            }
             eprintln!(
                 "[sync] rejecting peer chain: block {} has no decision proof",
                 b.height
@@ -1837,6 +1874,9 @@ async fn walk_chain_once_with_lanes(
             match written {
                 Ok((body, Ok(()))) => b = body,
                 Ok((_, Err(e))) => {
+                    for ep in &staged_vdf_epochs {
+                        rt.remove_ready_vdf_beacon(*ep);
+                    }
                     // Fail closed without advancing safety: a durable order we
                     // cannot establish must not be papered over.
                     eprintln!(
@@ -1846,6 +1886,9 @@ async fn walk_chain_once_with_lanes(
                     return None;
                 }
                 Err(e) => {
+                    for ep in &staged_vdf_epochs {
+                        rt.remove_ready_vdf_beacon(*ep);
+                    }
                     eprintln!(
                         "[sync] refusing peer chain: finalized persist task for block {} failed: {e}",
                         hex::encode(bh)
@@ -1967,6 +2010,9 @@ async fn walk_chain_once_with_lanes(
         if let Some(next) = blocks.get(i + 1) {
             let ours = rt.state.get_state_root().await;
             if ours != next.state_root {
+                for ep in &staged_vdf_epochs {
+                    rt.remove_ready_vdf_beacon(*ep);
+                }
                 eprintln!(
                     "[sync] refusing peer chain: applying block {} moved our root to {} but block {} commits to {}",
                     applied_height,

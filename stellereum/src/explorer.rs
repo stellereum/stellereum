@@ -1393,16 +1393,7 @@ async fn api_faucet(
         .await
         .map(|acc| acc.nonce)
         .unwrap_or(0);
-    let pending: Vec<u64> = st
-        .rpc
-        .mempool
-        .read()
-        .await
-        .all()
-        .iter()
-        .filter(|t| t.from == faucet_addr)
-        .map(|t| t.nonce)
-        .collect();
+    let pending: Vec<u64> = st.rpc.mempool.read().await.nonces_for_sender(&faucet_addr);
     let chain_id = faucet
         .chain_id()
         .unwrap_or_else(crate::consensus::consensus_chain_id);
@@ -1641,16 +1632,7 @@ async fn api_faucet_public(
         .await
         .map(|acc| acc.nonce)
         .unwrap_or(0);
-    let pending: Vec<u64> = st
-        .rpc
-        .mempool
-        .read()
-        .await
-        .all()
-        .iter()
-        .filter(|t| t.from == faucet_addr)
-        .map(|t| t.nonce)
-        .collect();
+    let pending: Vec<u64> = st.rpc.mempool.read().await.nonces_for_sender(&faucet_addr);
     let chain_id = faucet
         .chain_id()
         .unwrap_or_else(crate::consensus::consensus_chain_id);
@@ -2030,20 +2012,13 @@ async fn api_account(
         }
     }
     drop(ledger);
-    let pending: Vec<crate::sharding::Transaction> = {
+    let (recent_tx_count, pending_sorted) = {
         let pool = st.rpc.mempool.read().await;
-        pool.all()
-            .into_iter()
-            .filter(|t| t.from == a || t.to == a)
-            .collect()
+        pool.matching_account(&a, MAX_ACCOUNT_TXS)
     };
-    let recent_tx_count = pending.len();
-    let mut pending_sorted = pending;
-    pending_sorted.sort_by(|x, y| y.nonce.cmp(&x.nonce));
     let truncated = recent_tx_count > MAX_ACCOUNT_TXS;
     let recent: Vec<serde_json::Value> = pending_sorted
         .into_iter()
-        .take(MAX_ACCOUNT_TXS)
         .map(|t| {
             let out = t.from == a;
             json!({

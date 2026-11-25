@@ -19,6 +19,7 @@
 //!   "zkml_models" : height(8B BE) -> bincode(ZkMlModelRegistry)  [audit F-B]
 //!   "cross_shard" : height(8B BE) -> bincode(CrossShardReplaySnapshot) [audit F-I]
 //!   "cnvrf_v3"    : height(8B BE) -> bincode(CnVrfV3EngineSnapshot)
+//!   "cnvrf_freeze_inputs": height(8B BE) -> bincode(BTreeMap<u64, ([u8; 32], [u8; 48])>) [additive CN-VRF v3 freeze inputs]
 //!   "xshard_headers": b"latest" -> bincode(FinalizedHeaderRegistry snapshot) [durable C1 anchors]
 //!   "receipts_v1" : tx_hash (32B) -> bincode(StoredReceipt)   [NEW, additive only]
 //!   "receipts_by_height": height(8B BE)+index(4B BE)+tx_hash(32B) -> b"" [NEW, additive only]
@@ -149,6 +150,10 @@ pub struct Storage {
     /// the same reason as `session_keys`/`bridge`/`zkml_models`: `DomainSnapshot`
     /// is frozen, and an absent/empty entry means `CnVrfV3EngineSnapshot::default()`.
     pub(super) cnvrf_v3: sled::Tree,
+    /// CN-VRF v3 `H_freeze` boundary inputs (`epoch -> (freeze_block_hash, rolling_mix)`),
+    /// keyed by height and written alongside the domain snapshot. Own tree so
+    /// `CnVrfV3EngineSnapshot` bincode layout remains 100% backwards-compatible.
+    pub(super) cnvrf_freeze_inputs: sled::Tree,
     /// Durable cross-shard finalized-header registry
     /// ([`crate::sharding::FinalizedHeaderRegistry`]): the latest shard heads
     /// plus the bounded `(shard, block_hash) -> post-apply root` anchor window.
@@ -336,6 +341,7 @@ impl Storage {
         let zkml_models = db.open_tree("zkml_models")?;
         let cross_shard = db.open_tree("cross_shard")?;
         let cnvrf_v3 = db.open_tree("cnvrf_v3")?;
+        let cnvrf_freeze_inputs = db.open_tree("cnvrf_freeze_inputs")?;
         let xshard_headers = db.open_tree("xshard_headers")?;
         let receipts = db.open_tree("receipts_v1")?;
         let receipts_by_height = db.open_tree("receipts_by_height")?;
@@ -365,6 +371,7 @@ impl Storage {
             zkml_models,
             cross_shard,
             cnvrf_v3,
+            cnvrf_freeze_inputs,
             xshard_headers,
             receipts,
             receipts_by_height,

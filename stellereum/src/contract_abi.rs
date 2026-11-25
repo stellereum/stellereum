@@ -1126,9 +1126,10 @@ impl ContractAbi {
         // Canonical: type tag followed by the payload.
         if !bytes.is_empty() && bytes[0] == ty.tag() {
             let mut cur = Cursor::new(&bytes[1..]);
-            let v = AbiValue::decode_payload(ty, &mut cur)?;
-            if cur.is_empty() {
-                return Ok(v);
+            if let Ok(v) = AbiValue::decode_payload(ty, &mut cur) {
+                if cur.is_empty() {
+                    return Ok(v);
+                }
             }
         }
 
@@ -1147,10 +1148,13 @@ impl ContractAbi {
                 Ok(v)
             }
             AbiType::Bytes | AbiType::String => {
+                // Bare length-prefixed payload (`u32_le(len) || data`): pass the
+                // full buffer to `decode_payload`, which consumes the 4-byte
+                // prefix itself and validates `MAX_ABI_BLOB_LEN` / UTF-8.
                 if bytes.len() >= 4 {
                     let len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
                     if len == bytes.len() - 4 {
-                        let mut cur = Cursor::new(&bytes[4..]);
+                        let mut cur = Cursor::new(bytes);
                         return AbiValue::decode_payload(ty, &mut cur);
                     }
                 }

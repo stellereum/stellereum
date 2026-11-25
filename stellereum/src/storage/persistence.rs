@@ -50,6 +50,10 @@ pub enum PersistJob {
         height: u64,
         bytes: Vec<u8>,
     },
+    CnVrfFreezeInputs {
+        height: u64,
+        bytes: Vec<u8>,
+    },
     EvmBindingsState {
         height: u64,
         bytes: Vec<u8>,
@@ -139,6 +143,7 @@ pub fn persist_job_label(job: &PersistJob) -> &'static str {
         PersistJob::State { .. } => "State snapshot",
         PersistJob::Domains { .. } => "Domains snapshot",
         PersistJob::CnVrfV3 { .. } => "CN-VRF v3 snapshot",
+        PersistJob::CnVrfFreezeInputs { .. } => "CN-VRF v3 freeze inputs snapshot",
         PersistJob::EvmBindingsState { .. } => "EVM bindings state snapshot",
         PersistJob::PqRegistry { .. } => "PQ registry snapshot",
         PersistJob::EvmSettledState { .. } => "EVM settled nullifiers snapshot",
@@ -176,6 +181,7 @@ pub fn persist_drop_consequence(job: &PersistJob) -> &'static str {
             "receipts for this height are re-derivable by re-application; RPC serves no receipt until then"
         }
         PersistJob::CnVrfV3 { .. }
+        | PersistJob::CnVrfFreezeInputs { .. }
         | PersistJob::EvmBindingsState { .. }
         | PersistJob::PqRegistry { .. }
         | PersistJob::EvmSettledState { .. }
@@ -297,6 +303,9 @@ impl AsyncPersistence {
                         .and_then(|()| st.put_bridge(height, &bridge))
                         .and_then(|()| st.put_zkml_models(height, &zkml_models)),
                     PersistJob::CnVrfV3 { height, bytes } => st.put_cnvrf_v3(height, &bytes),
+                    PersistJob::CnVrfFreezeInputs { height, bytes } => {
+                        st.put_cnvrf_freeze_inputs(height, &bytes)
+                    }
                     PersistJob::EvmBindingsState { height, bytes } => {
                         st.put_evm_bindings_state(height, &bytes)
                     }
@@ -567,6 +576,12 @@ impl AsyncPersistence {
         self.push(PersistJob::CnVrfV3 { height, bytes });
     }
 
+    /// Non-blocking: enqueue CN-VRF v3 `H_freeze` inputs for `height`
+    /// (`BoundedWait` policy, matching `CnVrfV3`).
+    pub fn enqueue_cnvrf_freeze_inputs(&self, height: u64, bytes: Vec<u8>) {
+        self.push(PersistJob::CnVrfFreezeInputs { height, bytes });
+    }
+
     /// Non-blocking: enqueue a canonical `Domain::EvmBindings` snapshot for `height`.
     pub fn enqueue_evm_bindings_state(&self, height: u64, bytes: Vec<u8>) {
         self.push(PersistJob::EvmBindingsState { height, bytes });
@@ -628,6 +643,7 @@ impl AsyncPersistence {
         let bridge = engine.bridge_snapshot().await;
         let zkml_models = engine.zkml_models_snapshot().await;
         let cnvrf_v3 = bincode::serialize(&engine.cnvrf_v3_snapshot().await).unwrap_or_default();
+        let cnvrf_freeze_inputs = engine.cnvrf_freeze_inputs_snapshot().await;
         let evm_bindings = engine.evm_bindings_snapshot().await;
         let pq_registry = engine.pq_registry_snapshot().await;
         let evm_settled = engine.evm_settled_snapshot().await;
@@ -666,6 +682,7 @@ impl AsyncPersistence {
         // skip on error exactly like the old inline `if let Ok(bytes)` did.
         if let Some(bytes) = serialize_off_tick(snap).await {
             self.enqueue_cnvrf_v3(height, cnvrf_v3);
+            self.enqueue_cnvrf_freeze_inputs(height, cnvrf_freeze_inputs);
             self.enqueue_evm_bindings_state(height, evm_bindings);
             self.enqueue_pq_registry(height, pq_registry);
             self.enqueue_evm_settled_state(height, evm_settled);

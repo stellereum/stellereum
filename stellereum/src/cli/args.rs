@@ -973,6 +973,9 @@ pub(crate) enum ValidatorCommands {
         /// Optional self-bond top-up in nano-STELL emitted before unjail
         #[arg(long)]
         top_up: Option<u64>,
+        /// Optional gas limit override in nano-STELL (must cover base fee / D2 penalty floor)
+        #[arg(long)]
+        gas_limit: Option<u64>,
         /// JSON-RPC endpoint
         #[arg(long, default_value = "http://127.0.0.1:8545")]
         rpc: String,
@@ -1049,23 +1052,26 @@ pub(crate) enum WalletCommands {
     /// The ONLY transfer command that verifies when `STELL_PURE_PQ=1` (live +
     /// local-cluster): plain `wallet send` builds legacy ed25519 txs, which
     /// pure-PQ nodes refuse with `invalid transaction signature`.
-    /// The Falcon-512 keypair is derived from `--falcon-seed` with the SAME
-    /// raw derivation `Faucet::new` uses (`generate_from_seed_bytes`, no
-    /// wallet KDF), so passing the shared faucet seed spends the
-    /// genesis-funded faucet PQ account. The tx shape is byte-identical to a
-    /// faucet drip (`sign_pq_explicit_transfer`: unbound, always-explicit,
-    /// base fee + activation surcharge) — it fits the existing verifier, no
-    /// consensus change. Fail-closed: a bad seed is refused here, never
-    /// silently downgraded to an ed25519 (or unsigned) transaction.
+    /// The Falcon-512 keypair is derived from `--falcon-seed-file`,
+    /// `STELL_FALCON_SEED`, or `--falcon-seed` with the SAME raw derivation
+    /// `Faucet::new` uses (`generate_from_seed_bytes`, no wallet KDF), so
+    /// passing the shared faucet seed spends the genesis-funded faucet PQ
+    /// account. The tx shape is byte-identical to a faucet drip
+    /// (`sign_pq_explicit_transfer`: unbound, always-explicit, base fee +
+    /// activation surcharge) — it fits the existing verifier, no consensus
+    /// change. Fail-closed: a bad seed is refused here, never silently
+    /// downgraded to an ed25519 (or unsigned) transaction.
     /// Key-derivation caveat: the derivation is strict-only (LEAD: no
     /// legacy branch) — the funded account is always the address this
     /// derivation produces; a mismatched seed means the node refuses for
     /// insufficient balance.
     SendPq {
-        /// Falcon-512 seed in hex (32 bytes). For the genesis-funded faucet
-        /// account this is the shared `STELL_FAUCET_KEY` seed (dev only).
+        /// Falcon-512 seed in hex (32 bytes, dev/test only; prefer --falcon-seed-file or STELL_FALCON_SEED).
         #[arg(long)]
-        falcon_seed: String,
+        falcon_seed: Option<String>,
+        /// Path to a file containing the 32-byte Falcon-512 hex seed (preferred over --falcon-seed).
+        #[arg(long)]
+        falcon_seed_file: Option<PathBuf>,
         /// Recipient 32-byte address in hex
         #[arg(long)]
         to: String,
@@ -1121,6 +1127,9 @@ pub(crate) enum WalletCommands {
         /// same governed minimum as any `SysCallStake`.
         #[arg(long)]
         top_up: Option<u64>,
+        /// Optional gas limit override in nano-STELL (must cover base fee / D2 penalty floor)
+        #[arg(long)]
+        gas_limit: Option<u64>,
         /// JSON-RPC endpoint to submit to
         #[arg(long, default_value = "http://127.0.0.1:8545")]
         rpc: String,
@@ -1758,6 +1767,8 @@ mod cli_safety_init_tests {
             "/tmp/cold.key",
             "--validator",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--gas-limit",
+            "650000",
         ])
         .expect("parse wallet unjail");
         assert!(matches!(
@@ -1766,6 +1777,53 @@ mod cli_safety_init_tests {
                 sub: WalletCommands::Unjail {
                     falcon_key_file: Some(_),
                     falcon_seed: None,
+                    gas_limit: Some(650_000),
+                    ..
+                }
+            }
+        ));
+
+        let val_unjail_cli = Cli::try_parse_from([
+            "stellereum",
+            "validator",
+            "unjail",
+            "--withdrawal-key-file",
+            "/tmp/cold.key",
+            "--validator-id",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--gas-limit",
+            "1300000",
+        ])
+        .expect("parse validator unjail");
+        assert!(matches!(
+            val_unjail_cli.command,
+            Commands::Validator {
+                sub: ValidatorCommands::Unjail {
+                    gas_limit: Some(1_300_000),
+                    ..
+                }
+            }
+        ));
+
+        let send_pq_cli = Cli::try_parse_from([
+            "stellereum",
+            "wallet",
+            "send-pq",
+            "--falcon-seed-file",
+            "/tmp/faucet.seed",
+            "--to",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--amount",
+            "1000",
+        ])
+        .expect("parse wallet send-pq with --falcon-seed-file");
+        assert!(matches!(
+            send_pq_cli.command,
+            Commands::Wallet {
+                sub: WalletCommands::SendPq {
+                    falcon_seed: None,
+                    falcon_seed_file: Some(_),
+                    amount: 1000,
                     ..
                 }
             }

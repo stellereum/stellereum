@@ -937,6 +937,34 @@ impl EpochDkg {
         Ok(material)
     }
 
+    /// Compute every committee member's public Feldman share commitment
+    /// `Y_i = sum_j eval_point(C_j, i)` for `i in 1..=N`.
+    pub fn member_public_shares(
+        &self,
+    ) -> Result<std::collections::BTreeMap<u32, [u8; 32]>, String> {
+        let mut decoded_commitments: Vec<Vec<RistrettoPoint>> =
+            Vec::with_capacity(self.contributions.len());
+        for contribution in self.contributions.values() {
+            let mut pts = Vec::with_capacity(contribution.commitments.len());
+            for c in &contribution.commitments {
+                pts.push(
+                    decompress_point(c)
+                        .ok_or_else(|| "dkg commitment is not a valid curve point".to_string())?,
+                );
+            }
+            decoded_commitments.push(pts);
+        }
+        let mut out = std::collections::BTreeMap::new();
+        for idx in 1..=self.committee.members.len() as u32 {
+            let mut y = RistrettoPoint::default();
+            for pts in &decoded_commitments {
+                y += eval_point(pts, idx as u64);
+            }
+            out.insert(idx, y.compress().to_bytes());
+        }
+        Ok(out)
+    }
+
     /// The finalized key material (if the DKG completed).
     pub fn material(&self) -> Option<&EpochKeyMaterial> {
         self.material.as_ref()
@@ -2281,6 +2309,27 @@ pub fn combine_partials(
     Ok(shared.compress().to_bytes())
 }
 
+/// Combine at least `threshold` decryption partials into the shared secret
+/// point, additionally checking that every `validator_index` is in `1..=committee_size`.
+pub fn combine_partials_checked(
+    partials: &[DecryptionPartial],
+    threshold: usize,
+    committee_size: usize,
+) -> Result<[u8; 32], String> {
+    if committee_size == 0 {
+        return Err("committee size must be positive".to_string());
+    }
+    for p in partials {
+        if p.validator_index == 0 || (p.validator_index as usize) > committee_size {
+            return Err(format!(
+                "decryption partial validator_index {} is out of committee bounds 1..={}",
+                p.validator_index, committee_size
+            ));
+        }
+    }
+    combine_partials(partials, threshold)
+}
+
 /// Unseal a transaction from the combined decryption partials.
 pub fn unseal_transaction(
     envelope: &SealedEnvelope,
@@ -2289,6 +2338,19 @@ pub fn unseal_transaction(
     committee_hash: &[u8; 32],
 ) -> Result<Vec<u8>, String> {
     let shared = combine_partials(partials, threshold)?;
+    decrypt_with_shared_point(envelope, &shared, committee_hash)
+}
+
+/// Unseal a transaction from the combined decryption partials, enforcing that
+/// every `validator_index` is within `1..=committee_size`.
+pub fn unseal_transaction_checked(
+    envelope: &SealedEnvelope,
+    partials: &[DecryptionPartial],
+    threshold: usize,
+    committee_hash: &[u8; 32],
+    committee_size: usize,
+) -> Result<Vec<u8>, String> {
+    let shared = combine_partials_checked(partials, threshold, committee_size)?;
     decrypt_with_shared_point(envelope, &shared, committee_hash)
 }
 
@@ -2313,8 +2375,10 @@ pub struct OrderCommitment {
     pub tx_hashes: Vec<[u8; 32]>,
     /// The proposer's validator identity.
     pub proposer: [u8; 32],
-    /// The proposer's signature over [`order_commitment_signing_message`].
+    /// The proposer's Ed25519 signature over [`order_commitment_signing_message`].
     pub signature: Vec<u8>,
+    /// Optional Falcon-512 proposer signature over [`order_commitment_signing_message`].
+    pub pq_sig: Option<Vec<u8>>,
 }
 
 /// The exact bytes a proposer signs to commit to a round's order.
@@ -2334,7 +2398,7 @@ pub fn order_commitment_signing_message(
 }
 
 impl OrderCommitment {
-    /// Sign a round's order commitment with the proposer's key.
+    /// Sign a round's order commitment with the proposer's Ed25519 key.
     pub fn sign(
         epoch: u64,
         height: u64,
@@ -2353,13 +2417,78 @@ impl OrderCommitment {
             tx_hashes,
             proposer: signer.verifying_key().to_bytes(),
             signature,
+            pq_sig: None,
         }
     }
 
-    /// Verify the commitment's signature and its internal consistency.
+    /// Sign a round's order commitment with the proposer's Falcon-512 key.
+    pub fn sign_pq(
+        epoch: u64,
+        height: u64,
+        round: u32,
+        tx_hashes: Vec<[u8; 32]>,
+        proposer: [u8; 32],
+        falcon: &FalconKeypair,
+    ) -> OrderCommitment {
+        let order_root = crate::mev::order_merkle_root_of_hashes(&tx_hashes);
+        let msg = order_commitment_signing_message(epoch, height, round, &order_root);
+        let pq_sig = falcon.sign(&msg);
+        OrderCommitment {
+            epoch,
+            height,
+            round,
+            order_root,
+            tx_hashes,
+            proposer,
+            signature: Vec::new(),
+            pq_sig: Some(pq_sig),
+        }
+    }
+
+    /// Sign a round's order commitment with both Ed25519 and Falcon-512 keys.
+    pub fn sign_dual(
+        epoch: u64,
+        height: u64,
+        round: u32,
+        tx_hashes: Vec<[u8; 32]>,
+        signer: &SigningKey,
+        falcon: &FalconKeypair,
+    ) -> OrderCommitment {
+        let order_root = crate::mev::order_merkle_root_of_hashes(&tx_hashes);
+        let msg = order_commitment_signing_message(epoch, height, round, &order_root);
+        let signature = signer.sign(&msg).to_bytes().to_vec();
+        let pq_sig = falcon.sign(&msg);
+        OrderCommitment {
+            epoch,
+            height,
+            round,
+            order_root,
+            tx_hashes,
+            proposer: signer.verifying_key().to_bytes(),
+            signature,
+            pq_sig: Some(pq_sig),
+        }
+    }
+
+    /// Verify the commitment's Ed25519 signature and its internal consistency.
+    ///
+    /// Refuses under `is_pure_pq_enforced()` and refuses PQ-only commitments
+    /// that must be verified against an expected Falcon-512 key via [`Self::verify_pq`].
     pub fn verify(&self) -> Result<(), String> {
         if self.order_root != crate::mev::order_merkle_root_of_hashes(&self.tx_hashes) {
             return Err("order commitment does not match its transaction list".to_string());
+        }
+        if crate::post_quantum::is_pure_pq_enforced() {
+            return Err(
+                "order commitment requires Falcon-512 verification in pure-PQ mode (use verify_pq)"
+                    .to_string(),
+            );
+        }
+        if self.signature.is_empty() && self.pq_sig.is_some() {
+            return Err(
+                "PQ order commitment requires an expected Falcon-512 key (use verify_pq)"
+                    .to_string(),
+            );
         }
         let msg =
             order_commitment_signing_message(self.epoch, self.height, self.round, &self.order_root);
@@ -2369,6 +2498,31 @@ impl OrderCommitment {
             .map_err(|e| format!("order commitment signature is malformed: {e}"))?;
         pk.verify(&msg, &sig)
             .map_err(|e| format!("order commitment signature does not verify: {e}"))
+    }
+
+    /// Verify the commitment's Falcon-512 signature against `expected_falcon_pk`
+    /// and its internal consistency.
+    pub fn verify_pq(&self, expected_falcon_pk: &[u8]) -> Result<(), String> {
+        if self.order_root != crate::mev::order_merkle_root_of_hashes(&self.tx_hashes) {
+            return Err("order commitment does not match its transaction list".to_string());
+        }
+        let Some(pq_sig) = self.pq_sig.as_ref() else {
+            return Err("order commitment carries no Falcon-512 signature".to_string());
+        };
+        let msg =
+            order_commitment_signing_message(self.epoch, self.height, self.round, &self.order_root);
+        if !verify_pq_signature(PqScheme::Falcon512, expected_falcon_pk, &msg, pq_sig) {
+            return Err("order commitment Falcon-512 signature does not verify".to_string());
+        }
+        if !self.signature.is_empty() {
+            let pk = ed25519_dalek::VerifyingKey::from_bytes(&self.proposer)
+                .map_err(|e| format!("order commitment proposer key is invalid: {e}"))?;
+            let sig = Signature::from_slice(&self.signature)
+                .map_err(|e| format!("order commitment signature is malformed: {e}"))?;
+            pk.verify(&msg, &sig)
+                .map_err(|e| format!("order commitment Ed25519 signature does not verify: {e}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -2386,6 +2540,184 @@ pub struct ShareRelease {
     pub partials: Vec<([u8; 32], DecryptionPartial)>,
 }
 
+/// Domain separator of a Falcon-authenticated share-release envelope.
+pub const PQ_SHARE_RELEASE_SIG_DOMAIN: &[u8; 26] = b"STELL_MEV_PQ_SHARE_REL_SG1";
+/// Domain separator for Chaum-Pedersen DLEQ proofs binding a decryption partial
+/// `D_i = share_i * C` to the validator's Feldman commitment `Y_i = share_i * G`.
+pub const DLEQ_PROOF_DOMAIN: &[u8; 23] = b"STELL_MEV_DLEQ_PROOF_V1";
+
+/// Chaum-Pedersen DLEQ proof that `partial = share * ephemeral_pk` and
+/// `public_share = share * G` share the same discrete logarithm `share`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialDleqProof {
+    pub challenge: [u8; 32],
+    pub response: [u8; 32],
+}
+
+/// Construct a Chaum-Pedersen DLEQ proof for a released decryption partial.
+pub fn prove_partial_dleq(
+    share: &[u8; 32],
+    epoch: u64,
+    validator_index: u32,
+    ephemeral_pk: &[u8; 32],
+    partial_point: &[u8; 32],
+) -> Result<PartialDleqProof, String> {
+    let x = Option::<Scalar>::from(Scalar::from_canonical_bytes(*share))
+        .ok_or_else(|| "epoch share is not a canonical scalar".to_string())?;
+    let c_pt = decompress_point(ephemeral_pk)
+        .ok_or_else(|| "sealed envelope has an invalid ephemeral public key".to_string())?;
+    let d_pt = decompress_point(partial_point)
+        .ok_or_else(|| "decryption partial is not a valid curve point".to_string())?;
+    let y_pt = RISTRETTO_BASEPOINT_POINT * x;
+    if c_pt * x != d_pt {
+        return Err("decryption partial does not match epoch share".to_string());
+    }
+    let mut k_bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut k_bytes);
+    let k = Scalar::from_bytes_mod_order(k_bytes);
+    let r1 = (RISTRETTO_BASEPOINT_POINT * k).compress().to_bytes();
+    let r2 = (c_pt * k).compress().to_bytes();
+    let g_bytes = RISTRETTO_BASEPOINT_POINT.compress().to_bytes();
+    let y_bytes = y_pt.compress().to_bytes();
+    let challenge = hash_to_scalar(
+        DLEQ_PROOF_DOMAIN,
+        &[
+            &epoch.to_be_bytes(),
+            &validator_index.to_be_bytes(),
+            &g_bytes,
+            ephemeral_pk,
+            &y_bytes,
+            partial_point,
+            &r1,
+            &r2,
+        ],
+    );
+    let response = k + challenge * x;
+    Ok(PartialDleqProof {
+        challenge: challenge.to_bytes(),
+        response: response.to_bytes(),
+    })
+}
+
+/// Verify a Chaum-Pedersen DLEQ proof against the member's Feldman commitment `Y_i`.
+pub fn verify_partial_dleq(
+    proof: &PartialDleqProof,
+    epoch: u64,
+    validator_index: u32,
+    ephemeral_pk: &[u8; 32],
+    partial_point: &[u8; 32],
+    public_share: &[u8; 32],
+) -> Result<(), String> {
+    let c = Option::<Scalar>::from(Scalar::from_canonical_bytes(proof.challenge))
+        .ok_or_else(|| "dleq challenge is not a canonical scalar".to_string())?;
+    let s = Option::<Scalar>::from(Scalar::from_canonical_bytes(proof.response))
+        .ok_or_else(|| "dleq response is not a canonical scalar".to_string())?;
+    let c_pt = decompress_point(ephemeral_pk)
+        .ok_or_else(|| "dleq ephemeral_pk is not a valid curve point".to_string())?;
+    let d_pt = decompress_point(partial_point)
+        .ok_or_else(|| "dleq partial_point is not a valid curve point".to_string())?;
+    let y_pt = decompress_point(public_share)
+        .ok_or_else(|| "dleq public_share is not a valid curve point".to_string())?;
+    let r1 = (RISTRETTO_BASEPOINT_POINT * s - y_pt * c)
+        .compress()
+        .to_bytes();
+    let r2 = (c_pt * s - d_pt * c).compress().to_bytes();
+    let g_bytes = RISTRETTO_BASEPOINT_POINT.compress().to_bytes();
+    let expected = hash_to_scalar(
+        DLEQ_PROOF_DOMAIN,
+        &[
+            &epoch.to_be_bytes(),
+            &validator_index.to_be_bytes(),
+            &g_bytes,
+            ephemeral_pk,
+            public_share,
+            partial_point,
+            &r1,
+            &r2,
+        ],
+    );
+    if c != expected {
+        return Err("decryption partial fails Feldman DLEQ verification".to_string());
+    }
+    Ok(())
+}
+
+/// Falcon-512 authenticated wrapper for [`ShareRelease`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PqShareReleaseEnvelope {
+    pub release: ShareRelease,
+    pub signer_id: [u8; 32],
+    pub falcon_pk: Vec<u8>,
+    pub falcon_sig: Vec<u8>,
+    pub dleq_proofs: Vec<([u8; 32], PartialDleqProof)>,
+}
+
+/// Canonical signing preimage for [`PqShareReleaseEnvelope`].
+pub fn share_release_auth_message(release: &ShareRelease, signer_id: &[u8; 32]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(128 + release.partials.len() * 68);
+    msg.extend_from_slice(PQ_SHARE_RELEASE_SIG_DOMAIN);
+    msg.extend_from_slice(signer_id);
+    msg.extend_from_slice(&release.epoch.to_be_bytes());
+    msg.extend_from_slice(&release.height.to_be_bytes());
+    msg.extend_from_slice(&release.round.to_be_bytes());
+    msg.extend_from_slice(&release.order_root);
+    msg.extend_from_slice(&(release.partials.len() as u32).to_be_bytes());
+    for (tx_hash, partial) in &release.partials {
+        msg.extend_from_slice(tx_hash);
+        msg.extend_from_slice(&partial.validator_index.to_be_bytes());
+        msg.extend_from_slice(&partial.point);
+    }
+    msg
+}
+
+/// Sign a [`ShareRelease`] with the releasing validator's Falcon-512 keypair.
+pub fn pq_share_release_seal(
+    keypair: &FalconKeypair,
+    signer_id: [u8; 32],
+    release: ShareRelease,
+) -> PqShareReleaseEnvelope {
+    pq_share_release_seal_with_dleq(keypair, signer_id, release, Vec::new())
+}
+
+/// Sign a [`ShareRelease`] with the releasing validator's Falcon-512 keypair
+/// and attach per-partial Feldman DLEQ proofs.
+pub fn pq_share_release_seal_with_dleq(
+    keypair: &FalconKeypair,
+    signer_id: [u8; 32],
+    release: ShareRelease,
+    dleq_proofs: Vec<([u8; 32], PartialDleqProof)>,
+) -> PqShareReleaseEnvelope {
+    let msg = share_release_auth_message(&release, &signer_id);
+    let falcon_sig = keypair.sign(&msg);
+    PqShareReleaseEnvelope {
+        release,
+        signer_id,
+        falcon_pk: keypair.public_key().to_vec(),
+        falcon_sig,
+        dleq_proofs,
+    }
+}
+
+/// Verify a [`PqShareReleaseEnvelope`] against the validator's expected Falcon-512 public key.
+pub fn pq_share_release_verify(
+    envelope: &PqShareReleaseEnvelope,
+    expected_falcon_pk: &[u8],
+) -> Result<(), String> {
+    if envelope.falcon_pk.as_slice() != expected_falcon_pk {
+        return Err("pq share release envelope carries an unexpected falcon key".to_string());
+    }
+    let msg = share_release_auth_message(&envelope.release, &envelope.signer_id);
+    if !verify_pq_signature(
+        PqScheme::Falcon512,
+        expected_falcon_pk,
+        &msg,
+        &envelope.falcon_sig,
+    ) {
+        return Err("pq share release falcon signature does not verify".to_string());
+    }
+    Ok(())
+}
+
 /// The epoch key announcement: the committee's agreement on the epoch key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EpochKeyAnnouncement {
@@ -2400,8 +2732,12 @@ pub struct EpochKeyAnnouncement {
     pub threshold: usize,
     /// The committee members that contributed, with their indices.
     pub contributors: Vec<(u32, [u8; 32])>,
-    /// The member signatures over [`epoch_announcement_signing_message`].
+    /// The member Ed25519 signatures over [`epoch_announcement_signing_message`].
     pub signatures: Vec<([u8; 32], Vec<u8>)>,
+    /// The member Falcon-512 signatures over [`epoch_announcement_signing_message`].
+    pub pq_signatures: Vec<([u8; 32], Vec<u8>)>,
+    /// Full committee member list (verified against `committee_hash` when present).
+    pub committee_members: Vec<CommitteeMember>,
 }
 
 /// The exact bytes a committee member signs to announce the epoch key.
@@ -2421,7 +2757,7 @@ pub fn epoch_announcement_signing_message(
 }
 
 impl EpochKeyAnnouncement {
-    /// Sign an announcement with a committee member's key.
+    /// Sign an announcement with a committee member's Ed25519 key.
     pub fn sign(
         epoch: u64,
         public_key: [u8; 32],
@@ -2446,10 +2782,44 @@ impl EpochKeyAnnouncement {
             threshold,
             contributors,
             signatures: vec![(signer.verifying_key().to_bytes(), signature)],
+            pq_signatures: Vec::new(),
+            committee_members: Vec::new(),
         }
     }
 
-    /// Add a member's signature to the announcement.
+    /// Sign an announcement with a committee member's Falcon-512 key.
+    #[allow(clippy::too_many_arguments)] // GATE: PQ announcement constructor mirrors legacy EpochKeyAnnouncement::sign with FalconKeypair.
+    pub fn sign_pq(
+        epoch: u64,
+        public_key: [u8; 32],
+        committee_hash: [u8; 32],
+        transcript_root: [u8; 32],
+        threshold: usize,
+        contributors: Vec<(u32, [u8; 32])>,
+        validator_id: [u8; 32],
+        falcon: &FalconKeypair,
+    ) -> EpochKeyAnnouncement {
+        let msg = epoch_announcement_signing_message(
+            epoch,
+            &public_key,
+            &committee_hash,
+            &transcript_root,
+        );
+        let pq_sig = falcon.sign(&msg);
+        EpochKeyAnnouncement {
+            epoch,
+            public_key,
+            committee_hash,
+            transcript_root,
+            threshold,
+            contributors,
+            signatures: Vec::new(),
+            pq_signatures: vec![(validator_id, pq_sig)],
+            committee_members: Vec::new(),
+        }
+    }
+
+    /// Add a member's Ed25519 signature to the announcement.
     pub fn add_signature(&mut self, signer: &SigningKey) {
         let msg = epoch_announcement_signing_message(
             self.epoch,
@@ -2464,26 +2834,152 @@ impl EpochKeyAnnouncement {
         }
     }
 
-    /// Count the DISTINCT members whose signature verifies.
-    ///
-    /// Duplicates never count twice: a repeated signer must not be able to
-    /// fake a quorum.
-    pub fn valid_signature_count(&self) -> usize {
+    /// Add a member's Falcon-512 signature to the announcement.
+    pub fn add_pq_signature(&mut self, validator_id: [u8; 32], falcon: &FalconKeypair) {
         let msg = epoch_announcement_signing_message(
             self.epoch,
             &self.public_key,
             &self.committee_hash,
             &self.transcript_root,
         );
+        let sig = falcon.sign(&msg);
+        if !self.pq_signatures.iter().any(|(p, _)| *p == validator_id) {
+            self.pq_signatures.push((validator_id, sig));
+        }
+    }
+
+    /// Count the DISTINCT committee members whose signature verifies.
+    ///
+    /// Signers MUST belong to the committee (`committee_members`, verified
+    /// against `committee_hash`, or `contributors` when `committee_members` is
+    /// empty). Arbitrary throwaway keys outside the committee are never counted.
+    /// When `is_pure_pq_enforced()` is true, only Falcon-512 signatures verified
+    /// against registered committee PQ keys count.
+    pub fn valid_signature_count(&self) -> usize {
+        let allowed: std::collections::HashSet<[u8; 32]> = if !self.committee_members.is_empty() {
+            if EpochCommittee::build(self.epoch, self.committee_members.clone()).hash
+                != self.committee_hash
+            {
+                return 0;
+            }
+            self.committee_members
+                .iter()
+                .map(|m| m.validator_id)
+                .collect()
+        } else {
+            self.contributors.iter().map(|(_, id)| *id).collect()
+        };
+        let msg = epoch_announcement_signing_message(
+            self.epoch,
+            &self.public_key,
+            &self.committee_hash,
+            &self.transcript_root,
+        );
+        let height_hint = self.epoch.saturating_mul(EPOCH_BLOCKS);
         let mut seen = std::collections::HashSet::new();
+        let mut pq_failed = std::collections::HashSet::new();
         let mut count = 0usize;
+        for (pk, sig) in &self.pq_signatures {
+            if !allowed.contains(pk) || seen.contains(pk) {
+                continue;
+            }
+            if let Some((PqScheme::Falcon512, falcon_pk)) =
+                crate::consensus::pq_key_at_height(pk, height_hint)
+            {
+                if verify_pq_signature(PqScheme::Falcon512, &falcon_pk, &msg, sig)
+                    && seen.insert(*pk)
+                {
+                    count += 1;
+                } else {
+                    pq_failed.insert(*pk);
+                }
+            } else {
+                pq_failed.insert(*pk);
+            }
+        }
+        if crate::post_quantum::is_pure_pq_enforced() {
+            return count;
+        }
         for (pk, sig) in &self.signatures {
-            if !seen.insert(*pk) {
+            if !allowed.contains(pk) || seen.contains(pk) || pq_failed.contains(pk) {
                 continue;
             }
             if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(pk) {
                 if let Ok(sig) = Signature::from_slice(sig) {
-                    if vk.verify(&msg, &sig).is_ok() {
+                    if vk.verify(&msg, &sig).is_ok() && seen.insert(*pk) {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    /// Count distinct verified signers belonging to the caller-supplied `committee`
+    /// (verifying `self.committee_hash == committee.hash` first).
+    pub fn valid_signature_count_with_committee(&self, committee: &EpochCommittee) -> usize {
+        if self.committee_hash != committee.hash || self.epoch != committee.epoch {
+            return 0;
+        }
+        let members: Vec<[u8; 32]> = committee.members.iter().map(|m| m.validator_id).collect();
+        let pq_keys = std::collections::HashMap::new();
+        self.valid_signature_count_with_keys(&members, &pq_keys)
+    }
+
+    /// Count distinct verified signers in `allowed_members`, checking Falcon-512
+    /// signatures against `pq_keys` (or the height-indexed consensus PQ registry).
+    pub fn valid_signature_count_with_keys(
+        &self,
+        allowed_members: &[[u8; 32]],
+        pq_keys: &std::collections::HashMap<[u8; 32], Vec<u8>>,
+    ) -> usize {
+        let allowed: std::collections::HashSet<[u8; 32]> =
+            allowed_members.iter().copied().collect();
+        let msg = epoch_announcement_signing_message(
+            self.epoch,
+            &self.public_key,
+            &self.committee_hash,
+            &self.transcript_root,
+        );
+        let height_hint = self.epoch.saturating_mul(EPOCH_BLOCKS);
+        let mut seen = std::collections::HashSet::new();
+        let mut pq_failed = std::collections::HashSet::new();
+        let mut count = 0usize;
+        for (pk, sig) in &self.pq_signatures {
+            if !allowed.contains(pk) || seen.contains(pk) {
+                continue;
+            }
+            let key_opt = pq_keys.get(pk).cloned().or_else(|| {
+                crate::consensus::pq_key_at_height(pk, height_hint).and_then(|(s, k)| {
+                    if s == PqScheme::Falcon512 {
+                        Some(k)
+                    } else {
+                        None
+                    }
+                })
+            });
+            if let Some(falcon_pk) = key_opt {
+                if verify_pq_signature(PqScheme::Falcon512, &falcon_pk, &msg, sig)
+                    && seen.insert(*pk)
+                {
+                    count += 1;
+                } else {
+                    pq_failed.insert(*pk);
+                }
+            } else {
+                pq_failed.insert(*pk);
+            }
+        }
+        if crate::post_quantum::is_pure_pq_enforced() {
+            return count;
+        }
+        for (pk, sig) in &self.signatures {
+            if !allowed.contains(pk) || seen.contains(pk) || pq_failed.contains(pk) {
+                continue;
+            }
+            if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(pk) {
+                if let Ok(sig) = Signature::from_slice(sig) {
+                    if vk.verify(&msg, &sig).is_ok() && seen.insert(*pk) {
                         count += 1;
                     }
                 }
@@ -2495,6 +2991,11 @@ impl EpochKeyAnnouncement {
     /// Whether the announcement carries a quorum of member signatures.
     pub fn has_quorum(&self, quorum: usize) -> bool {
         self.valid_signature_count() >= quorum
+    }
+
+    /// Whether the announcement carries a quorum of member signatures against `committee`.
+    pub fn has_quorum_with_committee(&self, committee: &EpochCommittee, quorum: usize) -> bool {
+        self.valid_signature_count_with_committee(committee) >= quorum
     }
 
     /// The commitment to the announced epoch key: the value the block
@@ -2531,6 +3032,8 @@ pub const SHARE_RELEASE_PAYLOAD_MAGIC: &[u8; 4] = b"STR1";
 pub const EPOCH_ANNOUNCE_PAYLOAD_MAGIC: &[u8; 4] = b"STE1";
 /// Magic prefix of a Falcon-authenticated PQ-transport DKG-contribution frame.
 pub const PQ_DKG_PAYLOAD_MAGIC: &[u8; 4] = b"STPQ";
+/// Magic prefix of a Falcon-authenticated PQ share-release frame.
+pub const PQ_SHARE_RELEASE_PAYLOAD_MAGIC: &[u8; 4] = b"STRP";
 
 /// One frame of the epoch-seal gossip.
 ///
@@ -2549,6 +3052,8 @@ pub enum MevFrame {
     OrderCommit(OrderCommitment),
     /// A share release (the decryption partials).
     Release(ShareRelease),
+    /// A Falcon-authenticated PQ share release (the decryption partials).
+    PqRelease(PqShareReleaseEnvelope),
     /// The epoch key announcement.
     Announcement(EpochKeyAnnouncement),
 }
@@ -2562,6 +3067,7 @@ impl MevFrame {
             MevFrame::PqDkg(_) => PQ_DKG_PAYLOAD_MAGIC,
             MevFrame::OrderCommit(_) => ORDER_COMMIT_PAYLOAD_MAGIC,
             MevFrame::Release(_) => SHARE_RELEASE_PAYLOAD_MAGIC,
+            MevFrame::PqRelease(_) => PQ_SHARE_RELEASE_PAYLOAD_MAGIC,
             MevFrame::Announcement(_) => EPOCH_ANNOUNCE_PAYLOAD_MAGIC,
         }
     }
@@ -2574,6 +3080,7 @@ impl MevFrame {
             MevFrame::PqDkg(v) => bincode::serialize(v),
             MevFrame::OrderCommit(v) => bincode::serialize(v),
             MevFrame::Release(v) => bincode::serialize(v),
+            MevFrame::PqRelease(v) => bincode::serialize(v),
             MevFrame::Announcement(v) => bincode::serialize(v),
         }
         .map_err(|e| format!("mev frame serialize error: {e}"))?;
@@ -2624,6 +3131,10 @@ impl MevFrame {
                 opts.deserialize(body)
                     .map_err(|e| format!("share release decode error: {e}"))?,
             ),
+            m if m == PQ_SHARE_RELEASE_PAYLOAD_MAGIC => MevFrame::PqRelease(
+                opts.deserialize(body)
+                    .map_err(|e| format!("pq share release decode error: {e}"))?,
+            ),
             m if m == EPOCH_ANNOUNCE_PAYLOAD_MAGIC => MevFrame::Announcement(
                 opts.deserialize(body)
                     .map_err(|e| format!("epoch announcement decode error: {e}"))?,
@@ -2668,6 +3179,7 @@ pub fn is_mev_frame(bytes: &[u8]) -> bool {
         || magic == PQ_DKG_PAYLOAD_MAGIC
         || magic == ORDER_COMMIT_PAYLOAD_MAGIC
         || magic == SHARE_RELEASE_PAYLOAD_MAGIC
+        || magic == PQ_SHARE_RELEASE_PAYLOAD_MAGIC
         || magic == EPOCH_ANNOUNCE_PAYLOAD_MAGIC
 }
 
@@ -2738,6 +3250,8 @@ pub struct EpochSealManager {
     dkg: Option<EpochDkg>,
     /// Our key material for the current epoch (once the DKG completed).
     material: Option<EpochKeyMaterial>,
+    /// Public Feldman share commitments `Y_i = g^{x_i}` keyed by 1-based member index.
+    member_public_shares: std::collections::BTreeMap<u32, [u8; 32]>,
     /// The order commitments we have seen, keyed by `(height, round)`.
     commitments: std::collections::HashMap<(u64, u32), OrderCommitment>,
     /// The decryption partials we received from the peers:
@@ -2854,6 +3368,7 @@ impl EpochSealManager {
         self.received.clear();
         self.released.clear();
         self.material = None;
+        self.member_public_shares.clear();
         self.announcement = None;
         self.committed_epoch_key = None;
         self.epoch_key_diverged = false;
@@ -2962,6 +3477,11 @@ impl EpochSealManager {
         self.material.as_ref()
     }
 
+    /// Public Feldman share commitment `Y_i = g^{x_i}` for committee member `index`.
+    pub fn member_public_share(&self, index: u32) -> Option<[u8; 32]> {
+        self.member_public_shares.get(&index).copied()
+    }
+
     /// The epoch public key a wallet encrypts to (once the DKG completed).
     pub fn public_key(&self) -> Option<EpochPublicKey> {
         self.material.as_ref().map(|m| m.public_key())
@@ -3027,7 +3547,7 @@ impl EpochSealManager {
             .iter()
             .filter_map(|idx| committee.member_at(*idx).map(|m| (*idx, m.validator_id)))
             .collect();
-        Ok(EpochKeyAnnouncement::sign(
+        let mut ann = EpochKeyAnnouncement::sign(
             material.epoch,
             material.public_key,
             material.committee_hash,
@@ -3035,41 +3555,147 @@ impl EpochSealManager {
             material.threshold,
             contributors,
             signer,
-        ))
+        );
+        ann.committee_members = committee.members.clone();
+        Ok(ann)
+    }
+
+    /// Build the epoch-key announcement signed with both Ed25519 (when not in
+    /// pure-PQ mode) and Falcon-512.
+    pub fn build_announcement_pq(
+        &self,
+        signer: &SigningKey,
+        falcon: &FalconKeypair,
+    ) -> Result<EpochKeyAnnouncement, String> {
+        let material = self
+            .material
+            .as_ref()
+            .ok_or_else(|| "no epoch key material for this epoch".to_string())?;
+        let committee = self
+            .committee
+            .as_ref()
+            .ok_or_else(|| "no committee for this epoch".to_string())?;
+        let contributors: Vec<(u32, [u8; 32])> = committee
+            .contributors
+            .iter()
+            .filter_map(|idx| committee.member_at(*idx).map(|m| (*idx, m.validator_id)))
+            .collect();
+        let validator_id = signer.verifying_key().to_bytes();
+        let mut ann = EpochKeyAnnouncement::sign_pq(
+            material.epoch,
+            material.public_key,
+            material.committee_hash,
+            material.transcript_root,
+            material.threshold,
+            contributors,
+            validator_id,
+            falcon,
+        );
+        if !crate::post_quantum::is_pure_pq_enforced() {
+            ann.add_signature(signer);
+        }
+        ann.committee_members = committee.members.clone();
+        Ok(ann)
     }
 
     /// Merge an announcement received from a peer.
     ///
-    /// The announcement is only accepted when it agrees with OUR key (a
-    /// node that has no key yet accepts it and keeps it for the report), and
-    /// only its signatures are merged: a peer cannot talk us into a different
-    /// key.
+    /// The announcement is only accepted when it agrees with OUR key, matches
+    /// our committee hash, and every attached signature verifies for an active
+    /// committee member. A peer cannot talk us into a different key or pad the
+    /// announcement with non-member throwaway keys.
     pub fn merge_announcement(&mut self, announcement: EpochKeyAnnouncement) -> Result<(), String> {
         if announcement.epoch != self.epoch {
             return Err("epoch announcement is for another epoch".to_string());
         }
+        let committee = self
+            .committee
+            .as_ref()
+            .ok_or_else(|| "no committee for this epoch".to_string())?;
+        if announcement.committee_hash != committee.hash {
+            return Err(
+                "epoch announcement committee_hash does not match our committee".to_string(),
+            );
+        }
         if let Some(material) = self.material.as_ref() {
             if announcement.public_key != material.public_key
                 || announcement.committee_hash != material.committee_hash
+                || announcement.transcript_root != material.transcript_root
+                || announcement.threshold != material.threshold
             {
                 return Err("epoch announcement does not match our epoch key".to_string());
             }
         }
+        if announcement.pq_signatures.is_empty() && announcement.signatures.is_empty() {
+            return Err("epoch announcement carries no member signatures".to_string());
+        }
+        let msg = epoch_announcement_signing_message(
+            announcement.epoch,
+            &announcement.public_key,
+            &announcement.committee_hash,
+            &announcement.transcript_root,
+        );
+        let height_hint = announcement.epoch.saturating_mul(EPOCH_BLOCKS);
+        for (pk, sig) in &announcement.pq_signatures {
+            if committee.index_of(pk).is_none() {
+                return Err(
+                    "epoch announcement contains PQ signature from non-committee member"
+                        .to_string(),
+                );
+            }
+            let Some((PqScheme::Falcon512, falcon_pk)) =
+                crate::consensus::pq_key_at_height(pk, height_hint)
+            else {
+                return Err(
+                    "epoch announcement PQ signer has no registered Falcon-512 key".to_string(),
+                );
+            };
+            if !verify_pq_signature(PqScheme::Falcon512, &falcon_pk, &msg, sig) {
+                return Err("epoch announcement contains invalid Falcon-512 signature".to_string());
+            }
+        }
+        for (pk, sig) in &announcement.signatures {
+            if committee.index_of(pk).is_none() {
+                return Err(
+                    "epoch announcement contains signature from non-committee member".to_string(),
+                );
+            }
+            let vk = ed25519_dalek::VerifyingKey::from_bytes(pk)
+                .map_err(|_| "epoch announcement contains invalid signer key".to_string())?;
+            let parsed_sig = Signature::from_slice(sig)
+                .map_err(|_| "epoch announcement contains malformed signature".to_string())?;
+            vk.verify(&msg, &parsed_sig)
+                .map_err(|_| "epoch announcement contains invalid signature".to_string())?;
+        }
+        if crate::post_quantum::is_pure_pq_enforced() && announcement.pq_signatures.is_empty() {
+            return Err(
+                "epoch announcement carries no Falcon-512 signatures in pure-PQ mode".to_string(),
+            );
+        }
+        let mut normalized = announcement;
+        if normalized.committee_members.is_empty() {
+            normalized.committee_members = committee.members.clone();
+        }
         match self.announcement.as_mut() {
             Some(existing) => {
-                if existing.public_key != announcement.public_key
-                    || existing.committee_hash != announcement.committee_hash
-                    || existing.transcript_root != announcement.transcript_root
+                if existing.public_key != normalized.public_key
+                    || existing.committee_hash != normalized.committee_hash
+                    || existing.transcript_root != normalized.transcript_root
                 {
                     return Err("epoch announcement does not match the one we hold".to_string());
                 }
-                for (pk, sig) in announcement.signatures {
+                for (pk, sig) in normalized.signatures {
                     if !existing.signatures.iter().any(|(p, _)| *p == pk) {
                         existing.signatures.push((pk, sig));
                     }
                 }
+                for (pk, sig) in normalized.pq_signatures {
+                    if !existing.pq_signatures.iter().any(|(p, _)| *p == pk) {
+                        existing.pq_signatures.push((pk, sig));
+                    }
+                }
             }
-            None => self.announcement = Some(announcement),
+            None => self.announcement = Some(normalized),
         }
         Ok(())
     }
@@ -3186,6 +3812,9 @@ impl EpochSealManager {
                     );
                 }
             }
+            if let Ok(shares) = dkg.member_public_shares() {
+                self.member_public_shares = shares;
+            }
             self.material = Some(material);
         }
     }
@@ -3220,13 +3849,135 @@ impl EpochSealManager {
         Ok(commitment)
     }
 
+    /// Commit to the order of the sealed transactions for this height with
+    /// Falcon-512 authentication (plus Ed25519 when not in pure-PQ mode).
+    pub fn commit_order_pq(
+        &mut self,
+        height: u64,
+        round: u32,
+        tx_hashes: Vec<[u8; 32]>,
+        signer: &SigningKey,
+        falcon: &FalconKeypair,
+    ) -> Result<OrderCommitment, String> {
+        let candidate = if crate::post_quantum::is_pure_pq_enforced() {
+            OrderCommitment::sign_pq(
+                self.epoch,
+                height,
+                round,
+                tx_hashes,
+                signer.verifying_key().to_bytes(),
+                falcon,
+            )
+        } else {
+            OrderCommitment::sign_dual(self.epoch, height, round, tx_hashes, signer, falcon)
+        };
+        if let Some((h, existing)) = &self.height_commitment {
+            if *h == height {
+                if candidate.order_root == existing.order_root {
+                    return Ok(existing.clone());
+                }
+                return Err(format!(
+                    "the order for height {height} was already committed to a different root"
+                ));
+            }
+        }
+        self.prune_commitments(height);
+        self.height_commitment = Some((height, candidate.clone()));
+        self.commitments.insert((height, round), candidate.clone());
+        Ok(candidate)
+    }
+
     /// Record an order commitment we have seen.
     ///
-    /// A commitment that does not verify is refused. A valid commitment is
-    /// stored, and the caller may then release the partials for the
-    /// committed transactions.
+    /// Verifies `commitment.epoch == self.epoch`, committee membership,
+    /// signature (Falcon-512 when PQ key is registered / pure-PQ enforced),
+    /// and anti-equivocation (`height_commitment` + existing per-height/round
+    /// commitments) before inserting into `self.commitments`.
     pub fn note_commitment(&mut self, commitment: OrderCommitment) -> Result<(), String> {
-        commitment.verify()?;
+        self.note_commitment_verified(commitment, None, None)
+    }
+
+    /// Record an order commitment with explicit scheduled-proposer and
+    /// expected Falcon-512 public-key verification.
+    pub fn note_commitment_verified(
+        &mut self,
+        commitment: OrderCommitment,
+        expected_proposer: Option<[u8; 32]>,
+        expected_falcon_pk: Option<&[u8]>,
+    ) -> Result<(), String> {
+        if commitment.epoch != self.epoch {
+            return Err(format!(
+                "order commitment epoch {} does not match current epoch {}",
+                commitment.epoch, self.epoch
+            ));
+        }
+        let committee = self
+            .committee
+            .as_ref()
+            .ok_or_else(|| "no committee for this epoch".to_string())?;
+        if committee.index_of(&commitment.proposer).is_none() {
+            return Err(
+                "order commitment proposer is not a member of the epoch committee".to_string(),
+            );
+        }
+        if let Some(expected) = expected_proposer {
+            if commitment.proposer != expected {
+                return Err("order commitment proposer is not the scheduled proposer".to_string());
+            }
+        }
+        if let Some(falcon_pk) = expected_falcon_pk {
+            commitment.verify_pq(falcon_pk)?;
+        } else if commitment.pq_sig.is_some() {
+            if let Some((PqScheme::Falcon512, pk)) =
+                crate::consensus::pq_key_at_height(&commitment.proposer, commitment.height)
+            {
+                commitment.verify_pq(&pk)?;
+            } else {
+                return Err(
+                    "order commitment carries Falcon-512 signature without a registered PQ key"
+                        .to_string(),
+                );
+            }
+        } else {
+            commitment.verify()?;
+        }
+        if let Some((h, existing)) = &self.height_commitment {
+            if *h == commitment.height && existing.order_root != commitment.order_root {
+                return Err(format!(
+                    "order commitment for height {} conflicts with height_commitment",
+                    commitment.height
+                ));
+            }
+        }
+        if let Some(existing) = self.commitments.get(&(commitment.height, commitment.round)) {
+            if existing.proposer != commitment.proposer
+                || existing.order_root != commitment.order_root
+            {
+                return Err(format!(
+                    "equivocating order commitment for height {} round {}",
+                    commitment.height, commitment.round
+                ));
+            }
+            return Ok(());
+        }
+        if self.commitments.iter().any(|((h, _), c)| {
+            *h == commitment.height
+                && c.proposer == commitment.proposer
+                && c.order_root != commitment.order_root
+        }) {
+            return Err(format!(
+                "proposer equivocated on order commitment for height {}",
+                commitment.height
+            ));
+        }
+        let max_seen = self.commitments.keys().map(|(h, _)| *h).max().unwrap_or(0);
+        let floor = max_seen.saturating_sub(ORDER_COMMITMENT_LOOKBACK);
+        if commitment.height < floor {
+            return Err(format!(
+                "stale order commitment for height {} below lookback floor {floor}",
+                commitment.height
+            ));
+        }
         self.prune_commitments(commitment.height);
         self.commitments
             .insert((commitment.height, commitment.round), commitment);
@@ -3323,34 +4074,163 @@ impl EpochSealManager {
         }
     }
 
-    /// Ingest a share release from a peer.
+    /// FAIL-CLOSED: unauthenticated [`ShareRelease`] ingestion is refused.
     ///
-    /// The partials are accepted only if they match an order commitment we
-    /// have seen: a release for an unknown ordering is refused, so a
-    /// malicious peer cannot make us accept decryption material for a
-    /// transaction that was never committed to.
+    /// Runs the structural, commitment, committee-bounds, and anti-equivocation
+    /// checks first so callers see the specific failure reason, then refuses
+    /// any unauthenticated release. Use [`Self::ingest_release_authenticated`]
+    /// with a Falcon-512-signed [`PqShareReleaseEnvelope`].
     pub fn ingest_release(&mut self, release: ShareRelease) -> Result<usize, String> {
+        self.validate_release_candidate(&release)?;
+        Err(
+            "FULL-PQ: unauthenticated ShareRelease refused; use ingest_release_authenticated with PqShareReleaseEnvelope"
+                .to_string(),
+        )
+    }
+
+    fn validate_release_candidate(&self, release: &ShareRelease) -> Result<(), String> {
         // Audit M2: bind height AND round, not just (epoch, root) — otherwise
         // a release replays into any round sharing the same order root
         // (all-empty rounds share root [0;32]).
-        let known = self
+        if release.epoch != self.epoch {
+            return Err(format!(
+                "share release epoch {} does not match current epoch {}",
+                release.epoch, self.epoch
+            ));
+        }
+        let committee = self
+            .committee
+            .as_ref()
+            .ok_or_else(|| "no committee for this epoch".to_string())?;
+        let committee_size = committee.members.len() as u32;
+        let commitment = self
             .commitments
             .get(&(release.height, release.round))
-            .is_some_and(|c| c.order_root == release.order_root && c.epoch == release.epoch);
-        if !known {
+            .ok_or_else(|| {
+                "share release does not match any order commitment we know".to_string()
+            })?;
+        if commitment.order_root != release.order_root || commitment.epoch != release.epoch {
             return Err("share release does not match any order commitment we know".to_string());
         }
+        let mut batch_seen: std::collections::HashMap<([u8; 32], u32), [u8; 32]> =
+            std::collections::HashMap::with_capacity(release.partials.len());
+        for (tx_hash, partial) in &release.partials {
+            if partial.validator_index == 0 || partial.validator_index > committee_size {
+                return Err(format!(
+                    "share release validator_index {} out of committee bounds 1..={}",
+                    partial.validator_index, committee_size
+                ));
+            }
+            if !commitment.tx_hashes.contains(tx_hash) {
+                return Err(
+                    "share release references a tx_hash not in the committed order".to_string(),
+                );
+            }
+            if decompress_point(&partial.point).is_none() {
+                return Err("share release carries an invalid Ristretto curve point".to_string());
+            }
+            let key = (*tx_hash, partial.validator_index);
+            if let Some(prev_pt) = batch_seen.get(&key) {
+                if *prev_pt != partial.point {
+                    return Err(
+                        "share release contains conflicting partials for the same (tx_hash, validator_index)"
+                            .to_string(),
+                    );
+                }
+            } else {
+                batch_seen.insert(key, partial.point);
+            }
+            if self.partial_height == release.height {
+                if let Some(existing) = self.released.get(&key).or_else(|| self.received.get(&key))
+                {
+                    if existing.point != partial.point {
+                        return Err(
+                            "conflicting decryption partial for (tx_hash, validator_index): equivocation rejected"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ingest_release_inner(&mut self, release: ShareRelease) -> Result<usize, String> {
+        self.validate_release_candidate(&release)?;
         let mut accepted = 0usize;
         self.roll_partials_to(release.height);
         for (tx_hash, partial) in &release.partials {
-            if partial.validator_index == 0 {
+            let key = (*tx_hash, partial.validator_index);
+            if self.released.contains_key(&key) || self.received.contains_key(&key) {
                 continue;
             }
-            self.received
-                .insert((*tx_hash, partial.validator_index), *partial);
+            self.received.insert(key, *partial);
             accepted += 1;
         }
         Ok(accepted)
+    }
+
+    /// Verify a Falcon-authenticated [`PqShareReleaseEnvelope`] against
+    /// `expected_falcon_pk`, bind `signer_id` to its committee index so it
+    /// cannot release under another member's `validator_index`, and ingest the
+    /// partials.
+    pub fn ingest_release_authenticated(
+        &mut self,
+        envelope: &PqShareReleaseEnvelope,
+        expected_falcon_pk: &[u8],
+    ) -> Result<usize, String> {
+        self.ingest_release_authenticated_with_ephemeral(envelope, expected_falcon_pk, |_| None)
+    }
+
+    /// Verify a Falcon-authenticated [`PqShareReleaseEnvelope`] AND, when
+    /// `ephemeral_pk_for_tx(tx_hash)` and `member_public_shares[signer_index]`
+    /// are available, verify every partial's Chaum-Pedersen DLEQ proof against
+    /// the DKG Feldman commitments before ingesting.
+    pub fn ingest_release_authenticated_with_ephemeral(
+        &mut self,
+        envelope: &PqShareReleaseEnvelope,
+        expected_falcon_pk: &[u8],
+        ephemeral_pk_for_tx: impl Fn(&[u8; 32]) -> Option<[u8; 32]>,
+    ) -> Result<usize, String> {
+        pq_share_release_verify(envelope, expected_falcon_pk)?;
+        let committee = self
+            .committee
+            .as_ref()
+            .ok_or_else(|| "no committee for this epoch".to_string())?;
+        let signer_index = committee.index_of(&envelope.signer_id).ok_or_else(|| {
+            "pq share release signer is not a member of the epoch committee".to_string()
+        })?;
+        let public_share_opt = self.member_public_shares.get(&signer_index).copied();
+        for (tx_hash, partial) in &envelope.release.partials {
+            if partial.validator_index != signer_index {
+                return Err(format!(
+                    "pq share release partial index {} does not match authenticated signer index {}",
+                    partial.validator_index, signer_index
+                ));
+            }
+            if let (Some(public_share), Some(eph_pk)) =
+                (public_share_opt, ephemeral_pk_for_tx(tx_hash))
+            {
+                let proof = envelope
+                    .dleq_proofs
+                    .iter()
+                    .find(|(h, _)| h == tx_hash)
+                    .map(|(_, p)| p)
+                    .ok_or_else(|| {
+                        "pq share release missing Feldman DLEQ proof for committed partial"
+                            .to_string()
+                    })?;
+                verify_partial_dleq(
+                    proof,
+                    envelope.release.epoch,
+                    signer_index,
+                    &eph_pk,
+                    &partial.point,
+                    &public_share,
+                )?;
+            }
+        }
+        self.ingest_release_inner(envelope.release.clone())
     }
 
     /// The decryption partials we hold for a sealed transaction (ours plus
@@ -3775,17 +4655,23 @@ mod tests {
     }
 
     /// The epoch key announcement needs a quorum of DISTINCT member
-    /// signatures: a repeated signer must not be able to fake it.
+    /// signatures: a repeated signer or non-member throwaway key must not count.
     #[test]
     fn the_epoch_announcement_counts_distinct_signers() {
         let signer = SigningKey::generate(&mut OsRng);
+        let other = SigningKey::generate(&mut OsRng);
+        let outsider = SigningKey::generate(&mut OsRng);
+        let contributors = vec![
+            (1, signer.verifying_key().to_bytes()),
+            (2, other.verifying_key().to_bytes()),
+        ];
         let mut ann = EpochKeyAnnouncement::sign(
             4,
             [1u8; 32],
             [2u8; 32],
             [3u8; 32],
-            3,
-            vec![(1, [4u8; 32])],
+            2,
+            contributors,
             &signer,
         );
         assert_eq!(ann.valid_signature_count(), 1);
@@ -3796,7 +4682,13 @@ mod tests {
             1,
             "duplicates never count twice"
         );
-        let other = SigningKey::generate(&mut OsRng);
+        // A throwaway non-member key must NOT be counted.
+        ann.add_signature(&outsider);
+        assert_eq!(
+            ann.valid_signature_count(),
+            1,
+            "non-member throwaway keys must never count"
+        );
         ann.add_signature(&other);
         assert_eq!(ann.valid_signature_count(), 2);
         assert!(ann.has_quorum(2));

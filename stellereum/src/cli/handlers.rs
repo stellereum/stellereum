@@ -591,6 +591,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
 
             WalletCommands::SendPq {
                 falcon_seed,
+                falcon_seed_file,
                 to,
                 amount,
                 target_shard,
@@ -604,8 +605,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 // `wallet sign --scheme falcon`): never the light-wallet KDF
                 // (that yields a different address that holds no funds), and
                 // NEVER an ed25519 fallback — a bad seed bails below.
-                let seed = parse_wallet_seed(&falcon_seed, "falcon seed")?;
-                let seed = zeroize::Zeroizing::new(seed);
+                let seed = resolve_falcon_seed(falcon_seed, falcon_seed_file)?;
                 let pq_key =
                     stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed);
                 let sender = stellereum::post_quantum::derive_pq_address(
@@ -737,6 +737,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 falcon_key_file,
                 validator,
                 top_up,
+                gas_limit,
                 rpc,
                 nonce,
                 chain_id,
@@ -798,19 +799,45 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                     }
                 };
 
+                let default_gas = unjail_default_gas(top_up);
+                let floor_from_rpc = if dry_run {
+                    0
+                } else {
+                    query_base_fee_best_effort(&rpc)
+                };
+                let initial_gas = default_gas.max(floor_from_rpc).max(gas_limit.unwrap_or(0));
                 let tx = match chain_id {
-                    Some(cid) => {
-                        build_unjail_tx_with_chain(&pq_key, validator_addr, top_up, nonce, cid)
-                    }
-                    None => build_unjail_tx(&pq_key, validator_addr, top_up, nonce),
+                    Some(cid) => build_unjail_tx_with_chain_and_gas(
+                        &pq_key,
+                        validator_addr,
+                        top_up,
+                        nonce,
+                        cid,
+                        Some(initial_gas),
+                    ),
+                    None => build_unjail_tx_with_gas(
+                        &pq_key,
+                        validator_addr,
+                        top_up,
+                        nonce,
+                        Some(initial_gas),
+                    ),
                 };
                 if !tx.verify_signature() {
                     anyhow::bail!("refusing to submit: built PQ transaction does not verify");
+                }
+                if let Some(cid) = chain_id {
+                    if !tx.verify_signature_for_chain(cid, true) {
+                        anyhow::bail!(
+                            "refusing to submit: built unjail tx failed chain-bound verify"
+                        );
+                    }
                 }
                 println!("✅ Unjail transaction signed (Falcon-512, explicit PQ1 envelope):");
                 println!("  Hash:      {}", hex::encode(tx.compute_tx_hash()));
                 println!("  Validator: {}", hex::encode(validator_addr));
                 println!("  Top-up:    {} nano-STELL", top_up.unwrap_or(0));
+                println!("  Gas Limit: {}", tx.gas_limit);
                 println!("  Nonce:     {nonce}");
                 println!(
                     "  Note: the block refuses the unjail before release_height or below MIN+buffer"
@@ -821,16 +848,19 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                     return Ok(());
                 }
 
-                let raw = hex::encode(bincode::serialize(&tx)?);
-                let mut params = serde_json::json!({ "tx": raw });
-                if let Some(t) = &token {
-                    params["token"] = serde_json::json!(t);
-                }
-                let result = query("stell_sendRawTransaction", params)?;
-                println!(
-                    "  Submitted, mempool tx hash: {}",
-                    result.as_str().unwrap_or("?")
-                );
+                let hash = submit_unjail_with_retry(
+                    &rpc,
+                    &pq_key,
+                    validator_addr,
+                    top_up,
+                    nonce,
+                    chain_id,
+                    tx,
+                    gas_limit.is_some(),
+                    token.as_deref(),
+                    verbose,
+                )?;
+                println!("  Submitted, mempool tx hash: {hash}");
             }
 
             WalletCommands::DelegateSession {
@@ -2884,6 +2914,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 withdrawal_seed,
                 validator_id,
                 top_up,
+                gas_limit,
                 rpc,
                 nonce,
                 chain_id,
@@ -2905,27 +2936,49 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 // address. --dry-run prints the same diagnosis but proceeds.
                 preflight_unjail(&rpc, &validator_id, dry_run, true)?;
                 let account_nonce = resolve_nonce(&rpc, &withdrawal_addr, nonce)?;
-                let tx = build_unjail_tx_with_chain(
+                let default_gas = unjail_default_gas(top_up);
+                let floor_from_rpc = if dry_run {
+                    0
+                } else {
+                    query_base_fee_best_effort(&rpc)
+                };
+                let initial_gas = default_gas.max(floor_from_rpc).max(gas_limit.unwrap_or(0));
+                let tx = build_unjail_tx_with_chain_and_gas(
                     &withdrawal_kp,
                     validator_id,
                     top_up,
                     account_nonce,
                     chain_id,
+                    Some(initial_gas),
                 );
-                verify_and_submit_chain_bound_tx(
-                    &tx,
-                    chain_id,
-                    "unjail",
-                    &format!(
-                        "✅ Unjail signed (SysCallUnjail, Ruleset v7, chain_id={chain_id}):\n  Validator ID: {}\n  Withdrawal:   {}\n  Top-up:       {} nano-STELL\n  Nonce:        {account_nonce}",
-                        hex::encode(validator_id),
-                        hex::encode(withdrawal_addr),
-                        top_up.unwrap_or(0),
-                    ),
-                    dry_run,
+                if !tx.verify_signature_for_chain(chain_id, true) {
+                    anyhow::bail!("refusing to submit: built unjail tx failed chain-bound verify");
+                }
+                println!(
+                    "✅ Unjail signed (SysCallUnjail, Ruleset v7, chain_id={chain_id}):\n  Validator ID: {}\n  Withdrawal:   {}\n  Top-up:       {} nano-STELL\n  Gas Limit:    {}\n  Nonce:        {account_nonce}",
+                    hex::encode(validator_id),
+                    hex::encode(withdrawal_addr),
+                    top_up.unwrap_or(0),
+                    tx.gas_limit,
+                );
+                println!("  Hash:         {}", hex::encode(tx.compute_tx_hash()));
+                if dry_run {
+                    println!("  raw: {}", hex::encode(bincode::serialize(&tx)?));
+                    return Ok(());
+                }
+                let hash = submit_unjail_with_retry(
                     &rpc,
+                    &withdrawal_kp,
+                    validator_id,
+                    top_up,
+                    account_nonce,
+                    Some(chain_id),
+                    tx,
+                    gas_limit.is_some(),
                     token.as_deref(),
+                    false,
                 )?;
+                println!("  Submitted, mempool tx hash: {hash}");
             }
         },
         Commands::Gov { sub } => match sub {
@@ -3510,6 +3563,113 @@ fn rpc_next_block_height(rpc: &str) -> anyhow::Result<u64> {
         anyhow::bail!("node at {rpc} returned unexpected stell_blockNumber: {res}");
     };
     Ok(current.saturating_add(1))
+}
+
+const UNJAIL_ESCALATION_CAP: u64 = 5_000_000;
+const UNJAIL_ESCALATION_MULTS: [u64; 4] = [2, 4, 8, 16];
+
+fn query_base_fee_best_effort(rpc: &str) -> u64 {
+    let Ok(res) = rpc_call(rpc, "stell_baseFee", serde_json::json!([])) else {
+        return 0;
+    };
+    res.get("base_fee")
+        .and_then(json_nano_amount)
+        .or_else(|| json_nano_amount(&res))
+        .unwrap_or(0)
+}
+
+fn is_below_base_fee_err(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("below the base fee")
+}
+
+#[allow(clippy::too_many_arguments)]
+// GATE: unjail submission + automatic D2 fee-floor retry needs signing, RPC, and verbosity params.
+fn submit_unjail_with_retry(
+    rpc: &str,
+    signer_kp: &stellereum::post_quantum::FalconKeypair,
+    validator_id: [u8; 32],
+    top_up: Option<u64>,
+    nonce: u64,
+    chain_id: Option<u64>,
+    initial_tx: Transaction,
+    gas_forced: bool,
+    token: Option<&str>,
+    verbose: bool,
+) -> anyhow::Result<String> {
+    let submit_once = |tx: &Transaction| -> anyhow::Result<String> {
+        if verbose {
+            let raw = hex::encode(bincode::serialize(tx)?);
+            let mut params = serde_json::json!({ "tx": raw });
+            if let Some(t) = token {
+                params["token"] = serde_json::json!(t);
+            }
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "stell_sendRawTransaction",
+                "params": params,
+            })
+            .to_string();
+            eprintln!("  rpc -> stell_sendRawTransaction: {body}");
+            let resp: serde_json::Value = ureq::post(rpc).send_string(&body)?.into_json()?;
+            eprintln!("  rpc <- stell_sendRawTransaction: {resp}");
+            if let Some(e) = resp.get("error") {
+                anyhow::bail!("rejected by node: {e}");
+            }
+            Ok(resp["result"].as_str().unwrap_or("?").to_string())
+        } else {
+            rpc_submit_tx(rpc, "stell_sendRawTransaction", tx, token)
+        }
+    };
+
+    let mut current_gas = initial_tx.gas_limit;
+    let mut last_err = match submit_once(&initial_tx) {
+        Ok(hash) => return Ok(hash),
+        Err(e) if !gas_forced && is_below_base_fee_err(&e) => e,
+        Err(e) => return Err(e),
+    };
+
+    let default_gas = unjail_default_gas(top_up);
+    for mult in UNJAIL_ESCALATION_MULTS {
+        let next_gas = default_gas.saturating_mul(mult).min(UNJAIL_ESCALATION_CAP);
+        if next_gas <= current_gas {
+            continue;
+        }
+        eprintln!("[unjail] fee floor elevated; retrying with gas_limit={next_gas}");
+        let tx = match chain_id {
+            Some(cid) => build_unjail_tx_with_chain_and_gas(
+                signer_kp,
+                validator_id,
+                top_up,
+                nonce,
+                cid,
+                Some(next_gas),
+            ),
+            None => {
+                build_unjail_tx_with_gas(signer_kp, validator_id, top_up, nonce, Some(next_gas))
+            }
+        };
+        if !tx.verify_signature() {
+            anyhow::bail!("refusing to submit: built PQ transaction does not verify");
+        }
+        if let Some(cid) = chain_id {
+            if !tx.verify_signature_for_chain(cid, true) {
+                anyhow::bail!("refusing to submit: built unjail tx failed chain-bound verify");
+            }
+        }
+        current_gas = next_gas;
+        match submit_once(&tx) {
+            Ok(hash) => return Ok(hash),
+            Err(e) if is_below_base_fee_err(&e) => {
+                last_err = e;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(last_err)
 }
 
 fn verify_and_submit_chain_bound_tx(

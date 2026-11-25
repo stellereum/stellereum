@@ -102,6 +102,10 @@ pub const MAX_TXT_RECORD_LEN: usize = 4096;
 /// Timeout for the whole resolve of ONE seed domain (query + retries).
 pub const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Timeout for resolving a discovered peer's hostname (`A`/`AAAA` lookup)
+/// before giving up on that candidate (`SEC-DNS-LOOKUP-TIMEOUT`).
+pub const DNS_HOST_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Per-nameserver UDP wait inside one domain resolve (several servers may be
 /// tried before the domain budget above is exhausted).
 const PER_SERVER_TIMEOUT: Duration = Duration::from_secs(2);
@@ -806,12 +810,50 @@ pub async fn discover_seeds(domains: &[String]) -> Vec<DiscoveredPeer> {
 }
 
 /// Resolve a discovered peer's host to dialable `ip:port` endpoints via
-/// A/AAAA lookup. Empty result = the host currently resolves to nothing.
+/// A/AAAA lookup, bounded by [`DNS_HOST_LOOKUP_TIMEOUT`]. Empty result =
+/// the host currently resolves to nothing or timed out.
 pub async fn resolve_peer_endpoints(peer: &DiscoveredPeer) -> Vec<String> {
-    match tokio::net::lookup_host((peer.host.as_str(), peer.port)).await {
-        Ok(addrs) => addrs.map(|a| a.to_string()).collect(),
-        Err(e) => {
+    resolve_peer_endpoints_with_timeout(peer, DNS_HOST_LOOKUP_TIMEOUT).await
+}
+
+/// Resolve a discovered peer's host to dialable `ip:port` endpoints via
+/// A/AAAA lookup with an explicit timeout bound. Logs a warning and returns
+/// `Vec::new()` on failure or timeout instead of hanging indefinitely.
+pub async fn resolve_peer_endpoints_with_timeout(
+    peer: &DiscoveredPeer,
+    timeout: Duration,
+) -> Vec<String> {
+    resolve_peer_endpoints_with_lookup(
+        peer,
+        timeout,
+        tokio::net::lookup_host((peer.host.as_str(), peer.port)),
+    )
+    .await
+}
+
+/// Testable core of [`resolve_peer_endpoints_with_timeout`]: runs the given
+/// host-lookup future inside `tokio::time::timeout(timeout, ...)`, logging a
+/// warning and returning `Vec::new()` on error or timeout.
+pub async fn resolve_peer_endpoints_with_lookup<F, I>(
+    peer: &DiscoveredPeer,
+    timeout: Duration,
+    lookup: F,
+) -> Vec<String>
+where
+    F: std::future::Future<Output = std::io::Result<I>>,
+    I: IntoIterator<Item = SocketAddr>,
+{
+    match tokio::time::timeout(timeout, lookup).await {
+        Ok(Ok(addrs)) => addrs.into_iter().map(|a| a.to_string()).collect(),
+        Ok(Err(e)) => {
             tracing::warn!("[dns-seeds] {} host lookup failed: {e}", peer.host);
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!(
+                "[dns-seeds] {} host lookup timed out after {timeout:?}",
+                peer.host
+            );
             Vec::new()
         }
     }

@@ -1379,15 +1379,21 @@ pub(super) async fn drain_inbound_messages(
                             // what catch-up needs.
                             let cheap = committed_height_is_cheaply_relevant(our_tip, height);
                             let attested_hash = if cheap {
-                                let block_hash = block.compute_hash();
-                                (certificate.kind == VoteKind::Precommit
+                                if certificate.kind == VoteKind::Precommit
                                     && certificate.height == height
-                                    && certificate.block_hash == Some(block_hash)
-                                    && certificate.verify_with_schedule(
-                                        &st.rt.validator_set_for_height(height),
-                                        st.rt.committee_schedule_at(height),
-                                    ))
-                                .then_some(block_hash)
+                                    && certificate.shard_id == cfg.block_shard
+                                    && block.shard_id == cfg.block_shard
+                                {
+                                    let block_hash = block.compute_hash();
+                                    (certificate.block_hash == Some(block_hash)
+                                        && certificate.verify_with_schedule(
+                                            &st.rt.validator_set_for_height(height),
+                                            st.rt.committee_schedule_at(height),
+                                        ))
+                                    .then_some(block_hash)
+                                } else {
+                                    None
+                                }
                             } else {
                                 // Far ahead: verify the QC's OWN signed
                                 // block-hash binding (no body hashing, no

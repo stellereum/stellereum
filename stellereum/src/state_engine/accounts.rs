@@ -1854,6 +1854,61 @@ impl InMemoryStateEngine {
         self.bump_domain_generation(crate::commitment::Domain::CnVrf);
     }
 
+    /// Read access to the CN-VRF v3 `H_freeze` boundary inputs
+    /// (`epoch -> (freeze_block_hash, rolling_mix)`).
+    pub async fn cnvrf_freeze_inputs_read(
+        &self,
+    ) -> tokio::sync::RwLockReadGuard<'_, std::collections::BTreeMap<u64, ([u8; 32], [u8; 48])>>
+    {
+        self.cnvrf_freeze_inputs.read().await
+    }
+
+    /// Serialize `cnvrf_freeze_inputs` for persistence. Returns an empty `Vec`
+    /// when empty (0-bytes invariant).
+    pub async fn cnvrf_freeze_inputs_snapshot(&self) -> Vec<u8> {
+        let guard = self.cnvrf_freeze_inputs.read().await;
+        if guard.is_empty() {
+            return Vec::new();
+        }
+        // `[u8; 48]` implements `Serialize` only up to 32 via serde's core
+        // array impls? Check: encode each value as `( [u8; 32], Vec<u8> )` or
+        // tuple-free bytes? Actually serde in Rust 1.80+ or serde `derive`:
+        // wait — serde's standard array impl only supports up to [T; 32]!
+        // Let's serialize via `Vec<(u64, [u8; 32], Vec<u8>)>` so bincode never
+        // hits serde's 32-element array limit!
+        let entries: Vec<(u64, [u8; 32], Vec<u8>)> = guard
+            .iter()
+            .map(|(&epoch, &(h, mix))| (epoch, h, mix.to_vec()))
+            .collect();
+        bincode::serialize(&entries).unwrap_or_default()
+    }
+
+    /// Restore persisted `cnvrf_freeze_inputs` bytes (empty bytes install an
+    /// empty map).
+    pub async fn restore_cnvrf_freeze_inputs(&self, bytes: &[u8]) -> Result<(), String> {
+        if bytes.is_empty() {
+            self.cnvrf_freeze_inputs.write().await.clear();
+            return Ok(());
+        }
+        let entries: Vec<(u64, [u8; 32], Vec<u8>)> =
+            bincode_deserialize_exact(bytes, MAX_SNAPSHOT_DECODE_BYTES)
+                .map_err(|e| format!("restore cnvrf_freeze_inputs failed: {e:?}"))?;
+        let mut map = std::collections::BTreeMap::new();
+        for (epoch, hash, mix_vec) in entries {
+            if mix_vec.len() != crate::cn_vrf::V3_LINK_LEN {
+                return Err(format!(
+                    "restore cnvrf_freeze_inputs: invalid rolling_mix length {} for epoch {epoch}",
+                    mix_vec.len()
+                ));
+            }
+            let mut mix = [0u8; crate::cn_vrf::V3_LINK_LEN];
+            mix.copy_from_slice(&mix_vec);
+            map.insert(epoch, (hash, mix));
+        }
+        *self.cnvrf_freeze_inputs.write().await = map;
+        Ok(())
+    }
+
     /// Read the canonical on-chain EVM ↔ PQ address bindings (`Domain::EvmBindings`).
     pub async fn evm_bindings_read(
         &self,

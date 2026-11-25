@@ -290,6 +290,24 @@ impl Storage {
         Ok(self.cnvrf_v3.get(height.to_be_bytes())?.map(|v| v.to_vec()))
     }
 
+    // ---------- CN-VRF v3 freeze-input snapshots (`"cnvrf_freeze_inputs"`) ----------
+
+    pub fn put_cnvrf_freeze_inputs(&self, height: u64, bytes: &[u8]) -> Result<()> {
+        self.cnvrf_freeze_inputs
+            .insert(height.to_be_bytes(), bytes)?;
+        Ok(())
+    }
+
+    /// The CN-VRF v3 `H_freeze` inputs (`epoch -> (freeze_block_hash, rolling_mix)`)
+    /// as they stood after `height`, when stored. `None` (or empty bytes) for
+    /// older directories means empty map.
+    pub fn cnvrf_freeze_inputs_at(&self, height: u64) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .cnvrf_freeze_inputs
+            .get(height.to_be_bytes())?
+            .map(|v| v.to_vec()))
+    }
+
     // ---------- Canonical EVM bindings domain snapshots (`Domain::EvmBindings`) ----------
 
     pub fn put_evm_bindings_state(&self, height: u64, bytes: &[u8]) -> Result<()> {
@@ -856,6 +874,16 @@ impl Storage {
                 let snap: crate::state_engine::CnVrfV3EngineSnapshot = bincode::deserialize(&bytes)
                     .map_err(|e| anyhow!("restore cnvrf_v3 at height {snapshot_height}: {e}"))?;
                 engine.restore_cnvrf_v3_snapshot(&snap).await;
+            }
+        }
+        if let Some(bytes) = self.cnvrf_freeze_inputs_at(snapshot_height)? {
+            if !bytes.is_empty() {
+                engine
+                    .restore_cnvrf_freeze_inputs(&bytes)
+                    .await
+                    .map_err(|e| {
+                        anyhow!("restore cnvrf_freeze_inputs at height {snapshot_height}: {e}")
+                    })?;
             }
         }
         if let Some(bytes) = self.evm_settled_state_at(snapshot_height)? {
@@ -2482,6 +2510,16 @@ pub async fn load_full_state_into(
                     .apply_to_engine(engine)
                     .await
                     .map_err(|e| anyhow!("restore snap_v4 live at {}: {e}", marker.height))?;
+                if let Some(bytes) = storage.cnvrf_freeze_inputs_at(marker.height)? {
+                    if !bytes.is_empty() {
+                        engine
+                            .restore_cnvrf_freeze_inputs(&bytes)
+                            .await
+                            .map_err(|e| {
+                                anyhow!("restore cnvrf_freeze_inputs at {}: {e}", marker.height)
+                            })?;
+                    }
+                }
                 return Ok(Some((marker.height, staking, gov)));
             }
         }
@@ -2525,6 +2563,7 @@ pub async fn load_full_state_into(
     // over the same multi-MB bytes.
     let cross_shard_snap: Option<crate::sharding::CrossShardReplaySnapshot>;
     let cnvrf_snap: Option<crate::state_engine::CnVrfV3EngineSnapshot>;
+    let cnvrf_freeze_inputs_opt: Option<Vec<u8>>;
     let evm_bindings_opt: Option<Vec<u8>>;
     let pq_registry_opt: Option<Vec<u8>>;
     let evm_settled_opt: Option<Vec<u8>>;
@@ -2605,6 +2644,12 @@ pub async fn load_full_state_into(
         if let Some(snap) = &cnvrf_snap {
             tmp.restore_cnvrf_v3_snapshot(snap).await;
         }
+        cnvrf_freeze_inputs_opt = storage.cnvrf_freeze_inputs_at(height)?;
+        if let Some(bytes) = &cnvrf_freeze_inputs_opt {
+            tmp.restore_cnvrf_freeze_inputs(bytes)
+                .await
+                .map_err(|e| anyhow!("restore cnvrf_freeze_inputs: {e}"))?;
+        }
         evm_bindings_opt = storage.evm_bindings_state_at(height)?;
         if let Some(bytes) = &evm_bindings_opt {
             tmp.restore_evm_bindings(bytes)
@@ -2661,6 +2706,12 @@ pub async fn load_full_state_into(
     }
     if let Some(snap) = &cnvrf_snap {
         engine.restore_cnvrf_v3_snapshot(snap).await;
+    }
+    if let Some(bytes) = &cnvrf_freeze_inputs_opt {
+        engine
+            .restore_cnvrf_freeze_inputs(bytes)
+            .await
+            .map_err(|e| anyhow!("restore cnvrf_freeze_inputs: {e}"))?;
     }
     if let Some(bytes) = &evm_bindings_opt {
         engine
@@ -2746,6 +2797,11 @@ pub async fn load_state_into(
                     .await
                     .map_err(|e| anyhow!("restore evm_settled_state: {e}"))?;
             }
+            if let Some(bytes) = storage.cnvrf_freeze_inputs_at(height)? {
+                tmp.restore_cnvrf_freeze_inputs(&bytes)
+                    .await
+                    .map_err(|e| anyhow!("restore cnvrf_freeze_inputs: {e}"))?;
+            }
             let domains_paired = matches!(storage.latest_domains()?, Some((dh, _)) if dh == height);
             if !domains_paired {
                 storage.verify_restored_root(&tmp, height).await?;
@@ -2771,6 +2827,12 @@ pub async fn load_state_into(
                     .restore_evm_settled(&bytes)
                     .await
                     .map_err(|e| anyhow!("restore evm_settled_state: {e}"))?;
+            }
+            if let Some(bytes) = storage.cnvrf_freeze_inputs_at(height)? {
+                engine
+                    .restore_cnvrf_freeze_inputs(&bytes)
+                    .await
+                    .map_err(|e| anyhow!("restore cnvrf_freeze_inputs: {e}"))?;
             }
             Ok(Some(height))
         }

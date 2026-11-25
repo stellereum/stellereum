@@ -494,6 +494,87 @@ impl ValidatorRuntime {
             || self.finalized_epoch_beacons.contains_key(&epoch)
     }
 
+    /// Extract and verify `block.cnvrf_v3.epoch_vdf` into `ready_vdf_beacons`
+    /// BEFORE `committee_schedule_at(block.height)` is consulted by `adopt_committed`
+    /// or `walk_chain_once_with_lanes`.
+    ///
+    /// Preserves 100% byte-identical no-op behavior below `CNVRF_V3_ACTIVATION_HEIGHT`.
+    /// Returns `Ok(Some(epoch))` when a new verified beacon was staged into
+    /// `ready_vdf_beacons` (so the caller can roll it back via
+    /// [`Self::remove_ready_vdf_beacon`] if a later check rejects the block).
+    pub fn extract_and_verify_epoch_vdf_from_block(
+        &mut self,
+        block: &Block,
+    ) -> Result<Option<u64>, String> {
+        use crate::cn_vrf::EPOCH_LEN;
+
+        if !self.cnvrf_v3_is_active_at(block.height) {
+            return Ok(None);
+        }
+        let payload = block.cnvrf_v3.as_ref();
+        if block.height.is_multiple_of(EPOCH_LEN) && block.height >= EPOCH_LEN {
+            let epoch = block.height / EPOCH_LEN;
+            let Some(vdf) = payload.and_then(|p| p.epoch_vdf.as_ref()) else {
+                return Err(format!(
+                    "boundary block {} omits the epoch {epoch} MinRoot VDF beacon",
+                    block.height
+                ));
+            };
+            if vdf.epoch != epoch {
+                return Err(format!(
+                    "epoch VDF beacon names epoch {} but the block is {}",
+                    vdf.epoch, epoch
+                ));
+            }
+            if vdf.proof.steps != self.cnvrf_v3_vdf_steps {
+                return Err(format!(
+                    "epoch VDF beacon uses {} steps, the network agrees on {}",
+                    vdf.proof.steps, self.cnvrf_v3_vdf_steps
+                ));
+            }
+            if let Some((freeze_hash, freeze_mix)) = self.cnvrf_freeze_inputs.get(&epoch).copied() {
+                let prev_epoch = epoch.saturating_sub(1);
+                let expected_seed = crate::cn_vrf::epoch_seed(
+                    self.cnvrf_v3_chain_id,
+                    epoch,
+                    self.finalized_epoch_beacons.get(&prev_epoch),
+                    crate::cn_vrf::epoch_had_vdf(prev_epoch, self.cnvrf_v3_activation_height()),
+                    &freeze_hash,
+                    &freeze_mix,
+                );
+                if vdf.raw_seed != expected_seed {
+                    return Err(format!(
+                        "epoch VDF beacon {epoch} does not match the freeze input"
+                    ));
+                }
+            }
+            if crate::minroot_vdf::verify(&vdf.raw_seed, vdf.proof.steps, &vdf.proof).is_none() {
+                return Err(format!(
+                    "epoch VDF beacon {epoch} fails MinRoot verification"
+                ));
+            }
+            if !self.finalized_epoch_beacons.contains_key(&epoch)
+                && !self.ready_vdf_beacons.contains_key(&epoch)
+            {
+                self.ready_vdf_beacons.insert(epoch, vdf.clone());
+                return Ok(Some(epoch));
+            }
+            return Ok(None);
+        }
+        if let Some(p) = payload {
+            if p.epoch_vdf.is_some() {
+                return Err("epoch VDF beacon on a non-boundary height".to_string());
+            }
+        }
+        Ok(None)
+    }
+
+    /// Remove a temporarily staged beacon from `ready_vdf_beacons` (rollback on
+    /// rejected adopt/sync).
+    pub fn remove_ready_vdf_beacon(&mut self, epoch: u64) {
+        self.ready_vdf_beacons.remove(&epoch);
+    }
+
     /// Number of queued outbound CN-VRF v3 commitments waiting to be packed.
     pub fn pending_cnvrf_v3_commits_len(&self) -> usize {
         self.pending_cnvrf_v3_commits.len()
@@ -593,6 +674,7 @@ impl ValidatorRuntime {
         self.finalized_epoch_beacons = self.state.epoch_vdf_beacons_read().await.clone();
         let v3_state = self.state.cnvrf_v3_read().await.clone();
         self.cnvrf_v3_mirror = v3_state.clone();
+        self.cnvrf_freeze_inputs = self.state.cnvrf_freeze_inputs_read().await.clone();
 
         if !self.cnvrf_v3_is_active_at(self.hc.height) {
             return;
@@ -901,6 +983,9 @@ impl ValidatorRuntime {
         // Refresh synchronous mirrors from the authoritative state engine.
         self.finalized_epoch_beacons = self.state.epoch_vdf_beacons_read().await.clone();
         self.cnvrf_v3_mirror = self.state.cnvrf_v3_read().await.clone();
+        for (epoch, inputs) in self.state.cnvrf_freeze_inputs_read().await.iter() {
+            self.cnvrf_freeze_inputs.insert(*epoch, *inputs);
+        }
 
         let current_epoch = crate::cn_vrf::epoch_of_height(next_height);
         let min_keep_epoch = current_epoch.saturating_sub(1);
@@ -909,6 +994,7 @@ impl ValidatorRuntime {
             .retain(|&e| e >= min_keep_epoch);
         self.ready_vdf_beacons
             .retain(|&e, _| e >= min_keep_epoch && !self.finalized_epoch_beacons.contains_key(&e));
+        self.cnvrf_freeze_inputs.retain(|&e, _| e >= min_keep_epoch);
         self.pending_cnvrf_v3_commits.retain(|c| {
             let h_freeze = c
                 .epoch_n
@@ -1043,7 +1129,7 @@ impl ValidatorRuntime {
     /// * `UnexpectedReveal` — no commit, yet the proposer injected a reveal;
     /// * unforgeable commit entry (bad signature / wrong epoch / past cutoff);
     /// * a boundary block that omits or mis-verifies its `MinRoot` epoch beacon.
-    pub(super) fn validate_cnvrf_v3_payload(&self, block: &Block) -> Result<(), String> {
+    pub fn validate_cnvrf_v3_payload(&self, block: &Block) -> Result<(), String> {
         use crate::cn_vrf::{
             epoch_of_height, SlotRevealOutcome, EPOCH_LEN, V3_COMMIT_LOOKAHEAD_BLOCKS,
         };

@@ -23,7 +23,7 @@ validator-set commitments.
 | A4 | Bridge withdrawal target-address cap | `BRIDGE_TARGET_ADDRESS_CAP_HEIGHT` | `u64::MAX` | `{0}` and `{0,1}` | Cap `BridgeIntent::Withdraw.target_address` at `MAX_BRIDGE_TARGET_ADDRESS_BYTES` (`128` UTF-8 bytes) during `validate_at_height` and `plan_at_height` settlement |
 | A5 | Cross-shard bounce escrow | `XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT` | `u64::MAX` | `{0,1}` only (`{0}` stays `u64::MAX`) | Require committed XSHARD-01 escrow leaf (`status[i] && L(T)`) for produced/outbound/bounce paths, §9 2PC precedence, `runtime/cluster.rs` parity, and deterministic history cleanse |
 | A6 | Downtime miss budget decision | `DOWNTIME_MISS_THRESHOLD` (`42`) / `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` | `42` (frozen) | `{0}` and `{0,1}` | Decision record: keep `42` if C/A/D move to 2 vCPU, or gate efficiency-based jailing / `150`-miss interim behind `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` if 1 vCPU remains |
-| A7 | Actor mailbox hardening | `ACTOR_MAILBOX_HARDENING_HEIGHT` | `u64::MAX` | `{0}` and `{0,1}` | Height-gate hardened actor mailbox invariants: deterministic sorted-recipient FIFO delivery, `MAX_ACTOR_ROUNDS`/`MAX_ACTOR_MSGS_PER_BLOCK` caps, `MessageUndo` atomic rollback + bounce-once refund, and block-level `check_actor_cap` parity |
+| A7 | Actor mailbox hardening | `ACTOR_MAILBOX_HARDENING_HEIGHT` | `u64::MAX` | `{0}` and `{0,1}` | Reject asset-debiting/state-mutating opcodes in non-self `ActorSendBody` deliveries (opcode allowlist + `ctx.balance = msg.value`), and bound/bill `host.send_message` `ActorSendBody.gas_budget <= MAX_CONTRACT_ACTOR_GAS_BUDGET` (`1_000_000`) + `GAS_ACTOR_DELIVER` |
 
 All height-gated constants follow strict `>= H` activation semantics with the
 `u64::MAX` sentinel meaning "never active" (even at `height == u64::MAX`).
@@ -265,47 +265,62 @@ by CI.
 ### A7 — `ACTOR_MAILBOX_HARDENING_HEIGHT`
 
 - **Code surface**: `stellereum/src/chain_spec.rs`
-  (`ACTOR_MAILBOX_HARDENING_HEIGHT`, `actor_mailbox_hardening_active_at(h)` —
-  to be wired), `stellereum/src/state_engine/apply/actor.rs`
-  (`apply_actor_messages_at`, `deliver_actor_message`, `try_deliver`),
-  `stellereum/src/state_engine/apply/block.rs` (`apply_block_transition` step 1b),
-  `stellereum/src/state_engine/mod.rs` (`MAX_ACTOR_ROUNDS = 8`,
-  `MAX_ACTOR_MSGS_PER_BLOCK = 4_096`), `stellereum/src/runtime/{apply,mev_sync,consensus_step}.rs`
-  (`check_actor_cap`), `stellereum/src/node/sync.rs` (walk-side `check_actor_cap`),
-  `stellereum/src/feature_gates.rs`.
+  (`ACTOR_MAILBOX_HARDENING_HEIGHT`, `actor_mailbox_hardening_height()`,
+  `actor_mailbox_hardening_active_at(h)`), `stellereum/src/state_engine/apply/actor.rs`
+  (`try_deliver`, `is_allowed_non_self_actor_opcode`), `stellereum/src/svm.rs`
+  (`MAX_CONTRACT_ACTOR_GAS_BUDGET = 1_000_000`, `bill_outbound_actor_messages`,
+  `route_contract_messages_hardened`, `SysCallCallContract`,
+  `SysCallCallContractArgs`), `stellereum/src/feature_gates.rs`.
 - **Threat**:
-  1. Unordered `HashMap` recipient iteration during the mailbox pass causes
-     two validators applying the same block to deliver interdependent actor
-     messages in different orders and diverge on `state_root`.
-  2. Half-applied recipient/third-party mutations on body revert, out-of-gas, or
-     unfunded nested sends leak partial balance state unless rolled back
-     atomically before issuing a single bounce refund.
-  3. Unbounded mailbox recursion or blocks exceeding `MAX_ACTOR_MSGS_PER_BLOCK`
-     leave root-invisible queued messages across block boundaries unless
-     enforced identically at propose, vote/validate, and sync-walk boundaries.
+  1. Legacy `try_deliver` executed arbitrary `ActorSendBody.program` opcodes
+     against the recipient's full `acc.balance` even when `msg.sender != owner`,
+     allowing an external sender to inject asset-debiting or state-mutating
+     opcodes (`Transfer`, `SysCallActorSend`, etc.) inside a delivered actor
+     body.
+  2. Contract outbound messages emitted via `host.send_message` carrying an
+     `ActorSendBody` were previously neither capped by
+     `MAX_CONTRACT_ACTOR_GAS_BUDGET` nor prepaid against the caller's
+     `state.gas_remaining` (`GAS_ACTOR_DELIVER + body.gas_budget`), permitting
+     unbilled actor execution work from contract calls.
 - **Pre-activation (`height < H`, or `u64::MAX`)**:
-  - Historical blocks keep legacy Ruleset v7 replay semantics byte-for-byte
-    with empty queues at block boundaries and no change to genesis/historical
-    KATs or `AccountState` leaf encoding.
+  - `try_deliver` and contract outbound message routing
+    (`route_contract_messages_hardened`, `SysCallCallContract`,
+    `SysCallCallContractArgs`) preserve legacy Ruleset v7 replay semantics
+    byte-for-byte with no change to historical KATs or `AccountState` leaf
+    encoding. Pinned by `stellereum/tests/w7_svm_and_contracts_fixes.rs`.
 - **Post-activation (`height >= H`)**:
-  - `apply_actor_messages_at` executes deterministically in sorted recipient
-    address order (`sort_unstable`) with FIFO per-recipient ordering, bounded
-    by `MAX_ACTOR_ROUNDS` (`8`) and `MAX_ACTOR_MSGS_PER_BLOCK` (`4_096`).
-  - Failed deliveries roll back all touched accounts via `MessageUndo` and
-    bounce once as a pure refund (`bounced: true`, body never re-executed).
-  - Propose, consensus validation, and sync walk enforce identical
-    `check_actor_cap` limits (`backlog + block_sends <= MAX_ACTOR_MSGS_PER_BLOCK`)
-    so no node can admit or adopt a block that leaves root-invisible mailbox
-    state across a block boundary.
-  - Any future persistent cross-block inbox state (`ACTORQ1` conditional leaf)
-    remains out of scope and would require its own separate activation gate.
+  - **Non-self `ActorSendBody` opcode allowlist (`actor.rs::try_deliver`)**:
+    when `msg.sender != owner`, `body.program` must contain only allowlisted
+    read-only / pure / verification / contract-call opcodes
+    (`is_allowed_non_self_actor_opcode`: `Nop`, `Push`, `Pop`, `Add`, `Sub`,
+    `Mul`, `Div`, `LoadBalance`, `Halt`, `SysCallVerifyPqSignature`,
+    `SysCallCallContract`, `SysCallCallContractArgs`). Any other opcode is
+    rejected with `"actor body contains unauthorized opcode for non-self delivery"`,
+    triggering `MessageUndo` rollback and bounce-once refund.
+  - **`msg.value`-only balance (`actor.rs::try_deliver`)**: for non-self
+    deliveries (`msg.sender != owner`), `VmContext::balance` is restricted to
+    `msg.value` rather than the recipient's pre-existing `acc.balance`, and the
+    body runs with `VmExecOptions { chain_height, ..Default::default() }`.
+    Self-sends (`msg.sender == owner`) retain full owner balance access.
+  - **`host.send_message` gas cap & billing (`svm.rs`)**:
+    `SysCallCallContract` and `SysCallCallContractArgs` invoke
+    `bill_outbound_actor_messages` on outbound `host.send_message` messages:
+    empty payloads normalize to `gas_budget = 0` and bill `GAS_ACTOR_DELIVER`;
+    payloads decoding as `ActorSendBody` must satisfy
+    `body.gas_budget <= MAX_CONTRACT_ACTOR_GAS_BUDGET` (`1_000_000`) and bill
+    `GAS_ACTOR_DELIVER + body.gas_budget` against the caller's remaining gas
+    (reverting on budget cap breach or `OutOfGas` if `gas_remaining` is
+    insufficient); non-empty payloads that fail to decode as `ActorSendBody` are
+    dropped by `route_contract_messages_hardened` (which also skips any
+    `ActorSendBody` with `gas_budget > MAX_CONTRACT_ACTOR_GAS_BUDGET`).
 - **Prerequisites before arming**:
-  1. Wire `ACTOR_MAILBOX_HARDENING_HEIGHT` (compiled default `u64::MAX`) in
-     `chain_spec.rs`, `current_activation_schedule()`, and `feature_gates.rs`.
-  2. Cross-node `apply_block_transition` E2E proving identical `state_root`
-     under multi-recipient / multi-round / revert-and-bounce workloads and
-     uniform rejection of over-cap blocks across propose, consensus, and walk.
-  3. Inert pin test + `docs/feature_gates.yaml` regeneration via
+  1. Keep `ACTOR_MAILBOX_HARDENING_HEIGHT` registered in
+     `chain_spec::current_activation_schedule()` and `feature_gates.rs` (wired
+     at `u64::MAX`, proving test `tests/w7_svm_and_contracts_fixes.rs`).
+  2. Cross-node `apply_block_transition` E2E confirming identical `state_root`
+     under non-self allowlist rejection + bounce-once, `msg.value`-only balance
+     isolation, and `host.send_message` `MAX_CONTRACT_ACTOR_GAS_BUDGET` billing.
+  3. Inert pin update + `docs/feature_gates.yaml` regeneration via
      `stellereum gates --yaml`.
 
 ---

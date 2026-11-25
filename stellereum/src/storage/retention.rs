@@ -240,7 +240,7 @@ impl Storage {
     /// asking "is there more to do" was told yes forever by blocks that were
     /// deliberately being kept, and the prune loop never terminated.
     fn body_is_removable(height: u64, keep_from: u64) -> bool {
-        height + 1 < keep_from
+        height.saturating_add(1) < keep_from
     }
 
     /// Delete block bodies below `keep_from`, keeping their header records.
@@ -386,6 +386,7 @@ impl Storage {
         self.prune_zkml_models_below(keep_from)?;
         self.prune_cross_shard_below(keep_from)?;
         self.prune_cnvrf_v3_below(keep_from)?;
+        self.prune_cnvrf_freeze_inputs_below(keep_from)?;
         self.prune_evm_bindings_state_below(keep_from)?;
         self.prune_pq_registry_below(keep_from)?;
         self.prune_evm_settled_state_below(keep_from)?;
@@ -555,6 +556,32 @@ impl Storage {
             .collect();
         for k in keys {
             self.cnvrf_v3.remove(k)?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// Drop `cnvrf_freeze_inputs` snapshots older than `keep_from`. Called from
+    /// `prune_domains_below`. Never drops a row at a retained snapshot height:
+    /// see [`Self::aux_retained_heights`].
+    pub fn prune_cnvrf_freeze_inputs_below(&self, keep_from: u64) -> Result<usize> {
+        let keep = self.aux_retained_heights();
+        let mut removed = 0;
+        let keys: Vec<sled::IVec> = self
+            .cnvrf_freeze_inputs
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .filter(|k| {
+                if k.len() != 8 {
+                    return false;
+                }
+                let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
+                h < keep_from && !keep.contains(&h)
+            })
+            .collect();
+        for k in keys {
+            self.cnvrf_freeze_inputs.remove(k)?;
             removed += 1;
         }
         Ok(removed)

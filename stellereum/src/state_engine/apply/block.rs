@@ -719,6 +719,9 @@ impl InMemoryStateEngine {
         if let Some(vdf_beacon) = block.cnvrf_v3.as_ref().and_then(|p| p.epoch_vdf.as_ref()) {
             let e = vdf_beacon.epoch;
             if !epoch_beacons.contains_key(&e) && e <= current_epoch.saturating_add(1) {
+                let h_freeze = crate::cn_vrf::freeze_height_of_epoch(e);
+                let freeze_expected =
+                    e >= 1 && block.height >= h_freeze && self.cnvrf_v3_is_active_at(h_freeze);
                 let seed_matches = if let Some((freeze_hash, freeze_mix)) = freeze_inputs.get(&e) {
                     // ONE derivation, shared with the producer (H_freeze
                     // dispatch in `runtime/anchors.rs`) and the proposal
@@ -741,7 +744,15 @@ impl InMemoryStateEngine {
                     );
                     vdf_beacon.raw_seed == expected
                 } else {
-                    true
+                    if freeze_expected {
+                        tracing::warn!(
+                            epoch = e,
+                            height = block.height,
+                            h_freeze,
+                            "cnvrf_v3 epoch_vdf rejected: missing freeze_inputs after H_freeze"
+                        );
+                    }
+                    !freeze_expected
                 };
                 if seed_matches {
                     if let Some(out) = crate::minroot_vdf::verify(
@@ -767,8 +778,9 @@ impl InMemoryStateEngine {
             }
         }
 
-        // 6. Expire old epoch commits (keep current, previous, and current-2).
+        // 6. Expire old epoch commits and freeze inputs (keep current, previous, and current-2).
         v3_state.expire_before(current_epoch.saturating_sub(2));
+        freeze_inputs.retain(|&e, _| e >= current_epoch.saturating_sub(2));
 
         let cnvrf_changed = *v3_state != v3_before
             || *abort_state != abort_before

@@ -841,18 +841,28 @@ pub(crate) async fn run_consensus_node(
                 // both heights (always fresh); the gap probe below catches a
                 // store whose NEWEST state ran ahead of its newest domains
                 // (unpaired tail from a crash between the two snapshot jobs).
-                let ledger_h_for_check: u64 = ap
+                let legacy_ledger_h: Option<u64> =
+                    ap.storage().latest_ledger_height().ok().flatten();
+                let snap_v4_authority = ap
                     .storage()
-                    .latest_ledger_height()
+                    .latest_snap_committed()
                     .ok()
                     .flatten()
-                    .unwrap_or(h);
+                    .is_some_and(|m| m.height == h)
+                    && legacy_ledger_h.is_none_or(|lh| lh < h);
+                let ledger_h_for_check: u64 = if snap_v4_authority {
+                    h
+                } else {
+                    legacy_ledger_h.unwrap_or(h)
+                };
                 // Newest-state vs newest-domains gap (crash-tail detector).
-                if let Ok(Some((s_newest, l_newest))) = ap.storage().ledger_state_gap() {
-                    if let Err(reason) =
-                        stellereum::storage::check_validator_set_freshness(s_newest, l_newest)
-                    {
-                        rt.mark_validator_set_stale(s_newest, l_newest, reason);
+                if !snap_v4_authority {
+                    if let Ok(Some((s_newest, l_newest))) = ap.storage().ledger_state_gap() {
+                        if let Err(reason) =
+                            stellereum::storage::check_validator_set_freshness(s_newest, l_newest)
+                        {
+                            rt.mark_validator_set_stale(s_newest, l_newest, reason);
+                        }
                     }
                 }
                 if let Ok(Some(hist)) = ap.storage().load_validator_set_history() {

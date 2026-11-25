@@ -18,7 +18,17 @@ MemoryMax=1G
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=stellereum-indexer
-PrivateTmp=true
+
+# Sandboxing & privilege hardening (defense-in-depth):
+# Prevent the indexer or any child process from gaining new privileges via setuid/filecaps.
+NoNewPrivileges=yes
+# Isolate /tmp and /var/tmp in a private mount namespace.
+PrivateTmp=yes
+# Mount the OS hierarchy read-only except explicit ReadWritePaths below.
+ProtectSystem=strict
+# Keep /home and /root read-only; only the indexer's state directory is writable.
+ProtectHome=read-only
+ReadWritePaths=/root/stellereum-indexer
 
 [Install]
 WantedBy=multi-user.target

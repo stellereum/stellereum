@@ -363,7 +363,25 @@ fn run_supervise(args: &Args, progress: &Progress) -> Result<(), String> {
                 })?,
             )
         };
-        let plan = select_authoritative_plan(marker_plan, None, args)?;
+        let rpc_plan = match args.rpc.as_deref() {
+            Some(url) => wait_for_rpc_plan(args, url).map_err(|e| {
+                let _ = progress.record("error", &format!("rpc-plan {e}"));
+                e
+            })?,
+            None => None,
+        };
+        if let Some(plan) = &rpc_plan {
+            progress.record(
+                "plan-rpc",
+                &format!(
+                    "name={} height={} sha256={}",
+                    plan.name,
+                    plan.height,
+                    format_sha256_hex(&plan.sha256)
+                ),
+            )?;
+        }
+        let plan = select_authoritative_plan(marker_plan, rpc_plan, args)?;
         progress.record(
             "halt-marker",
             &format!(
@@ -757,5 +775,27 @@ mod tests {
         assert!(parse_args(svec(&["--staged="])).is_err());
         assert!(parse_args(svec(&["--staged", "/a", "--live="])).is_err());
         assert!(parse_args(svec(&["--staged", "/a", "--health-wait-secs", "5"])).is_err());
+    }
+
+    #[test]
+    fn select_authoritative_plan_enforces_rpc_marker_agreement() {
+        let args = Args::default();
+        let p1 = UpgradePlan {
+            name: "v0.2.0".to_string(),
+            height: 1200,
+            sha256: [0xabu8; 32],
+        };
+        let p2 = UpgradePlan {
+            name: "v0.2.1".to_string(),
+            height: 1200,
+            sha256: [0xabu8; 32],
+        };
+        assert_eq!(
+            select_authoritative_plan(Some(p1.clone()), Some(p1.clone()), &args).expect("agree"),
+            p1
+        );
+        let err = select_authoritative_plan(Some(p1), Some(p2), &args)
+            .expect_err("disagreeing marker and rpc plan must refuse");
+        assert!(err.contains("disagrees"), "{err}");
     }
 }

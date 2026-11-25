@@ -476,7 +476,13 @@ impl ValidatorRuntime {
     pub(super) async fn publish_epoch_announcement(&mut self) {
         let announcement = {
             let pool = self.mempool.read().await;
-            pool.mev_seal.build_announcement(&self.key).ok()
+            if let Some(fk) = self.falcon_signing_key() {
+                pool.mev_seal.build_announcement_pq(&self.key, fk).ok()
+            } else if !crate::post_quantum::is_pure_pq_enforced() {
+                pool.mev_seal.build_announcement(&self.key).ok()
+            } else {
+                None
+            }
         };
         let Some(announcement) = announcement else {
             return;
@@ -523,9 +529,15 @@ impl ValidatorRuntime {
                         return;
                     }
                     let material = pool.mev_seal.material().cloned();
-                    let announcement = material
-                        .as_ref()
-                        .and_then(|_| pool.mev_seal.build_announcement(&self.key).ok());
+                    let announcement = material.as_ref().and_then(|_| {
+                        if let Some(fk) = self.falcon_signing_key() {
+                            pool.mev_seal.build_announcement_pq(&self.key, fk).ok()
+                        } else if !crate::post_quantum::is_pure_pq_enforced() {
+                            pool.mev_seal.build_announcement(&self.key).ok()
+                        } else {
+                            None
+                        }
+                    });
                     (material, announcement)
                 };
                 if let Some(material) = material {
@@ -581,9 +593,15 @@ impl ValidatorRuntime {
                         return;
                     }
                     let material = pool.mev_seal.material().cloned();
-                    let announcement = material
-                        .as_ref()
-                        .and_then(|_| pool.mev_seal.build_announcement(&self.key).ok());
+                    let announcement = material.as_ref().and_then(|_| {
+                        if let Some(fk) = self.falcon_signing_key() {
+                            pool.mev_seal.build_announcement_pq(&self.key, fk).ok()
+                        } else if !crate::post_quantum::is_pure_pq_enforced() {
+                            pool.mev_seal.build_announcement(&self.key).ok()
+                        } else {
+                            None
+                        }
+                    });
                     (material, announcement)
                 };
                 if let Some(material) = material {
@@ -599,9 +617,34 @@ impl ValidatorRuntime {
                 }
             }
             crate::mev_epoch::MevFrame::OrderCommit(commitment) => {
+                let Some(expected_proposer) = self.expected_proposer_at(
+                    &self.validators,
+                    commitment.height,
+                    commitment.round,
+                ) else {
+                    tracing::warn!(
+                        "[mev-seal] order commitment refused: no scheduled proposer for h={} r={}",
+                        commitment.height,
+                        commitment.round
+                    );
+                    return;
+                };
+                let expected_falcon_pk =
+                    crate::consensus::pq_key_at_height(&commitment.proposer, commitment.height)
+                        .and_then(|(scheme, pk)| {
+                            if scheme == crate::post_quantum::PqScheme::Falcon512 {
+                                Some(pk)
+                            } else {
+                                None
+                            }
+                        });
                 {
                     let mut pool = self.mempool.write().await;
-                    if let Err(e) = pool.mev_seal.note_commitment(commitment.clone()) {
+                    if let Err(e) = pool.mev_seal.note_commitment_verified(
+                        commitment.clone(),
+                        Some(expected_proposer),
+                        expected_falcon_pk.as_deref(),
+                    ) {
                         tracing::warn!("[mev-seal] order commitment refused: {e}");
                         return;
                     }
@@ -610,10 +653,45 @@ impl ValidatorRuntime {
                 self.release_sealed_partials(&commitment).await;
             }
             crate::mev_epoch::MevFrame::Release(release) => {
+                if crate::post_quantum::is_pure_pq_enforced() {
+                    tracing::warn!(
+                        "[mev-seal] unauthenticated share release refused in pure-PQ mode"
+                    );
+                    return;
+                }
                 let mut pool = self.mempool.write().await;
                 match pool.mev_seal.ingest_release(release) {
                     Ok(n) => tracing::debug!("[mev-seal] accepted {n} decryption partial(s)"),
                     Err(e) => tracing::debug!("[mev-seal] share release refused: {e}"),
+                }
+            }
+            crate::mev_epoch::MevFrame::PqRelease(envelope) => {
+                let Some((scheme, pk)) = crate::consensus::pq_key_at_height(
+                    &envelope.signer_id,
+                    envelope.release.height,
+                ) else {
+                    tracing::warn!(
+                        "[mev-seal] pq share release refused: no registered PQ key for signer"
+                    );
+                    return;
+                };
+                let expected_falcon_pk: &[u8] = match scheme {
+                    crate::post_quantum::PqScheme::Falcon512 => &pk,
+                    _ => {
+                        tracing::warn!(
+                            "[mev-seal] pq share release refused: unsupported PQ scheme {:?}",
+                            scheme
+                        );
+                        return;
+                    }
+                };
+                let mut pool = self.mempool.write().await;
+                match pool
+                    .mev_seal
+                    .ingest_release_authenticated(&envelope, expected_falcon_pk)
+                {
+                    Ok(n) => tracing::debug!("[mev-seal] accepted {n} pq decryption partial(s)"),
+                    Err(e) => tracing::debug!("[mev-seal] pq share release refused: {e}"),
                 }
             }
             crate::mev_epoch::MevFrame::Announcement(announcement) => {
@@ -649,6 +727,7 @@ impl ValidatorRuntime {
             order_root,
             partials: Vec::new(),
         };
+        let mut dleq_proofs: Vec<([u8; 32], crate::mev_epoch::PartialDleqProof)> = Vec::new();
         for tx_hash in &commitment.tx_hashes {
             let envelope = {
                 let pool = self.mempool.read().await;
@@ -657,12 +736,29 @@ impl ValidatorRuntime {
             let Some(envelope) = envelope else {
                 continue;
             };
-            let partial = {
+            let (partial, dleq_opt) = {
                 let mut pool = self.mempool.write().await;
-                pool.mev_seal.release_partial(height, round, &envelope)
+                let partial = pool.mev_seal.release_partial(height, round, &envelope);
+                let dleq = match (&partial, pool.mev_seal.material()) {
+                    (Ok(p), Some(mat)) => crate::mev_epoch::prove_partial_dleq(
+                        &mat.share,
+                        epoch,
+                        p.validator_index,
+                        &envelope.ephemeral_pk,
+                        &p.point,
+                    )
+                    .ok(),
+                    _ => None,
+                };
+                (partial, dleq)
             };
             match partial {
-                Ok(p) => release.partials.push((*tx_hash, p)),
+                Ok(p) => {
+                    if let Some(proof) = dleq_opt {
+                        dleq_proofs.push((*tx_hash, proof));
+                    }
+                    release.partials.push((*tx_hash, p));
+                }
                 Err(e) => tracing::debug!("[mev-seal] partial refused: {e}"),
             }
         }
@@ -673,8 +769,20 @@ impl ValidatorRuntime {
             "[mev-seal] released {} decryption partial(s) for h={height} r={round}",
             release.partials.len()
         );
-        self.gossip_mev_frame(crate::mev_epoch::MevFrame::Release(release))
-            .await;
+        if let Some(fk) = self.falcon_signing_key() {
+            let envelope = crate::mev_epoch::pq_share_release_seal_with_dleq(
+                fk,
+                self.id,
+                release,
+                dleq_proofs,
+            );
+            self.gossip_mev_frame(crate::mev_epoch::MevFrame::PqRelease(envelope))
+                .await;
+        } else {
+            tracing::warn!(
+                "[mev-seal] Falcon-512 keypair required to release authenticated partials; skipping gossip"
+            );
+        }
     }
 
     /// The EPOCH-SEAL proposer path: unseal the committed sealed
@@ -729,10 +837,16 @@ impl ValidatorRuntime {
                 }
                 None => {
                     let tx_hashes: Vec<[u8; 32]> = candidates.iter().map(|c| c.tx_hash).collect();
-                    match pool
-                        .mev_seal
-                        .commit_order(height, round, tx_hashes, &self.key)
-                    {
+                    let res = if let Some(fk) = self.falcon_signing_key() {
+                        pool.mev_seal
+                            .commit_order_pq(height, round, tx_hashes, &self.key, fk)
+                    } else if !crate::post_quantum::is_pure_pq_enforced() {
+                        pool.mev_seal
+                            .commit_order(height, round, tx_hashes, &self.key)
+                    } else {
+                        Err("pure-PQ requires Falcon-512 keypair for order commitment".to_string())
+                    };
+                    match res {
                         Ok(c) => (c, candidates),
                         Err(e) => {
                             tracing::warn!("[mev-seal] order commitment refused: {e}");
@@ -762,6 +876,10 @@ impl ValidatorRuntime {
         // 3. Unseal what we can.
         let mut out: Vec<Transaction> = Vec::new();
         let mut dropped: Vec<(crate::mev_epoch::SealedEnvelope, DropReason)> = Vec::new();
+        let committee_size = {
+            let pool = self.mempool.read().await;
+            pool.mev_seal.committee().map(|c| c.members.len())
+        };
         for candidate in &candidates {
             let partials = {
                 let pool = self.mempool.read().await;
@@ -773,12 +891,29 @@ impl ValidatorRuntime {
                 dropped.push((candidate.clone(), DropReason::NotEnoughShares));
                 continue;
             }
-            let plaintext = match crate::mev_epoch::unseal_transaction(
-                candidate,
-                &partials,
-                threshold,
-                &committee_hash,
-            ) {
+            if let Some(n) = committee_size {
+                if let Err(e) = crate::mev_epoch::combine_partials_checked(&partials, threshold, n)
+                {
+                    tracing::warn!("[mev-seal] partial bounds check failed: {e}");
+                    dropped.push((candidate.clone(), DropReason::Undecryptable));
+                    continue;
+                }
+            }
+            let plaintext = match match committee_size {
+                Some(n) => crate::mev_epoch::unseal_transaction_checked(
+                    candidate,
+                    &partials,
+                    threshold,
+                    &committee_hash,
+                    n,
+                ),
+                None => crate::mev_epoch::unseal_transaction(
+                    candidate,
+                    &partials,
+                    threshold,
+                    &committee_hash,
+                ),
+            } {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!("[mev-seal] unseal failed: {e}");

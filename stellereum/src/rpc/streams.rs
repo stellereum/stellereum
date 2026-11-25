@@ -3191,7 +3191,14 @@ pub(super) async fn ws_handle_text(
             }
         }
     } else if method == "stell_unsubscribe" {
-        if let Some(sid) = params.get(0).and_then(|v| v.as_str()) {
+        if let Some(sid) = params
+            .get(0)
+            .and_then(|v| v.as_str())
+            .or_else(|| params.get("subscription").and_then(|v| v.as_str()))
+            .or_else(|| params.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             owned.remove(sid);
         }
     }

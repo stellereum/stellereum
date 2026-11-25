@@ -399,10 +399,20 @@ impl UpgradePlan {
             "params": [],
         })
         .to_string();
-        let response = ureq::post(url)
+        let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(5))
+            .redirects(0)
+            .try_proxy_from_env(false)
+            .build();
+        let response = agent
+            .post(url)
+            .set("Content-Type", "application/json")
             .send_string(&body)
             .map_err(|e| format!("RPC {url}: {e}"))?;
+        let status = response.status();
+        if !(200..300).contains(&status) {
+            return Err(format!("RPC {url}: HTTP {status}"));
+        }
         let value: serde_json::Value = {
             let text = response
                 .into_string()
@@ -1034,6 +1044,78 @@ WantedBy=multi-user.target\n\
 #     --apply\n"
 }
 
+/// Validate that the `--progress` target file and its parent directory are
+/// safe to append to: neither is a symlink, the target (if present) is a
+/// regular file, and the parent directory is neither group-writable (`0o020`)
+/// nor world-writable (`0o002`).
+pub fn check_progress_path(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let meta = fs::symlink_metadata(parent).map_err(|e| {
+        format!(
+            "progress file {}: parent {}: {e}",
+            path.display(),
+            parent.display()
+        )
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "progress file {}: parent {} is a SYMLINK; refusing",
+            path.display(),
+            parent.display()
+        ));
+    }
+    if !meta.is_dir() {
+        return Err(format!(
+            "progress file {}: parent {} is not a directory",
+            path.display(),
+            parent.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        if mode & 0o020 != 0 {
+            return Err(format!(
+                "progress file {}: parent {} is GROUP-WRITABLE (mode {:o}); refusing",
+                path.display(),
+                parent.display(),
+                mode
+            ));
+        }
+        if mode & 0o002 != 0 {
+            return Err(format!(
+                "progress file {}: parent {} is WORLD-WRITABLE (mode {:o}); refusing",
+                path.display(),
+                parent.display(),
+                mode
+            ));
+        }
+    }
+    match fs::symlink_metadata(path) {
+        Ok(target_meta) => {
+            if target_meta.file_type().is_symlink() {
+                return Err(format!(
+                    "progress file {} is a SYMLINK; refusing",
+                    path.display()
+                ));
+            }
+            if !target_meta.is_file() {
+                return Err(format!(
+                    "progress file {} is not a regular file",
+                    path.display()
+                ));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("stat progress file {}: {e}", path.display())),
+    }
+    Ok(())
+}
+
 /// Append-only progress journal. One line per step, timestamped in epoch
 /// seconds, so an operator can prove what the supervisor did and when.
 #[derive(Clone, Debug)]
@@ -1052,17 +1134,43 @@ impl Progress {
 
     pub fn record(&self, step: &str, detail: &str) -> Result<(), String> {
         if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("create progress dir {}: {e}", parent.display()))?;
+            match fs::symlink_metadata(parent) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(format!(
+                            "progress file {}: parent {} is a SYMLINK; refusing",
+                            self.path.display(),
+                            parent.display()
+                        ));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("create progress dir {}: {e}", parent.display()))?;
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "progress file {}: parent {}: {e}",
+                        self.path.display(),
+                        parent.display()
+                    ));
+                }
+            }
         }
+        check_progress_path(&self.path)?;
         let unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let line = format!("unix={unix} step={step} {detail}\n");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o644);
+        }
+        let mut file = options
             .open(&self.path)
             .map_err(|e| format!("open progress {}: {e}", self.path.display()))?;
         file.write_all(line.as_bytes())
@@ -1501,6 +1609,61 @@ mod tests {
         assert!(flag.exists(), "restart command must run during rollback");
         let log = fs::read_to_string(progress.path()).expect("read progress");
         assert!(log.contains("step=rollback"), "{log}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_rpc_refuses_http_3xx_redirects() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let addr = listener.local_addr().expect("addr");
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let reply = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/evil\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(reply.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        let url = format!("http://{addr}");
+        let err = UpgradePlan::read_rpc(&url).expect_err("3xx redirect must be refused");
+        assert!(err.contains("302"), "{err}");
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn progress_record_rejects_writable_parent_and_symlink_target() {
+        let dir = temp_dir("progress-perms");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod 755");
+
+        let group_dir = dir.join("group_writable");
+        fs::create_dir_all(&group_dir).expect("mkdir group");
+        fs::set_permissions(&group_dir, fs::Permissions::from_mode(0o775)).expect("chmod 775");
+        let err = Progress::new(group_dir.join("p.log"))
+            .record("start", "test")
+            .expect_err("group-writable parent must be refused");
+        assert!(err.contains("GROUP-WRITABLE"), "{err}");
+
+        let world_dir = dir.join("world_writable");
+        fs::create_dir_all(&world_dir).expect("mkdir world");
+        fs::set_permissions(&world_dir, fs::Permissions::from_mode(0o757)).expect("chmod 757");
+        let err = Progress::new(world_dir.join("p.log"))
+            .record("start", "test")
+            .expect_err("world-writable parent must be refused");
+        assert!(err.contains("WORLD-WRITABLE"), "{err}");
+
+        let clean_dir = dir.join("clean");
+        fs::create_dir_all(&clean_dir).expect("mkdir clean");
+        fs::set_permissions(&clean_dir, fs::Permissions::from_mode(0o755)).expect("chmod 755");
+        let real_file = clean_dir.join("real.log");
+        fs::write(&real_file, b"").expect("write real");
+        let link_file = clean_dir.join("link.log");
+        std::os::unix::fs::symlink(&real_file, &link_file).expect("symlink");
+        let err = Progress::new(link_file)
+            .record("start", "test")
+            .expect_err("symlink progress file must be refused");
+        assert!(err.contains("SYMLINK"), "{err}");
 
         fs::remove_dir_all(&dir).ok();
     }

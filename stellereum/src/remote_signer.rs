@@ -1408,7 +1408,7 @@ fn decode_safety_state(bytes: &[u8]) -> Result<ConsensusSafetyState, SignerError
                 last_prevote: legacy.last_prevote,
                 last_precommit: legacy.last_precommit,
                 last_proposal: legacy.last_proposal,
-                last_non_nil_prevote: None,
+                last_non_nil_prevote: legacy.last_prevote.filter(|s| s.target.is_some()),
             });
         }
     }

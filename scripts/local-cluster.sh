@@ -32,10 +32,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLUSTER="$ROOT/run/cluster"
 
-P2P_BASE=19410        # P2P listen/advertise base: 19410+i (127.0.0.1)
-RPC_BASE=18645        # JSON-RPC base: 18645+i (NOTE: 18545 is taken on this
-                      # dev box by an ssh tunnel, so NOT 18545+i)
-EXP_BASE=18080        # explorer/gateway base: 18080+i (default 8080 would clash)
+P2P_BASE="${STELL_LOCAL_P2P_BASE:-19410}"        # P2P listen/advertise base: 19410+i (127.0.0.1)
+RPC_BASE="${STELL_LOCAL_RPC_BASE:-18645}"        # JSON-RPC base: 18645+i (NOTE: 18545 is taken on this
+                                                 # dev box by an ssh tunnel, so NOT 18545+i)
+EXP_BASE="${STELL_LOCAL_EXP_BASE:-18080}"        # explorer/gateway base: 18080+i (default 8080 would clash)
 FAUCET_KEY="1111111111111111111111111111111111111111111111111111111111111111"
 CHAIN_NOTE="chain id default 5757 on all nodes (STELL_CHAIN_ID left unset)"
 XPC_HEIGHT=5             # 2-shard mode only: STELL_XPC_ACTIVATION_HEIGHT (low so 2PC reachable in minutes)

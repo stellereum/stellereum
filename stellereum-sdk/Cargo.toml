@@ -38,9 +38,3 @@ thiserror = "1"
 ureq = { version = "2", features = ["json"] }
 zeroize = { version = "1", features = ["derive"] }
 stellereum = { path = "../stellereum", optional = true }
-
-[profile.dev]
-debug = 0
-
-[profile.test]
-debug = 0

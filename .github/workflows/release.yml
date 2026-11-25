@@ -42,18 +42,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: stellereum
           shared-key: release
 
       # `--locked` is the reproducibility contract: the release must build from
       # the committed lockfile, not from whatever the registry serves today.
       - name: Build node (release, locked)
-        working-directory: stellereum
-        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+        run: cargo build -p stellereum --release --locked --target x86_64-unknown-linux-gnu
 
       - name: Name, digest, SBOM
         run: |
-          cp stellereum/target/x86_64-unknown-linux-gnu/release/stellereum "$BIN"
+          cp target/x86_64-unknown-linux-gnu/release/stellereum "$BIN"
           sha256sum "$BIN" > "$BIN.sha256"
           cat "$BIN.sha256"
 

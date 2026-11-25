@@ -1,15 +1,53 @@
 [workspace]
-# The operator-side supervisor is the only member of this small workspace.
-# The node tree keeps its own standalone manifest and profile settings; the
-# excludes make that explicit so `cargo` invoked inside `stellereum/` never
-# adopts this workspace by accident.
-members = ["stellereum-upgrader"]
-exclude = [
+# Unified Rust workspace for all core node, overlay, SDK, indexer, and tool
+# crates. Standalone / specialized workspaces remain explicitly excluded:
+# - stellereum-contracts: separate wasm32-unknown-unknown workspace
+# - stellereum/fuzz: cargo-fuzz workspace
+# - stell-wallet: separate wallet workspace
+# - scripts/tools/stelops: minimal standalone ops binary with custom release profile
+# - scripts/loadtest/loadtest, infnode/tools/ec-mail-recovery: standalone tools
+# Note: infnode/Cargo.toml was removed so Cargo invoked inside infnode/crates/*
+# walks up to this root workspace and shares the unified Cargo.lock.
+members = [
     "stellereum",
-    "infnode",
-    "stellereum-contracts",
-    "stellereum-indexer",
+    "infnode/crates/infnode",
+    "infnode/crates/infmail",
     "stellereum-sdk",
+    "stellereum-indexer",
+    "stellereum-upgrader",
+    "stellereum-ledger-tool",
+]
+exclude = [
+    "stellereum-contracts",
+    "stellereum/fuzz",
     "stell-wallet",
+    "scripts/tools/stelops",
+    "scripts/loadtest/loadtest",
+    "infnode/tools/ec-mail-recovery",
 ]
 resolver = "2"
+
+# Workspace-level profiles (moved from stellereum/Cargo.toml; Cargo requires
+# profiles to live at the workspace root).
+# Test speed: the suite is crypto-heavy (Ed25519, hashing, Merkle, WASM), and an
+# unoptimized dependency graph made it unusably slow. Dependencies are compiled
+# with full optimizations while our own crates stay at opt-level 0, so rebuilds
+# remain quick. Debuginfo is dropped because it dominated link time and disk
+# (20 GB of target/debug) without helping the tests at all.
+[profile.dev]
+debug = 0
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.test]
+debug = 0
+# The suite is CRYPTO-heavy and the crypto lives in the node crate (Falcon-verify,
+# SHAKE-256, BLAKE3 chain, MinRoot field arithmetic). At opt-level 0 those
+# tests ran ~3x slower than optimized code, which is why the full gate took
+# 20+ minutes. Level 2 keeps our own debug info off (debug = 0 above) while
+# executing the same math the release binary runs.
+opt-level = 2
+
+[profile.test.package."*"]
+opt-level = 3

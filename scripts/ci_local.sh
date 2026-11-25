@@ -129,37 +129,25 @@ run_stage() {
 }
 
 stage_fmt() {
-  local ws rc=0
-  for ws in stellereum infnode stellereum-sdk; do
-    run_in "$ws" "cargo fmt --all --check ($ws)" cargo fmt --all --check || rc=1
-  done
-  return "$rc"
+  run_in . "cargo fmt --all --check" cargo fmt --all --check
 }
 
 stage_clippy() {
-  local ws rc=0
-  for ws in stellereum infnode; do
-    run_in "$ws" "cargo clippy --all-targets -- -D warnings ($ws)" \
-      cargo clippy --locked --all-targets -- -D warnings || rc=1
-  done
-  return "$rc"
+  run_in . "cargo clippy --workspace --locked --all-targets -- -D warnings" \
+    cargo clippy --workspace --locked --all-targets -- -D warnings
 }
 
 stage_lib() {
-  local rc=0
-  run_in stellereum "cargo test --lib (stellereum)" \
-    cargo test --locked --lib -- --test-threads="$TEST_THREADS" || rc=1
-  run_in infnode "cargo test --lib (infnode)" \
-    cargo test --locked --lib -- --test-threads="$TEST_THREADS" || rc=1
-  return "$rc"
+  run_in . "cargo test --workspace --locked --lib" \
+    cargo test --workspace --locked --lib -- --test-threads="$TEST_THREADS"
 }
 
 stage_suite() {
   local suite="$1" tests t rc=0
   tests="$(suite_tests "$suite")" || return 2
   for t in $tests; do
-    run_in stellereum "cargo test --test $t ($suite)" \
-      cargo test --locked --test "$t" -- --test-threads="$TEST_THREADS" || rc=1
+    run_in . "cargo test -p stellereum --test $t ($suite)" \
+      cargo test --locked -p stellereum --test "$t" -- --test-threads="$TEST_THREADS" || rc=1
   done
   return "$rc"
 }
@@ -179,7 +167,7 @@ stage_full() {
 
 stage_sdk() {
   local rc=0
-  run_in stellereum-sdk "cargo test (stellereum-sdk)" cargo test --locked || rc=1
+  run_in . "cargo test -p stellereum-sdk" cargo test --locked -p stellereum-sdk || rc=1
   if [ -d "$ROOT/sdk-js/node_modules" ]; then
     run_in sdk-js "npm run typecheck (sdk-js)" npm run typecheck || rc=1
     run_in sdk-js "npm test (sdk-js)" npm test || rc=1

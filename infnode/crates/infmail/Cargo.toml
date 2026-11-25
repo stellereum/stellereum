@@ -1,34 +1,34 @@
 [package]
 name = "infmail"
-version.workspace = true
-edition.workspace = true
+version = "0.1.0"
+edition = "2021"
 description = "Инфмейл: webmail-сервис поверх сети infnode (аккаунты, письма, файлы, подписки, 2FA, NFT). Отдельный проект, не часть ядра infnode."
 license = "MIT OR Apache-2.0"
 
 [dependencies]
 infnode = { path = "../infnode" }
-anyhow = { workspace = true }
-argon2 = { workspace = true }
-axum = { workspace = true }
-base64 = { workspace = true }
-blake3 = { workspace = true }
-clap = { workspace = true }
-ed25519-dalek = { workspace = true }
-hex = { workspace = true }
-hmac = { workspace = true }
-imap = { workspace = true }
-native-tls = { workspace = true }
-lettre = { workspace = true }
-png = { workspace = true }
-rand = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-sha2 = { workspace = true }
-time = { workspace = true }
-tokio = { workspace = true }
-tower-http = { workspace = true }
-ureq = { workspace = true }
-x25519-dalek = { workspace = true }
+anyhow = "1"
+argon2 = "0.5"
+axum = "0.8"
+base64 = "0.22"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core", "zeroize"] }
+hex = "0.4"
+hmac = "0.12"
+imap = { version = "2.4", default-features = false, features = ["tls"] }
+native-tls = "0.2"
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls-tls", "ring", "webpki-roots", "tokio1"] }
+png = "0.17"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+time = { version = "0.3", features = ["std"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 
 [[bin]]
 name = "infmail"

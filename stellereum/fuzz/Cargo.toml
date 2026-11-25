@@ -7,6 +7,8 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+[workspace]
+
 [dependencies]
 stellereum = { path = ".." }
 # Relative path: `fuzz/` -> repo root -> sibling workspace checkout.

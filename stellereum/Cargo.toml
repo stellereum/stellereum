@@ -55,26 +55,3 @@ ml-kem = "0.3"
 tokio-tungstenite = "0.24"
 # `test-util` adds no external dependencies and lets router timeout tests advance virtual time.
 tokio = { version = "1", features = ["test-util"] }
-
-# Test speed: the suite is crypto-heavy (Ed25519, hashing, Merkle, WASM), and an
-# unoptimized dependency graph made it unusably slow. Dependencies are compiled
-# with full optimizations while our own crate stays at opt-level 0, so rebuilds
-# remain quick. Debuginfo is dropped because it dominated link time and disk
-# (20 GB of target/debug) without helping the tests at all.
-[profile.dev]
-debug = 0
-
-[profile.dev.package."*"]
-opt-level = 3
-
-[profile.test]
-debug = 0
-# The suite is CRYPTO-heavy and the crypto lives in THIS crate (Falcon-verify,
-# SHAKE-256, BLAKE3 chain, MinRoot field arithmetic). At opt-level 0 those
-# tests ran ~3x slower than optimized code, which is why the full gate took
-# 20+ minutes. Level 2 keeps our own debug info off (debug = 0 above) while
-# executing the same math the release binary runs.
-opt-level = 2
-
-[profile.test.package."*"]
-opt-level = 3

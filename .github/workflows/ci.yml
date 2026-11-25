@@ -33,9 +33,7 @@ env:
   TEST_THREADS: '2'
 
 jobs:
-  # (a) Formatting across every Rust workspace the gate touches. cargo-fmt
-  # follows path dependencies, so the stellereum invocation also covers the
-  # infnode sources it links; the explicit loop keeps that behaviour obvious.
+  # (a) Formatting across the unified root workspace.
   fmt:
     name: fmt
     runs-on: ubuntu-latest
@@ -46,28 +44,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: cargo fmt --all --check
-        run: |
-          set -uo pipefail
-          rc=0
-          for ws in stellereum infnode stellereum-sdk; do
-            echo "::group::cargo fmt --all --check ($ws)"
-            (cd "$ws" && cargo fmt --all --check) || rc=1
-            echo "::endgroup::"
-          done
-          exit "$rc"
+        run: cargo fmt --all --check
 
-  # (b) Clippy for the node crate and the infnode workspace. `--all-targets`
-  # includes the integration-test crates, so a test-only warning is red too.
+  # (b) Clippy across the unified workspace. `--all-targets` includes the
+  # integration-test crates, so a test-only warning is red too.
   clippy:
-    name: clippy (${{ matrix.workspace }})
+    name: clippy
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        workspace:
-          - stellereum
-          - infnode
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -75,14 +59,12 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ${{ matrix.workspace }}
-          shared-key: clippy-${{ matrix.workspace }}
-      - name: cargo clippy --all-targets -- -D warnings
-        working-directory: ${{ matrix.workspace }}
-        run: cargo clippy --locked --all-targets -- -D warnings
+          shared-key: clippy-workspace
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --locked --all-targets -- -D warnings
 
-  # (c) Unit/library tests. Integration suites are deliberately excluded here
-  # so a single red binary does not mask the rest of the PR gate.
+  # (c) Unit/library tests across the unified workspace. Integration suites are
+  # deliberately excluded here so a single red binary does not mask the PR gate.
   test-lib:
     name: test-lib
     runs-on: ubuntu-latest
@@ -94,16 +76,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            stellereum
-            infnode
           shared-key: test-lib
-      - name: lib tests (stellereum)
-        working-directory: stellereum
-        run: cargo test --locked --lib -- --test-threads="$TEST_THREADS"
-      - name: lib tests (infnode)
-        working-directory: infnode
-        run: cargo test --locked --lib -- --test-threads="$TEST_THREADS"
+      - name: workspace lib tests
+        run: cargo test --workspace --locked --lib -- --test-threads="$TEST_THREADS"
 
   # (d) The curated heavy integration suites, one matrix leg per category.
   # The whole workspace is 340+ binaries; running all of it belongs to the
@@ -160,17 +135,15 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: stellereum
           shared-key: test-suites
       - name: Run curated suites
-        working-directory: stellereum
         env:
           TESTS: ${{ matrix.tests }}
         run: |
           set -euo pipefail
           for t in $TESTS; do
-            echo "::group::cargo test --test $t"
-            cargo test --locked --test "$t" -- --test-threads="$TEST_THREADS"
+            echo "::group::cargo test -p stellereum --test $t"
+            cargo test --locked -p stellereum --test "$t" -- --test-threads="$TEST_THREADS"
             echo "::endgroup::"
           done
 
@@ -191,11 +164,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: stellereum-sdk
           shared-key: sdk-rust
       - name: Rust SDK tests
-        working-directory: stellereum-sdk
-        run: cargo test --locked
+        run: cargo test --locked -p stellereum-sdk
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -248,7 +219,7 @@ jobs:
         with:
           command: check
           arguments: --all-features
-          manifest-path: stellereum/Cargo.toml
+          manifest-path: Cargo.toml
 
   # (h) RustSec advisory check as an independent second opinion: cargo-deny can
   # be silenced with an ignore, cargo-audit cannot be silenced by this repo at
@@ -262,4 +233,3 @@ jobs:
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: stellereum

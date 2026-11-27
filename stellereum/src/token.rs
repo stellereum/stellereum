@@ -825,7 +825,12 @@ impl TokenRegistry {
                 }
             }
         } else {
-            for (token_id, actor) in self.tokens.iter() {
+            let start = match cursor {
+                Some(c) => std::ops::Bound::Excluded(c),
+                None => std::ops::Bound::Unbounded,
+            };
+            let iter = self.tokens.range((start, std::ops::Bound::Unbounded));
+            for (token_id, actor) in iter {
                 if page.scanned >= scan_cap {
                     page.truncated = true;
                     break;
@@ -977,6 +982,376 @@ impl TokenRegistry {
             .get(token_id)
             .map(|t| t.balance_of(account))
             .unwrap_or(0)
+    }
+
+    /// Plan a direct token transfer against an immutable `&TokenRegistry`
+    /// without cloning the registry.
+    pub fn plan_transfer(
+        &self,
+        token_id: &[u8; 32],
+        from: [u8; 32],
+        to: [u8; 32],
+        amount: u64,
+    ) -> Result<TokenTxDelta, TokenError> {
+        let mut delta = TokenTxDelta::default();
+        self.plan_transfer_into(&mut delta, token_id, from, to, amount)?;
+        Ok(delta)
+    }
+
+    /// Plan a direct token transfer into an existing `TokenTxDelta` overlay.
+    pub fn plan_transfer_into(
+        &self,
+        delta: &mut TokenTxDelta,
+        token_id: &[u8; 32],
+        from: [u8; 32],
+        to: [u8; 32],
+        amount: u64,
+    ) -> Result<(), TokenError> {
+        let token = self.tokens.get(token_id).ok_or(TokenError::TokenNotFound)?;
+        if amount == 0 {
+            return Err(TokenError::ZeroAmount);
+        }
+        if to == ZERO_ADDRESS || from == ZERO_ADDRESS {
+            return Err(TokenError::ZeroAddress);
+        }
+        if from == to {
+            return Err(TokenError::SelfTransfer);
+        }
+        if token.metadata.paused {
+            return Err(TokenError::Paused);
+        }
+        let from_bal = delta.balance_of(self, token_id, &from);
+        if from_bal < amount {
+            return Err(TokenError::InsufficientBalance);
+        }
+        let to_bal = delta.balance_of(self, token_id, &to);
+        let new_to = to_bal.checked_add(amount).ok_or(TokenError::Overflow)?;
+        let new_from = from_bal - amount;
+        delta.balances.insert((*token_id, from), new_from);
+        delta.balances.insert((*token_id, to), new_to);
+        delta.events.push(TokenEvent::Transfer {
+            token_id: *token_id,
+            from,
+            to,
+            amount,
+        });
+        Ok(())
+    }
+
+    /// Plan an allowance-backed `transfer_from` against an immutable
+    /// `&TokenRegistry` without cloning the registry.
+    pub fn plan_transfer_from(
+        &self,
+        token_id: &[u8; 32],
+        spender: [u8; 32],
+        from: [u8; 32],
+        to: [u8; 32],
+        amount: u64,
+    ) -> Result<TokenTxDelta, TokenError> {
+        let mut delta = TokenTxDelta::default();
+        self.plan_transfer_from_into(&mut delta, token_id, spender, from, to, amount)?;
+        Ok(delta)
+    }
+
+    /// Plan an allowance-backed `transfer_from` into an existing `TokenTxDelta`
+    /// overlay.
+    pub fn plan_transfer_from_into(
+        &self,
+        delta: &mut TokenTxDelta,
+        token_id: &[u8; 32],
+        spender: [u8; 32],
+        from: [u8; 32],
+        to: [u8; 32],
+        amount: u64,
+    ) -> Result<(), TokenError> {
+        let token = self.tokens.get(token_id).ok_or(TokenError::TokenNotFound)?;
+        if amount == 0 {
+            return Err(TokenError::ZeroAmount);
+        }
+        if to == ZERO_ADDRESS || from == ZERO_ADDRESS {
+            return Err(TokenError::ZeroAddress);
+        }
+        if from == to {
+            return Err(TokenError::SelfTransfer);
+        }
+        if token.metadata.paused {
+            return Err(TokenError::Paused);
+        }
+        let current_allowance = delta.allowance(self, token_id, &from, &spender);
+        if current_allowance < amount {
+            return Err(TokenError::InsufficientAllowance);
+        }
+        let from_bal = delta.balance_of(self, token_id, &from);
+        if from_bal < amount {
+            return Err(TokenError::InsufficientBalance);
+        }
+        let to_bal = delta.balance_of(self, token_id, &to);
+        let new_to = to_bal.checked_add(amount).ok_or(TokenError::Overflow)?;
+        let remaining = current_allowance - amount;
+        let new_from = from_bal - amount;
+        delta
+            .allowances
+            .insert((*token_id, from, spender), remaining);
+        delta.balances.insert((*token_id, from), new_from);
+        delta.balances.insert((*token_id, to), new_to);
+        delta.events.push(TokenEvent::Transfer {
+            token_id: *token_id,
+            from,
+            to,
+            amount,
+        });
+        Ok(())
+    }
+
+    /// Plan an `approve` against an immutable `&TokenRegistry` without cloning
+    /// the registry.
+    pub fn plan_approve(
+        &self,
+        token_id: &[u8; 32],
+        owner: [u8; 32],
+        spender: [u8; 32],
+        amount: u64,
+    ) -> Result<TokenTxDelta, TokenError> {
+        let mut delta = TokenTxDelta::default();
+        self.plan_approve_into(&mut delta, token_id, owner, spender, amount)?;
+        Ok(delta)
+    }
+
+    /// Plan an `approve` into an existing `TokenTxDelta` overlay.
+    pub fn plan_approve_into(
+        &self,
+        delta: &mut TokenTxDelta,
+        token_id: &[u8; 32],
+        owner: [u8; 32],
+        spender: [u8; 32],
+        amount: u64,
+    ) -> Result<(), TokenError> {
+        let _token = self.tokens.get(token_id).ok_or(TokenError::TokenNotFound)?;
+        if owner == ZERO_ADDRESS || spender == ZERO_ADDRESS {
+            return Err(TokenError::ZeroAddress);
+        }
+        if owner == spender {
+            return Err(TokenError::SelfTransfer);
+        }
+        delta.allowances.insert((*token_id, owner, spender), amount);
+        delta.events.push(TokenEvent::Approval {
+            token_id: *token_id,
+            owner,
+            spender,
+            amount,
+        });
+        Ok(())
+    }
+
+    /// Plan a `mint` against an immutable `&TokenRegistry` without cloning the
+    /// registry.
+    pub fn plan_mint(
+        &self,
+        token_id: &[u8; 32],
+        caller: [u8; 32],
+        to: [u8; 32],
+        amount: u64,
+    ) -> Result<TokenTxDelta, TokenError> {
+        let mut delta = TokenTxDelta::default();
+        self.plan_mint_into(&mut delta, token_id, caller, to, amount)?;
+        Ok(delta)
+    }
+
+    /// Plan a `mint` into an existing `TokenTxDelta` overlay.
+    pub fn plan_mint_into(
+        &self,
+        delta: &mut TokenTxDelta,
+        token_id: &[u8; 32],
+        caller: [u8; 32],
+        to: [u8; 32],
+        amount: u64,
+    ) -> Result<(), TokenError> {
+        let token = self.tokens.get(token_id).ok_or(TokenError::TokenNotFound)?;
+        if token.metadata.minter == ZERO_ADDRESS {
+            return Err(TokenError::MinterRenounced);
+        }
+        if !token.is_minter(&caller) {
+            return Err(TokenError::NotMinter);
+        }
+        if amount == 0 {
+            return Err(TokenError::ZeroAmount);
+        }
+        if to == ZERO_ADDRESS {
+            return Err(TokenError::ZeroAddress);
+        }
+        if token.metadata.paused {
+            return Err(TokenError::Paused);
+        }
+        let cur_total = delta.total_supply(self, token_id);
+        let new_total = cur_total.checked_add(amount).ok_or(TokenError::Overflow)?;
+        if let Some(cap) = token.metadata.max_supply {
+            if new_total > cap {
+                return Err(TokenError::SupplyCapExceeded);
+            }
+        }
+        let to_bal = delta.balance_of(self, token_id, &to);
+        let new_to = to_bal.checked_add(amount).ok_or(TokenError::Overflow)?;
+        delta.balances.insert((*token_id, to), new_to);
+        delta.total_supply_overrides.insert(*token_id, new_total);
+        delta.events.push(TokenEvent::Mint {
+            token_id: *token_id,
+            to,
+            amount,
+            new_total,
+        });
+        Ok(())
+    }
+
+    /// Plan a `burn` against an immutable `&TokenRegistry` without cloning the
+    /// registry.
+    pub fn plan_burn(
+        &self,
+        token_id: &[u8; 32],
+        caller: [u8; 32],
+        from: [u8; 32],
+        amount: u64,
+    ) -> Result<TokenTxDelta, TokenError> {
+        let mut delta = TokenTxDelta::default();
+        self.plan_burn_into(&mut delta, token_id, caller, from, amount)?;
+        Ok(delta)
+    }
+
+    /// Plan a `burn` into an existing `TokenTxDelta` overlay.
+    pub fn plan_burn_into(
+        &self,
+        delta: &mut TokenTxDelta,
+        token_id: &[u8; 32],
+        caller: [u8; 32],
+        from: [u8; 32],
+        amount: u64,
+    ) -> Result<(), TokenError> {
+        let token = self.tokens.get(token_id).ok_or(TokenError::TokenNotFound)?;
+        if amount == 0 {
+            return Err(TokenError::ZeroAmount);
+        }
+        if from == ZERO_ADDRESS {
+            return Err(TokenError::ZeroAddress);
+        }
+        if token.metadata.paused {
+            return Err(TokenError::Paused);
+        }
+        let is_admin = token.is_minter(&caller);
+        if caller != from && !is_admin {
+            return Err(TokenError::NotMinter);
+        }
+        let from_bal = delta.balance_of(self, token_id, &from);
+        if from_bal < amount {
+            return Err(TokenError::InsufficientBalance);
+        }
+        let new_from = from_bal - amount;
+        let cur_total = delta.total_supply(self, token_id);
+        let new_total = cur_total.checked_sub(amount).ok_or(TokenError::Overflow)?;
+        delta.balances.insert((*token_id, from), new_from);
+        delta.total_supply_overrides.insert(*token_id, new_total);
+        delta.events.push(TokenEvent::Burn {
+            token_id: *token_id,
+            from,
+            amount,
+            new_total,
+        });
+        Ok(())
+    }
+
+    /// Commit a planned [`TokenTxDelta`] into this registry.
+    ///
+    /// Zero balances and zero allowances are removed from `actor.balances` /
+    /// `actor.allowances` to stay bit-for-bit identical with sequential
+    /// `TokenActor::debit` / `approve` / `transfer_from` and `tokens_digest`.
+    pub fn apply_tx_delta(&mut self, delta: TokenTxDelta) {
+        for ((token_id, account), bal) in delta.balances {
+            if let Some(actor) = self.tokens.get_mut(&token_id) {
+                if bal == 0 {
+                    actor.balances.remove(&account);
+                } else {
+                    actor.balances.insert(account, bal);
+                }
+            }
+        }
+        for ((token_id, owner, spender), amt) in delta.allowances {
+            if let Some(actor) = self.tokens.get_mut(&token_id) {
+                if amt == 0 {
+                    actor.allowances.remove(&(owner, spender));
+                } else {
+                    actor.allowances.insert((owner, spender), amt);
+                }
+            }
+        }
+        for (token_id, total_supply) in delta.total_supply_overrides {
+            if let Some(actor) = self.tokens.get_mut(&token_id) {
+                actor.metadata.total_supply = total_supply;
+            }
+        }
+    }
+}
+
+/// `(token_id, account)` balance cell key used by the parallel-execution overlay.
+pub type TokenBalanceKey = ([u8; 32], [u8; 32]);
+/// `(token_id, owner, spender)` allowance cell key used by the overlay.
+pub type TokenAllowanceKey = ([u8; 32], [u8; 32], [u8; 32]);
+
+/// Per-key delta overlay for fungible token transactions planned against an
+/// immutable `&TokenRegistry`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenTxDelta {
+    /// `(token_id, account) -> new_balance` (`0` removes the entry on apply).
+    pub balances: HashMap<TokenBalanceKey, u64>,
+    /// `(token_id, owner, spender) -> new_allowance` (`0` removes the entry on apply).
+    pub allowances: HashMap<TokenAllowanceKey, u64>,
+    /// `token_id -> new_total_supply`.
+    pub total_supply_overrides: HashMap<[u8; 32], u64>,
+    /// Emitted token events in execution order.
+    pub events: Vec<TokenEvent>,
+}
+
+impl TokenTxDelta {
+    /// Read an account's effective balance with this overlay layered over `registry`.
+    pub fn balance_of(
+        &self,
+        registry: &TokenRegistry,
+        token_id: &[u8; 32],
+        account: &[u8; 32],
+    ) -> u64 {
+        self.balances
+            .get(&(*token_id, *account))
+            .copied()
+            .unwrap_or_else(|| registry.balance_of(token_id, account))
+    }
+
+    /// Read an allowance with this overlay layered over `registry`.
+    pub fn allowance(
+        &self,
+        registry: &TokenRegistry,
+        token_id: &[u8; 32],
+        owner: &[u8; 32],
+        spender: &[u8; 32],
+    ) -> u64 {
+        self.allowances
+            .get(&(*token_id, *owner, *spender))
+            .copied()
+            .unwrap_or_else(|| {
+                registry
+                    .get(token_id)
+                    .map(|t| t.allowance(owner, spender))
+                    .unwrap_or(0)
+            })
+    }
+
+    /// Read a token's effective total supply with this overlay layered over `registry`.
+    pub fn total_supply(&self, registry: &TokenRegistry, token_id: &[u8; 32]) -> u64 {
+        self.total_supply_overrides
+            .get(token_id)
+            .copied()
+            .unwrap_or_else(|| {
+                registry
+                    .get(token_id)
+                    .map(|t| t.metadata.total_supply)
+                    .unwrap_or(0)
+            })
     }
 }
 
@@ -1556,5 +1931,57 @@ mod tests {
             },
         );
         assert_eq!(res, Err(TokenError::TokenNotFound));
+    }
+
+    #[test]
+    fn test_owner_token_page_advances_past_scan_cap() {
+        let mut reg = TokenRegistry::new();
+        let minter = addr(1);
+        let holder = addr(2);
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let name = format!("Token{i}");
+            let sym = format!("TK{i}");
+            ids.push(reg.create_token(minter, meta(&name, &sym), 1_000).unwrap());
+        }
+        ids.sort();
+        let target_id = ids[4];
+        reg.execute(
+            &target_id,
+            minter,
+            TokenOp::Transfer {
+                to: holder,
+                amount: 250,
+            },
+        )
+        .unwrap();
+
+        let p1 = reg.owner_token_page(&holder, None, false, None, 10, 2);
+        assert!(p1.items.is_empty());
+        assert!(p1.truncated);
+        assert!(p1.has_more);
+        assert_eq!(p1.scanned, 2);
+        assert_eq!(p1.next_cursor, Some(ids[1]));
+
+        let p2 = reg.owner_token_page(&holder, None, false, p1.next_cursor, 10, 2);
+        assert!(p2.items.is_empty());
+        assert!(p2.truncated);
+        assert!(p2.has_more);
+        assert_eq!(p2.scanned, 2);
+        assert_eq!(p2.next_cursor, Some(ids[3]));
+
+        let p3 = reg.owner_token_page(&holder, None, false, p2.next_cursor, 10, 2);
+        assert!(!p3.truncated);
+        assert!(!p3.has_more);
+        assert_eq!(p3.scanned, 1);
+        assert_eq!(p3.next_cursor, None);
+        assert_eq!(
+            p3.items,
+            vec![TokenHolding {
+                token_id: target_id,
+                holder,
+                balance: 250,
+            }]
+        );
     }
 }

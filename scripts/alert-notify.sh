@@ -26,6 +26,10 @@ DEFAULT_STATE_DIR="${XDG_RUNTIME_DIR:-$HOME/.local/state}/stellereum-alert-notif
 STATE="${STELL_ALERT_STATE:-$DEFAULT_STATE_DIR/state}"
 LOG="${STELL_ALERT_LOG:-/var/log/stell-alerts.log}"
 HOOK="${STELL_ALERT_HOOK:-}"
+UNREACHABLE_COOLDOWN="${STELL_ALERT_UNREACHABLE_COOLDOWN:-3600}"
+case "$UNREACHABLE_COOLDOWN" in
+    ''|*[!0-9]*) UNREACHABLE_COOLDOWN=3600 ;;
+esac
 LOOP=0
 
 while [ $# -gt 0 ]; do
@@ -52,11 +56,32 @@ emit() {
 }
 
 pass() {
-    local body
+    local body unreachable_state
+    unreachable_state="${STATE}.unreachable"
     body="$(curl -fsS -m 10 "$AM_URL/api/v2/alerts?active=true&silenced=false&inhibited=false" 2>/dev/null)" || {
-        emit "ALERTMANAGER_UNREACHABLE $AM_URL"
+        local now_ts last_ts should_emit=0
+        now_ts="$(date +%s)"
+        if [ ! -f "$unreachable_state" ]; then
+            should_emit=1
+        elif [ "$UNREACHABLE_COOLDOWN" -gt 0 ]; then
+            last_ts="$(cat "$unreachable_state" 2>/dev/null || echo 0)"
+            case "$last_ts" in
+                ''|*[!0-9]*) last_ts=0 ;;
+            esac
+            if [ $((now_ts - last_ts)) -ge "$UNREACHABLE_COOLDOWN" ]; then
+                should_emit=1
+            fi
+        fi
+        if [ "$should_emit" -eq 1 ]; then
+            emit "ALERTMANAGER_UNREACHABLE $AM_URL"
+            printf '%s\n' "$now_ts" >"$unreachable_state" 2>/dev/null || true
+        fi
         return 0
     }
+    if [ -f "$unreachable_state" ]; then
+        rm -f "$unreachable_state" 2>/dev/null || true
+        emit "ALERTMANAGER_REACHABLE $AM_URL"
+    fi
     local tmp_dir now_f
     tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/stell-alert.XXXXXX")" || {
         emit "ALERT_NOTIFY_TMP_ERROR"

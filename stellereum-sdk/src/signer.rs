@@ -134,11 +134,30 @@ pub enum TxIntent {
         #[serde(flatten)]
         common: TxCommon,
     },
+    ContractDeploy {
+        code_hex: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        abi_json: Option<String>,
+        #[serde(flatten)]
+        common: TxCommon,
+    },
     ContractCall {
         contract: String,
         method: String,
         #[serde(default)]
         args: Vec<JsonCallArg>,
+        #[serde(default)]
+        value: u64,
+        #[serde(flatten)]
+        common: TxCommon,
+    },
+    ContractCallRaw {
+        contract: String,
+        method: String,
+        #[serde(default)]
+        args: Vec<i64>,
+        #[serde(default)]
+        calldata_hex: String,
         #[serde(default)]
         value: u64,
         #[serde(flatten)]
@@ -233,7 +252,9 @@ impl TxIntent {
     fn common(&self) -> &TxCommon {
         match self {
             TxIntent::Transfer { common, .. }
+            | TxIntent::ContractDeploy { common, .. }
             | TxIntent::ContractCall { common, .. }
+            | TxIntent::ContractCallRaw { common, .. }
             | TxIntent::Stake { common, .. }
             | TxIntent::Unjail { common, .. }
             | TxIntent::EvmBinding { common, .. }
@@ -249,6 +270,29 @@ impl TxIntent {
             TxIntent::Transfer { to, amount, .. } => {
                 TxBuilder::transfer(address::parse_address(to)?, *amount)
             }
+            TxIntent::ContractDeploy {
+                code_hex, abi_json, ..
+            } => {
+                let code = decode_hex(code_hex, "code_hex")?;
+                if code.is_empty() {
+                    return Err(SdkError::InvalidArgument(
+                        "contract_deploy requires non-empty code_hex".into(),
+                    ));
+                }
+                match abi_json {
+                    Some(abi) => {
+                        if abi.len() > crate::opcode::MAX_CONTRACT_ABI_BYTES {
+                            return Err(SdkError::InvalidArgument(format!(
+                                "abi_json is {} bytes, max {}",
+                                abi.len(),
+                                crate::opcode::MAX_CONTRACT_ABI_BYTES
+                            )));
+                        }
+                        TxBuilder::contract_deploy_with_abi(code, abi.as_bytes().to_vec())
+                    }
+                    None => TxBuilder::contract_deploy(code),
+                }
+            }
             TxIntent::ContractCall {
                 contract,
                 method,
@@ -261,6 +305,25 @@ impl TxIntent {
                     .map(JsonCallArg::to_call_arg)
                     .collect::<Result<_>>()?;
                 TxBuilder::contract_call(address::parse_address(contract)?, method, &typed, *value)?
+            }
+            TxIntent::ContractCallRaw {
+                contract,
+                method,
+                args,
+                calldata_hex,
+                value,
+                ..
+            } => {
+                let h = calldata_hex.strip_prefix("0x").unwrap_or(calldata_hex);
+                let calldata = hex::decode(h)
+                    .map_err(|e| SdkError::InvalidArgument(format!("calldata_hex: {e}")))?;
+                TxBuilder::contract_call_raw(
+                    address::parse_address(contract)?,
+                    method,
+                    args,
+                    calldata,
+                    *value,
+                )?
             }
             TxIntent::Stake {
                 validator, amount, ..
@@ -412,35 +475,29 @@ pub fn sign_request(
         TxIntent::EvmBinding {
             evm_address,
             evm_proof,
-            ..
+            common,
         } => {
             let evm = parse_evm_address(evm_address)?;
             let proof = decode_hex(evm_proof, "evm_proof")?;
-            let mut builder = EvmBindingBuilder::new(identity, evm, proof)?;
-            if let Some(g) = request.tx.common().gas_limit {
-                builder = builder.gas_limit(g);
-            }
-            builder.nonce(request.tx.common().nonce).sign(key)?
+            let tx = EvmBindingBuilder::new(identity, evm, proof)?
+                .nonce(common.nonce)
+                .build_unsigned(key)?;
+            apply_evm_common_and_sign(tx, key, common, identity, crate::evm::EVM_BINDING_MIN_GAS)?
         }
         TxIntent::EvmCarrier {
             evm_tx,
             to_pq,
             amount_nano,
-            ..
+            common,
         } => {
             let raw = decode_hex(evm_tx, "evm_tx")?;
             let to = address::parse_address(to_pq)?;
-            let mut builder = EvmCarrierBuilder::new(identity, raw, to)?;
+            let mut builder = EvmCarrierBuilder::new(identity, raw, to)?.nonce(common.nonce);
             if let Some(a) = amount_nano {
                 builder = builder.amount_nano(*a);
             }
-            if let Some(g) = request.tx.common().gas_limit {
-                builder = builder.gas_limit(g);
-            }
-            if request.tx.common().nonce != 0 {
-                builder = builder.nonce(request.tx.common().nonce);
-            }
-            builder.sign(key)?
+            let tx = builder.build_unsigned(key)?;
+            apply_evm_common_and_sign(tx, key, common, identity, crate::evm::EVM_CARRIER_MIN_GAS)?
         }
         TxIntent::GovPropose {
             proposal_id,
@@ -513,6 +570,42 @@ fn apply_common(
         builder = builder.gas_limit(g);
     }
     Ok(builder)
+}
+
+fn apply_evm_common_and_sign(
+    mut tx: Transaction,
+    key: &FalconKeypair,
+    common: &TxCommon,
+    identity: ProtocolIdentity,
+    min_gas: u64,
+) -> Result<SignedTx> {
+    tx.source_shard = common.source_shard;
+    tx.target_shard = common.target_shard;
+    tx.priority_fee_per_gas = common.priority_fee_per_gas;
+    tx.gas_limit = common.gas_limit.unwrap_or_else(|| {
+        let base = common.base_fee.unwrap_or(FROZEN_MIN_GAS_FLOOR);
+        let surcharge = if common.implicit {
+            0
+        } else {
+            crate::tx::PQ_ACTIVATION_SURCHARGE_GAS
+        };
+        min_gas
+            .max(base)
+            .max(FROZEN_MIN_GAS_FLOOR)
+            .saturating_add(surcharge)
+            .saturating_add(common.priority_fee_per_gas)
+    });
+    let envelope_mode = if common.implicit {
+        EnvelopeMode::Implicit
+    } else {
+        EnvelopeMode::Explicit
+    };
+    let chain_id = if common.unbound {
+        None
+    } else {
+        Some(identity.chain_id)
+    };
+    crate::tx::sign_unsigned_with_identity(tx, key, envelope_mode, identity, chain_id)
 }
 
 fn decode_hex(value: &str, field: &str) -> Result<Vec<u8>> {
@@ -765,5 +858,428 @@ mod tests {
         }))
         .unwrap();
         assert!(sign_request(&key, &mismatch_req).is_err());
+    }
+
+    #[test]
+    fn contract_deploy_request_roundtrip() {
+        let key = FalconKeypair::generate().unwrap();
+        let code = b"\0asm\x01\0\0\0".to_vec();
+        let code_hex = hex::encode(&code);
+
+        // 1. Bare contract deploy (without abi_json).
+        let req: SignRequest = serde_json::from_value(serde_json::json!({
+            "tx": {
+                "kind": "contract_deploy",
+                "code_hex": format!("0x{code_hex}"),
+                "nonce": 5
+            }
+        }))
+        .unwrap();
+        let (signed, resp) = sign_request(&key, &req).unwrap();
+        signed.verify().unwrap();
+        assert_eq!(signed.from(), signed.to());
+        assert_eq!(signed.amount(), 0);
+        assert_eq!(signed.nonce(), 5);
+        assert_eq!(resp.envelope, "pq1-explicit");
+        assert_eq!(
+            signed.payload_bytes(),
+            crate::opcode::encode_payload(&[crate::opcode::Op::DeployContract {
+                code: code.clone()
+            }])
+        );
+
+        // 2. Contract deploy with inline ABI JSON.
+        let abi = r#"{"methods":[{"name":"get","params":[],"returns":"i64","mutates_state":false}],"events":[]}"#;
+        let req_abi: SignRequest = serde_json::from_value(serde_json::json!({
+            "tx": {
+                "kind": "contract_deploy",
+                "code_hex": code_hex,
+                "abi_json": abi,
+                "nonce": 6
+            }
+        }))
+        .unwrap();
+        let (signed_abi, _) = sign_request(&key, &req_abi).unwrap();
+        signed_abi.verify().unwrap();
+        assert_eq!(
+            signed_abi.payload_bytes(),
+            crate::opcode::encode_payload(&[crate::opcode::Op::DeployContractWithAbi {
+                code,
+                abi_json: abi.as_bytes().to_vec(),
+            }])
+        );
+
+        // 3. Empty code_hex and oversized abi_json are refused.
+        let empty_req: SignRequest = serde_json::from_value(serde_json::json!({
+            "tx": {
+                "kind": "contract_deploy",
+                "code_hex": "",
+                "nonce": 7
+            }
+        }))
+        .unwrap();
+        assert!(sign_request(&key, &empty_req).is_err());
+
+        let big_abi = "x".repeat(crate::opcode::MAX_CONTRACT_ABI_BYTES + 1);
+        let big_req: SignRequest = serde_json::from_value(serde_json::json!({
+            "tx": {
+                "kind": "contract_deploy",
+                "code_hex": "0061736d01000000",
+                "abi_json": big_abi,
+                "nonce": 8
+            }
+        }))
+        .unwrap();
+        assert!(sign_request(&key, &big_req).is_err());
+    }
+
+    fn test_secp_key() -> k256::ecdsa::SigningKey {
+        let bytes = hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+            .unwrap();
+        k256::ecdsa::SigningKey::from_slice(&bytes).unwrap()
+    }
+
+    fn test_evm_address(sk: &k256::ecdsa::SigningKey) -> [u8; 20] {
+        use sha3::{Digest as _, Keccak256};
+        let point = sk.verifying_key().to_encoded_point(false);
+        let mut h = Keccak256::new();
+        h.update(&point.as_bytes()[1..]);
+        let hash = h.finalize();
+        let mut out = [0u8; 20];
+        out.copy_from_slice(&hash[12..]);
+        out
+    }
+
+    fn test_binding_proof(pq: &[u8; 32], evm: &[u8; 20]) -> Vec<u8> {
+        let sk = test_secp_key();
+        let digest = crate::evm::binding_message(5757, evm, pq);
+        let (sig, recid) = sk.sign_prehash_recoverable(&digest).unwrap();
+        let mut proof = Vec::with_capacity(65);
+        proof.extend_from_slice(&sig.to_bytes()[..32]);
+        proof.extend_from_slice(&sig.to_bytes()[32..]);
+        proof.push(recid.to_byte());
+        proof
+    }
+
+    fn rlp_encode_bytes(out: &mut Vec<u8>, b: &[u8]) {
+        if b.len() == 1 && b[0] < 0x80 {
+            out.push(b[0]);
+        } else if b.len() < 56 {
+            out.push(0x80 + b.len() as u8);
+            out.extend_from_slice(b);
+        } else {
+            let len_bytes = b.len().to_be_bytes();
+            let first = len_bytes.iter().position(|x| *x != 0).unwrap_or(7);
+            let trimmed = &len_bytes[first..];
+            out.push(0xb7 + trimmed.len() as u8);
+            out.extend_from_slice(trimmed);
+            out.extend_from_slice(b);
+        }
+    }
+
+    fn rlp_encode_u128(out: &mut Vec<u8>, v: u128) {
+        let bytes = v.to_be_bytes();
+        let first = bytes.iter().position(|x| *x != 0).unwrap_or(16);
+        rlp_encode_bytes(out, &bytes[first..]);
+    }
+
+    fn rlp_encode_list(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        if payload.len() < 56 {
+            out.push(0xc0 + payload.len() as u8);
+        } else {
+            let len_bytes = payload.len().to_be_bytes();
+            let first = len_bytes.iter().position(|x| *x != 0).unwrap_or(7);
+            let trimmed = &len_bytes[first..];
+            out.push(0xf7 + trimmed.len() as u8);
+            out.extend_from_slice(trimmed);
+        }
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn test_eip1559_raw(nonce: u64, value_wei: u128, to: [u8; 20]) -> Vec<u8> {
+        use sha3::{Digest as _, Keccak256};
+        let sk = test_secp_key();
+        let mut body = Vec::new();
+        rlp_encode_u128(&mut body, 5757);
+        rlp_encode_u128(&mut body, nonce as u128);
+        rlp_encode_u128(&mut body, 1);
+        rlp_encode_u128(&mut body, 1);
+        rlp_encode_u128(&mut body, 21_000);
+        rlp_encode_bytes(&mut body, &to);
+        rlp_encode_u128(&mut body, value_wei);
+        rlp_encode_bytes(&mut body, &[]);
+        body.push(0xc0); // empty accessList
+
+        let mut preimage = vec![0x02];
+        preimage.extend_from_slice(&rlp_encode_list(&body));
+        let mut h = Keccak256::new();
+        h.update(&preimage);
+        let hash: [u8; 32] = h.finalize().into();
+
+        let (sig, recid) = sk.sign_prehash_recoverable(&hash).unwrap();
+        let sig_bytes = sig.to_bytes();
+        let r_trim = sig_bytes[..32].iter().position(|x| *x != 0).unwrap_or(32);
+        let s_trim = sig_bytes[32..].iter().position(|x| *x != 0).unwrap_or(32);
+
+        rlp_encode_u128(&mut body, recid.to_byte() as u128);
+        rlp_encode_bytes(&mut body, &sig_bytes[r_trim..32]);
+        rlp_encode_bytes(&mut body, &sig_bytes[32 + s_trim..]);
+
+        let mut out = vec![0x02];
+        out.extend_from_slice(&rlp_encode_list(&body));
+        out
+    }
+
+    #[test]
+    fn contract_call_raw_request_roundtrip() {
+        let key = FalconKeypair::generate().unwrap();
+        let contract = [0x44u8; 32];
+        let raw_cd = vec![1u8, 2, 3, 4];
+        let req: SignRequest = serde_json::from_value(serde_json::json!({
+            "tx": {
+                "kind": "contract_call_raw",
+                "contract": address::to_hex(&contract),
+                "method": "set_pq",
+                "args": [42, -7],
+                "calldata_hex": format!("0x{}", hex::encode(&raw_cd)),
+                "value": 99,
+                "nonce": 3
+            }
+        }))
+        .unwrap();
+        let (signed, resp) = sign_request(&key, &req).unwrap();
+        signed.verify().unwrap();
+        assert_eq!(signed.to(), contract);
+        assert_eq!(signed.amount(), 99);
+        assert_eq!(signed.nonce(), 3);
+        assert_eq!(resp.to, address::to_hex(&contract));
+        assert_eq!(
+            signed.payload_bytes(),
+            crate::opcode::encode_payload(&[crate::opcode::Op::call_raw(
+                contract,
+                "set_pq",
+                &[42, -7],
+                raw_cd,
+            )
+            .unwrap()])
+        );
+    }
+
+    #[test]
+    fn stake_request_roundtrip() {
+        let key = FalconKeypair::generate().unwrap();
+        let validator = [0x66u8; 32];
+        let req: SignRequest = serde_json::from_value(serde_json::json!({
+            "tx": {
+                "kind": "stake",
+                "validator": address::to_hex(&validator),
+                "amount": 5_000_000,
+                "nonce": 2
+            }
+        }))
+        .unwrap();
+        let (signed, _) = sign_request(&key, &req).unwrap();
+        signed.verify().unwrap();
+        assert_eq!(signed.from(), signed.to());
+        assert_eq!(signed.amount(), 5_000_000);
+        assert_eq!(signed.nonce(), 2);
+        assert_eq!(
+            signed.payload_bytes(),
+            crate::opcode::encode_payload(&[crate::opcode::Op::Stake {
+                validator,
+                amount: 5_000_000,
+            }])
+        );
+    }
+
+    #[test]
+    fn unjail_request_roundtrip_with_and_without_top_up() {
+        let key = FalconKeypair::generate().unwrap();
+        let validator = [0x77u8; 32];
+
+        let req_plain: SignRequest = serde_json::from_value(serde_json::json!({
+            "tx": {
+                "kind": "unjail",
+                "validator": address::to_hex(&validator),
+                "top_up": null,
+                "nonce": 4
+            }
+        }))
+        .unwrap();
+        let (signed_plain, _) = sign_request(&key, &req_plain).unwrap();
+        signed_plain.verify().unwrap();
+        assert_eq!(signed_plain.amount(), 0);
+        assert_eq!(
+            signed_plain.payload_bytes(),
+            crate::opcode::encode_payload(&[crate::opcode::Op::Unjail { validator }])
+        );
+
+        let req_topup: SignRequest = serde_json::from_value(serde_json::json!({
+            "tx": {
+                "kind": "unjail",
+                "validator": address::to_hex(&validator),
+                "top_up": 12_500,
+                "nonce": 5
+            }
+        }))
+        .unwrap();
+        let (signed_topup, _) = sign_request(&key, &req_topup).unwrap();
+        signed_topup.verify().unwrap();
+        assert_eq!(signed_topup.amount(), 12_500);
+        assert_eq!(
+            signed_topup.payload_bytes(),
+            crate::opcode::encode_payload(&[
+                crate::opcode::Op::Stake {
+                    validator,
+                    amount: 12_500,
+                },
+                crate::opcode::Op::Unjail { validator },
+            ])
+        );
+    }
+
+    #[test]
+    fn gov_vote_request_roundtrip_and_invalid_choice() {
+        let key = FalconKeypair::generate().unwrap();
+        let req: SignRequest = serde_json::from_value(serde_json::json!({
+            "tx": {
+                "kind": "gov_vote",
+                "proposal_id": 14,
+                "choice": "abstain",
+                "height_observed": 120,
+                "nonce": 1
+            }
+        }))
+        .unwrap();
+        let (signed, _) = sign_request(&key, &req).unwrap();
+        signed.verify().unwrap();
+        assert_eq!(signed.from(), signed.to());
+        assert_eq!(signed.amount(), 0);
+        assert_eq!(
+            signed.payload_bytes(),
+            crate::opcode::encode_payload(&[crate::opcode::Op::GovVote {
+                proposal_id: 14,
+                choice: VoteChoice::Abstain,
+                height_observed: 120,
+            }])
+        );
+
+        let bad_req: SignRequest = serde_json::from_value(serde_json::json!({
+            "tx": {
+                "kind": "gov_vote",
+                "proposal_id": 14,
+                "choice": "maybe",
+                "height_observed": 120,
+                "nonce": 2
+            }
+        }))
+        .unwrap();
+        assert!(sign_request(&key, &bad_req).is_err());
+    }
+
+    #[test]
+    fn evm_binding_forwards_all_common_fields() {
+        let key = FalconKeypair::generate().unwrap();
+        let evm = test_evm_address(&test_secp_key());
+        let proof = test_binding_proof(&key.address(), &evm);
+
+        let req: SignRequest = serde_json::from_value(serde_json::json!({
+            "tx": {
+                "kind": "evm_binding",
+                "evm_address": format!("0x{}", hex::encode(evm)),
+                "evm_proof": format!("0x{}", hex::encode(&proof)),
+                "nonce": 8,
+                "base_fee": 900_000,
+                "priority_fee_per_gas": 77,
+                "source_shard": 1,
+                "target_shard": 2,
+                "implicit": true,
+                "unbound": true
+            }
+        }))
+        .unwrap();
+        let (signed, resp) = sign_request(&key, &req).unwrap();
+        signed.verify_with_key(&key).unwrap();
+        assert_eq!(signed.nonce(), 8);
+        assert!(!signed.is_pq_activation());
+        assert_eq!(resp.envelope, "pq1-implicit");
+        assert!(!signed.is_bound());
+        assert_eq!(signed.chain_id(), None);
+        assert_eq!(resp.chain_id, None);
+        assert_eq!(signed.priority_fee_per_gas(), 77);
+        assert_eq!(signed.gas_limit(), 900_000 + 77);
+        assert_eq!(signed.transaction().source_shard, 1);
+        assert_eq!(signed.transaction().target_shard, 2);
+    }
+
+    #[test]
+    fn evm_carrier_forwards_common_fields_and_enforces_nonce_zero() {
+        let key = FalconKeypair::generate().unwrap();
+        let to_pq = [0x88u8; 32];
+
+        // 1. Common fields are forwarded (implicit, unbound, base_fee, priority_fee, shards).
+        let raw_n4 = test_eip1559_raw(4, 3_000_000_000, [0x55u8; 20]);
+        let req_common: SignRequest = serde_json::from_value(serde_json::json!({
+            "tx": {
+                "kind": "evm_carrier",
+                "evm_tx": format!("0x{}", hex::encode(&raw_n4)),
+                "to_pq": address::to_hex(&to_pq),
+                "nonce": 4,
+                "base_fee": 950_000,
+                "priority_fee_per_gas": 33,
+                "source_shard": 2,
+                "target_shard": 3,
+                "implicit": true,
+                "unbound": true
+            }
+        }))
+        .unwrap();
+        let (signed, resp) = sign_request(&key, &req_common).unwrap();
+        signed.verify_with_key(&key).unwrap();
+        assert_eq!(signed.nonce(), 4);
+        assert_eq!(signed.amount(), 3);
+        assert!(!signed.is_pq_activation());
+        assert_eq!(resp.envelope, "pq1-implicit");
+        assert!(!signed.is_bound());
+        assert_eq!(signed.chain_id(), None);
+        assert_eq!(signed.priority_fee_per_gas(), 33);
+        assert_eq!(signed.gas_limit(), 950_000 + 33);
+        assert_eq!(signed.transaction().source_shard, 2);
+        assert_eq!(signed.transaction().target_shard, 3);
+
+        // 2. Explicit nonce == 0 succeeds when the EVM intent has nonce == 0.
+        let raw_n0 = test_eip1559_raw(0, 2_000_000_000, [0x55u8; 20]);
+        let req_n0 = SignRequest {
+            tx: TxIntent::EvmCarrier {
+                evm_tx: hex::encode(&raw_n0),
+                to_pq: address::to_hex(&to_pq),
+                amount_nano: Some(2),
+                common: TxCommon {
+                    nonce: 0,
+                    ..TxCommon::default()
+                },
+            },
+        };
+        let (signed_n0, _) = sign_request(&key, &req_n0).unwrap();
+        signed_n0.verify().unwrap();
+        assert_eq!(signed_n0.nonce(), 0);
+        assert_eq!(signed_n0.amount(), 2);
+
+        // 3. Explicit nonce == 0 is NOT ignored when the EVM intent has nonce == 4.
+        let req_mismatch = SignRequest {
+            tx: TxIntent::EvmCarrier {
+                evm_tx: hex::encode(&raw_n4),
+                to_pq: address::to_hex(&to_pq),
+                amount_nano: None,
+                common: TxCommon {
+                    nonce: 0,
+                    ..TxCommon::default()
+                },
+            },
+        };
+        let err = sign_request(&key, &req_mismatch).unwrap_err();
+        assert_eq!(err, SdkError::CarrierNonceMismatch { evm: 4, tx: 0 });
     }
 }

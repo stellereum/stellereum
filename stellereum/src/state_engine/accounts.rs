@@ -312,7 +312,9 @@ impl InMemoryStateEngine {
                 | SysCallTokenApprove { .. }
                 | SysCallTokenBalanceOf { .. }
                 | SysCallTokenCreate { .. } => need_tokens = true,
-                SysCallDeployContract { .. } => need_contracts = true,
+                SysCallDeployContract { .. } | SysCallDeployContractWithAbi { .. } => {
+                    need_contracts = true
+                }
                 SysCallCallContract { .. }
                 | SysCallCallContractArgs { .. }
                 | SysCallActorSend { .. } => {
@@ -2434,7 +2436,10 @@ impl InMemoryStateEngine {
         }
 
         // 2. Contract code + ABI manifest, owned by the contract account.
+        //    Deterministic deployments also store raw `&code` directly at `*addr`
+        //    even when no AccountState exists for `*addr`; classify `*addr` too.
         for (addr, contract) in self.contracts.read().await.contracts.iter() {
+            manifest.own(*addr, *addr);
             manifest.own(crate::state_engine::contract_key(addr), *addr);
             if contract.abi.is_some() {
                 manifest.own(crate::state_engine::contract_abi_key(addr), *addr);

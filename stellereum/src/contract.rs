@@ -35,9 +35,9 @@
 use crate::contract_abi::{AbiError, AbiValue, ContractAbi};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use wasmi::{
     Config, Engine, Extern, ExternType, Instance, Linker, Memory, Module, Store, StoreLimits,
     StoreLimitsBuilder,
@@ -323,6 +323,285 @@ impl ContractOutcome {
     }
 }
 
+/// Logical state location accessed during Block-STM contract execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ContractLoc {
+    Slot([u8; 32], i64),
+    Balance([u8; 32]),
+    StorageLen([u8; 32]),
+}
+
+/// Version tag observed when reading a [`ContractLoc`] under Block-STM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadVersion {
+    Base,
+    Tx(usize, u32),
+}
+
+/// Read-only multi-version state view consulted by WASM host functions during
+/// speculative Block-STM execution.
+pub trait StmStateView: Send + Sync {
+    fn read_slot(&self, contract: &[u8; 32], key: i64, tx_idx: usize) -> (i64, ReadVersion);
+    fn has_base_slot(&self, contract: &[u8; 32], key: i64) -> bool;
+    fn base_storage_len(&self, contract: &[u8; 32]) -> usize;
+    fn read_balance(&self, contract: &[u8; 32], tx_idx: usize) -> (u64, ReadVersion);
+
+    /// Effective storage key count visible to `tx_idx` along with the latest
+    /// [`ReadVersion`] that added a new slot key below `tx_idx`.
+    fn read_storage_len(&self, contract: &[u8; 32], _tx_idx: usize) -> (usize, ReadVersion) {
+        (self.base_storage_len(contract), ReadVersion::Base)
+    }
+}
+
+/// Read/write trace collected during a single speculative contract execution.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StmExecutionTrace {
+    pub reads: Vec<(ContractLoc, ReadVersion)>,
+    pub slot_writes: HashMap<i64, i64>,
+    pub balance_delta_spent: u64,
+    pub new_slot_keys: usize,
+}
+
+#[derive(Clone, Debug)]
+struct BaseContractState {
+    storage: HashMap<i64, i64>,
+    balance: u64,
+}
+
+#[derive(Clone, Debug)]
+struct MvTxEntry {
+    incarnation: u32,
+    contract: [u8; 32],
+    slot_writes: HashMap<i64, i64>,
+    balance_after: Option<u64>,
+    new_slot_keys: usize,
+}
+
+/// Thread-safe multi-version slot/balance store backed by a committed
+/// [`ContractRegistry`] base plus per-`tx_idx` incarnation writes.
+#[derive(Debug)]
+pub struct ContractMvMemory {
+    base: HashMap<[u8; 32], BaseContractState>,
+    entries: RwLock<BTreeMap<usize, MvTxEntry>>,
+}
+
+impl ContractMvMemory {
+    /// Construct a multi-version overlay backed by the committed state in `registry`.
+    pub fn new(registry: &ContractRegistry) -> Self {
+        let base = registry
+            .contracts
+            .iter()
+            .map(|(addr, c)| {
+                (
+                    *addr,
+                    BaseContractState {
+                        storage: c.storage.clone(),
+                        balance: c.balance,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            base,
+            entries: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    fn read_slot_locked(
+        base: &HashMap<[u8; 32], BaseContractState>,
+        entries: &BTreeMap<usize, MvTxEntry>,
+        contract: &[u8; 32],
+        key: i64,
+        tx_idx: usize,
+    ) -> (i64, ReadVersion) {
+        for (&t, entry) in entries.range(..tx_idx).rev() {
+            if entry.contract == *contract {
+                if let Some(&val) = entry.slot_writes.get(&key) {
+                    return (val, ReadVersion::Tx(t, entry.incarnation));
+                }
+            }
+        }
+        let val = base
+            .get(contract)
+            .and_then(|c| c.storage.get(&key))
+            .copied()
+            .unwrap_or(0);
+        (val, ReadVersion::Base)
+    }
+
+    fn read_balance_locked(
+        base: &HashMap<[u8; 32], BaseContractState>,
+        entries: &BTreeMap<usize, MvTxEntry>,
+        contract: &[u8; 32],
+        tx_idx: usize,
+    ) -> (u64, ReadVersion) {
+        for (&t, entry) in entries.range(..tx_idx).rev() {
+            if entry.contract == *contract {
+                if let Some(bal) = entry.balance_after {
+                    return (bal, ReadVersion::Tx(t, entry.incarnation));
+                }
+            }
+        }
+        let bal = base.get(contract).map_or(0, |c| c.balance);
+        (bal, ReadVersion::Base)
+    }
+
+    fn read_storage_len_locked(
+        base: &HashMap<[u8; 32], BaseContractState>,
+        entries: &BTreeMap<usize, MvTxEntry>,
+        contract: &[u8; 32],
+        tx_idx: usize,
+    ) -> (usize, ReadVersion) {
+        let base_storage = base.get(contract).map(|c| &c.storage);
+        let base_len = base_storage.map_or(0, HashMap::len);
+        let mut added_keys: HashSet<i64> = HashSet::new();
+        let mut ver = ReadVersion::Base;
+        for (&t, entry) in entries.range(..tx_idx) {
+            if entry.contract == *contract {
+                for &k in entry.slot_writes.keys() {
+                    if !base_storage.is_some_and(|s| s.contains_key(&k)) {
+                        added_keys.insert(k);
+                    }
+                }
+                if entry.new_slot_keys > 0 {
+                    ver = ReadVersion::Tx(t, entry.incarnation);
+                }
+            }
+        }
+        (base_len.saturating_add(added_keys.len()), ver)
+    }
+
+    fn latest_version_below_locked(
+        entries: &BTreeMap<usize, MvTxEntry>,
+        loc: ContractLoc,
+        tx_idx: usize,
+    ) -> ReadVersion {
+        match loc {
+            ContractLoc::Slot(contract, key) => {
+                for (&t, entry) in entries.range(..tx_idx).rev() {
+                    if entry.contract == contract && entry.slot_writes.contains_key(&key) {
+                        return ReadVersion::Tx(t, entry.incarnation);
+                    }
+                }
+                ReadVersion::Base
+            }
+            ContractLoc::Balance(contract) => {
+                for (&t, entry) in entries.range(..tx_idx).rev() {
+                    if entry.contract == contract && entry.balance_after.is_some() {
+                        return ReadVersion::Tx(t, entry.incarnation);
+                    }
+                }
+                ReadVersion::Base
+            }
+            ContractLoc::StorageLen(contract) => {
+                for (&t, entry) in entries.range(..tx_idx).rev() {
+                    if entry.contract == contract && entry.new_slot_keys > 0 {
+                        return ReadVersion::Tx(t, entry.incarnation);
+                    }
+                }
+                ReadVersion::Base
+            }
+        }
+    }
+
+    /// Return the latest version written to `loc` strictly below `tx_idx`.
+    pub fn latest_version_below(&self, loc: ContractLoc, tx_idx: usize) -> ReadVersion {
+        let entries = self.entries.read().expect("ContractMvMemory lock poisoned");
+        Self::latest_version_below_locked(&entries, loc, tx_idx)
+    }
+
+    /// Validate that every read recorded in `trace` still matches
+    /// [`Self::latest_version_below`] for `tx_idx`.
+    pub fn validate_reads(&self, tx_idx: usize, trace: &StmExecutionTrace) -> bool {
+        let entries = self.entries.read().expect("ContractMvMemory lock poisoned");
+        trace
+            .reads
+            .iter()
+            .all(|(loc, ver)| Self::latest_version_below_locked(&entries, *loc, tx_idx) == *ver)
+    }
+
+    /// Record (or overwrite) the write-set produced by `(tx_idx, incarnation)`.
+    pub fn record_incarnation(
+        &self,
+        tx_idx: usize,
+        incarnation: u32,
+        contract: [u8; 32],
+        trace: &StmExecutionTrace,
+    ) {
+        let mut entries = self
+            .entries
+            .write()
+            .expect("ContractMvMemory lock poisoned");
+        let balance_after = if trace.balance_delta_spent > 0 {
+            let (prior_bal, _) = Self::read_balance_locked(&self.base, &entries, &contract, tx_idx);
+            Some(prior_bal.saturating_sub(trace.balance_delta_spent))
+        } else {
+            None
+        };
+        entries.insert(
+            tx_idx,
+            MvTxEntry {
+                incarnation,
+                contract,
+                slot_writes: trace.slot_writes.clone(),
+                balance_after,
+                new_slot_keys: trace.new_slot_keys,
+            },
+        );
+    }
+
+    /// Remove any recorded incarnation for `tx_idx` (e.g. on abort or before re-execution).
+    pub fn invalidate_tx(&self, tx_idx: usize) {
+        let mut entries = self
+            .entries
+            .write()
+            .expect("ContractMvMemory lock poisoned");
+        entries.remove(&tx_idx);
+    }
+
+    /// Commit all surviving transaction write-sets in `tx_idx` order into `reg`.
+    pub fn commit_into_registry(&self, reg: &mut ContractRegistry) {
+        let entries = self.entries.read().expect("ContractMvMemory lock poisoned");
+        for entry in entries.values() {
+            if let Some(contract) = reg.contracts.get_mut(&entry.contract) {
+                for (&k, &v) in &entry.slot_writes {
+                    contract.storage.insert(k, v);
+                }
+                if let Some(bal) = entry.balance_after {
+                    contract.balance = bal;
+                }
+            }
+        }
+    }
+}
+
+impl StmStateView for ContractMvMemory {
+    fn read_slot(&self, contract: &[u8; 32], key: i64, tx_idx: usize) -> (i64, ReadVersion) {
+        let entries = self.entries.read().expect("ContractMvMemory lock poisoned");
+        Self::read_slot_locked(&self.base, &entries, contract, key, tx_idx)
+    }
+
+    fn has_base_slot(&self, contract: &[u8; 32], key: i64) -> bool {
+        self.base
+            .get(contract)
+            .is_some_and(|c| c.storage.contains_key(&key))
+    }
+
+    fn base_storage_len(&self, contract: &[u8; 32]) -> usize {
+        self.base.get(contract).map_or(0, |c| c.storage.len())
+    }
+
+    fn read_balance(&self, contract: &[u8; 32], tx_idx: usize) -> (u64, ReadVersion) {
+        let entries = self.entries.read().expect("ContractMvMemory lock poisoned");
+        Self::read_balance_locked(&self.base, &entries, contract, tx_idx)
+    }
+
+    fn read_storage_len(&self, contract: &[u8; 32], tx_idx: usize) -> (usize, ReadVersion) {
+        let entries = self.entries.read().expect("ContractMvMemory lock poisoned");
+        Self::read_storage_len_locked(&self.base, &entries, contract, tx_idx)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContractError {
     EmptyCode,
@@ -560,11 +839,12 @@ fn validate_memory_limits(code: &[u8], enforce_table_cap: bool) -> Result<(), Co
         let (sec_len, n) = read_leb128_u32(&code[pos..])?;
         pos += n;
         let sec_len = sec_len as usize;
-        if pos + sec_len > code.len() {
+        let end = pos.checked_add(sec_len).ok_or(ContractError::InvalidWasm)?;
+        if end > code.len() {
             return Err(ContractError::InvalidWasm);
         }
-        let sec_bytes = &code[pos..pos + sec_len];
-        pos += sec_len;
+        let sec_bytes = &code[pos..end];
+        pos = end;
 
         if sec_id == 4 && enforce_table_cap {
             // Table section: [count, (elemtype, limits)...]
@@ -744,6 +1024,7 @@ impl ContractRegistry {
             block_hash: [0u8; 32],
             return_data: Vec::new(),
             calldata: Vec::new(),
+            stm: None,
         };
         let mut store = Store::new(engine, host);
         store.limiter(|s| &mut s.limits);
@@ -886,6 +1167,7 @@ impl ContractRegistry {
             block_hash: [0u8; 32],
             return_data: Vec::new(),
             calldata: Vec::new(),
+            stm: None,
         };
         let mut store = Store::new(engine, host);
         store.limiter(|s| &mut s.limits);
@@ -1554,6 +1836,13 @@ impl ContractRegistry {
         enforce_table_cap: bool,
         falcon_fuel_v2: bool,
     ) -> Result<ContractOutcome, ContractError> {
+        if calldata.len() > crate::svm::MAX_CONTRACT_CALLDATA_BYTES {
+            return Err(ContractError::AbiMismatch(format!(
+                "calldata exceeds {} bytes, got {}",
+                crate::svm::MAX_CONTRACT_CALLDATA_BYTES,
+                calldata.len()
+            )));
+        }
         let contract = self
             .contracts
             .get_mut(address)
@@ -1598,6 +1887,138 @@ impl ContractRegistry {
             outbound_messages,
             return_data,
         })
+    }
+
+    /// Execute a contract call against a read-only registry using a Block-STM
+    /// state view, returning the [`ContractOutcome`] alongside the collected
+    /// [`StmExecutionTrace`] without mutating `self`.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: Block-STM parallel execution requires target, payload, budget, options, tx index, and shared STM view.
+    pub fn call_with_stm_trace(
+        &self,
+        address: &[u8; 32],
+        method: &str,
+        args: &[i64],
+        calldata: &[u8],
+        fuel: u64,
+        opts: &ContractCallOptions,
+        tx_idx: usize,
+        stm_view: Arc<dyn StmStateView>,
+    ) -> Result<(ContractOutcome, StmExecutionTrace), ContractError> {
+        self.call_with_stm_trace_with_gates(
+            address, method, args, calldata, fuel, opts, tx_idx, stm_view, false, false,
+        )
+    }
+
+    /// Height-aware [`Self::call_with_stm_trace`].
+    #[allow(clippy::too_many_arguments)]
+    // GATE: height-gated Block-STM contract call forwards target, payload, budget, options, tx index, STM view, and height.
+    pub fn call_with_stm_trace_at(
+        &self,
+        address: &[u8; 32],
+        method: &str,
+        args: &[i64],
+        calldata: &[u8],
+        fuel: u64,
+        opts: &ContractCallOptions,
+        tx_idx: usize,
+        stm_view: Arc<dyn StmStateView>,
+        height: u64,
+    ) -> Result<(ContractOutcome, StmExecutionTrace), ContractError> {
+        self.call_with_stm_trace_with_gates(
+            address,
+            method,
+            args,
+            calldata,
+            fuel,
+            opts,
+            tx_idx,
+            stm_view,
+            crate::chain_spec::wasm_table_elements_cap_active_at(height),
+            crate::chain_spec::falcon_host_fuel_v2_active_at(height),
+        )
+    }
+
+    /// Execute a contract call against a read-only registry using a Block-STM
+    /// state view with explicit activation gate toggles.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: shared Block-STM contract call implementation parameterized by activation gate flags.
+    pub fn call_with_stm_trace_with_gates(
+        &self,
+        address: &[u8; 32],
+        method: &str,
+        args: &[i64],
+        calldata: &[u8],
+        fuel: u64,
+        opts: &ContractCallOptions,
+        tx_idx: usize,
+        stm_view: Arc<dyn StmStateView>,
+        enforce_table_cap: bool,
+        falcon_fuel_v2: bool,
+    ) -> Result<(ContractOutcome, StmExecutionTrace), ContractError> {
+        if calldata.len() > crate::svm::MAX_CONTRACT_CALLDATA_BYTES {
+            return Err(ContractError::AbiMismatch(format!(
+                "calldata exceeds {} bytes, got {}",
+                crate::svm::MAX_CONTRACT_CALLDATA_BYTES,
+                calldata.len()
+            )));
+        }
+        let contract = self.contracts.get(address).ok_or(ContractError::NotFound)?;
+        if contract.paused {
+            return Err(ContractError::Paused);
+        }
+        let fuel = fuel.min(MAX_CONTRACT_FUEL);
+        let ctx = ContractCallContext {
+            caller: opts.caller,
+            value: opts.value,
+            block_time: opts.block_time,
+            block_hash: opts.block_hash,
+        };
+        let stm_ctx = StmHookContext {
+            tx_idx,
+            view: stm_view,
+            trace: StmExecutionTrace::default(),
+            balance_loaded: false,
+        };
+        let (
+            out,
+            used,
+            _new_storage,
+            _new_balance,
+            events,
+            outbound_messages,
+            return_data,
+            stm_trace,
+        ) = run_contract_hardened_with_gates_inner(
+            *address,
+            &contract.code,
+            HashMap::new(),
+            0,
+            method,
+            args,
+            calldata,
+            fuel,
+            &ctx,
+            if opts.hardened {
+                opts.origin
+            } else {
+                ctx.caller
+            },
+            opts.hardened,
+            enforce_table_cap,
+            falcon_fuel_v2,
+            Some(stm_ctx),
+        )?;
+        Ok((
+            ContractOutcome {
+                result: out,
+                fuel_used: used,
+                events,
+                outbound_messages,
+                return_data,
+            },
+            stm_trace.unwrap_or_default(),
+        ))
     }
 
     /// Execute a sub-call with [`SubCallSnapshot`] isolation.
@@ -1873,6 +2294,18 @@ impl ContractRegistry {
                 Vec::new(),
             );
         }
+        if calldata.len() > crate::svm::MAX_CONTRACT_CALLDATA_BYTES {
+            return (
+                GetMethodResponse::error(
+                    format!(
+                        "calldata too large: at most {} bytes",
+                        crate::svm::MAX_CONTRACT_CALLDATA_BYTES
+                    ),
+                    0,
+                ),
+                Vec::new(),
+            );
+        }
 
         let engine = contract_engine();
         let module = match cached_module(engine, &contract.code) {
@@ -1901,6 +2334,7 @@ impl ContractRegistry {
             block_hash: [0u8; 32],
             return_data: Vec::new(),
             calldata: calldata.to_vec(),
+            stm: None,
         };
         let mut store = Store::new(engine, host);
         store.limiter(|s| &mut s.limits);
@@ -2288,6 +2722,13 @@ fn cached_module(engine: &Engine, code: &[u8]) -> Result<Module, wasmi::Error> {
     Ok(module)
 }
 
+struct StmHookContext {
+    tx_idx: usize,
+    view: Arc<dyn StmStateView>,
+    trace: StmExecutionTrace,
+    balance_loaded: bool,
+}
+
 struct HostState {
     limits: StoreLimits,
     contract_addr: [u8; 32],
@@ -2305,6 +2746,7 @@ struct HostState {
     return_data: Vec<u8>,
     /// ABI-encoded arguments of the current call (see `host.calldata`).
     calldata: Vec<u8>,
+    stm: Option<StmHookContext>,
 }
 
 impl HostState {
@@ -2396,7 +2838,19 @@ fn host_linker(engine: &Engine) -> Linker<HostState> {
         "sload",
         |mut caller: wasmi::Caller<'_, HostState>, key: i64| -> Result<i64, wasmi::Error> {
             HostState::charge(&mut caller, FUEL_SLOAD)?;
-            Ok(caller.data().storage.get(&key).copied().unwrap_or(0))
+            let state = caller.data_mut();
+            if let Some(&val) = state.storage.get(&key) {
+                return Ok(val);
+            }
+            if let Some(stm) = state.stm.as_mut() {
+                let contract_addr = state.contract_addr;
+                let (val, ver) = stm.view.read_slot(&contract_addr, key, stm.tx_idx);
+                stm.trace
+                    .reads
+                    .push((ContractLoc::Slot(contract_addr, key), ver));
+                return Ok(val);
+            }
+            Ok(0)
         },
     );
     let _ = linker.func_wrap(
@@ -2408,6 +2862,35 @@ fn host_linker(engine: &Engine) -> Linker<HostState> {
          -> Result<(), wasmi::Error> {
             HostState::charge(&mut caller, FUEL_SSTORE)?;
             let state = caller.data_mut();
+            if let Some(stm) = state.stm.as_mut() {
+                if !state.storage.contains_key(&key) {
+                    let contract_addr = state.contract_addr;
+                    if !stm.view.has_base_slot(&contract_addr, key) {
+                        let (_prev_val, slot_ver) =
+                            stm.view.read_slot(&contract_addr, key, stm.tx_idx);
+                        if slot_ver != ReadVersion::Base {
+                            stm.trace
+                                .reads
+                                .push((ContractLoc::Slot(contract_addr, key), slot_ver));
+                        } else {
+                            let (prior_len, len_ver) =
+                                stm.view.read_storage_len(&contract_addr, stm.tx_idx);
+                            stm.trace
+                                .reads
+                                .push((ContractLoc::StorageLen(contract_addr), len_ver));
+                            if prior_len.saturating_add(stm.trace.new_slot_keys)
+                                >= MAX_CONTRACT_STORAGE_KEYS
+                            {
+                                return Err(wasmi::Error::new("contract storage limit exceeded"));
+                            }
+                            stm.trace.new_slot_keys += 1;
+                        }
+                    }
+                }
+                state.storage.insert(key, val);
+                stm.trace.slot_writes.insert(key, val);
+                return Ok(());
+            }
             // Writing a *new* key grows the permanent consensus state, so it is
             // capped; overwriting an existing slot is always allowed.
             if !state.storage.contains_key(&key) && state.storage.len() >= MAX_CONTRACT_STORAGE_KEYS
@@ -2692,6 +3175,19 @@ fn host_linker(engine: &Engine) -> Linker<HostState> {
             }
 
             let state = caller.data_mut();
+            if value_nano > 0 {
+                if let Some(stm) = state.stm.as_mut() {
+                    if !stm.balance_loaded {
+                        let contract_addr = state.contract_addr;
+                        let (bal, ver) = stm.view.read_balance(&contract_addr, stm.tx_idx);
+                        state.balance = bal;
+                        stm.trace
+                            .reads
+                            .push((ContractLoc::Balance(contract_addr), ver));
+                        stm.balance_loaded = true;
+                    }
+                }
+            }
             if (value_nano as u64) > state.balance {
                 return Ok(-2);
             }
@@ -2700,6 +3196,14 @@ fn host_linker(engine: &Engine) -> Linker<HostState> {
             }
 
             state.balance -= value_nano as u64;
+            if value_nano > 0 {
+                if let Some(stm) = state.stm.as_mut() {
+                    stm.trace.balance_delta_spent = stm
+                        .trace
+                        .balance_delta_spent
+                        .saturating_add(value_nano as u64);
+                }
+            }
 
             let sender = state.contract_addr;
             let bounce = bounce_flag != 0;
@@ -3028,10 +3532,75 @@ pub fn run_contract_hardened_with_gates(
     ),
     ContractError,
 > {
+    let (out, used, storage, balance, events, outbound_messages, return_data, _) =
+        run_contract_hardened_with_gates_inner(
+            contract_addr,
+            code,
+            initial_storage.clone(),
+            initial_balance,
+            method,
+            args,
+            calldata,
+            fuel,
+            ctx,
+            origin,
+            hardened,
+            enforce_table_cap,
+            falcon_fuel_v2,
+            None,
+        )?;
+    Ok((
+        out,
+        used,
+        storage,
+        balance,
+        events,
+        outbound_messages,
+        return_data,
+    ))
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+// GATE: shared execution core supporting optional Block-STM trace overlay without duplicating wasm setup.
+fn run_contract_hardened_with_gates_inner(
+    contract_addr: [u8; 32],
+    code: &[u8],
+    initial_storage: HashMap<i64, i64>,
+    initial_balance: u64,
+    method: &str,
+    args: &[i64],
+    calldata: &[u8],
+    fuel: u64,
+    ctx: &ContractCallContext,
+    origin: [u8; 32],
+    hardened: bool,
+    enforce_table_cap: bool,
+    falcon_fuel_v2: bool,
+    stm: Option<StmHookContext>,
+) -> Result<
+    (
+        i64,
+        u64,
+        HashMap<i64, i64>,
+        u64,
+        Vec<ContractEvent>,
+        Vec<ContractMessage>,
+        Vec<u8>,
+        Option<StmExecutionTrace>,
+    ),
+    ContractError,
+> {
     if args.len() > MAX_CONTRACT_CALL_ARGS {
         return Err(ContractError::AbiMismatch(format!(
             "a call may take at most {MAX_CONTRACT_CALL_ARGS} arguments, got {}",
             args.len()
+        )));
+    }
+    if calldata.len() > crate::svm::MAX_CONTRACT_CALLDATA_BYTES {
+        return Err(ContractError::AbiMismatch(format!(
+            "calldata exceeds {} bytes, got {}",
+            crate::svm::MAX_CONTRACT_CALLDATA_BYTES,
+            calldata.len()
         )));
     }
     let owned_engine;
@@ -3049,7 +3618,7 @@ pub fn run_contract_hardened_with_gates(
         limits: store_limits_with_table_cap(enforce_table_cap),
         contract_addr,
         balance: initial_balance,
-        storage: initial_storage.clone(),
+        storage: initial_storage,
         events: Vec::new(),
         outbound_messages: Vec::new(),
         caller: ctx.caller,
@@ -3061,6 +3630,7 @@ pub fn run_contract_hardened_with_gates(
         block_hash: ctx.block_hash,
         return_data: Vec::new(),
         calldata: calldata.to_vec(),
+        stm,
     };
     let mut store = Store::new(engine, host);
     store.limiter(|s| &mut s.limits);
@@ -3114,6 +3684,7 @@ pub fn run_contract_hardened_with_gates(
         final_host.events,
         final_host.outbound_messages,
         final_host.return_data,
+        final_host.stm.map(|s| s.trace),
     ))
 }
 
@@ -4437,5 +5008,35 @@ mod tests {
             .unwrap();
         // u32_le(count=1) + tag + 8 bytes = 13 bytes
         assert_eq!(outcome.result, 13);
+    }
+
+    #[test]
+    fn validate_memory_limits_rejects_truncated_and_overflowing_section_lengths() {
+        // Truncated section length: section 5 declares 100 bytes but only 2 follow.
+        let truncated = [
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // wasm magic + version
+            0x05, 0x64, 0x01, 0x00, // section 5, len=100, 2 trailing bytes
+        ];
+        assert_eq!(
+            validate_memory_limits(&truncated, true),
+            Err(ContractError::InvalidWasm)
+        );
+
+        // Overflowing / huge LEB128 section length (u32::MAX = 0xff ff ff ff 0f).
+        let overflowing = [
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // wasm magic + version
+            0x05, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x00, // section 5, len=u32::MAX
+        ];
+        assert_eq!(
+            validate_memory_limits(&overflowing, true),
+            Err(ContractError::InvalidWasm)
+        );
+
+        // Unterminated LEB128 length at EOF.
+        let unterminated = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x05, 0x80];
+        assert_eq!(
+            validate_memory_limits(&unterminated, true),
+            Err(ContractError::InvalidWasm)
+        );
     }
 }

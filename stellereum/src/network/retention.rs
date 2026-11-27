@@ -254,6 +254,32 @@ pub fn plan_retained_prune(
     PruneDeletes { blobs, kv }
 }
 
+/// Timeout for resolving a single header-index blob under `fetch_sem()` during
+/// `maybe_prune_retained`, preventing a stalled peer from leaking a permit.
+pub const PRUNE_INDEX_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+async fn fetch_blob_with_sem_timeout_on<F>(
+    sem: &tokio::sync::Semaphore,
+    timeout: std::time::Duration,
+    fut: F,
+) -> Result<Option<Vec<u8>>, tokio::sync::AcquireError>
+where
+    F: std::future::Future<Output = Option<Vec<u8>>>,
+{
+    let _permit = sem.acquire().await?;
+    Ok(tokio::time::timeout(timeout, fut).await.ok().flatten())
+}
+
+async fn fetch_blob_with_sem_timeout<F>(
+    timeout: std::time::Duration,
+    fut: F,
+) -> Result<Option<Vec<u8>>, tokio::sync::AcquireError>
+where
+    F: std::future::Future<Output = Option<Vec<u8>>>,
+{
+    fetch_blob_with_sem_timeout_on(fetch_sem(), timeout, fut).await
+}
+
 impl P2pNetworkAdapter {
     /// Delete this node's own DHT publishes below `finalized − KEEP`.
     ///
@@ -306,9 +332,10 @@ impl P2pNetworkAdapter {
                 .store(tip_height, std::sync::atomic::Ordering::Relaxed);
             return 0;
         }
-        let (batch, next) = prune_batch(cursor, bound, dht_prune_max_per_run());
+        let (batch, _next) = prune_batch(cursor, bound, dht_prune_max_per_run());
         let epoch = self.epoch();
         let mut pruned = 0usize;
+        let mut last_done = cursor;
         for h in batch {
             // The body is hash-addressed: resolve it through the height→hash
             // index. Only the LOCAL manifest is consulted first — if we never
@@ -317,19 +344,45 @@ impl P2pNetworkAdapter {
             let idx_name = header_index_name(&epoch, shard_id, h);
             let idx_mkey =
                 infnode::node::Node::blob_manifest_key(BUCKET_STELLEREUM_HEADERS, &idx_name);
+            let mut idx_body_failed = false;
             let body_hash_hex: Option<String> = if self.node.get_local_kv(&idx_mkey).await.is_some()
             {
-                let Ok(_permit) = fetch_sem().acquire().await else {
-                    return pruned;
-                };
-                self.node
-                    .fetch_blob(BUCKET_STELLEREUM_HEADERS, &idx_name)
-                    .await
-                    .and_then(|b| parse_header_index(&b))
-                    .and_then(|(ih, hex)| (ih == h).then_some(hex))
+                match fetch_blob_with_sem_timeout(
+                    PRUNE_INDEX_FETCH_TIMEOUT,
+                    self.node.fetch_blob(BUCKET_STELLEREUM_HEADERS, &idx_name),
+                )
+                .await
+                {
+                    Ok(Some(b)) => {
+                        parse_header_index(&b).and_then(|(ih, hex)| (ih == h).then_some(hex))
+                    }
+                    Ok(None) => {
+                        idx_body_failed = true;
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            shard = shard_id,
+                            height = h,
+                            error = %e,
+                            "[retention] prune index semaphore acquire failed; pausing cursor"
+                        );
+                        idx_body_failed = true;
+                        None
+                    }
+                }
             } else {
                 None
             };
+            if idx_body_failed {
+                tracing::warn!(
+                    shard = shard_id,
+                    height = h,
+                    index = %idx_name,
+                    "[retention] failed to resolve existing header index; stopping prune cursor before height"
+                );
+                break;
+            }
             let plan = plan_retained_prune(&epoch, shard_id, h, body_hash_hex.as_deref());
             for (bucket, name) in &plan.blobs {
                 self.node.delete_blob_local(bucket, name).await;
@@ -343,27 +396,30 @@ impl P2pNetworkAdapter {
             for k in &plan.kv {
                 self.node.kv_remove_local(k).await;
             }
+            last_done = h;
             pruned += 1;
         }
         self.prune_cursor
-            .store(next, std::sync::atomic::Ordering::Relaxed);
+            .store(last_done, std::sync::atomic::Ordering::Relaxed);
         self.last_prune_tip
             .store(tip_height, std::sync::atomic::Ordering::Relaxed);
-        // Persist the cursor so the next restart resumes instead of rewinding
-        // to 0. One kv write per pass (every ~100 heights): negligible next
-        // to the deletes themselves. Best-effort; a lost write only repeats
-        // idempotent deletes.
-        let epoch = self.epoch();
-        let key = prune_cursor_key(&epoch, shard_id);
-        self.node
-            .kv_store_local_with_ttl(&key, &next.to_string(), dht_forever_ttl_ms())
-            .await;
+        if last_done > cursor {
+            // Persist the cursor so the next restart resumes instead of rewinding
+            // to 0. One kv write per pass (every ~100 heights): negligible next
+            // to the deletes themselves. Best-effort; a lost write only repeats
+            // idempotent deletes.
+            let epoch = self.epoch();
+            let key = prune_cursor_key(&epoch, shard_id);
+            self.node
+                .kv_store_local_with_ttl(&key, &last_done.to_string(), dht_forever_ttl_ms())
+                .await;
+        }
         tracing::info!(
             "prune pass: tip={} bound={} pruned={} cursor={}",
             tip_height,
             bound,
             pruned,
-            next
+            last_done
         );
         pruned
     }
@@ -1015,6 +1071,40 @@ pub async fn paced_store_blob(
 /// catch-up node would then reject that header as unanchored ("missing QC →
 /// skip"). With the sidecar in the header's own lane the breaker treats them
 /// as one unit: either the whole group is shed, or the whole group lands.
+struct PacedStoreTarget<'a> {
+    bucket: &'a str,
+    name: &'a str,
+    payload: &'a [u8],
+    ttl_ms: i64,
+}
+
+/// Like [`paced_store_blob`], but deletes any existing local blob for
+/// `(bucket, name)` right before writing the replacement — and ONLY after the
+/// circuit breaker, concurrency slot, and pacing gate have all admitted the
+/// store (so a shed never deletes the existing local pointer).
+pub async fn paced_store_pointer_overwrite(
+    node: &std::sync::Arc<infnode::node::Node>,
+    bucket: &str,
+    name: &str,
+    payload: &[u8],
+    ttl_ms: i64,
+    kind: ReplStoreKind,
+) -> usize {
+    paced_store_blob_in_lane_inner(
+        node,
+        PacedStoreTarget {
+            bucket,
+            name,
+            payload,
+            ttl_ms,
+        },
+        kind,
+        kind,
+        true,
+    )
+    .await
+}
+
 pub async fn paced_store_blob_in_lane(
     node: &std::sync::Arc<infnode::node::Node>,
     bucket: &str,
@@ -1024,6 +1114,34 @@ pub async fn paced_store_blob_in_lane(
     kind: ReplStoreKind,
     lane_kind: ReplStoreKind,
 ) -> usize {
+    paced_store_blob_in_lane_inner(
+        node,
+        PacedStoreTarget {
+            bucket,
+            name,
+            payload,
+            ttl_ms,
+        },
+        kind,
+        lane_kind,
+        false,
+    )
+    .await
+}
+
+async fn paced_store_blob_in_lane_inner(
+    node: &std::sync::Arc<infnode::node::Node>,
+    target: PacedStoreTarget<'_>,
+    kind: ReplStoreKind,
+    lane_kind: ReplStoreKind,
+    delete_before_store: bool,
+) -> usize {
+    let PacedStoreTarget {
+        bucket,
+        name,
+        payload,
+        ttl_ms,
+    } = target;
     let cfg = ReplPublishConfig::from_env();
     let gate = match lane_kind {
         ReplStoreKind::Bulk | ReplStoreKind::Companion => repl_bulk_gate(),
@@ -1109,6 +1227,9 @@ pub async fn paced_store_blob_in_lane(
         }
     }
     // 4. Retry budget: bounded attempts, jittered backoff, then drop+LOUD.
+    if delete_before_store {
+        node.delete_blob_local(bucket, name).await;
+    }
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
@@ -1169,5 +1290,66 @@ pub async fn paced_store_blob_in_lane(
         ))
         .await;
         tokio::task::yield_now().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_blob_with_sem_timeout_releases_permit_on_stalled_future() {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let entered_tx = std::sync::Arc::clone(&entered);
+
+        let fetch_fut =
+            fetch_blob_with_sem_timeout_on(&sem, PRUNE_INDEX_FETCH_TIMEOUT, async move {
+                entered_tx.notify_one();
+                std::future::pending::<Option<Vec<u8>>>().await
+            });
+
+        let observer_fut = async {
+            entered.notified().await;
+            assert_eq!(
+                sem.available_permits(),
+                0,
+                "permit must be held while the bounded fetch is in flight"
+            );
+        };
+
+        let (res, ()) = tokio::join!(fetch_fut, observer_fut);
+        assert!(
+            matches!(res, Ok(None)),
+            "stalled fetch must time out and return Ok(None)"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "permit must be released immediately after fetch timeout"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_blob_with_sem_timeout_uses_fetch_sem_and_completes() {
+        let timed_out = fetch_blob_with_sem_timeout(
+            PRUNE_INDEX_FETCH_TIMEOUT,
+            std::future::pending::<Option<Vec<u8>>>(),
+        )
+        .await;
+        assert!(matches!(timed_out, Ok(None)));
+
+        let ok = fetch_blob_with_sem_timeout(
+            PRUNE_INDEX_FETCH_TIMEOUT,
+            std::future::ready(Some(b"42:abcd".to_vec())),
+        )
+        .await;
+        assert_eq!(ok.unwrap(), Some(b"42:abcd".to_vec()));
+
+        let permit = fetch_sem()
+            .acquire()
+            .await
+            .expect("fetch_sem must grant a permit after timeout");
+        drop(permit);
     }
 }

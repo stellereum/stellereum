@@ -21,7 +21,8 @@
 #
 # Peer-count note: there is NO dedicated peer-count gauge in metrics.rs.
 # PeersLost derives the count from the per-peer label set of
-# stell_peer_latency_seconds (SELF-MEASURED latency series, one per peer id).
+# stell_peer_latency_seconds_count (histogram _count series, one per peer id),
+# falling back to 0 via stell_consensus_height when no peer series are emitted.
 # Stale series linger until the peer is re-observed, so this alert is a
 # lower-bound tripwire, not an exact census. See ops/alerts.md.
 #
@@ -174,10 +175,19 @@ groups:
   - name: stellereum-net
     interval: 30s
     rules:
-      # Derived peer count: number of distinct `peer` label values currently
-      # exposing SELF-MEASURED latency. Tune `3` to your minimum peer floor.
+      # Derived peer count: number of distinct `peer` label values per instance
+      # currently exposing SELF-MEASURED latency (_count of the histogram).
+      # Falls back to 0 when an active node has zero peer series.
+      # Tune `3` to your minimum peer floor.
       - alert: PeersLost
-        expr: count(count by (peer) (stell_peer_latency_seconds)) < 3
+        expr: |
+          (
+            count by (instance) (
+              count by (instance, peer) (stell_peer_latency_seconds_count)
+            )
+            or
+            (count by (instance) (stell_consensus_height) * 0)
+          ) < 3
         for: 10m
         labels:
           severity: warning

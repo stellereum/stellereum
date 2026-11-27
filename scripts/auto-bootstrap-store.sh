@@ -21,6 +21,12 @@
 #                           HTTP 200 verifies before extract, HTTP 404 warns and
 #                           proceeds unless --require-sha256 is set)
 #   --require-sha256        Fail closed if SHA-256 manifest is missing/unavailable
+#   --cosign-sig-url URL    Cosign .sig URL for the snapshot archive (requires
+#                           --cosign-pem-url unless --require-cosign defaults both
+#                           from <snapshot-url>.sig/.pem)
+#   --cosign-pem-url URL    Cosign .pem certificate URL for the snapshot archive
+#   --require-cosign        Require cosign verification via verify-cosign-artifact.sh
+#                           (defaults URLs to <snapshot-url>.sig/.pem if omitted)
 #   --binary PATH           Path to stellereum binary (default: $HOME_DIR/stellereum,
 #                           ./stellereum/target/release/stellereum, or PATH)
 #   --keys-dir DIR          Keys directory containing validator.key
@@ -51,6 +57,11 @@ SNAPSHOT_URL="https://rpc.stellereum.org/snapshot/latest.tar.zst"
 SHA256_URL=""
 SHA256_URL_EXPLICIT=0
 REQUIRE_SHA256=0
+COSIGN_SIG_URL=""
+COSIGN_SIG_URL_EXPLICIT=0
+COSIGN_PEM_URL=""
+COSIGN_PEM_URL_EXPLICIT=0
+REQUIRE_COSIGN="${STELL_REQUIRE_COSIGN:-0}"
 BINARY=""
 BINARY_EXPLICIT=0
 KEYS_DIR=""
@@ -64,7 +75,7 @@ USER_SYSTEMD=0
 ENV_FILE=""
 ENV_FILE_EXPLICIT=0
 DRY_RUN=0
-STOP_TIMEOUT="${STELL_STOP_TIMEOUT:-90}"
+STOP_TIMEOUT="${STELL_STOP_TIMEOUT:-300}"
 GUARD_TIMER="${STELL_GUARD_UNIT:-stell-node-guard.timer}"
 GUARD_SERVICE="${GUARD_TIMER%.timer}.service"
 
@@ -97,6 +108,11 @@ while [[ $# -gt 0 ]]; do
         --sha256-url) SHA256_URL="${2:?--sha256-url requires a URL}"; SHA256_URL_EXPLICIT=1; shift 2 ;;
         --sha256-url=*) SHA256_URL="${1#--sha256-url=}"; SHA256_URL_EXPLICIT=1; shift ;;
         --require-sha256) REQUIRE_SHA256=1; shift ;;
+        --cosign-sig-url) COSIGN_SIG_URL="${2:?--cosign-sig-url requires a URL}"; COSIGN_SIG_URL_EXPLICIT=1; shift 2 ;;
+        --cosign-sig-url=*) COSIGN_SIG_URL="${1#--cosign-sig-url=}"; COSIGN_SIG_URL_EXPLICIT=1; shift ;;
+        --cosign-pem-url) COSIGN_PEM_URL="${2:?--cosign-pem-url requires a URL}"; COSIGN_PEM_URL_EXPLICIT=1; shift 2 ;;
+        --cosign-pem-url=*) COSIGN_PEM_URL="${1#--cosign-pem-url=}"; COSIGN_PEM_URL_EXPLICIT=1; shift ;;
+        --require-cosign) REQUIRE_COSIGN=1; shift ;;
         --binary) BINARY="${2:?--binary requires a path}"; BINARY_EXPLICIT=1; shift 2 ;;
         --binary=*) BINARY="${1#--binary=}"; BINARY_EXPLICIT=1; shift ;;
         --keys-dir) KEYS_DIR="${2:?--keys-dir requires a directory}"; shift 2 ;;
@@ -135,6 +151,44 @@ elif [[ -z "$SHA256_URL" && "$REQUIRE_SHA256" == "1" ]]; then
     die "--require-sha256 cannot be used with an empty --sha256-url"
 fi
 
+case "$REQUIRE_COSIGN" in
+    0|1) ;;
+    *) die "STELL_REQUIRE_COSIGN must be 0 or 1 (got '$REQUIRE_COSIGN')" ;;
+esac
+
+if [[ "$COSIGN_SIG_URL_EXPLICIT" == "1" && -z "$COSIGN_SIG_URL" ]]; then
+    die "--cosign-sig-url cannot be empty"
+fi
+if [[ "$COSIGN_PEM_URL_EXPLICIT" == "1" && -z "$COSIGN_PEM_URL" ]]; then
+    die "--cosign-pem-url cannot be empty"
+fi
+if [[ "$COSIGN_SIG_URL_EXPLICIT" == "1" && "$COSIGN_PEM_URL_EXPLICIT" == "0" ]]; then
+    if [[ "$REQUIRE_COSIGN" == "1" ]]; then
+        COSIGN_PEM_URL="${SNAPSHOT_URL}.pem"
+    else
+        die "--cosign-sig-url requires --cosign-pem-url"
+    fi
+fi
+if [[ "$COSIGN_PEM_URL_EXPLICIT" == "1" && "$COSIGN_SIG_URL_EXPLICIT" == "0" ]]; then
+    if [[ "$REQUIRE_COSIGN" == "1" ]]; then
+        COSIGN_SIG_URL="${SNAPSHOT_URL}.sig"
+    else
+        die "--cosign-pem-url requires --cosign-sig-url"
+    fi
+fi
+
+USE_COSIGN=0
+if [[ "$REQUIRE_COSIGN" == "1" || ( -n "$COSIGN_SIG_URL" && -n "$COSIGN_PEM_URL" ) ]]; then
+    USE_COSIGN=1
+    if [[ -z "$COSIGN_SIG_URL" ]]; then
+        COSIGN_SIG_URL="${SNAPSHOT_URL}.sig"
+    fi
+    if [[ -z "$COSIGN_PEM_URL" ]]; then
+        COSIGN_PEM_URL="${SNAPSHOT_URL}.pem"
+    fi
+fi
+COSIGN_VERIFIER="$SCRIPT_DIR/verify-cosign-artifact.sh"
+
 # Auto-detect --home from $PWD if omitted
 if [[ -z "$HOME_DIR" ]]; then
     if [[ -d "$PWD/data/store" && -d "$PWD/keys" ]] && \
@@ -168,6 +222,18 @@ for tool in curl tar zstd; do
 done
 if [[ -n "$SHA256_URL" ]] && ! command -v sha256sum >/dev/null 2>&1; then
     die "required tool 'sha256sum' not found in PATH"
+fi
+if [[ "$USE_COSIGN" == "1" ]]; then
+    if [[ ! -x "$COSIGN_VERIFIER" ]]; then
+        die "cosign verifier script not found or not executable: $COSIGN_VERIFIER"
+    fi
+    if ! command -v cosign >/dev/null 2>&1; then
+        if [[ "$DRY_RUN" == "1" ]]; then
+            warn "cosign not found in PATH (would fail in a live run with --require-cosign / cosign URLs)"
+        else
+            die "required tool 'cosign' not found in PATH"
+        fi
+    fi
 fi
 
 # Locate stellereum binary
@@ -353,6 +419,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
     log "  binary:       $BINARY"
     log "  snapshot url: $SNAPSHOT_URL"
     log "  sha256 url:   ${SHA256_URL:-<disabled>} (require=$REQUIRE_SHA256)"
+    log "  cosign:       $([[ "$USE_COSIGN" == "1" ]] && echo "enabled (require=$REQUIRE_COSIGN, sig=$COSIGN_SIG_URL, pem=$COSIGN_PEM_URL)" || echo "<disabled>")"
     log "  env file:     ${ENV_FILE:-<none>}"
     if [[ -n "$ENV_FILE" ]]; then
         log "step: safely source env file $ENV_FILE (without printing secret values)"
@@ -360,6 +427,9 @@ if [[ "$DRY_RUN" == "1" ]]; then
     log "step: download snapshot from $SNAPSHOT_URL to a temporary staging file"
     if [[ -n "$SHA256_URL" ]]; then
         log "step: fetch SHA-256 from $SHA256_URL (HTTP 200 -> verify before extract; HTTP 404 -> $([[ "$REQUIRE_SHA256" == "1" ]] && echo 'fail (--require-sha256)' || echo 'warn and proceed'))"
+    fi
+    if [[ "$USE_COSIGN" == "1" ]]; then
+        log "step: fetch cosign .sig ($COSIGN_SIG_URL) and .pem ($COSIGN_PEM_URL) and run '$COSIGN_VERIFIER --require'"
     fi
     if [[ -n "$SYSTEMD_UNIT" ]]; then
         if systemd_is_active_bus; then
@@ -407,6 +477,8 @@ chmod 700 "$HOME_DIR"
 WORK_DIR="$(mktemp -d "$HOME_DIR/.bootstrap-work.XXXXXX")"
 ARCHIVE_FILE="$WORK_DIR/snapshot.tar.zst"
 SHA_FILE="$WORK_DIR/snapshot.tar.zst.sha256"
+COSIGN_SIG_FILE="$WORK_DIR/snapshot.tar.zst.sig"
+COSIGN_PEM_FILE="$WORK_DIR/snapshot.tar.zst.pem"
 
 SYSTEMD_ACTIVE=0
 UNIT_MASKED_BY_US=0
@@ -455,16 +527,29 @@ if [[ -n "$SHA256_URL" ]]; then
         fi
         ok "snapshot SHA-256 verified ($actual_sha)"
     elif [[ "$sha_http_code" == "404" ]]; then
+        rm -f "$SHA_FILE"
         if [[ "$REQUIRE_SHA256" == "1" ]]; then
             die "SHA-256 manifest returned HTTP 404 at $SHA256_URL and --require-sha256 is set"
         fi
         warn "SHA-256 manifest returned HTTP 404 at $SHA256_URL; proceeding without checksum verification"
     else
+        rm -f "$SHA_FILE"
         if [[ "$REQUIRE_SHA256" == "1" ]]; then
             die "failed to fetch SHA-256 manifest at $SHA256_URL (HTTP ${sha_http_code:-error}) and --require-sha256 is set"
         fi
         warn "could not fetch SHA-256 manifest at $SHA256_URL (HTTP ${sha_http_code:-error}); proceeding without checksum verification"
     fi
+fi
+
+if [[ "$USE_COSIGN" == "1" ]]; then
+    log "fetching cosign signature ($COSIGN_SIG_URL) and certificate ($COSIGN_PEM_URL)..."
+    curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -o "$COSIGN_SIG_FILE" "$COSIGN_SIG_URL" \
+        || die "failed to download cosign signature from $COSIGN_SIG_URL"
+    curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -o "$COSIGN_PEM_FILE" "$COSIGN_PEM_URL" \
+        || die "failed to download cosign certificate from $COSIGN_PEM_URL"
+    "$COSIGN_VERIFIER" --require --sig "$COSIGN_SIG_FILE" --pem "$COSIGN_PEM_FILE" "$ARCHIVE_FILE" \
+        || die "cosign artifact verification failed for downloaded snapshot"
+    ok "snapshot cosign signature verified"
 fi
 
 log "verifying downloaded archive integrity (zstd -t)..."

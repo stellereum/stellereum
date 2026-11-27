@@ -384,10 +384,56 @@ fn secp_sub_n_minus_s(s: &[u8; 32]) -> [u8; 32] {
 /// growth on a long-lived node otherwise).
 pub const MAX_SETTLED_EVM_MAP: usize = 50_000;
 
+fn register_evm_settlement_bounded(
+    fwd: &mut std::collections::HashMap<String, [u8; 32]>,
+    rev: &mut std::collections::HashMap<[u8; 32], String>,
+    norm: String,
+    stell_hash: [u8; 32],
+    cap: usize,
+) {
+    if cap == 0 {
+        return;
+    }
+    // Remove any stale half-mapping on overwrite before enforcing capacity so
+    // forward and reverse maps never diverge.
+    if let Some(old_stell) = fwd.get(&norm).copied() {
+        if old_stell != stell_hash {
+            rev.remove(&old_stell);
+        }
+    }
+    if let Some(old_evm) = rev.get(&stell_hash).cloned() {
+        if old_evm != norm {
+            fwd.remove(&old_evm);
+        }
+    }
+    while (!fwd.contains_key(&norm) && fwd.len() >= cap)
+        || (!rev.contains_key(&stell_hash) && rev.len() >= cap)
+    {
+        if !fwd.contains_key(&norm) && fwd.len() >= cap {
+            if let Some(evicted_evm) = fwd.keys().next().cloned() {
+                if let Some(evicted_stell) = fwd.remove(&evicted_evm) {
+                    rev.remove(&evicted_stell);
+                }
+            } else {
+                break;
+            }
+        } else if let Some(evicted_stell) = rev.keys().next().copied() {
+            if let Some(evicted_evm) = rev.remove(&evicted_stell) {
+                fwd.remove(&evicted_evm);
+            }
+        } else {
+            break;
+        }
+    }
+    fwd.insert(norm.clone(), stell_hash);
+    rev.insert(stell_hash, norm);
+}
+
 /// Register a bidirectional mapping `keccak(EVM raw) <-> stell tx hash`.
 ///
 /// Both directions are queryable via [`evm_to_stell_hash`] /
-/// [`stell_to_evm_hash`]. Overwrites any previous entry for either key.
+/// [`stell_to_evm_hash`]. Overwrites any previous entry for either key and
+/// evicts symmetrically so forward and reverse maps never diverge.
 /// Also drops the settled hash from the pending intent pool so
 /// `pending -> mined` reads observe the mined view first.
 pub fn register_evm_settlement(evm_hash_hex: &str, stell_hash: &[u8; 32]) {
@@ -395,24 +441,14 @@ pub fn register_evm_settlement(evm_hash_hex: &str, stell_hash: &[u8; 32]) {
         Ok(n) => n,
         Err(_) => return,
     };
-    if let Ok(mut fwd) = EVM_TO_STELL.lock() {
-        // Bounded: evict an arbitrary entry past the cap (same DoS-guard
-        // policy as the pending pool; mappings are redundant hints — the
-        // canonical receipt lookup does not depend on them).
-        if fwd.len() >= MAX_SETTLED_EVM_MAP {
-            if let Some(k) = fwd.keys().next().cloned() {
-                fwd.remove(&k);
-            }
-        }
-        fwd.insert(norm.clone(), *stell_hash);
-    }
-    if let Ok(mut rev) = STELL_TO_EVM.lock() {
-        if rev.len() >= MAX_SETTLED_EVM_MAP {
-            if let Some(k) = rev.keys().next().cloned() {
-                rev.remove(&k);
-            }
-        }
-        rev.insert(*stell_hash, norm.clone());
+    if let (Ok(mut fwd), Ok(mut rev)) = (EVM_TO_STELL.lock(), STELL_TO_EVM.lock()) {
+        register_evm_settlement_bounded(
+            &mut fwd,
+            &mut rev,
+            norm.clone(),
+            *stell_hash,
+            MAX_SETTLED_EVM_MAP,
+        );
     }
     // Best-effort: the intent is now mined; free the pending slot.
     if let Ok(mut pending) = EVM_PENDING_TXS.lock() {
@@ -655,6 +691,14 @@ pub fn stell_hash_to_evm(hash: &[u8; 32]) -> String {
     format!("0x{}", hex::encode(hash))
 }
 
+/// Computes the EIP-155 base `v = chain_id * 2 + 35` without `u64` overflow.
+fn eip155_base_v(chain_id: u64) -> u128 {
+    u128::from(chain_id)
+        .checked_mul(2)
+        .and_then(|x| x.checked_add(35))
+        .unwrap_or(u128::MAX)
+}
+
 /// Converts a Stellereum transaction to an EVM JSON-RPC transaction with a custom chain ID.
 pub fn stell_tx_to_evm_with_chain(
     tx: &crate::sharding::Transaction,
@@ -705,7 +749,7 @@ pub fn stell_tx_to_evm_with_chain(
             gas_price: Some("0x1".to_string()),
             gas: format_u64_hex(tx.gas_limit),
             input,
-            v: format!("0x{:x}", chain_id * 2 + 35),
+            v: format!("0x{:x}", eip155_base_v(chain_id)),
             r: "0x0".to_string(),
             s: "0x0".to_string(),
             tx_type: Some("0x0".to_string()),
@@ -728,7 +772,7 @@ pub fn stell_tx_to_evm_with_chain(
         "0x0".to_string()
     };
     // EIP-155 formula: v = {0,1} + chainId * 2 + 35
-    let v = format!("0x{:x}", chain_id * 2 + 35);
+    let v = format!("0x{:x}", eip155_base_v(chain_id));
 
     let input = if !tx.payload.is_empty() {
         match bincode::serialize(&tx.payload) {
@@ -891,7 +935,7 @@ pub fn stell_receipt_to_evm_tx_with_chain(
         gas_price: Some("0x1".to_string()),
         gas: format_u64_hex(r.gas_limit.max(r.fee_charged)),
         input: "0x".to_string(),
-        v: format!("0x{:x}", chain_id * 2 + 35),
+        v: format!("0x{:x}", eip155_base_v(chain_id)),
         r: "0x0".to_string(),
         s: "0x0".to_string(),
         tx_type: Some("0x0".to_string()),
@@ -961,7 +1005,9 @@ pub fn stell_block_summary_to_evm_full(
     full_tx: bool,
 ) -> EvmBlock {
     let mut block = stell_block_summary_to_evm_with_parent(summary, parent_hash);
-    let total_gas: u64 = receipts.iter().map(|r| r.fee_charged).sum();
+    let total_gas: u64 = receipts
+        .iter()
+        .fold(0u64, |acc, r| acc.saturating_add(r.fee_charged));
     block.gas_used = format_u64_hex(total_gas);
     if full_tx {
         let full_tx_list: Vec<EvmTransaction> = receipts
@@ -1016,7 +1062,10 @@ pub fn stell_block_to_evm(b: &crate::sharding::Block, full_txs: bool) -> EvmBloc
         BlockTransactions::Hashes(tx_hashes)
     };
 
-    let total_gas_limit: u64 = b.transactions.iter().map(|tx| tx.gas_limit).sum();
+    let total_gas_limit: u64 = b
+        .transactions
+        .iter()
+        .fold(0u64, |acc, tx| acc.saturating_add(tx.gas_limit));
     let gas_limit = if total_gas_limit > 0 {
         total_gas_limit
     } else {
@@ -1075,5 +1124,49 @@ impl EvmTransaction {
         let recovered = self.recover_sender()?;
         let from_addr = parse_address(&self.from)?;
         Ok(recovered == from_addr)
+    }
+}
+
+#[cfg(test)]
+mod settlement_eviction_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn symmetric_evm_to_stell_eviction_keeps_maps_bijective() {
+        let mut fwd = HashMap::new();
+        let mut rev = HashMap::new();
+        let cap = 3;
+
+        for i in 1u8..=8 {
+            let evm = format!("0x{:064x}", i);
+            let stell = [i; 32];
+            register_evm_settlement_bounded(&mut fwd, &mut rev, evm, stell, cap);
+            assert_eq!(fwd.len(), rev.len());
+            assert!(fwd.len() <= cap);
+            for (k, v) in &fwd {
+                assert_eq!(rev.get(v), Some(k), "forward and reverse maps diverged");
+            }
+            for (k, v) in &rev {
+                assert_eq!(fwd.get(v), Some(k), "reverse and forward maps diverged");
+            }
+        }
+
+        // Overwrite an existing evm key with a new stell hash: stale reverse entry must be removed.
+        let existing_evm = fwd.keys().next().cloned().expect("non-empty fwd");
+        let new_stell = [0xeeu8; 32];
+        register_evm_settlement_bounded(&mut fwd, &mut rev, existing_evm.clone(), new_stell, cap);
+        assert_eq!(fwd.len(), rev.len());
+        assert_eq!(fwd.get(&existing_evm), Some(&new_stell));
+        assert_eq!(rev.get(&new_stell), Some(&existing_evm));
+        for (k, v) in &fwd {
+            assert_eq!(rev.get(v), Some(k));
+        }
+    }
+
+    #[test]
+    fn eip155_base_v_handles_u64_max_without_overflow() {
+        assert_eq!(eip155_base_v(5757), 5757 * 2 + 35);
+        assert_eq!(eip155_base_v(u64::MAX), u128::from(u64::MAX) * 2 + 35);
     }
 }

@@ -32,6 +32,134 @@ pub(super) fn effective_catchup_pass_budget(
     }
 }
 
+/// Prefetch a bounded batch of missing block hashes concurrently into
+/// `block_cache` (never exceeding [`HEAL_CACHE_CAP`]).
+async fn heal_prefetch_missing_hashes(
+    adapter: &Arc<P2pNetworkAdapter>,
+    store: &stellereum::storage::Storage,
+    candidates: &[[u8; 32]],
+    deadline: Instant,
+    block_cache: &mut std::collections::HashMap<[u8; 32], stellereum::sharding::Block>,
+) -> Result<(), String> {
+    use futures::stream::{self, StreamExt};
+
+    let cap_left = HEAL_CACHE_CAP.saturating_sub(block_cache.len());
+    if cap_left == 0 {
+        return Ok(());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut to_fetch = Vec::new();
+    for &h in candidates {
+        if to_fetch.len() >= cap_left {
+            break;
+        }
+        if block_cache.contains_key(&h) || !seen.insert(h) {
+            continue;
+        }
+        if let Ok(Some(local)) = store.get_block(&h) {
+            if local.compute_hash() == h && block_cache.len() < HEAL_CACHE_CAP {
+                block_cache.insert(h, local);
+            }
+            continue;
+        }
+        to_fetch.push(h);
+    }
+    if to_fetch.is_empty() {
+        return Ok(());
+    }
+    let concurrency = stellereum::sync::FETCH_MAX_CONCURRENCY.max(1);
+    for chunk in to_fetch.chunks(concurrency * 2) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "healing timed out after {}s during concurrent block prefetch",
+                HEAL_ENGINE_TIMEOUT.as_secs()
+            ));
+        }
+        let batch: Vec<([u8; 32], Option<stellereum::sharding::Block>)> = tokio::time::timeout(
+            remaining,
+            stream::iter(chunk.iter().copied())
+                .map(|h| {
+                    let a = Arc::clone(adapter);
+                    async move { (h, a.fetch_block(&h).await) }
+                })
+                .buffer_unordered(concurrency)
+                .collect(),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "healing timed out after {}s during concurrent block prefetch",
+                HEAL_ENGINE_TIMEOUT.as_secs()
+            )
+        })?;
+        for (h, maybe_blk) in batch {
+            if let Some(blk) = maybe_blk {
+                if blk.compute_hash() == h && block_cache.len() < HEAL_CACHE_CAP {
+                    block_cache.insert(h, blk);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve missing heights in `range` concurrently via header-index / QC probes
+/// and prefetch their bodies (plus `cur_hash` at `range.end`) into
+/// `block_cache` in bounded concurrent batches.
+async fn heal_prefetch_height_range(
+    adapter: &Arc<P2pNetworkAdapter>,
+    store: &stellereum::storage::Storage,
+    shard: u32,
+    range: std::ops::Range<u64>,
+    cur_hash: [u8; 32],
+    deadline: Instant,
+    block_cache: &mut std::collections::HashMap<[u8; 32], stellereum::sharding::Block>,
+) -> Result<(), String> {
+    use futures::stream::{self, StreamExt};
+
+    let mut candidates = vec![cur_hash];
+    if range.start < range.end && block_cache.len() < HEAL_CACHE_CAP {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "healing timed out after {}s resolving prefetch heights",
+                HEAL_ENGINE_TIMEOUT.as_secs()
+            ));
+        }
+        let concurrency = stellereum::sync::FETCH_MAX_CONCURRENCY.max(1);
+        let resolved: Vec<Option<[u8; 32]>> = tokio::time::timeout(
+            remaining,
+            stream::iter(range)
+                .map(|h| {
+                    let a = Arc::clone(adapter);
+                    async move {
+                        if let Some(hash) = a.fetch_head_hash_probe(shard, h).await {
+                            return Some(hash);
+                        }
+                        match a.fetch_block_qc_probe(shard, h).await {
+                            Some(qc) if qc.height == h => qc.block_hash,
+                            _ => None,
+                        }
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .collect(),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "healing timed out after {}s resolving prefetch heights",
+                HEAL_ENGINE_TIMEOUT.as_secs()
+            )
+        })?;
+        for hash in resolved.into_iter().flatten() {
+            candidates.push(hash);
+        }
+    }
+    heal_prefetch_missing_hashes(adapter, store, &candidates, deadline, block_cache).await
+}
+
 /// Bring the engine's state up to the finalized head BEFORE joining consensus.
 ///
 /// A restart loads the newest PAIRED snapshot (state S) and seeds the finalized head
@@ -42,11 +170,16 @@ pub(super) fn effective_catchup_pass_budget(
 ///
 /// Method, in order: (1) replay bodies S+1..F from the LOCAL block store (our own
 /// finalized history, archive mode keeps every body); bodies missing locally are
-/// fetched from peers; (2) every replayed block must carry a verifiable precommit QC
-/// and commit to the running engine root -- history that predates decision proofs
-/// cannot be replayed and fails here, which is correct: it is unverifiable by anyone.
-/// (3) If the gap cannot be closed, exit(1). A node that cannot prove its state must
-/// not vote; the operator wipes or restores a verified backup.
+/// fetched from peers (retained up to [`HEAL_CACHE_CAP`] across the backward walk
+/// and prefetched in bounded concurrent batches); (2) every replayed block must
+/// carry a verifiable precommit QC and commit to the running engine root -- history
+/// that predates decision proofs cannot be replayed and fails here, which is
+/// correct: it is unverifiable by anyone. (3) If the gap cannot be closed, exit(1).
+/// A node that cannot prove its state must not vote; the operator wipes or restores
+/// a verified backup.
+///
+/// Advances `*engine_height` in place after each replayed block so retries never
+/// replay already-applied heights from a stale starting height.
 ///
 /// Returns the engine height reached (== F on success).
 #[allow(clippy::blocks_in_conditions)]
@@ -60,60 +193,164 @@ pub(super) async fn heal_engine_to_head(
     rt: &mut ValidatorRuntime,
     store: &stellereum::storage::Storage,
     shard: u32,
-    engine_height: u64,
+    engine_height: &mut u64,
     finalized_head: u64,
     finalized_hash: [u8; 32],
 ) -> Result<u64, String> {
-    if engine_height >= finalized_head {
-        return Ok(engine_height);
+    let start_height = *engine_height;
+    if start_height >= finalized_head {
+        return Ok(start_height);
     }
+    let deadline = Instant::now() + HEAL_ENGINE_TIMEOUT;
     // Walk BACKWARD from the head collecting hashes, preferring local bodies and
-    // falling back to the network per hash. Bounded by the same million-block cap
-    // as the live catch-up path.
+    // falling back to bounded concurrent peer prefetch + per-hash fetch.
+    // Retained blocks are cached up to `HEAL_CACHE_CAP` so forward replay avoids
+    // re-fetching blocks already pulled during the backward walk.
     let mut hashes: Vec<[u8; 32]> = vec![finalized_hash];
+    let mut block_cache: std::collections::HashMap<[u8; 32], stellereum::sharding::Block> =
+        std::collections::HashMap::with_capacity(
+            (finalized_head.saturating_sub(start_height) as usize).min(HEAL_CACHE_CAP),
+        );
     let mut cur = finalized_hash;
+    let mut prefetched_backward = false;
     for _ in 0..1_000_000u64 {
         let h = hashes.len() as u64;
         // Height of `cur` = finalized_head - (hashes.len() - 1). Stop when we reach
-        // engine_height's block (whose hash we anchor below).
-        if finalized_head - (h - 1) <= engine_height {
+        // start_height's block (whose hash we anchor below).
+        let cur_height = finalized_head.saturating_sub(h - 1);
+        if cur_height <= start_height {
             break;
         }
-        let blk = match store.get_block(&cur) {
-            Ok(Some(b)) => b,
-            _ => match adapter.fetch_block(&cur).await {
-                Some(b) => b,
-                None => {
+        let blk = if let Some(cached) = block_cache.get(&cur) {
+            cached.clone()
+        } else if let Ok(Some(local)) = store.get_block(&cur) {
+            if local.compute_hash() != cur {
+                return Err(format!(
+                    "healing broken: stored body {} has mismatched hash {}",
+                    hex::encode(cur),
+                    hex::encode(local.compute_hash())
+                ));
+            }
+            if block_cache.len() < HEAL_CACHE_CAP {
+                block_cache.insert(cur, local.clone());
+            }
+            local
+        } else {
+            if !prefetched_backward && cur_height > start_height.saturating_add(1) {
+                prefetched_backward = true;
+                let cap_left = HEAL_CACHE_CAP.saturating_sub(block_cache.len()) as u64;
+                if cap_left > 0 {
+                    let prefetch_lo = cur_height
+                        .saturating_sub(cap_left)
+                        .max(start_height.saturating_add(1));
+                    heal_prefetch_height_range(
+                        adapter,
+                        store,
+                        shard,
+                        prefetch_lo..cur_height,
+                        cur,
+                        deadline,
+                        &mut block_cache,
+                    )
+                    .await?;
+                }
+            }
+            if let Some(cached) = block_cache.get(&cur) {
+                cached.clone()
+            } else {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(format!(
+                        "healing timed out after {}s during backward walk",
+                        HEAL_ENGINE_TIMEOUT.as_secs()
+                    ));
+                }
+                let fetched = tokio::time::timeout(remaining, adapter.fetch_block(&cur))
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "healing timed out after {}s fetching body {}",
+                            HEAL_ENGINE_TIMEOUT.as_secs(),
+                            hex::encode(cur)
+                        )
+                    })?;
+                let Some(b) = fetched else {
                     return Err(format!(
                         "healing stuck: body {} unavailable locally and from peers",
                         hex::encode(cur)
-                    ))
+                    ));
+                };
+                if b.compute_hash() != cur {
+                    return Err(format!(
+                        "healing broken: peer body {} has mismatched hash {}",
+                        hex::encode(cur),
+                        hex::encode(b.compute_hash())
+                    ));
                 }
-            },
+                if block_cache.len() < HEAL_CACHE_CAP {
+                    block_cache.insert(cur, b.clone());
+                }
+                b
+            }
         };
         cur = blk.prev_hash;
         hashes.push(cur);
     }
+    if (hashes.len() as u64).saturating_sub(1) < finalized_head.saturating_sub(start_height) {
+        return Err("healing gap exceeds 1_000_000 blocks".to_string());
+    }
     hashes.reverse();
-    // hashes[0] must be the engine state's block (height == engine_height). We prove
+    // hashes[0] must be the engine state's block (height == start_height). We prove
     // it by hash-linkage below rather than by trusting labels: each applied block's
     // F3.2 root check ties it to the running engine, so a wrong anchor fails loudly
     // on the first apply instead of forking quietly.
-    let _ = shard;
-    let mut applied = engine_height;
+    let mut applied = start_height;
+    let replay_prefetch_span = stellereum::sync::FETCH_MAX_CONCURRENCY.max(1) * 4;
     for (i, hash) in hashes.iter().enumerate().skip(1) {
-        let expected_height = engine_height + i as u64;
-        let blk = match store.get_block(hash) {
-            Ok(Some(b)) => b,
-            _ => match adapter.fetch_block(hash).await {
-                Some(b) => b,
-                None => {
+        let expected_height = start_height + i as u64;
+        let blk = if let Some(cached) = block_cache.remove(hash) {
+            cached
+        } else if let Ok(Some(local)) = store.get_block(hash) {
+            local
+        } else {
+            let batch_end = hashes.len().min(i.saturating_add(replay_prefetch_span));
+            heal_prefetch_missing_hashes(
+                adapter,
+                store,
+                &hashes[i..batch_end],
+                deadline,
+                &mut block_cache,
+            )
+            .await?;
+            if let Some(cached) = block_cache.remove(hash) {
+                cached
+            } else {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
                     return Err(format!(
-                        "healing stuck: body {} unavailable locally and from peers",
-                        hex::encode(hash)
-                    ))
+                        "healing timed out after {}s at height {expected_height}",
+                        HEAL_ENGINE_TIMEOUT.as_secs()
+                    ));
                 }
-            },
+                let fetched = tokio::time::timeout(remaining, adapter.fetch_block(hash))
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "healing timed out after {}s fetching body {}",
+                            HEAL_ENGINE_TIMEOUT.as_secs(),
+                            hex::encode(hash)
+                        )
+                    })?;
+                match fetched {
+                    Some(b) => b,
+                    None => {
+                        return Err(format!(
+                            "healing stuck: body {} unavailable locally and from peers",
+                            hex::encode(hash)
+                        ))
+                    }
+                }
+            }
         };
         if blk.height != expected_height {
             return Err(format!(
@@ -133,11 +370,18 @@ pub(super) async fn heal_engine_to_head(
                 hex::encode(blk.prev_hash)
             ));
         }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "healing timed out after {}s before replaying height {expected_height}",
+                HEAL_ENGINE_TIMEOUT.as_secs()
+            ));
+        }
         rt.replay_historical_block(&blk)
             .await
             .map_err(|e| format!("healing refused at height {expected_height}: {e}"))?;
-        rt.blocks.insert(*hash, blk.clone());
+        rt.blocks.insert(*hash, blk);
         applied = expected_height;
+        *engine_height = expected_height;
     }
     Ok(applied)
 }
@@ -622,7 +866,7 @@ pub(super) async fn run_retro_publish_step(
 /// EVENT-DRIVEN CATCH-UP latch (round efficiency, no safety change):
 /// re-arm `catchup_pending` whenever verified peer evidence sits ahead of our tip.
 pub(super) fn update_catchup_latch(st: &mut DriverState) {
-    let tip = st.rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+    let tip = st.rt.decided_tip_height_for_height(st.rt.hc.height);
     st.peer_named_height = clamp_peer_evidence_height(tip, st.peer_named_height);
     if st.rt.peer_hint.is_some_and(|(ph, _)| ph > tip) || st.peer_named_height > tip {
         st.catchup_pending = true;

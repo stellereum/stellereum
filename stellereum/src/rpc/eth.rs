@@ -233,7 +233,10 @@ impl RpcState {
     /// body in the archive store is authoritative. `None` means this node
     /// genuinely cannot reconstruct it (body pruned / no store attached);
     /// callers must then answer with fewer fields, never with zeroed ones.
-    fn receipt_body_tx(&self, r: &crate::rpc::TxReceipt) -> Option<crate::sharding::Transaction> {
+    async fn receipt_body_tx(
+        &self,
+        r: &crate::rpc::TxReceipt,
+    ) -> Option<crate::sharding::Transaction> {
         if let Some(ref raw_hex) = r.raw_tx {
             let stripped = raw_hex
                 .strip_prefix("0x")
@@ -245,12 +248,19 @@ impl RpcState {
                 }
             }
         }
-        let store = self.archive_store.as_ref()?;
-        let block = store.get_block(&r.block_hash).ok().flatten()?;
-        block
-            .transactions
-            .into_iter()
-            .find(|tx| tx.compute_tx_hash() == r.tx_hash)
+        let store = self.archive_store.as_ref()?.clone();
+        let block_hash = r.block_hash;
+        let tx_hash = r.tx_hash;
+        tokio::task::spawn_blocking(move || {
+            let block = store.get_block(&block_hash).ok().flatten()?;
+            block
+                .transactions
+                .into_iter()
+                .find(|tx| tx.compute_tx_hash() == tx_hash)
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Translates a transaction receipt by transaction hash to standard `EvmReceipt`.
@@ -273,30 +283,39 @@ impl RpcState {
         let lookup_bytes: [u8; 32] =
             crate::evm_adapter::evm_to_stell_hash(&norm).unwrap_or(h_bytes);
         let is_settled_evm = lookup_bytes != h_bytes;
-        let idx = self.receipts.read().await;
-        if let Some(r) = idx.get(&lookup_bytes) {
-            let mut receipt = if is_settled_evm {
-                crate::evm_adapter::settled_receipt_for_evm(&norm, r)
-            } else {
-                crate::evm_adapter::stell_receipt_to_evm(r)
-            };
-            let block_receipts = idx.for_height(r.height);
-            let cumulative: u64 = block_receipts
-                .iter()
-                .filter(|br| br.index <= r.index)
-                .fold(0u64, |acc, br| acc.saturating_add(br.fee_charged));
-            receipt.cumulative_gas_used = crate::evm_adapter::format_u64_hex(cumulative);
-            if receipt.from == "0x0000000000000000000000000000000000000000" {
+        let found = {
+            let idx = self.receipts.read().await;
+            idx.get(&lookup_bytes).map(|r| {
+                let mut receipt = if is_settled_evm {
+                    crate::evm_adapter::settled_receipt_for_evm(&norm, r)
+                } else {
+                    crate::evm_adapter::stell_receipt_to_evm(r)
+                };
+                let block_receipts = idx.for_height(r.height);
+                let cumulative: u64 = block_receipts
+                    .iter()
+                    .filter(|br| br.index <= r.index)
+                    .fold(0u64, |acc, br| acc.saturating_add(br.fee_charged));
+                receipt.cumulative_gas_used = crate::evm_adapter::format_u64_hex(cumulative);
+                let need_body = if receipt.from == "0x0000000000000000000000000000000000000000" {
+                    Some(r.clone())
+                } else {
+                    None
+                };
+                (receipt, need_body)
+            })
+        };
+        if let Some((mut receipt, need_body)) = found {
+            if let Some(r_owned) = need_body {
                 // Restart-hydrated receipts have no raw bytes: recover the
                 // committed body from the archive store before falling back to
                 // the (unfinalized) mempool copy. A pruned body stays unknown;
                 // the zero address is the honest "not reconstructed" marker
                 // this view already documented, never a real sender.
-                if let Some(tx) = self.receipt_body_tx(r) {
+                if let Some(tx) = self.receipt_body_tx(&r_owned).await {
                     receipt.from = crate::evm_adapter::stell_address_to_evm(&tx.from);
                     receipt.to = Some(crate::evm_adapter::stell_address_to_evm(&tx.to));
                 } else {
-                    drop(idx);
                     let mp = self.mempool.read().await;
                     if let Some(tx) = mp.get(&lookup_bytes) {
                         receipt.from = crate::evm_adapter::stell_address_to_evm(&tx.from);
@@ -342,19 +361,22 @@ impl RpcState {
         let lookup_bytes: [u8; 32] =
             crate::evm_adapter::evm_to_stell_hash(&norm).unwrap_or(h_bytes);
         let is_settled_evm = lookup_bytes != h_bytes;
-        let idx = self.receipts.read().await;
+        let receipt_opt = {
+            let idx = self.receipts.read().await;
+            idx.get(&lookup_bytes).cloned()
+        };
         // Mined view first (settled EVM intents included): pending must not
         // shadow a finalized transaction.
-        let mined_meta = idx
-            .get(&lookup_bytes)
+        let mined_meta = receipt_opt
+            .as_ref()
             .map(|r| (r.block_hash, r.height, r.index));
-        if let Some(r) = idx.get(&lookup_bytes) {
+        if let Some(r) = receipt_opt {
             // Never synthesise a zero-valued transaction for a receipt whose
             // body this node does not hold (audit F-11). A live receipt carries
             // `raw_tx`; a restart-hydrated one is reconstructed from the
             // committed block body. If neither exists, the honest answer is
             // `null` — the receipt/status methods still report finality.
-            if let Some(tx) = self.receipt_body_tx(r) {
+            if let Some(tx) = self.receipt_body_tx(&r).await {
                 let mut evm_tx = crate::evm_adapter::stell_tx_to_evm_with_chain(
                     &tx,
                     Some(r.block_hash),
@@ -368,7 +390,6 @@ impl RpcState {
                 return Ok(Some(evm_tx));
             }
         }
-        drop(idx);
         let mp = self.mempool.read().await;
         if let Some(tx) = mp.get(&lookup_bytes) {
             // A pool copy of a FINALIZED transaction (not swept yet) must still
@@ -720,37 +741,82 @@ impl RpcState {
     ) -> Result<Value, crate::evm_adapter::JsonRpcError> {
         use crate::evm_adapter as evm;
         let criteria = evm::FilterCriteria::from_value(params)?;
-        let block_hash_filter = evm::extract_block_hash_filter(params);
+        let block_hash_filter = evm::extract_block_hash_filter(params)?;
         // Touch the recent window so the query is scoped to committed history
         // (heights outside it are still served via the global adapter below).
         let _head = self.height.load(std::sync::atomic::Ordering::Relaxed);
         let _window_len = self.recent_blocks.read().await.len();
         // Local committed receipts (currently log-free, kept for when execution emits logs).
-        let mut out: Vec<evm::EvmLog> = {
+        let parse_block_bound = |s: &str| -> Option<u64> {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "earliest" => Some(0),
+                "latest" | "pending" => None,
+                _ => evm::parse_hex_u64(s).ok(),
+            }
+        };
+        let from_height = criteria.from_block.as_deref().and_then(parse_block_bound);
+        let to_height = criteria.to_block.as_deref().and_then(parse_block_bound);
+        let want_block_hash: Option<[u8; 32]> = block_hash_filter
+            .as_deref()
+            .and_then(|h| evm::parse_hash_bytes(h).ok());
+        let matched_receipts: Vec<crate::rpc::TxReceipt> = if matches!(
+            (from_height, to_height),
+            (Some(lo), Some(hi)) if lo > hi
+        ) {
+            Vec::new()
+        } else {
             let idx = self.receipts.read().await;
-            let mut local = Vec::new();
-            for r in idx.map.values() {
-                let evm_receipt = evm::stell_receipt_to_evm(r);
-                for log in &evm_receipt.logs {
-                    if let Some(ref want) = block_hash_filter {
-                        match &log.block_hash {
-                            Some(have) if have.to_lowercase() == want.to_lowercase() => {}
-                            _ => continue,
-                        }
-                    }
-                    if criteria.matches(log) {
-                        local.push(log.clone());
-                        if local.len() >= evm::MAX_GET_LOGS_RESULTS {
-                            break;
+            let mut receipts = Vec::new();
+            if from_height.is_some() || to_height.is_some() {
+                let start = match from_height {
+                    Some(h) => std::ops::Bound::Included(h),
+                    None => std::ops::Bound::Unbounded,
+                };
+                let end = match to_height {
+                    Some(h) => std::ops::Bound::Included(h),
+                    None => std::ops::Bound::Unbounded,
+                };
+                for (_h, hashes) in idx.by_height.range((start, end)) {
+                    for tx_hash in hashes {
+                        if let Some(r) = idx.map.get(tx_hash) {
+                            if want_block_hash.is_some_and(|want| r.block_hash != want) {
+                                continue;
+                            }
+                            receipts.push(r.clone());
                         }
                     }
                 }
-                if local.len() >= evm::MAX_GET_LOGS_RESULTS {
-                    break;
+            } else {
+                for r in idx.map.values() {
+                    if want_block_hash.is_some_and(|want| r.block_hash != want) {
+                        continue;
+                    }
+                    receipts.push(r.clone());
                 }
             }
-            local
+            receipts
         };
+        let mut out: Vec<evm::EvmLog> = Vec::new();
+        for r in &matched_receipts {
+            let evm_receipt = evm::stell_receipt_to_evm(r);
+            for log in &evm_receipt.logs {
+                if let Some(ref want) = block_hash_filter {
+                    match &log.block_hash {
+                        Some(have) if have.to_lowercase() == want.to_lowercase() => {}
+                        _ => continue,
+                    }
+                }
+                if criteria.matches(log) {
+                    out.push(log.clone());
+                    if out.len() >= evm::MAX_GET_LOGS_RESULTS {
+                        break;
+                    }
+                }
+            }
+            if out.len() >= evm::MAX_GET_LOGS_RESULTS {
+                break;
+            }
+        }
         // Global EVM adapter receipts (EVM intents / bridged logs).
         if out.len() < evm::MAX_GET_LOGS_RESULTS {
             let mut global = evm::global_adapter()

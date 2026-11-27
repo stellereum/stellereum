@@ -2,7 +2,9 @@ use rusqlite::Result;
 use serde_json::Value;
 use stellereum_indexer::db::{BlockRecord, Database, EventFilter, EventRecord, TxRecord};
 use stellereum_indexer::events::{AbiCache, RawEvent};
-use stellereum_indexer::server::{create_router, AppState};
+use stellereum_indexer::server::{
+    create_router, create_router_with_limits, AppState, IndexerStreamHub, MAX_INDEXER_SSE_PER_IP,
+};
 
 #[test]
 fn test_sqlite_db_lifecycle_and_queries() -> Result<()> {
@@ -352,17 +354,10 @@ fn test_smooth_block_time_stats_and_charts() -> Result<()> {
     // dt = 210 - 150 = 60
     // raw_time = 60 / 99 = 0.6060606060606061
     //
-    // The served figure is then CLAMPED to [0.48, 0.50] (the live chain
-    // produces ~0.5 s blocks and the explorer's header shows that), so the
-    // answer here is the clamp's upper bound, not the raw quotient.
+    // Honest stats: avg_block_time is no longer clamped to [0.48, 0.50] and reports the real quotient (60 / 99 ≈ 0.606s).
     assert!(
-        (stats.avg_block_time - 0.50).abs() < 0.001,
-        "avg_block_time should be clamped to ~0.50s, got {}",
-        stats.avg_block_time
-    );
-    assert!(
-        (0.48..=0.50).contains(&stats.avg_block_time),
-        "avg_block_time must stay inside the clamp, got {}",
+        (stats.avg_block_time - (60.0 / 99.0)).abs() < 0.001,
+        "avg_block_time should report real unclamped quotient ~0.606s, got {}",
         stats.avg_block_time
     );
 
@@ -1411,4 +1406,227 @@ async fn test_multi_shard_blocks_and_shards_endpoints() {
     assert_eq!(srch["type"], "block");
     assert_eq!(srch["result"]["shard_id"], 1);
     assert_eq!(srch["result"]["hash"], "0xs1_block10");
+}
+
+#[test]
+fn test_reindexing_same_tx_hash_does_not_double_increment_account_tx_count() -> Result<()> {
+    let db = Database::open(":memory:")?;
+    let from = format!("0x{}", "11".repeat(32));
+    let to = format!("0x{}", "22".repeat(32));
+    let to_reorg = format!("0x{}", "33".repeat(32));
+
+    let tx = TxRecord {
+        tx_hash: "0xdup_tx_hash_0001".to_string(),
+        block_height: 42,
+        tx_index: 0,
+        from_addr: from.clone(),
+        to_addr: to.clone(),
+        from_stl57: None,
+        to_stl57: None,
+        amount: "1000".to_string(),
+        fee_charged: "10".to_string(),
+        gas_limit: "21000".to_string(),
+        status: "success".to_string(),
+        timestamp: 1_792_000_042,
+    };
+
+    db.insert_transaction_in_shard(0, &tx)?;
+    assert_eq!(db.get_account(&from)?.unwrap().tx_count, 1);
+    assert_eq!(db.get_account(&to)?.unwrap().tx_count, 1);
+
+    // Re-inserting the same tx_hash (block repair / re-sync) must NOT inflate tx_count.
+    db.insert_transaction_in_shard(0, &tx)?;
+    let from_acct = db.get_account(&from)?.expect("sender account exists");
+    let to_acct = db.get_account(&to)?.expect("recipient account exists");
+    assert_eq!(
+        from_acct.tx_count, 1,
+        "sender tx_count must stay 1 after duplicate insert, not 2"
+    );
+    assert_eq!(
+        to_acct.tx_count, 1,
+        "recipient tx_count must stay 1 after duplicate insert, not 2"
+    );
+    assert_eq!(from_acct.first_seen_height, 42);
+    assert_eq!(from_acct.last_seen_height, 42);
+    assert_eq!(db.get_stats()?.total_transactions, 1);
+    assert_eq!(db.get_stats()?.total_accounts, 2);
+
+    // Re-indexing at a different height with unchanged addresses updates height bounds only.
+    let mut repaired_tx = tx.clone();
+    repaired_tx.block_height = 45;
+    db.insert_transaction_in_shard(0, &repaired_tx)?;
+    let from_after_repair = db.get_account(&from)?.unwrap();
+    assert_eq!(from_after_repair.tx_count, 1);
+    assert_eq!(from_after_repair.first_seen_height, 42);
+    assert_eq!(from_after_repair.last_seen_height, 45);
+
+    // Reorg replacement with a different recipient recomputes affected accounts cleanly.
+    let mut reorg_tx = repaired_tx;
+    reorg_tx.to_addr = to_reorg.clone();
+    db.insert_transaction_in_shard(0, &reorg_tx)?;
+    assert_eq!(db.get_account(&from)?.unwrap().tx_count, 1);
+    assert!(
+        db.get_account(&to)?.is_none(),
+        "replaced recipient with 0 remaining txs must be removed"
+    );
+    assert_eq!(db.get_account(&to_reorg)?.unwrap().tx_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_connect_info_isolates_per_ip_sse_and_rate_limit_buckets() {
+    let db = Database::open(":memory:").expect("db");
+    let hub = std::sync::Arc::new(IndexerStreamHub::new());
+    let state = AppState::new(db.clone()).with_stream_hub(std::sync::Arc::clone(&hub));
+    let app = create_router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let sse_srv = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    // 1. Per-IP SSE cap isolation: exhausting MAX_INDEXER_SSE_PER_IP for client A
+    //    must block client A's 9th stream (429) while leaving client B independent (200).
+    let ip_a = "198.51.100.1";
+    let ip_b = "198.51.100.2";
+    let mut a_streams = Vec::new();
+    for _ in 0..MAX_INDEXER_SSE_PER_IP {
+        let resp = client
+            .get(format!("{base}/api/v2/stream?topics=newHeads"))
+            .header("X-Forwarded-For", ip_a)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        a_streams.push(resp);
+    }
+    assert_eq!(
+        hub.active_clients_for_ip(ip_a.parse().unwrap()),
+        MAX_INDEXER_SSE_PER_IP
+    );
+
+    let a_over = client
+        .get(format!("{base}/api/v2/stream?topics=newHeads"))
+        .header("X-Forwarded-For", ip_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        a_over.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "client A exceeding MAX_INDEXER_SSE_PER_IP must receive 429"
+    );
+
+    let b_stream = client
+        .get(format!("{base}/api/v2/stream?topics=newHeads"))
+        .header("X-Forwarded-For", ip_b)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        b_stream.status(),
+        reqwest::StatusCode::OK,
+        "client B must have an independent SSE bucket when ConnectInfo<SocketAddr> is populated"
+    );
+    assert_eq!(hub.active_clients_for_ip(ip_b.parse().unwrap()), 1);
+    assert_eq!(hub.active_clients(), MAX_INDEXER_SSE_PER_IP + 1);
+
+    drop(b_stream);
+    drop(a_streams);
+    sse_srv.abort();
+
+    // 2. Per-IP rate-limit bucket isolation under create_router_with_limits.
+    let unix_sec = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let mut verified_rate_isolation = false;
+    for _attempt in 0..5 {
+        let limited_app = create_router_with_limits(
+            AppState::new(db.clone()),
+            64,
+            std::time::Duration::from_secs(5),
+            3,
+            10,
+        );
+        let lim_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lim_base = format!("http://{}", lim_listener.local_addr().unwrap());
+        let lim_srv = tokio::spawn(async move {
+            axum::serve(
+                lim_listener,
+                limited_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let start = unix_sec();
+        let mut a_ok = 0u32;
+        for _ in 0..3 {
+            let r = client
+                .get(format!("{lim_base}/api/v2/price"))
+                .header("X-Forwarded-For", "198.51.100.10")
+                .send()
+                .await
+                .unwrap();
+            if unix_sec() != start {
+                break;
+            }
+            assert_eq!(r.status(), reqwest::StatusCode::OK);
+            a_ok += 1;
+        }
+        if unix_sec() != start || a_ok != 3 {
+            lim_srv.abort();
+            continue;
+        }
+
+        let a_limited = client
+            .get(format!("{lim_base}/api/v2/price"))
+            .header("X-Forwarded-For", "198.51.100.10")
+            .send()
+            .await
+            .unwrap();
+        let b_allowed = client
+            .get(format!("{lim_base}/api/v2/price"))
+            .header("X-Forwarded-For", "198.51.100.20")
+            .send()
+            .await
+            .unwrap();
+        let same_sec = unix_sec() == start;
+        lim_srv.abort();
+        if !same_sec {
+            continue;
+        }
+
+        assert_eq!(
+            a_limited.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "client A must be rate-limited after exhausting 3 req/s"
+        );
+        assert_eq!(
+            b_allowed.status(),
+            reqwest::StatusCode::OK,
+            "client B must not be throttled by client A's rate-limit bucket"
+        );
+        verified_rate_isolation = true;
+        break;
+    }
+    assert!(
+        verified_rate_isolation,
+        "failed to complete rate-limit burst within a single second after 5 attempts"
+    );
 }

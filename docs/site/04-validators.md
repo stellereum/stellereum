@@ -15,7 +15,7 @@ Full click-by-click runbook: `docs/VALIDATOR_ONBOARDING.md`.
 
 A bare 1000-STELL bond is refused at admission. Below the top 250 you
 are bonded but not proposing. Bond via `SysCallStake`
-(`stell-wallet stake --validator <hex> 1100`; `--dry-run` first).
+(`stell stake --validator <hex> 1100` or `stellereum validator register-validator`; `--dry-run` first).
 Quorum is `floor(2·power/3)+1`: 1→1, 2→2, 3→3, 4→3, 5→4 — so 2- and
 3-validator nets halt on one outage; **run four or more**
 (`docs/OPERATIONS.md` §5).
@@ -44,8 +44,8 @@ and checkpoints are consensus-committed (`STAKING_REWARD_ACC_V1` domain)
 balance until claimed:
 
 ```sh
-stell-wallet claim-rewards --validator <YOUR-HEX>            # own rewards
-stell-wallet claim-rewards --validator <OTHER-HEX> --delegator
+stell claim-rewards --validator <YOUR-HEX>            # own rewards
+stell claim-rewards --validator <OTHER-HEX> --delegator
 ```
 
 Opcodes `SysCallClaimRewards` / `SysCallClaimDelegatorRewards`
@@ -103,12 +103,13 @@ Spinning disk stalls the persist queue and reads as consensus lag.
 ```sh
 stellereum keys init --keys-dir ./keys
 stellereum keys peer-stanza --keys-dir ./keys --name node-e
-# new nodes start STELL_OBSERVER=1; --skip-snapshot because node-bootstrap follows
-scripts/join-testnet.sh --mode validator --advertise <IP:9410> \
+# From repo root: new nodes start STELL_OBSERVER=1 and STELL_SHARDS=0;
+# pass --skip-snapshot because node-bootstrap follows
+./scripts/join-testnet.sh --mode validator --advertise <IP:9410> \
   --peers-file <admin-set.yaml> --skip-snapshot
-stellereum node-bootstrap --config node.yaml --shard 1
-rpc stell_faucet '{"address":"-1:<YOUR-HEX>"}'   # gas only: 50 STELL cap
-stell-wallet stake --validator <YOUR-HEX> 1100
+stellereum node-bootstrap --config node.yaml --shard 0
+TOKEN="$STELL_FAUCET_TOKEN" rpc stell_faucet '{"address":"-1:<YOUR-HEX>"}'   # gas only: 50 STELL cap
+stell stake --validator <YOUR-HEX> 1100
 ```
 
 The public faucet is capped at **50 STELL** lifetime and cannot fund the

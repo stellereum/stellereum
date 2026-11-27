@@ -15,13 +15,16 @@
 #       The running <node-dir>/stellereum is NOT touched.
 #
 #   activate [nodes...]
-#       per node, in sequence: preflight the staged digest, timestamp T0,
-#       cp stellereum -> stellereum.prev, mv stellereum.new.next -> stellereum,
-#       systemctl restart, wait for active, then wait for the local RPC to be
-#       within 5 blocks of the public tip. Print the measured downtime, warn
-#       above 15 s, report a jail with release_height + cold-key unjail command,
-#       and re-check stell_getValidators (>=3 validators, fragile=false) before
-#       touching the next node. Any failed check ABORTS the rest of the rollout.
+#       per node, in sequence: preflight the staged digest + unit ExecStart,
+#       timestamp T0, cp stellereum -> stellereum.prev,
+#       mv stellereum.new.next -> stellereum, pause stell-node-guard,
+#       systemctl restart, wait for active, verify /api/version or binary
+#       identity, then wait for the local RPC to be within 5 blocks of the
+#       public tip. Print the measured downtime, warn above 90% budget, report
+#       a jail with release_height + cold-key unjail command, and re-check
+#       stell_getValidators (>=3 validators, fragile=false) before touching
+#       the next node. Any failed check auto-rolls back to stellereum.prev
+#       and ABORTS the rest of the rollout.
 #
 # The script never reads env files, never prints key material, and never
 # auto-unjails unless both --unjail-on-jail and --withdrawal-key-file are given.
@@ -44,6 +47,8 @@
 #                              node, soak --canary-soak-secs, auto-rollback on
 #                              failure, and leave remaining nodes untouched
 #   --canary-soak-secs N       canary soak window in seconds (default: 30)
+#   --require-cosign           require cosign verification via verify-cosign-artifact.sh
+#                              before staging (default: verify --if-present when .sig/.pem exist)
 #   -h, --help                 this text
 #
 # Environment (all optional):
@@ -52,6 +57,7 @@
 #   STELL_MIN_BLOCK_MS             live tempo used for the jail arithmetic (400)
 #   STELL_ROLL_DEPLOY_CATCHUP_SECS catch-up poll bound after restart (300)
 #   STELL_CLUSTER_SIZE             expected validator count for the 4/4 line (4)
+#   STELL_REQUIRE_COSIGN           set to 1 to require cosign verification during stage (0)
 #
 # Exit codes: 0 ok, 1 rollout aborted, 64 usage/configuration error.
 # No --allow-root: ssh as root, or run as the service user for a --user unit.
@@ -72,6 +78,7 @@ DOWNTIME_WARN_MS=$((JAIL_MISSES * BLOCK_MS * 9 / 10))
 CATCHUP_SECS="${STELL_ROLL_DEPLOY_CATCHUP_SECS:-300}"
 CLUSTER_SIZE="${STELL_CLUSTER_SIZE:-4}"
 PUBLIC_RPC="${STELL_PUBLIC_RPC:-https://rpc.stellereum.org}"
+REQUIRE_COSIGN="${STELL_REQUIRE_COSIGN:-0}"
 
 COMMAND=""
 BINARY=""
@@ -91,7 +98,7 @@ note() { printf '[rolling-deploy] %s\n' "$*"; }
 warn() { printf '[rolling-deploy] WARN: %s\n' "$*" >&2; }
 die()  { printf '[rolling-deploy] ERROR: %s\n' "$*" >&2; exit 64; }
 
-usage() { sed -n '2,57p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^# ====/p' "$0" | sed 's/^# \{0,1\}//' | sed '$d'; }
 
 now_ms() {
     local n
@@ -213,6 +220,62 @@ nrun_long() {
 # record (live incident 2026-11-23, nodeC).
 guard_unit() {
     printf '%s' "${STELL_ROLL_GUARD_UNIT:-stell-node-guard.timer}"
+}
+
+guard_service() {
+    local t
+    t="$(guard_unit)"
+    if [[ "$t" == *.timer ]]; then
+        printf '%s' "${t%.timer}.service"
+    else
+        printf '%s' "${t}.service"
+    fi
+}
+
+# Fence both the liveness timer and any active guard service so neither can
+# race with a restart. Outputs "1" if the timer was active before fencing.
+fence_guard() {
+    local node="$1" sysctl g_timer g_service q_timer q_service
+    sysctl="$(sysctl_for "$node")"
+    g_timer="$(guard_unit)"
+    g_service="$(guard_service)"
+    q_timer="$(printf '%q' "$g_timer")"
+    q_service="$(printf '%q' "$g_service")"
+    nrun_long "$node" "
+        was_active=0
+        if $sysctl is-active --quiet $q_timer 2>/dev/null; then
+            was_active=1
+            $sysctl stop $q_timer >/dev/null 2>&1 || true
+        fi
+        if $sysctl is-active --quiet $q_service 2>/dev/null; then
+            $sysctl stop $q_service >/dev/null 2>&1 || true
+        fi
+        printf '%s' \"\$was_active\"
+    " 2>/dev/null || printf '0'
+}
+
+restore_guard() {
+    local node="$1" was_active="$2" sysctl g_timer q_timer
+    [ "$was_active" = "1" ] || return 0
+    sysctl="$(sysctl_for "$node")"
+    g_timer="$(guard_unit)"
+    q_timer="$(printf '%q' "$g_timer")"
+    nrun_long "$node" "$sysctl start $q_timer >/dev/null 2>&1 || true"
+}
+
+node_explorer_url() {
+    local node="$1" exp ssh
+    exp="$(node_attr "$node" EXPLORER)"
+    if [ -n "$exp" ]; then
+        printf '%s' "$exp"
+        return 0
+    fi
+    ssh="$(node_attr "$node" SSH)"
+    if [ -z "$ssh" ]; then
+        printf 'http://127.0.0.1:18081'
+    else
+        printf 'http://127.0.0.1:8080'
+    fi
 }
 
 rpc_cmd() {
@@ -345,6 +408,15 @@ show_plan() {
     note "DRY RUN — nothing is copied, restarted, or written."
     note "jail budget: $(jail_budget_text); warn above $(fmt_s1 "$DOWNTIME_WARN_MS")"
     note "public RPC: $PUBLIC_RPC"
+    if [ -z "$COMMAND" ] || [ "$COMMAND" = "stage" ]; then
+        if [ "$REQUIRE_COSIGN" -eq 1 ]; then
+            note "cosign check (stage): REQUIRED ($SCRIPT_DIR/verify-cosign-artifact.sh --require ${BINARY:-<binary>})"
+        elif [ -n "$BINARY" ] && { [ -e "${BINARY}.sig" ] || [ -e "${BINARY}.pem" ]; }; then
+            note "cosign check (stage): --if-present ($SCRIPT_DIR/verify-cosign-artifact.sh --if-present $BINARY)"
+        else
+            note "cosign check (stage): --if-present (will invoke verify-cosign-artifact.sh if <binary>.sig/.pem exist)"
+        fi
+    fi
     if [ "$CANARY" -eq 1 ]; then
         note "canary mode: activate ONLY first node (${NODES[0]}), soak ${CANARY_SOAK_SECS}s (height advancing + not jailed + cluster healthy), auto-rollback on fail"
     fi
@@ -368,14 +440,14 @@ show_plan() {
             if [ "$CANARY" -eq 1 ] && [ "$idx" -gt 0 ]; then
                 note "  activate: SKIPPED (canary mode touches only first node ${NODES[0]})"
             else
-                note "  activate: sha256 preflight -> cp -f stellereum stellereum.prev -> mv .new.next stellereum"
-                note "            pause $(guard_unit), then $([ "$scope" = user ] && printf 'systemctl --user' || printf 'systemctl') restart $unit, then resume the guard"
+                note "  activate: ExecStart check + sha256 preflight -> cp -f stellereum stellereum.prev -> mv .new.next stellereum"
+                note "            pause $(guard_unit) + $(guard_service) (if active), then $([ "$scope" = user ] && printf 'systemctl --user' || printf 'systemctl') restart $unit, then resume timer (only if it was active)"
                 note "            (a live guard can start a SECOND instance on the same store)"
-                note "            wait is-active <=120 s, then local height within 5 of $PUBLIC_RPC"
-                note "            warn if downtime >15 s; abort if <3 validators or fragile=true"
+                note "            wait is-active <=120 s, verify /api/version (git_hash) or binary identity, then local height within 5 of $PUBLIC_RPC"
+                note "            warn if downtime >90% budget; auto-rollback to stellereum.prev (verify is-active + catch-up) & abort on fail"
                 if [ "$CANARY" -eq 1 ]; then
                     note "  canary:   soak ${CANARY_SOAK_SECS}s checking local RPC height advancing + not jailed + cluster healthy"
-                    note "            auto-rollback on fail: pause $(guard_unit), mv -f stellereum.prev stellereum, $([ "$scope" = user ] && printf 'systemctl --user' || printf 'systemctl') restart $unit, resume guard, ABORT"
+                    note "            auto-rollback on fail: pause $(guard_unit) + $(guard_service), mv -f stellereum.prev stellereum, $([ "$scope" = user ] && printf 'systemctl --user' || printf 'systemctl') restart $unit, resume timer if active, verify active + catch-up, ABORT"
                 fi
             fi
         fi
@@ -401,6 +473,19 @@ do_stage() {
     [ -n "$binary" ] || die "stage needs a binary path: stage <binary> [nodes...]"
     [ -f "$binary" ] || die "binary not found: $binary"
     [ -r "$binary" ] || die "binary not readable: $binary"
+
+    local verifier="$SCRIPT_DIR/verify-cosign-artifact.sh"
+    if [ "$REQUIRE_COSIGN" -eq 1 ]; then
+        [ -x "$verifier" ] || die "cosign verifier script missing or not executable: $verifier"
+        note "verifying cosign artifact (--require): $binary"
+        "$verifier" --require "$binary" || exit 1
+    elif [ -e "${binary}.sig" ] || [ -e "${binary}.pem" ]; then
+        [ -x "$verifier" ] || die "cosign verifier script missing or not executable: $verifier"
+        note "verifying cosign artifact (--if-present): $binary"
+        "$verifier" --if-present "$binary" || exit 1
+    else
+        note "no ${binary}.sig/.pem found alongside $binary; skipping cosign verification (--if-present; pass --require-cosign to enforce)"
+    fi
 
     digest="$(sha256sum "$binary" | cut -d' ' -f1)"
     [ "${#digest}" -eq 64 ] || die "could not compute sha256 of $binary"
@@ -485,17 +570,19 @@ report_jail() {
             fi
             ;;
     esac
+    local node_rpc
+    node_rpc="$(node_attr "$node" RPC)"
     printf '%s\n' "The jail needs the COLD withdrawal key; this script will not use a hot key."
     printf '[rolling-deploy] unjail command (run on %s):\n' "$node"
-    printf '  stellereum validator unjail --validator-id %s --withdrawal-key-file %s\n' \
-        "$vid" "${WITHDRAWAL_KEY_FILE:-<COLD_WITHDRAWAL_KEY_FILE>}"
+    printf '  stellereum validator unjail --validator-id %s --withdrawal-key-file %s --rpc %s\n' \
+        "$vid" "${WITHDRAWAL_KEY_FILE:-<COLD_WITHDRAWAL_KEY_FILE>}" "$node_rpc"
 
     local withdrawal
     withdrawal="$(printf '%s' "$json" | jq -r '.result.withdrawal_address // .withdrawal_address // empty')"
     if [ -z "$withdrawal" ] || [ "$withdrawal" = "null" ]; then
         printf '%s\n' "withdrawal_address is null: claim a cold address first, then unjail."
-        printf '  stellereum validator claim-withdrawal --validator-id %s --voting-key-file <HOT_VOTING_KEY> --withdrawal-key-file %s\n' \
-            "$vid" "${WITHDRAWAL_KEY_FILE:-<COLD_WITHDRAWAL_KEY_FILE>}"
+        printf '  stellereum validator claim-withdrawal --validator-id %s --voting-key-file <HOT_VOTING_KEY> --withdrawal-key-file %s --rpc %s\n' \
+            "$vid" "${WITHDRAWAL_KEY_FILE:-<COLD_WITHDRAWAL_KEY_FILE>}" "$node_rpc"
     fi
     printf '%s\n' "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
 
@@ -511,17 +598,34 @@ report_jail() {
         warn "refusing auto-unjail: the validator has no withdrawal_address yet"
         return 0
     fi
-    note "[$node] auto-unjailing as ordered (cold key path: $WITHDRAWAL_KEY_FILE)"
-    local q_dir q_vid q_key
+    case "$release" in
+        ''|null|*[!0-9]*)
+            warn "refusing auto-unjail: release_height is unknown or non-numeric ($release)"
+            return 0
+            ;;
+    esac
+    case "$height" in
+        ''|*[!0-9]*)
+            warn "refusing auto-unjail: current node height is unknown"
+            return 0
+            ;;
+    esac
+    if [ "$height" -lt "$release" ]; then
+        warn "refusing auto-unjail: height $height < release_height $release (unjail not yet eligible)"
+        return 0
+    fi
+    note "[$node] auto-unjailing as ordered (cold key path: $WITHDRAWAL_KEY_FILE, rpc=$node_rpc)"
+    local q_dir q_vid q_key q_rpc
     q_dir="$(printf '%q' "$dir")"
     q_vid="$(printf '%q' "$vid")"
     q_key="$(printf '%q' "$WITHDRAWAL_KEY_FILE")"
-    if ! nrun "$node" "cd $q_dir && ./stellereum validator unjail --validator-id $q_vid --withdrawal-key-file $q_key"; then
+    q_rpc="$(printf '%q' "$node_rpc")"
+    if ! nrun "$node" "cd $q_dir && ./stellereum validator unjail --validator-id $q_vid --withdrawal-key-file $q_key --rpc $q_rpc"; then
         warn "[$node] auto-unjail command failed; unjail manually"
         return 0
     fi
     local after
-    after="$(nrun "$node" "$(rpc_cmd "$(node_attr "$node" RPC)" stell_getValidatorStatus "{\"validator\":\"$vid\"}")" 2>/dev/null || true)"
+    after="$(nrun "$node" "$(rpc_cmd "$node_rpc" stell_getValidatorStatus "{\"validator\":\"$vid\"}")" 2>/dev/null || true)"
     note "[$node] jailed after unjail: $(printf '%s' "$after" | jq -r '.result.jailed // .jailed // "unknown"' 2>/dev/null || printf 'unknown')"
 }
 
@@ -532,9 +636,9 @@ check_validator() {
     local json jailed known
     [ -n "$vid" ] || { note "[$node] no validator id in $CONF; pass --validator <hex> to check jail state"; return 0; }
     json="$(nrun "$node" "$(rpc_cmd "$(node_attr "$node" RPC)" stell_getValidatorStatus "{\"validator\":\"$vid\"}")" 2>/dev/null || true)"
-    if [ -z "$json" ] || printf '%s' "$json" | grep -q '"error"'; then
-        warn "[$node] stell_getValidatorStatus failed; jail state UNKNOWN"
-        return 0
+    if [ -z "$json" ] || ! printf '%s' "$json" | jq -e '.error == null and (.result | type == "object")' >/dev/null 2>&1; then
+        warn "[$node] stell_getValidatorStatus failed or returned an RPC error; failing closed (jail state UNKNOWN)"
+        return 1
     fi
     known="$(printf '%s' "$json" | jq -r '.result.known // .known // "false"' 2>/dev/null || printf 'false')"
     if [ "$known" != "true" ]; then
@@ -550,10 +654,120 @@ check_validator() {
     return 0
 }
 
+verify_exec_start() {
+    local node="$1" dir="$2" unit="$3" sysctl q_dir q_unit res
+    sysctl="$(sysctl_for "$node")"
+    q_dir="$(printf '%q' "$dir")"
+    q_unit="$(printf '%q' "$unit")"
+    res="$(nrun "$node" "
+        p=\$($sysctl show $q_unit -p ExecStart 2>/dev/null | sed -n 's/.*path=\\([^ ;]*\\).*/\\1/p' | head -1)
+        if [ -z \"\$p\" ]; then
+            printf 'MISSING'
+            exit 0
+        fi
+        if [ \"\$p\" = $q_dir/stellereum ] || [ \"\$p\" -ef $q_dir/stellereum ]; then
+            printf 'OK:%s' \"\$p\"
+        else
+            printf 'MISMATCH:%s' \"\$p\"
+        fi
+    " 2>/dev/null || true)"
+    case "$res" in
+        OK:*)
+            note "[$node] unit $unit ExecStart verified: ${res#OK:}"
+            return 0
+            ;;
+        MISMATCH:*)
+            die "[$node] unit $unit ExecStart (${res#MISMATCH:}) does not match $dir/stellereum; refusing swap"
+            ;;
+        *)
+            die "[$node] could not verify ExecStart for unit $unit against $dir/stellereum"
+            ;;
+    esac
+}
+
+verify_running_identity() {
+    local node="$1" dir="$2" unit="$3" expected_sha="$4"
+    local sysctl q_unit disk_sha id_res pid exe_sha bin_verified=0 api_verified=0
+    local exp_url ver_json api_hash api_ver attempt
+
+    sysctl="$(sysctl_for "$node")"
+    q_unit="$(printf '%q' "$unit")"
+
+    if ! disk_sha="$(remote_sha "$node" "$dir/stellereum")"; then
+        warn "[$node] could not hash installed $dir/stellereum after restart"
+        return 1
+    fi
+    if [ "$disk_sha" != "$expected_sha" ]; then
+        warn "[$node] installed $dir/stellereum sha256 ($disk_sha) != staged ($expected_sha)"
+        return 1
+    fi
+
+    id_res="$(nrun "$node" "
+        pid=\$($sysctl show $q_unit -p MainPID --value 2>/dev/null || true)
+        case \"\$pid\" in
+            ''|*[!0-9]*|0) printf 'NOPID' ;;
+            *)
+                if [ -r \"/proc/\$pid/exe\" ]; then
+                    exe_sha=\$(sha256sum \"/proc/\$pid/exe\" 2>/dev/null | cut -d' ' -f1 || true)
+                    printf 'PID:%s:%s' \"\$pid\" \"\$exe_sha\"
+                else
+                    printf 'UNREADABLE:%s' \"\$pid\"
+                fi
+                ;;
+        esac
+    " 2>/dev/null || true)"
+
+    case "$id_res" in
+        PID:*)
+            pid="${id_res#PID:}"
+            exe_sha="${pid#*:}"
+            pid="${pid%%:*}"
+            if [ "$exe_sha" != "$expected_sha" ]; then
+                warn "[$node] running process pid=$pid /proc/$pid/exe sha256 (${exe_sha:-missing}) != staged ($expected_sha)"
+                return 1
+            fi
+            bin_verified=1
+            note "[$node] running process binary identity verified (pid=$pid sha256=$exe_sha)"
+            ;;
+    esac
+
+    exp_url="$(node_explorer_url "$node")"
+    ver_json=""
+    for attempt in 1 2 3; do
+        ver_json="$(nrun "$node" "curl -fsS -m 5 $(printf '%q' "${exp_url}/api/version")" 2>/dev/null || true)"
+        [ -n "$ver_json" ] && break
+        sleep 1
+    done
+    if [ -n "$ver_json" ]; then
+        api_hash="$(printf '%s' "$ver_json" | jq -r '.git_hash // empty' 2>/dev/null || true)"
+        api_ver="$(printf '%s' "$ver_json" | jq -r '.version // empty' 2>/dev/null || true)"
+        if [ -n "$api_hash" ]; then
+            api_verified=1
+            note "[$node] /api/version verified: version=${api_ver:-?} git_hash=$api_hash"
+            if [ -n "${STELL_EXPECT_GIT_HASH:-}" ] && [ "$api_hash" != "$STELL_EXPECT_GIT_HASH" ]; then
+                warn "[$node] /api/version git_hash ($api_hash) != STELL_EXPECT_GIT_HASH ($STELL_EXPECT_GIT_HASH)"
+                return 1
+            fi
+        elif [ -n "${STELL_EXPECT_GIT_HASH:-}" ]; then
+            warn "[$node] /api/version missing git_hash while STELL_EXPECT_GIT_HASH is set"
+            return 1
+        fi
+    elif [ -n "${STELL_EXPECT_GIT_HASH:-}" ]; then
+        warn "[$node] /api/version unreachable at ${exp_url}/api/version while STELL_EXPECT_GIT_HASH is set"
+        return 1
+    fi
+
+    if [ "$bin_verified" -eq 0 ] && [ "$api_verified" -eq 0 ]; then
+        warn "[$node] could not verify running binary identity via /proc/<pid>/exe or /api/version"
+        return 1
+    fi
+    return 0
+}
+
 activate_one() {
     local node="$1" dir unit sysctl rpc expected actual t0 t1 ms
     local start_h tip local_h active=0 caught=0 waited=0 deadline vid fail=0
-    local q_dir q_unit q_guard q_next q_shafile
+    local guard_was_active=0 q_dir q_unit q_next q_shafile
 
     dir="$(node_attr "$node" DIR)"
     unit="$(node_attr "$node" SERVICE)"
@@ -569,6 +783,7 @@ activate_one() {
 
     # --- 1. preflight: only the staged, verified bytes may be activated ------
     note "[$node] preflight: $dir/stellereum.new.next"
+    verify_exec_start "$node" "$dir" "$unit"
     nrun "$node" "test -f $q_next" \
         || die "[$node] no staged binary at $dir/stellereum.new.next (run stage first)"
     nrun "$node" "test ! -L $q_next" \
@@ -587,22 +802,16 @@ activate_one() {
     [ -n "$start_h" ] && note "[$node] height before restart: $start_h"
 
     # --- 2. T0, swap, restart ------------------------------------------------
+    # Fence the liveness guard timer + service before stopping/restarting $unit.
+    guard_was_active="$(fence_guard "$node")"
     t0="$(now_ms)"
     note "[$node] T0: swapping binary and restarting $unit"
-    # Pause the liveness guard so it cannot start a SECOND instance while the
-    # unit is coming down (see guard_unit()).
-    guard="$(guard_unit)"
-    q_guard="$(printf '%q' "$guard")"
-    nrun_long "$node" "$sysctl stop $q_guard >/dev/null 2>&1 || true"
     if ! nrun_long "$node" "cd $q_dir && cp -f stellereum stellereum.prev && mv -f stellereum.new.next stellereum && $sysctl restart $q_unit"; then
-        nrun_long "$node" "$sysctl start $q_guard >/dev/null 2>&1 || true"
-        if [ "$CANARY" -eq 1 ]; then
-            warn "[$node] swap/restart failed; $dir/stellereum.prev holds the previous binary"
-            return 1
-        fi
-        die "[$node] swap/restart failed; $dir/stellereum.prev holds the previous binary"
+        restore_guard "$node" "$guard_was_active"
+        warn "[$node] swap/restart failed; $dir/stellereum.prev holds the previous binary"
+        return 1
     fi
-    nrun_long "$node" "$sysctl start $q_guard >/dev/null 2>&1 || true"
+    restore_guard "$node" "$guard_was_active"
 
     deadline=$(( $(date +%s) + 120 ))
     t_active=""
@@ -619,7 +828,11 @@ activate_one() {
     done
     if [ "$active" -ne 1 ]; then
         warn "[$node] $unit did not become active within 120 s"
-        warn "[$node] inspect: ssh + journalctl (unit $unit); rollback: mv stellereum.prev stellereum + restart"
+        return 1
+    fi
+
+    if ! verify_running_identity "$node" "$dir" "$unit" "$expected"; then
+        warn "[$node] post-restart binary identity / /api/version verification failed"
         return 1
     fi
 
@@ -688,29 +901,81 @@ activate_one() {
 }
 
 rollback_canary_node() {
-    local node="$1" dir unit sysctl guard q_dir q_unit q_guard q_prev
+    local node="$1" label="${2:-CANARY}"
+    local dir unit sysctl guard_was_active=0 q_dir q_unit q_prev
+    local deadline active=0 caught=0 waited=0 pre_h tip local_h
+
     dir="$(node_attr "$node" DIR)"
     unit="$(node_attr "$node" SERVICE)"
     sysctl="$(sysctl_for "$node")"
-    guard="$(guard_unit)"
     q_dir="$(printf '%q' "$dir")"
     q_unit="$(printf '%q' "$unit")"
-    q_guard="$(printf '%q' "$guard")"
     q_prev="$(printf '%q' "$dir/stellereum.prev")"
 
-    warn "[$node] CANARY ROLLBACK: restoring $dir/stellereum.prev -> $dir/stellereum and restarting $unit"
+    warn "[$node] ${label} ROLLBACK: restoring $dir/stellereum.prev -> $dir/stellereum and restarting $unit"
     if ! nrun "$node" "test -f $q_prev"; then
         warn "[$node] cannot rollback: $dir/stellereum.prev is missing"
         return 1
     fi
-    nrun_long "$node" "$sysctl stop $q_guard >/dev/null 2>&1 || true"
+    pre_h="$(node_height "$node" || true)"
+    guard_was_active="$(fence_guard "$node")"
     if ! nrun_long "$node" "cd $q_dir && mv -f stellereum.prev stellereum && $sysctl restart $q_unit"; then
-        nrun_long "$node" "$sysctl start $q_guard >/dev/null 2>&1 || true"
-        warn "[$node] CANARY ROLLBACK FAILED during restore/restart"
+        restore_guard "$node" "$guard_was_active"
+        warn "[$node] ${label} ROLLBACK FAILED during restore/restart"
         return 1
     fi
-    nrun_long "$node" "$sysctl start $q_guard >/dev/null 2>&1 || true"
-    note "[$node] canary rollback complete; $unit restarted on previous binary"
+    restore_guard "$node" "$guard_was_active"
+
+    deadline=$(( $(date +%s) + 120 ))
+    while :; do
+        if nrun "$node" "$sysctl is-active --quiet $q_unit" 2>/dev/null; then
+            active=1
+            break
+        fi
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            break
+        fi
+        sleep 1
+    done
+    if [ "$active" -ne 1 ]; then
+        warn "[$node] ${label} ROLLBACK FAILED: $unit did not become active within 120 s"
+        return 1
+    fi
+
+    deadline=$(( $(date +%s) + CATCHUP_SECS ))
+    while :; do
+        tip="$(public_tip "$node" || true)"
+        local_h="$(node_height "$node" || true)"
+        if [[ "$local_h" =~ ^[0-9]+$ ]]; then
+            if [[ "$tip" =~ ^[0-9]+$ ]]; then
+                if [ "$local_h" -ge $((tip - 5)) ]; then
+                    caught=1
+                    break
+                fi
+            elif [[ "$pre_h" =~ ^[0-9]+$ ]] && [ "$local_h" -gt "$pre_h" ]; then
+                caught=1
+                break
+            elif [ "$local_h" -gt 0 ]; then
+                caught=1
+                break
+            fi
+        fi
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            break
+        fi
+        waited=$((waited + 2))
+        if [ "$waited" -ge 10 ]; then
+            waited=0
+            note "[$node] rollback catching up: local=${local_h:-?} tip=${tip:-?} (budget ${CATCHUP_SECS}s)"
+        fi
+        sleep 2
+    done
+    if [ "$caught" -ne 1 ]; then
+        warn "[$node] ${label} ROLLBACK FAILED: $unit active but did not catch up within ${CATCHUP_SECS}s (local=${local_h:-?} tip=${tip:-?})"
+        return 1
+    fi
+
+    note "[$node] ${label} rollback complete; $unit is active and caught up on previous binary (local=${local_h:-?} tip=${tip:-?})"
 }
 
 canary_soak() {
@@ -820,6 +1085,8 @@ do_activate() {
     for node in "${NODES[@]}"; do
         note "=== activating node $node ==="
         if ! activate_one "$node"; then
+            warn "ACTIVATION FAILED on node $node; rolling back to stellereum.prev and aborting rollout"
+            rollback_canary_node "$node" "AUTO" || true
             warn "ROLLOUT ABORTED after node $node; nodes not yet touched keep running the old binary"
             exit 1
         fi
@@ -842,6 +1109,7 @@ while [ $# -gt 0 ]; do
         --validator) [ $# -ge 2 ] || die "--validator needs a value"; VALIDATOR="$2"; shift 2 ;;
         --validator=*) VALIDATOR="${1#*=}"; shift ;;
         --unjail-on-jail) UNJAIL_ON_JAIL=1; shift ;;
+        --require-cosign) REQUIRE_COSIGN=1; shift ;;
         --withdrawal-key-file) [ $# -ge 2 ] || die "--withdrawal-key-file needs a value"; WITHDRAWAL_KEY_FILE="$2"; shift 2 ;;
         --withdrawal-key-file=*) WITHDRAWAL_KEY_FILE="${1#*=}"; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -857,7 +1125,7 @@ done
 
 # The jail budget is `42 x tempo`, and the tempo comes from the fleet's
 # expected config (or an explicit operator override). Recompute AFTER the
-# conf is sourced so the reported budget matches the live 800 ms fleet.
+# conf is sourced so the reported budget matches the live 400 ms fleet.
 BLOCK_MS="${STELL_MIN_BLOCK_MS:-${EXPECT_STELL_MIN_BLOCK_MS:-$BLOCK_MS}}"
 [[ "$BLOCK_MS" =~ ^[0-9]+$ ]] || die "BLOCK_MS must be a non-negative integer: $BLOCK_MS"
 DOWNTIME_WARN_MS=$((JAIL_MISSES * BLOCK_MS * 9 / 10))
@@ -870,6 +1138,11 @@ fi
 
 case "$CANARY_SOAK_SECS" in
     ''|*[!0-9]*) die "--canary-soak-secs must be a non-negative integer: $CANARY_SOAK_SECS" ;;
+esac
+
+case "$REQUIRE_COSIGN" in
+    0|1) ;;
+    *) die "STELL_REQUIRE_COSIGN must be 0 or 1: $REQUIRE_COSIGN" ;;
 esac
 
 if [ "$COMMAND" = "stage" ] && [ "$CANARY" -eq 1 ]; then

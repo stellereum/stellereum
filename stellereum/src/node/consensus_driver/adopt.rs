@@ -17,6 +17,82 @@ pub(super) fn truncate_utf8_prefix(raw: &str, max_bytes: usize) -> &str {
     &raw[..raw.floor_char_boundary(max_bytes)]
 }
 
+/// Serve a `BodyPull::full_request` via `CompactBodyServer::serve_full_msg_for`
+/// and dispatch the reply unicast-first through `dispatch_compact_body_reply`
+/// (W6-A3-7 anti-amplification contract), falling back to `broadcast` only
+/// when the requester key is unaddressable or unicast preflight fails.
+pub(super) async fn serve_and_dispatch_full_request<U, Fut, B>(
+    server: &mut stellereum::consensus_net::CompactBodyServer,
+    peer_key: &str,
+    pull: &stellereum::consensus_net::compact_prop::BodyPull,
+    now_ms: u64,
+    counters: &stellereum::consensus_net::CompactReplyCounters,
+    unicast: U,
+    broadcast: B,
+) -> Result<
+    Option<stellereum::consensus_net::BodyReplyRoute>,
+    stellereum::consensus_net::compact_prop::CompactRefusal,
+>
+where
+    U: FnOnce([u8; 20], ConsensusMsg) -> Fut,
+    Fut: std::future::Future<Output = Result<(), (ConsensusMsg, String)>>,
+    B: FnOnce(ConsensusMsg),
+{
+    let Some(msg) = server.serve_full_msg_for(peer_key, pull, now_ms)? else {
+        return Ok(None);
+    };
+    let route = stellereum::consensus_net::dispatch_compact_body_reply(
+        peer_key, msg, counters, unicast, broadcast,
+    )
+    .await;
+    Ok(Some(route))
+}
+
+/// Defer an `H+1` consensus message (`Proposal` or `Vote`) while `H` is still
+/// applying, prioritizing it over later-waking bulk deferrals if the deferred
+/// park has hit [`INBOUND_DEFERRED_CAP`]. Returns `true` if queued for wake-up
+/// (caller should `continue 'drain`), or `false` if even the back of the queue
+/// wakes at or before `wake_at` (caller logs loudly and handles inline instead
+/// of silently dropping).
+pub(super) fn try_defer_h1(
+    deferred: &mut std::collections::VecDeque<(Instant, String)>,
+    overcap_count: &mut u64,
+    raw: &str,
+    kind: &str,
+) -> bool {
+    let wake_at = Instant::now() + Duration::from_millis(10);
+    if deferred.len() < INBOUND_DEFERRED_CAP {
+        let pos = deferred
+            .iter()
+            .position(|(w, _)| *w > wake_at)
+            .unwrap_or(deferred.len());
+        deferred.insert(pos, (wake_at, raw.to_owned()));
+        return true;
+    }
+    if deferred.back().is_some_and(|(w, _)| *w > wake_at) {
+        deferred.pop_back();
+        *overcap_count += 1;
+        if *overcap_count % 20 == 1 {
+            tracing::warn!(
+                "[consensus] deferred park full ({INBOUND_DEFERRED_CAP}); evicted lower-priority entry to retain H+1 {kind}"
+            );
+        }
+        let pos = deferred
+            .iter()
+            .position(|(w, _)| *w > wake_at)
+            .unwrap_or(deferred.len());
+        deferred.insert(pos, (wake_at, raw.to_owned()));
+        return true;
+    }
+    *overcap_count += 1;
+    if *overcap_count % 20 == 1 {
+        tracing::warn!(
+            "[consensus] deferred park full ({INBOUND_DEFERRED_CAP}); handling H+1 {kind} inline instead of dropping"
+        );
+    }
+    false
+}
+
 /// Pre-verify every check `ValidatorRuntime::adopt_committed` enforces before
 /// `apply_and_advance` advances `SafetyAuthority`, returning `Some(block_hash)`
 /// iff the commit is valid to write-ahead persist.
@@ -29,7 +105,15 @@ pub(super) async fn preverify_committed_for_write_ahead(
     block: &stellereum::sharding::Block,
     certificate: &stellereum::consensus::QuorumCertificate,
 ) -> Option<stellereum::cell::CellHash> {
-    if rt.has_pending_apply() || height != rt.hc.height || block.height != height {
+    let pipelined = stellereum::chain_spec::execution_pipeline_v1_active_at(height);
+    if pipelined {
+        if !rt.can_validate_proposal_at_height(height)
+            || height != rt.hc.height
+            || block.height != height
+        {
+            return None;
+        }
+    } else if rt.has_pending_apply() || height != rt.hc.height || block.height != height {
         return None;
     }
     if rt.shard_registry.is_sharded()
@@ -66,7 +150,7 @@ pub(super) async fn preverify_committed_for_write_ahead(
     if block.round > certificate.round {
         return None;
     }
-    let expected_prev = rt.finalized.last().map(|(_, h)| *h).unwrap_or([0u8; 32]);
+    let expected_prev = rt.expected_parent_hash_for_height(height);
     if block.prev_hash != expected_prev {
         return None;
     }
@@ -141,7 +225,23 @@ pub(super) async fn preverify_committed_for_write_ahead(
             }
         }
     }
-    let root_before = rt.state.get_state_root().await;
+    let root_before = if pipelined {
+        match rt.state_root_for_committed_height(height) {
+            Some(r) => r,
+            None => {
+                if stellereum::chain_spec::committed_state_height_at(height) == 0
+                    && rt.finalized.is_empty()
+                    && rt.apply_in_flight_depth() == 0
+                {
+                    rt.state.get_state_root().await
+                } else {
+                    return None;
+                }
+            }
+        }
+    } else {
+        rt.state.get_state_root().await
+    };
     if block.state_root != root_before {
         return None;
     }
@@ -243,6 +343,9 @@ pub(super) async fn adopt_committed_with_write_ahead(
     block: stellereum::sharding::Block,
     certificate: stellereum::consensus::QuorumCertificate,
 ) -> Result<(stellereum::cell::CellHash, bool), String> {
+    if stellereum::chain_spec::execution_pipeline_v1_active_at(height) {
+        rt.ensure_genesis_root_seeded().await;
+    }
     let mut wrote_ahead = false;
     if let Some(ap) = persistence {
         if let Some(bh) =
@@ -588,8 +691,11 @@ pub(super) async fn drain_inbound_messages(
                             raw_len = raw.len(),
                         );
                     }
-                    if st.inbound_deferred.len() < INBOUND_DEFERRED_CAP {
-                        // SEC-06: Store deferred messages in time-gated queue with scheduled wake_at time.
+                    if st.inbound_deferred.len()
+                        < INBOUND_DEFERRED_CAP.saturating_sub(INBOUND_DEFERRED_H1_RESERVE)
+                    {
+                        // SEC-06: Store deferred messages in time-gated queue with scheduled wake_at time,
+                        // leaving `INBOUND_DEFERRED_H1_RESERVE` slots free for H+1 Proposals/Votes.
                         let wake_at = Instant::now() + Duration::from_millis(wait_ms);
                         let pos = st
                             .inbound_deferred
@@ -759,10 +865,11 @@ pub(super) async fn drain_inbound_messages(
                             continue;
                         }
                         // Parent plausibility: at OUR height the header must
-                        // build on our finalized tip, so a peer cannot mint
-                        // unlimited distinct salts with random prev_hashes.
-                        let (tip_h, tip_hash) =
-                            st.rt.finalized.last().copied().unwrap_or((0, [0u8; 32]));
+                        // build on our decided parent (finalized tip below the
+                        // gate, or queued parent at/above it), so a peer cannot
+                        // mint unlimited distinct salts with random prev_hashes.
+                        let tip_h = st.rt.decided_tip_height_for_height(st.rt.hc.height);
+                        let tip_hash = st.rt.expected_parent_hash_for_height(st.rt.hc.height);
                         if !compact_parent_is_plausible(
                             proposal.height,
                             proposal.header.prev_hash,
@@ -797,8 +904,12 @@ pub(super) async fn drain_inbound_messages(
                                     continue;
                                 }
                                 st.compact_index_builds_tick += 1;
-                                let txs = st.rt.mempool.read().await.all();
-                                st.compact_index.insert(&proposal.header, txs, now)
+                                let pool = st.rt.mempool.read().await;
+                                st.compact_index.insert(
+                                    &proposal.header,
+                                    pool.iter_txs().cloned(),
+                                    now,
+                                )
                             };
                             st.compact_rx.on_proposal_indexed(proposal, index)
                         };
@@ -821,25 +932,47 @@ pub(super) async fn drain_inbound_messages(
                         }
                         let now_ms = stellereum::liveness_alarm::now_ms();
                         if pull.is_full_request() {
-                            match st.compact_server.serve_full_for(&peer_key, &pull, now_ms) {
-                                Ok(Some(block)) => {
-                                    let round = pull.round;
-                                    enqueue_outbox(
-                                        &mut st.outbox,
-                                        ConsensusMsg::Proposal {
-                                            height: block.height,
-                                            round,
-                                            block,
-                                        },
-                                    );
+                            let counters = cfg.net.compact_reply_counters();
+                            let net_unicast = Arc::clone(&cfg.net);
+                            let hc_height = st.rt.hc.height;
+                            let hc_round = st.rt.hc.round;
+                            match serve_and_dispatch_full_request(
+                                &mut st.compact_server,
+                                &peer_key,
+                                &pull,
+                                now_ms,
+                                &counters,
+                                |peer, msg| async move {
+                                    match net_unicast.send_to_peer(peer, &msg).await {
+                                        Ok(()) => Ok(()),
+                                        Err(e) => Err((msg, e)),
+                                    }
+                                },
+                                |msg| {
+                                    enqueue_outbox(&mut st.outbox, msg);
                                     flush_outbox(
                                         &cfg.net_sender,
                                         &mut st.outbox,
-                                        st.rt.hc.height,
-                                        st.rt.hc.round,
+                                        hc_height,
+                                        hc_round,
                                     );
                                     step.outbox_flushes += 1;
                                     st.last_flush = std::time::Instant::now();
+                                },
+                            )
+                            .await
+                            {
+                                Ok(Some(route)) => {
+                                    if let stellereum::consensus_net::BodyReplyRoute::BoundedBroadcast(
+                                        why,
+                                    ) = route
+                                    {
+                                        tracing::debug!(
+                                            "[consensus] compact full-proposal reply #{} r{} used the bounded broadcast ({why:?})",
+                                            pull.height,
+                                            pull.round,
+                                        );
+                                    }
                                     st.compact_served += 1;
                                     if st.compact_served == 1 {
                                         info!(
@@ -960,8 +1093,14 @@ pub(super) async fn drain_inbound_messages(
                         let index = if cached {
                             st.compact_index.get(&header, now).expect("just checked")
                         } else {
-                            let txs = st.rt.mempool.read().await.all();
-                            st.compact_index.insert(&header, txs, now)
+                            if st.compact_index_builds_tick >= COMPACT_INDEX_BUILDS_PER_TICK {
+                                st.compact_budget_dropped += 1;
+                                continue;
+                            }
+                            st.compact_index_builds_tick += 1;
+                            let pool = st.rt.mempool.read().await;
+                            st.compact_index
+                                .insert(&header, pool.iter_txs().cloned(), now)
                         };
                         let inbound = st.compact_rx.on_body_indexed(&body, index);
                         settle_compact!(inbound, &peer_key);
@@ -1008,16 +1147,14 @@ pub(super) async fn drain_inbound_messages(
                         // dropping, so H+1 proposals execute immediately on the next tick!
                         if height == st.rt.hc.height + 1 {
                             if st.rt.has_pending_apply() {
-                                if st.inbound_deferred.len() < INBOUND_DEFERRED_CAP {
-                                    let wake_at = Instant::now() + Duration::from_millis(10);
-                                    let pos = st
-                                        .inbound_deferred
-                                        .iter()
-                                        .position(|(w, _)| *w > wake_at)
-                                        .unwrap_or(st.inbound_deferred.len());
-                                    st.inbound_deferred.insert(pos, (wake_at, raw));
+                                if try_defer_h1(
+                                    &mut st.inbound_deferred,
+                                    &mut st.inbound_overcap_count,
+                                    &raw,
+                                    "proposal",
+                                ) {
+                                    continue 'drain;
                                 }
-                                continue 'drain;
                             } else if block.height > 0 {
                                 // We are not applying H: we missed block H! Record peer hint immediately
                                 // so try_catch_up can pull block H without waiting.
@@ -1172,16 +1309,15 @@ pub(super) async fn drain_inbound_messages(
                             (v.height, v.kind, v.round, v.block_hash, v.voter);
                         // Height-ahead deferral: peer cast a vote for H+1 while
                         // we are still finishing H. Defer so it applies immediately on H+1!
-                        if vh == st.rt.hc.height + 1 && st.rt.has_pending_apply() {
-                            if st.inbound_deferred.len() < INBOUND_DEFERRED_CAP {
-                                let wake_at = Instant::now() + Duration::from_millis(10);
-                                let pos = st
-                                    .inbound_deferred
-                                    .iter()
-                                    .position(|(w, _)| *w > wake_at)
-                                    .unwrap_or(st.inbound_deferred.len());
-                                st.inbound_deferred.insert(pos, (wake_at, raw));
-                            }
+                        if vh == st.rt.hc.height + 1
+                            && st.rt.has_pending_apply()
+                            && try_defer_h1(
+                                &mut st.inbound_deferred,
+                                &mut st.inbound_overcap_count,
+                                &raw,
+                                "vote",
+                            )
+                        {
                             continue 'drain;
                         }
                         let round_before = st.rt.hc.round;
@@ -1354,7 +1490,7 @@ pub(super) async fn drain_inbound_messages(
                         // we have decided (and adopt refuses it when it does
                         // not extend our tip — the refusal must not strand
                         // us on the backstop timer).
-                        let our_tip = st.rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+                        let our_tip = st.rt.decided_tip_height_for_height(st.rt.hc.height);
                         if height > our_tip {
                             // CHEAP HEIGHT GATE FIRST (F-5): `Committed` is
                             // byte-limiter-exempt and may carry a 32 MiB
@@ -1470,27 +1606,28 @@ pub(super) async fn drain_inbound_messages(
                                 );
                             }
                         }
-                        // §7 Phase 2: adopting means executing, and the worker
-                        // is still applying the decided height. The message is
-                        // dropped, not queued: the peer rebroadcasts the commit
-                        // at its next finalize and the periodic catch-up
-                        // re-walks the same body, so a one-tick deferral loses
-                        // nothing and can never double-apply a height.
-                        if st.rt.has_pending_apply() {
+                        // §7 Phase 2: below `EXECUTION_PIPELINE_V1`, adopting while
+                        // an apply is in flight parks the commit for replay. At/above
+                        // the gate, if `height == hc.height` and we already hold the
+                        // committed lag-2 post-state root, fall through to adopt now;
+                        // otherwise park depth-2 / next-height commits for replay.
+                        let pipelined =
+                            stellereum::chain_spec::execution_pipeline_v1_active_at(height);
+                        let adopt_now_while_pipelined = pipelined
+                            && height == st.rt.hc.height
+                            && st.rt.can_validate_proposal_at_height(height);
+                        if st.rt.has_pending_apply() && !adopt_now_while_pipelined {
                             // PARK, do not drop: `adopt_committed` sees the
                             // in-flight apply and parks this commit in its
                             // bounded one-slot buffer (returning the
                             // "parked for replay" error). The replay hook
                             // after `try_poll_apply` re-runs every check.
-                            //
-                            // Only the NEXT height survives the replay: the
-                            // install advances us to `hc.height + 1`, so a
-                            // commit for H+1 is exactly the one the replay
-                            // can adopt. Parking the CURRENT (already
-                            // executing) height would instead sit in the
-                            // one-slot buffer and be dropped, evicting the
-                            // useful H+1 copy.
-                            if commit_parkable_during_apply(st.rt.hc.height, height) {
+                            if commit_parkable_during_apply_at(
+                                st.rt.hc.height,
+                                height,
+                                pipelined,
+                                st.rt.can_validate_proposal_at_height(height),
+                            ) {
                                 let _ = st
                                     .rt
                                     .adopt_committed(height, block.clone(), certificate.clone())
@@ -1930,5 +2067,139 @@ mod w7_adopt_tests {
         drop(ap);
         drop(storage);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn body_pull_full_request_routes_unicast_not_all_peer_outbox() {
+        let block = stellereum::sharding::Block {
+            height: 50,
+            round: 2,
+            ..Default::default()
+        };
+        let bh = block.compute_hash();
+        let mut server = stellereum::consensus_net::CompactBodyServer::new();
+        server.remember(&block, 2);
+
+        let pull = stellereum::consensus_net::compact_prop::BodyPull::full_request(50, 2, bh);
+        let counters = stellereum::consensus_net::CompactReplyCounters::new();
+        let requester_hex = "ab".repeat(20);
+        let mut unicast_sent: Option<([u8; 20], ConsensusMsg)> = None;
+        let mut all_peer_outbox = std::collections::VecDeque::new();
+
+        let route = serve_and_dispatch_full_request(
+            &mut server,
+            &requester_hex,
+            &pull,
+            1_000,
+            &counters,
+            |peer, msg| {
+                unicast_sent = Some((peer, msg));
+                async { Ok(()) }
+            },
+            |msg| {
+                enqueue_outbox(&mut all_peer_outbox, msg);
+            },
+        )
+        .await
+        .expect("valid full request")
+        .expect("cached block must be served");
+
+        assert_eq!(
+            route,
+            stellereum::consensus_net::BodyReplyRoute::Unicast([0xABu8; 20])
+        );
+        assert!(
+            all_peer_outbox.is_empty(),
+            "known requester BodyPull::full_request must NOT push Proposal to all-peer outbox"
+        );
+        assert_eq!(counters.unicast_sends(), 1);
+        assert_eq!(counters.broadcast_sends(), 0);
+        let (target, sent_msg) = unicast_sent.expect("unicast closure must fire");
+        assert_eq!(target, [0xABu8; 20]);
+        match sent_msg {
+            ConsensusMsg::Proposal {
+                height,
+                round,
+                block: b,
+            } => {
+                assert_eq!(height, 50);
+                assert_eq!(round, 2);
+                assert_eq!(b.compute_hash(), bh);
+            }
+            other => panic!("expected Proposal unicast reply, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn body_pull_full_request_unknown_requester_uses_bounded_broadcast_fallback() {
+        let block = stellereum::sharding::Block {
+            height: 51,
+            round: 0,
+            ..Default::default()
+        };
+        let bh = block.compute_hash();
+        let mut server = stellereum::consensus_net::CompactBodyServer::new();
+        server.remember(&block, 0);
+
+        let pull = stellereum::consensus_net::compact_prop::BodyPull::full_request(51, 0, bh);
+        let counters = stellereum::consensus_net::CompactReplyCounters::new();
+        let mut all_peer_outbox = std::collections::VecDeque::new();
+
+        let route = serve_and_dispatch_full_request(
+            &mut server,
+            "broadcast",
+            &pull,
+            1_000,
+            &counters,
+            |_peer, _msg| async { panic!("unknown requester cannot unicast") },
+            |msg| {
+                enqueue_outbox(&mut all_peer_outbox, msg);
+            },
+        )
+        .await
+        .expect("valid full request")
+        .expect("cached block must be served");
+
+        assert_eq!(
+            route,
+            stellereum::consensus_net::BodyReplyRoute::BoundedBroadcast(
+                stellereum::consensus_net::BodyReplyFallback::UnknownRequester
+            )
+        );
+        assert_eq!(all_peer_outbox.len(), 1);
+        assert_eq!(counters.unicast_sends(), 0);
+        assert_eq!(counters.broadcast_sends(), 1);
+    }
+
+    #[test]
+    fn inbound_deferred_prioritizes_h1_under_bulk_spam() {
+        let mut deferred = std::collections::VecDeque::new();
+        let mut overcap = 0u64;
+        let bulk_wake = Instant::now() + Duration::from_millis(500);
+        for i in 0..INBOUND_DEFERRED_CAP {
+            deferred.push_back((bulk_wake, format!("bulk-{i}")));
+        }
+
+        // Under full bulk park, H+1 message evicts a later-waking bulk entry
+        // instead of being silently dropped.
+        assert!(try_defer_h1(&mut deferred, &mut overcap, "h1-vote", "vote"));
+        assert_eq!(deferred.len(), INBOUND_DEFERRED_CAP);
+        assert_eq!(overcap, 1);
+        assert_eq!(deferred.front().expect("front").1, "h1-vote");
+
+        // When every entry wakes at or before `now` (no lower-priority entry to
+        // evict), `try_defer_h1` returns false so the caller handles inline.
+        deferred.clear();
+        let urgent_wake = Instant::now();
+        for i in 0..INBOUND_DEFERRED_CAP {
+            deferred.push_back((urgent_wake, format!("urgent-{i}")));
+        }
+        assert!(!try_defer_h1(
+            &mut deferred,
+            &mut overcap,
+            "h1-prop",
+            "proposal"
+        ));
+        assert_eq!(overcap, 2);
     }
 }

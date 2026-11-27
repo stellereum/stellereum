@@ -10,6 +10,15 @@ use std::time::{Duration, Instant};
 // Filter Polling Types & Manager (EIP-1474 / MetaMask Filter Polling)
 // ============================================================================
 
+/// Maximum number of addresses in a single `FilterCriteria.address` array.
+pub const MAX_FILTER_ADDRESSES: usize = 256;
+
+/// Maximum number of positional topic slots in an EVM log filter (`topics[0..=3]`).
+pub const MAX_FILTER_TOPICS: usize = 4;
+
+/// Maximum number of OR-values in a single topic slot (`topics[i]`).
+pub const MAX_FILTER_TOPIC_VALUES: usize = 256;
+
 /// Ethereum log filter criteria for `eth_newFilter` and `eth_getLogs`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,6 +98,12 @@ impl FilterCriteria {
             match addr_val {
                 Value::String(s) => Some(FilterAddress::Single(s.clone())),
                 Value::Array(arr) => {
+                    if arr.len() > MAX_FILTER_ADDRESSES {
+                        return Err(JsonRpcError::invalid_params(format!(
+                            "too many addresses in filter: {} exceeds max {MAX_FILTER_ADDRESSES}",
+                            arr.len()
+                        )));
+                    }
                     let list: Vec<String> = arr
                         .iter()
                         .filter_map(|v| v.as_str().map(|s| s.to_string()))
@@ -101,24 +116,41 @@ impl FilterCriteria {
             None
         };
 
-        let topics = obj.get("topics").and_then(|v| v.as_array()).map(|arr| {
-            let mut parsed_topics = Vec::new();
-            for item in arr {
-                match item {
-                    Value::Null => parsed_topics.push(None),
-                    Value::String(s) => parsed_topics.push(Some(FilterTopic::Single(s.clone()))),
-                    Value::Array(sub_arr) => {
-                        let list: Vec<String> = sub_arr
-                            .iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect();
-                        parsed_topics.push(Some(FilterTopic::Multiple(list)));
-                    }
-                    _ => parsed_topics.push(None),
+        let topics = match obj.get("topics") {
+            Some(Value::Array(arr)) => {
+                if arr.len() > MAX_FILTER_TOPICS {
+                    return Err(JsonRpcError::invalid_params(format!(
+                        "too many topics in filter: {} exceeds max {MAX_FILTER_TOPICS}",
+                        arr.len()
+                    )));
                 }
+                let mut parsed_topics = Vec::with_capacity(arr.len());
+                for item in arr {
+                    match item {
+                        Value::Null => parsed_topics.push(None),
+                        Value::String(s) => {
+                            parsed_topics.push(Some(FilterTopic::Single(s.clone())))
+                        }
+                        Value::Array(sub_arr) => {
+                            if sub_arr.len() > MAX_FILTER_TOPIC_VALUES {
+                                return Err(JsonRpcError::invalid_params(format!(
+                                    "too many topic OR-values in filter: {} exceeds max {MAX_FILTER_TOPIC_VALUES}",
+                                    sub_arr.len()
+                                )));
+                            }
+                            let list: Vec<String> = sub_arr
+                                .iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect();
+                            parsed_topics.push(Some(FilterTopic::Multiple(list)));
+                        }
+                        _ => parsed_topics.push(None),
+                    }
+                }
+                Some(parsed_topics)
             }
-            parsed_topics
-        });
+            _ => None,
+        };
 
         Ok(FilterCriteria {
             from_block,
@@ -565,20 +597,40 @@ pub fn normalize_filter_id(id: &str) -> String {
 }
 
 /// Extracts an optional `blockHash` scoping field from `eth_getLogs` params.
-/// Accepts `[{..., "blockHash": "0x..."}]` or a bare object; returns `None`
-/// when absent. Present-but-malformed hashes are rejected as invalid params
-/// (never silently ignored).
-pub fn extract_block_hash_filter(params: &Value) -> Option<String> {
+/// Accepts `[{..., "blockHash": "0x..."}]` or a bare object; returns `Ok(None)`
+/// when absent or null. Present-but-malformed hashes (or non-strings) are
+/// rejected as invalid params (never silently ignored).
+pub fn extract_block_hash_filter(params: &Value) -> Result<Option<String>, JsonRpcError> {
     let obj = match params {
-        Value::Array(arr) => arr.first()?.as_object()?,
+        Value::Array(arr) => match arr.first() {
+            Some(Value::Object(map)) => map,
+            Some(Value::Null) | None => return Ok(None),
+            Some(_) => {
+                return Err(JsonRpcError::invalid_params(
+                    "expected filter object in params array",
+                ))
+            }
+        },
         Value::Object(map) => map,
-        _ => return None,
+        Value::Null => return Ok(None),
+        _ => {
+            return Err(JsonRpcError::invalid_params(
+                "filter parameters must be an object",
+            ))
+        }
     };
-    let raw = obj
-        .get("blockHash")
-        .or_else(|| obj.get("block_hash"))?
-        .as_str()?;
-    normalize_hash(raw).ok()
+    let Some(val) = obj.get("blockHash").or_else(|| obj.get("block_hash")) else {
+        return Ok(None);
+    };
+    if val.is_null() {
+        return Ok(None);
+    }
+    let raw = val
+        .as_str()
+        .ok_or_else(|| JsonRpcError::invalid_params("blockHash must be a 32-byte hex string"))?;
+    let norm = normalize_hash(raw)
+        .map_err(|e| JsonRpcError::invalid_params(format!("invalid blockHash '{raw}': {e}")))?;
+    Ok(Some(norm))
 }
 
 /// Sort key for deterministic `eth_getLogs` ordering:
@@ -600,4 +652,67 @@ pub fn log_sort_key(log: &EvmLog) -> (u64, u64, u64) {
         .and_then(|s| parse_hex_u64(s).ok())
         .unwrap_or(0);
     (b, t, l)
+}
+
+#[cfg(test)]
+mod filter_validation_tests {
+    use super::*;
+
+    #[test]
+    fn extract_block_hash_filter_rejects_malformed_and_non_string() {
+        assert_eq!(extract_block_hash_filter(&json!([{}])).unwrap(), None);
+        assert_eq!(
+            extract_block_hash_filter(&json!([{ "blockHash": null }])).unwrap(),
+            None
+        );
+
+        let valid_hash = "0x".to_string() + &"ab".repeat(32);
+        assert_eq!(
+            extract_block_hash_filter(&json!([{ "blockHash": valid_hash.to_uppercase() }]))
+                .unwrap(),
+            Some(valid_hash)
+        );
+
+        for bad in [
+            json!([{ "blockHash": "0x1234" }]),
+            json!([{ "blockHash": "not-hex" }]),
+            json!([{ "blockHash": 42 }]),
+            json!([{ "block_hash": true }]),
+        ] {
+            let err =
+                extract_block_hash_filter(&bad).expect_err("malformed blockHash must be rejected");
+            assert_eq!(err.code, INVALID_PARAMS_CODE);
+        }
+    }
+
+    #[test]
+    fn filter_criteria_rejects_oversized_arrays() {
+        // address > MAX_FILTER_ADDRESSES (256)
+        let too_many_addrs: Vec<String> = (0..=MAX_FILTER_ADDRESSES)
+            .map(|i| format!("0x{:040x}", i))
+            .collect();
+        let err = FilterCriteria::from_value(&json!({ "address": too_many_addrs }))
+            .expect_err("oversized address array must be rejected");
+        assert_eq!(err.code, INVALID_PARAMS_CODE);
+
+        // Exactly MAX_FILTER_ADDRESSES is accepted
+        let max_addrs: Vec<String> = (0..MAX_FILTER_ADDRESSES)
+            .map(|i| format!("0x{:040x}", i))
+            .collect();
+        assert!(FilterCriteria::from_value(&json!({ "address": max_addrs })).is_ok());
+
+        // topics > 4
+        let too_many_topics = vec![Value::Null; MAX_FILTER_TOPICS + 1];
+        let err = FilterCriteria::from_value(&json!({ "topics": too_many_topics }))
+            .expect_err("more than 4 topics must be rejected");
+        assert_eq!(err.code, INVALID_PARAMS_CODE);
+
+        // topic OR-list > MAX_FILTER_TOPIC_VALUES (256)
+        let too_many_or: Vec<String> = (0..=MAX_FILTER_TOPIC_VALUES)
+            .map(|i| format!("0x{:064x}", i))
+            .collect();
+        let err = FilterCriteria::from_value(&json!({ "topics": [too_many_or] }))
+            .expect_err("oversized topic OR-list must be rejected");
+        assert_eq!(err.code, INVALID_PARAMS_CODE);
+    }
 }

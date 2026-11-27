@@ -1,0 +1,6 @@
+# Pure-Rust wasm32-unknown-unknown build configuration (no wasm-bindgen, no C toolchain).
+# getrandom 0.4.3 gates `extern_impl` behind nightly `#![feature(extern_item_impls)]`;
+# `custom` works on stable Rust and invokes `__getrandom_v03_custom` in `src/lib.rs`,
+# which delegates to the imported host function `env.stellereum_getrandom`.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", 'getrandom_backend="custom"']

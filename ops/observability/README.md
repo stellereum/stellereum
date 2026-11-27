@@ -4,7 +4,8 @@ Prometheus + Alertmanager + Grafana + node_exporter on the build host, scraping
 the four validators' `/metrics` endpoints without exposing them to the network.
 
 The nodes publish Prometheus text at `GET /metrics` on
-`STELL_EXPLORER_LISTEN=127.0.0.1:8080`. That binding is deliberate:
+`STELL_EXPLORER_LISTEN=127.0.0.1:8080` (A/C/D) and `127.0.0.1:18081` (B on the
+build host). That binding is deliberate:
 
 - `/metrics` is unauthenticated and carries peer ids, validator ids, heights and
   host performance data. It has no business on a public interface.
@@ -17,7 +18,7 @@ So the collector runs next to the tunnels:
 | Node | Where | Local scrape target | Path |
 | --- | --- | --- | --- |
 | A | `root@212.113.103.105:22` | `http://127.0.0.1:9080/metrics` | SSH tunnel |
-| B | this host (systemd `--user`) | `http://127.0.0.1:8080/metrics` | direct |
+| B | this host (systemd `--user`) | `http://127.0.0.1:18081/metrics` | direct |
 | C | `root@213.21.246.5:2222` | `http://127.0.0.1:9081/metrics` | SSH tunnel |
 | D | `root@138.124.102.200:22` | `http://127.0.0.1:9082/metrics` | SSH tunnel |
 
@@ -29,7 +30,7 @@ options are read from `scripts/cluster-nodes.conf`; nothing is duplicated here.
 ```
 ops/observability/
   docker-compose.yml        prometheus, alertmanager, grafana, node-exporter (9101)
-  prometheus.yml            scrape jobs (stell-nodes, node, prometheus, alertmanager)
+  prometheus.yml            scrape jobs (stell-nodes, node, prometheus, alertmanager, stell-status)
   alerts.yml                canonical Prometheus rules for the cluster
   alertmanager.yml          null receiver by default + commented Telegram shape
   .env.example              copy to .env (0600); no secret is committed
@@ -69,10 +70,11 @@ Grafana: <http://127.0.0.1:3000> (admin / the password in `.env`).
 Prometheus: <http://127.0.0.1:9090>. Alertmanager: <http://127.0.0.1:9093>.
 
 All four services run with `network_mode: host` and bind `127.0.0.1`
-explicitly. That is what makes `localhost:9080-9082` (the tunnels) and
-`localhost:8080` (B) reachable from inside the containers. Do not "fix" it by
-adding `ports:` or by switching Prometheus to a bridge network — the targets
-would then point at the container's own loopback.
+explicitly. That is what makes `localhost:9080-9082` (the tunnels),
+`localhost:18081` (B), and `localhost:8095` (`stell-status`) reachable from
+inside the containers. Do not "fix" it by adding `ports:` or by switching
+Prometheus to a bridge network — the targets would then point at the
+container's own loopback.
 
 ### Why the exporter listens on 9101, not 9100
 
@@ -123,9 +125,25 @@ with the same port (`9100`).
 
 `docker-compose.yml` uses `${GRAFANA_ADMIN_PASSWORD:?…}`: compose refuses to
 start without it instead of falling back to `admin/admin`. Telegram credentials
-are passed as `${TELEGRAM_BOT_TOKEN:-}` / `${TELEGRAM_CHAT_ID:-}` and consumed
-by Alertmanager's `--config.expand-env`; the receiver block stays commented in
-`alertmanager.yml`, so the default shape carries no secret at all.
+are kept in `.env` as `${TELEGRAM_BOT_TOKEN:-}` / `${TELEGRAM_CHAT_ID:-}`, and
+the shipped `alertmanager.yml` routes everything to the `null` receiver with no
+secrets in git. Alertmanager does **not** support `--config.expand-env` (that is
+a Prometheus-only flag), so to enable Telegram notifications you must render a
+host copy of `alertmanager.yml` from a template (substituting `TELEGRAM_BOT_TOKEN`
+and `TELEGRAM_CHAT_ID` into an untracked file mounted at
+`/etc/alertmanager/alertmanager.yml`) rather than relying on env-var expansion
+inside Alertmanager.
+
+### Public status service (`stell-status` on `127.0.0.1:8095`)
+
+`prometheus.yml` also defines a `stell-status` scrape job targeting
+`127.0.0.1:8095` (`metrics_path: /metrics`), served by
+`ops/status/status_server.py` (unit file `ops/status/stell-status.service`). That
+service independently polls the four validators plus the public RPC and exports
+`stell_status_*` metrics alongside `/api/status.json` (`/api/status`, `/status`,
+`/status.json`), `/health`, and `/readyz`. If `stell-status` is not running on the
+build host, only the `stell-status` Prometheus target reports `down`;
+`NodeMetricsUnreachable` watches `job="stell-nodes"` only.
 
 ## Tunnel lifecycle
 
@@ -183,7 +201,7 @@ fragile) before restarting anything. Quorum values are frozen core — never
 
 ### ValidatorJailed
 
-`max_over_time(stell_validator_efficiency_ratio[15m]) == 0`, 5m, critical.
+`max_over_time(stell_validator_efficiency_ratio{role="validator"}[15m]) == 0`, 5m, critical.
 The node is scraped but produced none of its expected proposals. Check
 `stell_validator_proposals_expected_total` vs `..._produced_total` on the node
 (the `stell:validator_proposal_efficiency15m` recording rule is that ratio) and
@@ -192,7 +210,7 @@ jailed signature. Do not rotate keys without a human order.
 
 ### ValidatorNotVoting
 
-15m mean of `stell_validator_efficiency_ratio` below 0.9 but not zero, 10m,
+15m mean of `stell_validator_efficiency_ratio{role="validator"}` below 0.9 but not zero, 10m,
 warning. The node proposes sometimes, so it is in the set; it is losing slots.
 Cross-check `stell_proposer_missed_total`, `stell_propose_gate_blocked_total`
 and the apply/CPU panels. This is the early warning before ValidatorJailed.
@@ -280,8 +298,8 @@ node's other alerts while it fires, to avoid stale-series noise.
 
 ### FalconSignRate
 
-Informational. Fires when `rate(stell_falcon_sign_total[5m]) == 0` while
-`stell_ready == 1`, for 10m. Signing dominates CPU on a 1-vCPU validator, so
+Informational. Fires when `rate(stell_falcon_sign_total{role="validator"}[5m]) == 0` while
+`stell_ready{role="validator"} == 1`, for 10m. Signing dominates CPU on a 1-vCPU validator, so
 zero while ready means the node is not voting/proposing (observer mode, wrong
 keys, stalled loop). The raw rate is the "Falcon signatures / s" dashboard
 panel and the `stell:falcon_sign_rate5m` recording rule. Routed to the null
@@ -306,8 +324,8 @@ cd /home/imm/stellereum-project
 cd ops/observability
 cp -n .env.example .env && chmod 600 .env
 # set GRAFANA_ADMIN_PASSWORD; for the duty-channel half also set
-# TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID and uncomment the telegram-duty
-# receiver + route in alertmanager.yml.
+# TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID, uncomment the telegram-duty receiver +
+# route in a rendered untracked copy of alertmanager.yml on the host, and mount it.
 docker compose config -q
 docker compose up -d
 
@@ -375,15 +393,19 @@ Gate is green when all of:
 `alertmanager.yml` ships a `null` receiver, so alerts stay active but reach no
 human. Two options:
 
-1. **Telegram** — uncomment the `telegram-duty` receiver and set
-   `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`. Exact procedure in the comments at
-   the top of `alertmanager.yml`.
+1. **Telegram** — render a host copy of `alertmanager.yml` with the
+   `telegram-duty` receiver/route uncommented and `TELEGRAM_BOT_TOKEN` /
+   `TELEGRAM_CHAT_ID` substituted (Alertmanager has no `--config.expand-env`),
+   and mount it into the container. Exact procedure in the comments at the top
+   of `alertmanager.yml`.
 2. **Local notifier (no secret)** — `systemd/stell-alert-notify.{service,timer}`
    plus `scripts/alert-notify.sh`: every 60 s it reads the Alertmanager API,
    appends only NEW alerts (and each RESOLVED exactly once) to
-   `ops/observability/alerts-delivered.log`, and runs `$STELL_ALERT_HOOK` with
-   each line if set — that hook can be a `curl` to any webhook, a chat bot or
-   `wall`, so delivery works with no third-party credentials in the repo.
+   `ops/observability/alerts-delivered.log` (deduplicating repeated
+   `ALERTMANAGER_UNREACHABLE` notices with a `${STATE}.unreachable` cooldown
+   file), and runs `$STELL_ALERT_HOOK` with each line if set — that hook can be
+   a `curl` to any webhook, a chat bot or `wall`, so delivery works with no
+   third-party credentials in the repo.
 
 ```sh
 mkdir -p ~/.config/systemd/user

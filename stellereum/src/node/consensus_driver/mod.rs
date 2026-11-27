@@ -84,6 +84,7 @@ pub(super) struct DriverState {
     pub(super) compact_served: u64,
     pub(super) last_probe: Instant,
     pub(super) last_mempool_save: Instant,
+    pub(super) last_mempool_kv_poll: Instant,
     pub(super) last_workchain_set_repair: Instant,
     pub(super) cast_prevote: Option<stellereum::consensus::Vote>,
     pub(super) cast_precommit: Option<stellereum::consensus::Vote>,
@@ -1102,19 +1103,34 @@ pub(crate) async fn run_consensus_node(
                     // fail-closed. Observed live: both nodes restarted
                     // together, neither had published yet, both refused, chain
                     // dead until manual wipe.
+                    let mut current_height = restored_state_height;
                     let mut healed = false;
                     for attempt in 1..=HEAL_MAX_ATTEMPTS {
-                        match catchup::heal_engine_to_head(
-                            &adapter,
-                            &mut rt,
-                            &ap.storage(),
-                            block_shard,
-                            restored_state_height,
-                            fh,
-                            fhash,
+                        // Track `current_height` in-place rather than reading
+                        // `rt.finalized.last()` (which already holds `fh` from
+                        // boot seeding) so partial progress S+1..=S+k is never
+                        // replayed from stale S on retry.
+                        let attempt_res = match tokio::time::timeout(
+                            HEAL_ENGINE_TIMEOUT,
+                            catchup::heal_engine_to_head(
+                                &adapter,
+                                &mut rt,
+                                &ap.storage(),
+                                block_shard,
+                                &mut current_height,
+                                fh,
+                                fhash,
+                            ),
                         )
                         .await
                         {
+                            Ok(res) => res,
+                            Err(_) => Err(format!(
+                                "healing timed out after {}s (engine progressed to {current_height})",
+                                HEAL_ENGINE_TIMEOUT.as_secs()
+                            )),
+                        };
+                        match attempt_res {
                             Ok(reached) => {
                                 info!("[storage] healed engine to height {reached}");
                                 {
@@ -1140,6 +1156,9 @@ pub(crate) async fn run_consensus_node(
                                 break;
                             }
                             Err(e) => {
+                                // Retain any partial replay progress S+1..=S+k
+                                // across retries and fail-closed reporting.
+                                restored_state_height = current_height;
                                 if heal_failure_should_exit(attempt) {
                                     // Fail CLOSED: the engine is still at
                                     // `restored_state_height < fh` and its
@@ -1241,6 +1260,35 @@ pub(crate) async fn run_consensus_node(
                             tracing::error!("{msg}");
                             sigkill_reconcile_failed = Some(msg);
                         }
+                    }
+                }
+            }
+        }
+
+        // EXECUTION_PIPELINE_V1: seed `post_state_roots` from the restored/healed
+        // engine state (or genesis when starting fresh) plus the lag-2 predecessor
+        // root from storage so lag-2 proposing and validation work immediately
+        // across genesis and restarts.
+        if restored_state_height == 0 && rt.finalized.is_empty() {
+            rt.ensure_genesis_root_seeded().await;
+        } else if restored_state_height > 0 {
+            let restored_root = rt.state.get_state_root().await;
+            rt.note_post_state_root(restored_state_height, restored_root);
+            let needed = stellereum::chain_spec::committed_state_height_at(rt.hc.height);
+            if !rt.post_state_roots.contains_key(&needed) {
+                if let Some(ap) = &persistence {
+                    if let Ok(Some(prev_root)) = ap.storage().finalized_post_root_at(needed) {
+                        rt.note_post_state_root(needed, prev_root);
+                    } else if needed == 0 {
+                        if let Ok(Some(g_bytes)) = ap.storage().get_meta("genesis_state_root") {
+                            if let Ok(g_arr) = <[u8; 32]>::try_from(g_bytes.as_slice()) {
+                                rt.note_post_state_root(0, g_arr);
+                            }
+                        }
+                    } else if let Ok(Some(hdr)) = ap.storage().header_at(
+                        stellereum::chain_spec::anchor_height_for_post_state_at(needed),
+                    ) {
+                        rt.note_post_state_root(needed, hdr.state_root);
                     }
                 }
             }
@@ -1615,6 +1663,34 @@ pub(crate) async fn run_consensus_node(
         info!("[sync] caught up to height {h} before joining consensus");
     }
 
+    // Ensure `post_state_roots` covers `committed_state_height_at(rt.hc.height)`
+    // after startup catch-up (genesis, snapshot sync, or tail walk).
+    if rt.finalized.is_empty() && rt.apply_in_flight_depth() == 0 {
+        rt.ensure_genesis_root_seeded().await;
+    } else {
+        let needed = stellereum::chain_spec::committed_state_height_at(rt.hc.height);
+        if !rt.post_state_roots.contains_key(&needed) {
+            if let Some(ap) = &persistence {
+                if let Ok(Some(prev_root)) = ap.storage().finalized_post_root_at(needed) {
+                    rt.note_post_state_root(needed, prev_root);
+                } else if needed == 0 {
+                    if let Ok(Some(g_bytes)) = ap.storage().get_meta("genesis_state_root") {
+                        if let Ok(g_arr) = <[u8; 32]>::try_from(g_bytes.as_slice()) {
+                            rt.note_post_state_root(0, g_arr);
+                        }
+                    }
+                } else if let Ok(Some(hdr)) =
+                    ap.storage()
+                        .header_at(stellereum::chain_spec::anchor_height_for_post_state_at(
+                            needed,
+                        ))
+                {
+                    rt.note_post_state_root(needed, hdr.state_root);
+                }
+            }
+        }
+    }
+
     // BFT-02: Restore vote history from persisted checkpoint to guarantee crash-resilience
     // and strictly forbid accidental self-equivocation across restarts.
     //
@@ -1835,6 +1911,7 @@ pub(crate) async fn run_consensus_node(
         compact_served: 0,
         last_probe: now_wall - Duration::from_secs(60),
         last_mempool_save: now_wall,
+        last_mempool_kv_poll: now_wall - Duration::from_millis(MEMPOOL_KV_POLL_INTERVAL_MS),
         last_workchain_set_repair: now_wall,
         cast_prevote: None,
         cast_precommit: None,

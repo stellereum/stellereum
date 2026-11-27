@@ -69,6 +69,15 @@ fuzz_target!(|data: &[u8]| {
 
         // --- (3) the two post-quantum signature envelopes -----------------
         let _ = stellereum::sharding::PqSignatureEnvelope::decode(data);
+        if let Ok(env) = stellereum::sharding::PqSignatureEnvelope::decode_canonical(data) {
+            assert_eq!(
+                env.encode(),
+                data,
+                "canonical PQ1 envelope must re-encode identically"
+            );
+        }
+        let _ = stellereum::sharding::PqSignatureEnvelope::decode_at_height(data, false);
+        let _ = stellereum::sharding::PqSignatureEnvelope::decode_at_height(data, true);
         let _ = stellereum::post_quantum::PqSignatureEnvelope::decode(data);
     }));
     // A panic (including an assertion above) is the bug this harness

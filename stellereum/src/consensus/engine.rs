@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use super::qc_split::produce_decision_certificate_with_schedule;
 use super::rotation::pq_key_at_height;
@@ -655,6 +655,9 @@ fn batch_signature_screens_for_tests() -> u64 {
     BATCH_SIGNATURE_SCREENS.with(|c| c.get())
 }
 
+/// Maximum equivocation pairs recorded per voter in [`VoteSet::equivocations`].
+pub const MAX_EQUIVOCATIONS_PER_VOTER: usize = 4;
+
 #[derive(Clone, Debug, Default)]
 pub struct VoteSet {
     /// voter -> vote (at most one accepted per voter)
@@ -752,7 +755,12 @@ impl VoteSet {
                             || (b.block_hash == existing.block_hash
                                 && a.block_hash == vote.block_hash))
                 });
-                if !already {
+                let voter_count = self
+                    .equivocations
+                    .iter()
+                    .filter(|(v, _, _)| *v == vote.voter)
+                    .count();
+                if !already && voter_count < MAX_EQUIVOCATIONS_PER_VOTER {
                     self.equivocations
                         .push((vote.voter, existing.clone(), vote));
                 }
@@ -1079,6 +1087,7 @@ impl VoteSet {
                 signatures.push((v.voter, v.ed25519_signature().to_vec()));
             }
         }
+        signatures.sort_by_key(|(id, _)| *id);
         let mut qc = QuorumCertificate {
             height: self.votes.values().next()?.height,
             round: self.votes.values().next()?.round,
@@ -1095,7 +1104,7 @@ impl VoteSet {
         // Post-Quantum Micro-Certificate (µQC) compilation:
         // When collected votes carry Falcon-512 signatures, compile PqMicroCertificate
         // and attach PQ_UQC_MARKER_ID to the resulting QuorumCertificate.
-        let mut falcon_sigs: HashMap<ValidatorId, Vec<u8>> = HashMap::new();
+        let mut falcon_sigs: BTreeMap<ValidatorId, Vec<u8>> = BTreeMap::new();
         for v in self.votes.values() {
             if v.block_hash == target {
                 if let Some(fsig) = v.falcon_signature() {
@@ -1361,7 +1370,7 @@ pub struct HeightConsensus {
     /// or re-enveloped frame: after a restart the set is empty, so a stale
     /// retransmit can no longer own the current round's slot and block the
     /// locked value's re-stamp (RESTART-SPLIT).
-    signed_admitted: HashSet<BlockHash>,
+    signed_admitted: HashMap<BlockHash, Round>,
     /// locked value: (block_hash, round at which we locked)
     ///
     /// The hash is the SIGNED identity of the body we locked (it commits the
@@ -1371,7 +1380,7 @@ pub struct HeightConsensus {
     /// (ruleset v6).
     pub locked: Option<(BlockHash, Round)>,
     /// Round-free value identity per block hash known at THIS height (ruleset
-    /// v6).
+    /// v6), paired with the local round at which it was recorded for pruning.
     ///
     /// A lock is on a VALUE, not on the bits of one signed proposal. When a
     /// proposer re-stamps its locked body at the current round, the body hash
@@ -1382,7 +1391,7 @@ pub struct HeightConsensus {
     /// the signed hash remains the map key everywhere else (votes, QCs,
     /// finality), and an unknown hash falls back to plain equality
     /// (conservative: absence of identity is never identity).
-    value_ids: HashMap<BlockHash, [u8; 32]>,
+    value_ids: HashMap<BlockHash, ([u8; 32], Round)>,
     /// votes keyed by (round, kind)
     pub(super) prevotes: HashMap<Round, VoteSet>,
     pub(super) precommits: HashMap<Round, VoteSet>,
@@ -1635,7 +1644,7 @@ impl HeightConsensus {
             proposal: None,
             proposal_round: None,
             proposal_signed_round: None,
-            signed_admitted: HashSet::new(),
+            signed_admitted: HashMap::new(),
             locked: None,
             value_ids: HashMap::new(),
             prevotes: HashMap::new(),
@@ -1902,7 +1911,7 @@ impl HeightConsensus {
         // a body proposed at r, and a current-round re-stamp is always live.
         if signed_round.saturating_add(1) < self.round
             && !already_signed_admitted
-            && !self.signed_admitted.contains(&block_hash)
+            && !self.signed_admitted.contains_key(&block_hash)
         {
             return Ok(());
         }
@@ -1912,7 +1921,8 @@ impl HeightConsensus {
         // Remember every body admitted at (or one round before) its signed
         // round so a genuine later re-serve stays live. `next_round` does not
         // clear this: the body remains a legitimate value for this height.
-        self.signed_admitted.insert(block_hash);
+        self.signed_admitted
+            .insert(block_hash, self.round.max(signed_round));
         Ok(())
     }
 
@@ -1921,7 +1931,7 @@ impl HeightConsensus {
     /// a legitimate verbatim re-serve from a stale frame first seen under a
     /// fresh envelope (RESTART-SPLIT).
     pub fn was_signed_admitted(&self, block_hash: &BlockHash) -> bool {
-        self.signed_admitted.contains(block_hash)
+        self.signed_admitted.contains_key(block_hash)
     }
 
     /// True only when we hold a proposal accepted in the CURRENT round. Voting
@@ -1940,12 +1950,12 @@ impl HeightConsensus {
     /// locked value" from "a different value" — something the signed hash
     /// alone cannot express. Idempotent and cheap.
     pub fn note_value_id(&mut self, block_hash: BlockHash, value_id: [u8; 32]) {
-        self.value_ids.insert(block_hash, value_id);
+        self.value_ids.insert(block_hash, (value_id, self.round));
     }
 
     /// The registered round-free identity of `block_hash`, if known.
     pub fn value_id_of(&self, block_hash: &BlockHash) -> Option<[u8; 32]> {
-        self.value_ids.get(block_hash).copied()
+        self.value_ids.get(block_hash).map(|(vid, _)| *vid)
     }
 
     /// True when two block hashes name the SAME value (ruleset v6).
@@ -2751,6 +2761,27 @@ impl HeightConsensus {
             self.prevote_qc.remove(&round);
             excess -= 1;
         }
+
+        // Prune stale round entries in `value_ids` and `signed_admitted`
+        // (retaining the last 16 rounds plus any currently active locked,
+        // proposal, or polka block hash so BFT lock safety is preserved).
+        const MAX_VALUE_ID_ROUND_WINDOW: Round = 16;
+        let retain_floor = self.round.saturating_sub(MAX_VALUE_ID_ROUND_WINDOW);
+        let locked_hash = self.locked.map(|(h, _)| h);
+        let proposal_hash = self.proposal.map(|(_, h)| h);
+        let polka_hash = self.observed_polka.map(|(_, h)| h);
+        self.value_ids.retain(|h, (_, r)| {
+            *r >= retain_floor
+                || Some(*h) == locked_hash
+                || Some(*h) == proposal_hash
+                || Some(*h) == polka_hash
+        });
+        self.signed_admitted.retain(|h, r| {
+            *r >= retain_floor
+                || Some(*h) == locked_hash
+                || Some(*h) == proposal_hash
+                || Some(*h) == polka_hash
+        });
     }
 
     /// View change: advance to the next round, resetting per-round proposal state.
@@ -3256,6 +3287,10 @@ impl HeightConsensus {
 // Multi-height driver (pipelined)
 // ============================================================================
 
+/// Maximum number of recent finalized heights retained in
+/// [`ConsensusDriver::finalized`].
+pub const MAX_DRIVER_FINALIZED_WINDOW: usize = 512;
+
 /// Drives consensus across heights. A single engine per height is created on
 /// demand; once decided, the driver records finality and can advance.
 #[derive(Clone, Debug, Default)]
@@ -3289,6 +3324,9 @@ impl ConsensusDriver {
         if let Some(cur) = &self.current {
             if let Some(block) = cur.decided {
                 self.finalized.insert(cur.height, block);
+                while self.finalized.len() > MAX_DRIVER_FINALIZED_WINDOW {
+                    let _ = self.finalized.pop_first();
+                }
                 let next = cur.height + 1;
                 let mut fresh = HeightConsensus::new(next, self.validators.clone());
                 fresh.set_parent_hash(block);
@@ -3414,5 +3452,145 @@ mod f1x_review_tests {
             1,
             "re-setting the same parent must keep derived state"
         );
+    }
+
+    #[test]
+    fn certificate_with_schedule_deterministic_signature_order() {
+        let target = Some([0xABu8; 32]);
+        let parent = [0xCDu8; 32];
+        let mut validators_vec = Vec::new();
+        let mut votes = Vec::new();
+        for i in 0..4u8 {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[0x40 + i; 32]);
+            let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0x80 + i);
+            let id = sk.verifying_key().to_bytes();
+            crate::consensus::register_validator_pq_key(
+                id,
+                crate::post_quantum::PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
+            validators_vec.push((id, 10));
+            votes.push(Vote::sign_with_falcon(
+                &sk,
+                &fk,
+                10,
+                0,
+                VoteKind::Precommit,
+                target,
+            ));
+        }
+        let vs = ValidatorSet::from_list(validators_vec);
+
+        let mut set_fwd = VoteSet::new();
+        for v in &votes {
+            set_fwd
+                .add(v.clone(), &vs, 10, 0, VoteKind::Precommit)
+                .unwrap();
+        }
+        let mut set_rev = VoteSet::new();
+        for v in votes.iter().rev() {
+            set_rev
+                .add(v.clone(), &vs, 10, 0, VoteKind::Precommit)
+                .unwrap();
+        }
+
+        let qc_fwd = set_fwd
+            .certificate_with_schedule(target, &vs, Some(&parent), CommitteeSchedule::ParentHash)
+            .expect("fwd qc");
+        let qc_rev = set_rev
+            .certificate_with_schedule(target, &vs, Some(&parent), CommitteeSchedule::ParentHash)
+            .expect("rev qc");
+
+        assert_eq!(qc_fwd, qc_rev);
+        assert_eq!(
+            bincode::serialize(&qc_fwd).unwrap(),
+            bincode::serialize(&qc_rev).unwrap()
+        );
+        let non_marker_ids: Vec<ValidatorId> = qc_fwd
+            .signatures
+            .iter()
+            .filter(|(id, _)| *id != super::super::types::PQ_UQC_MARKER_ID)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut sorted = non_marker_ids.clone();
+        sorted.sort();
+        assert_eq!(non_marker_ids, sorted);
+    }
+
+    #[test]
+    fn vote_set_caps_equivocations_per_voter() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0x71);
+        let id = sk.verifying_key().to_bytes();
+        crate::consensus::register_validator_pq_key(
+            id,
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+        let vs = ValidatorSet::from_list(vec![(id, 10)]);
+        let mut set = VoteSet::new();
+        let first = Vote::sign_with_falcon(&sk, &fk, 5, 0, VoteKind::Prevote, Some([0x01u8; 32]));
+        set.add(first, &vs, 5, 0, VoteKind::Prevote).unwrap();
+
+        for i in 2..12u8 {
+            let conflict = Vote::sign_with_falcon(&sk, &fk, 5, 0, VoteKind::Prevote, Some([i; 32]));
+            set.add(conflict, &vs, 5, 0, VoteKind::Prevote).unwrap();
+        }
+        assert_eq!(set.equivocations().len(), MAX_EQUIVOCATIONS_PER_VOTER);
+    }
+
+    #[test]
+    fn height_consensus_prunes_stale_value_ids_and_signed_admitted() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]);
+        let id = sk.verifying_key().to_bytes();
+        let vs = ValidatorSet::from_list(vec![(id, 10)]);
+        let mut hc = HeightConsensus::new(1, vs);
+
+        let bh_locked = [0xA1u8; 32];
+        let vid_locked = [0xB1u8; 32];
+        let proposer = hc.proposer().unwrap();
+        hc.receive_proposal_for_at(proposer, bh_locked, Some(proposer), 0)
+            .unwrap();
+        hc.note_value_id(bh_locked, vid_locked);
+        hc.locked = Some((bh_locked, 0));
+
+        hc.next_round();
+        let bh_stale = [0xA2u8; 32];
+        let vid_stale = [0xB2u8; 32];
+        let proposer1 = hc.proposer().unwrap();
+        hc.receive_proposal_for_at(proposer1, bh_stale, Some(proposer1), 1)
+            .unwrap();
+        hc.note_value_id(bh_stale, vid_stale);
+
+        for _ in 0..20 {
+            hc.next_round();
+        }
+        assert!(hc.value_id_of(&bh_stale).is_none());
+        assert!(!hc.was_signed_admitted(&bh_stale));
+        assert_eq!(hc.value_id_of(&bh_locked), Some(vid_locked));
+        assert!(hc.was_signed_admitted(&bh_locked));
+    }
+
+    #[test]
+    fn consensus_driver_prunes_finalized_tail_window() {
+        let vs = ValidatorSet::from_list(vec![([0x55u8; 32], 10)]);
+        let mut driver = ConsensusDriver::new(vs, 1);
+        for h in 1..=(MAX_DRIVER_FINALIZED_WINDOW as u64 + 10) {
+            let mut block = [0u8; 32];
+            block[..8].copy_from_slice(&h.to_le_bytes());
+            if let Some(cur) = driver.current.as_mut() {
+                cur.decided = Some(block);
+            }
+            driver.advance();
+        }
+        assert_eq!(driver.finalized.len(), MAX_DRIVER_FINALIZED_WINDOW);
+        let mut first_block = [0u8; 32];
+        first_block[..8].copy_from_slice(&1u64.to_le_bytes());
+        assert!(!driver.is_final(1, first_block));
+
+        let last_h = MAX_DRIVER_FINALIZED_WINDOW as u64 + 10;
+        let mut last_block = [0u8; 32];
+        last_block[..8].copy_from_slice(&last_h.to_le_bytes());
+        assert!(driver.is_final(last_h, last_block));
     }
 }

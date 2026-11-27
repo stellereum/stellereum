@@ -118,6 +118,41 @@ pub struct TempoConfig {
     pub deadlock_timeout_secs: Option<u64>,
 }
 
+fn deserialize_opt_shards<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let val = Option::<Value>::deserialize(d)?;
+    match val {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(Value::Array(items)) => {
+            let mut parts = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::Number(n) => {
+                        let id = n.as_u64().ok_or_else(|| {
+                            D::Error::custom("shard id must be an unsigned integer")
+                        })?;
+                        parts.push(id.to_string());
+                    }
+                    Value::String(s) => parts.push(s),
+                    other => {
+                        return Err(D::Error::custom(format!(
+                            "invalid shard entry in shards array: {other}"
+                        )));
+                    }
+                }
+            }
+            Ok(Some(parts.join(",")))
+        }
+        Some(other) => Err(D::Error::custom(format!(
+            "shards must be a string or array of integers, got {other}"
+        ))),
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConsensusConfig {
@@ -125,6 +160,7 @@ pub struct ConsensusConfig {
     pub observer: Option<bool>,
     pub workchain_observer: Option<bool>,
     pub new_chain: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_opt_shards")]
     pub shards: Option<String>,
     pub experimental_shards: Option<bool>,
     pub pure_pq: Option<bool>,
@@ -1159,6 +1195,16 @@ impl NodeTomlConfig {
             self.tempo.min_block_ms,
             DEFAULT_MIN_BLOCK_MS,
         );
+        let round_timeout_env_set = env_get("STELL_ROUND_TIMEOUT_MS")
+            .filter(|s| !s.trim().is_empty())
+            .is_some();
+        if self.tempo.round_timeout_ms.is_some() || round_timeout_env_set {
+            report.warnings.push(format!(
+                "tempo.round_timeout_ms / STELL_ROUND_TIMEOUT_MS is deprecated and ignored: \
+                 FROZEN_ROUND_TIMEOUT_BASE_MS = {} ms is consensus-frozen",
+                crate::consensus::FROZEN_ROUND_TIMEOUT_BASE_MS
+            ));
+        }
         let round_timeout_ms = resolve_u64(
             &mut settings,
             &mut report,
@@ -2445,7 +2491,6 @@ mod tests {
 [tempo]
 tick_ms = 50
 min_block_ms = 50
-round_timeout_ms = 3_000
 straggler_grace_ms = 500
 straggler_grace_cap_ms = 10_000
 
@@ -2490,7 +2535,7 @@ runtime_workers = 4
 "#;
         let cfg = NodeTomlConfig::from_toml_str(toml).expect("valid TOML must parse");
         assert_eq!(cfg.tempo.tick_ms, Some(50));
-        assert_eq!(cfg.tempo.round_timeout_ms, Some(3000));
+        assert_eq!(cfg.tempo.round_timeout_ms, None);
         assert_eq!(cfg.storage.archive, Some(false));
         assert_eq!(cfg.storage.keep_blocks, Some(8000));
         assert_eq!(cfg.faucet.faucet_drip_stell, Some(5));
@@ -2652,5 +2697,35 @@ rpc_listen = "0.0.0.0:8545"
             discover_toml_path_with_env(None, None, missing).unwrap(),
             TomlPathSource::None
         );
+    }
+
+    #[test]
+    fn round_timeout_override_emits_frozen_warning_and_shards_array_parses() {
+        let cfg = NodeTomlConfig::from_toml_str(
+            r#"
+[tempo]
+round_timeout_ms = 5000
+[consensus]
+shards = [0]
+"#,
+        )
+        .expect("parse deprecated round_timeout_ms and shards array");
+        assert_eq!(cfg.tempo.round_timeout_ms, Some(5000));
+        assert_eq!(cfg.consensus.shards.as_deref(), Some("0"));
+        let rep = cfg.validate_with_env(|_| None);
+        assert!(rep.is_ok());
+        assert!(rep
+            .warnings
+            .iter()
+            .any(|w| w.contains("FROZEN_ROUND_TIMEOUT_BASE_MS")));
+
+        let empty_cfg = NodeTomlConfig::default();
+        let mut env = HashMap::new();
+        env.insert("STELL_ROUND_TIMEOUT_MS", "4500".to_string());
+        let env_rep = empty_cfg.validate_with_env(|k| env.get(k).cloned());
+        assert!(env_rep
+            .warnings
+            .iter()
+            .any(|w| w.contains("FROZEN_ROUND_TIMEOUT_BASE_MS")));
     }
 }

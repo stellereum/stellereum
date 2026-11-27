@@ -138,6 +138,9 @@ fn resolve_addr(host_port: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("cannot resolve {host_port:?}: no addresses"))
 }
 
+/// Maximum HTTP JSON-RPC response size accepted by the wallet client (16 MiB).
+pub const MAX_RPC_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Policy: an API token must never travel over cleartext HTTP to a REMOTE
 /// host. Loopback (`127.0.0.1`/`localhost`/`::1`) is exempt: the bytes never
 /// leave the host (secure-context model — same as Bitcoin Core's localhost
@@ -152,30 +155,65 @@ pub fn check_http_token_policy(url: &str, api_token: Option<&str>) -> Result<(),
     if token.is_empty() {
         return Ok(());
     }
-    if !url.starts_with("http://") {
+    if url
+        .get(..8)
+        .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
+    {
         return Ok(()); // https: encrypted transport
     }
+    let cleartext_err = || {
+        Err(
+            "refusing to send API token over cleartext http to a non-loopback host: \
+             use https or unset the token"
+                .to_string(),
+        )
+    };
+    let Some(after_scheme) = url
+        .get(..7)
+        .filter(|s| s.eq_ignore_ascii_case("http://"))
+        .map(|_| &url[7..])
+    else {
+        return cleartext_err();
+    };
     // Loopback exemption: EXACT host match (never substring — a
-    // `localhost.evil.com` DNS-rebinding name must not pass).
-    let host = url
-        .strip_prefix("http://")
-        .unwrap_or(url)
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("");
-    let host_only = host
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(host)
-        .trim_matches(|c| c == '[' || c == ']');
-    if host_only == "127.0.0.1" || host_only == "localhost" || host_only == "::1" {
+    // `localhost.evil.com` DNS-rebinding name or `127.0.0.1:x@evil.com`
+    // userinfo confusion must not pass).
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return cleartext_err();
+    }
+    let is_loopback = if let Some(rest) = authority.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((ipv6_lit, tail)) => {
+                let valid_port = tail.is_empty()
+                    || tail
+                        .strip_prefix(':')
+                        .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+                valid_port
+                    && ipv6_lit
+                        .parse::<std::net::Ipv6Addr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            }
+            None => false,
+        }
+    } else if authority.contains(['[', ']']) {
+        false
+    } else {
+        let host_only = match authority.split_once(':') {
+            Some((h, port)) => {
+                if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+                    return cleartext_err();
+                }
+                h
+            }
+            None => authority,
+        };
+        host_only == "127.0.0.1" || host_only == "localhost"
+    };
+    if is_loopback {
         return Ok(());
     }
-    Err(
-        "refusing to send API token over cleartext http to a non-loopback host: \
-         use https or unset the token"
-            .to_string(),
-    )
+    cleartext_err()
 }
 
 /// Raw HTTP/1.1 POST with HTTPS and HTTP support.
@@ -223,15 +261,24 @@ fn http_post(url: &str, body: &str, api_token: Option<&str>) -> Result<String, S
 
         let mut raw = Vec::new();
         stream
+            .take((MAX_RPC_RESPONSE_BYTES + 1) as u64)
             .read_to_end(&mut raw)
             .map_err(|e| format!("HTTP read from {host_port} failed: {e}"))?;
+        if raw.len() > MAX_RPC_RESPONSE_BYTES {
+            return Err(format!(
+                "HTTP response from {host_port} exceeded max size ({MAX_RPC_RESPONSE_BYTES} bytes)"
+            ));
+        }
         let text = String::from_utf8_lossy(&raw).into_owned();
         let (head, response_body) = match text.find("\r\n\r\n") {
             Some(i) => (text[..i].to_string(), text[i + 4..].to_string()),
             None => return Err("malformed HTTP response (no header/body split)".to_string()),
         };
-        let status_line = head.lines().next().unwrap_or("");
-        if !status_line.contains(" 200") {
+        let status_line = head.lines().next().unwrap_or("").trim_end_matches('\r');
+        let mut status_parts = status_line.split_whitespace();
+        let http_version = status_parts.next().unwrap_or("");
+        let status_code = status_parts.next().and_then(|s| s.parse::<u16>().ok());
+        if !http_version.starts_with("HTTP/") || status_code != Some(200) {
             return Err(format!(
                 "HTTP {} from {host_port}: {}",
                 status_line.trim(),
@@ -541,19 +588,25 @@ pub fn verify_spv_balance_answer(address: &[u8; 32], answer: &SpvAnswer) -> SpvV
             };
         }
     };
+    let mut expected = [0u8; 16];
+    expected[..8].copy_from_slice(&answer.balance.to_be_bytes());
+    expected[8..16].copy_from_slice(&answer.nonce.to_be_bytes());
     if let Some(leaf) = &answer.leaf_data {
-        if stellereum::cell::PatriciaTrie::verify_merkle_proof(
-            &answer.state_root,
-            address,
-            leaf,
-            proof,
-        ) {
+        let valid_len = leaf.len() == stellereum::cpat2::ACCOUNT_LEAF_LEN_LEGACY
+            || leaf.len() == stellereum::cpat2::ACCOUNT_LEAF_LEN_PQ;
+        if valid_len
+            && leaf[..16] == expected[..]
+            && stellereum::cell::PatriciaTrie::verify_merkle_proof(
+                &answer.state_root,
+                address,
+                leaf,
+                proof,
+            )
+        {
             return SpvVerdict::Verified;
         }
+        return SpvVerdict::Failed;
     }
-    let mut expected = Vec::with_capacity(16);
-    expected.extend_from_slice(&answer.balance.to_be_bytes());
-    expected.extend_from_slice(&answer.nonce.to_be_bytes());
     if stellereum::cell::PatriciaTrie::verify_merkle_proof(
         &answer.state_root,
         address,
@@ -867,6 +920,7 @@ pub fn faucet_drip(
     let token = cfg.faucet_token.clone().ok_or_else(|| {
         "no faucet token: pass --faucet-token or set STELL_FAUCET_TOKEN".to_string()
     })?;
+    check_http_token_policy(&cfg.url, Some(&token))?;
     let mut params = serde_json::json!({ "address": address_hex, "token": token });
     if let Some(a) = amount_nano {
         params["amount"] = serde_json::json!(a);

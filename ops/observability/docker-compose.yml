@@ -7,7 +7,7 @@
 #   are only reachable through the SSH tunnels opened by
 #   scripts/observe-local.sh on this host. Host networking makes the
 #   container's 127.0.0.1 the host's 127.0.0.1, so the scrape targets are
-#   literally the tunnel ports (9080-9082) and B's 8080. Nothing is exposed on
+#   literally the tunnel ports (9080-9082) and B's 18081. Nothing is exposed on
 #   a public interface: each service is told to bind 127.0.0.1 explicitly.
 #
 # SECRETS: none live in this file. Copy .env.example to .env (mode 0600) and

@@ -9,7 +9,14 @@
 
 import { isDuplicateMessage, isRetryableError, RpcError, SignerError } from "./errors.ts";
 import { StellereumProvider, type StellereumProviderOptions } from "./provider.ts";
-import type { FalconSigner, SignRequest, SignResponse, TxIntent } from "./signer.ts";
+import {
+  buildContractDeployTransaction,
+  type ContractDeployIntent,
+  type FalconSigner,
+  type SignRequest,
+  type SignResponse,
+  type TxIntent,
+} from "./signer.ts";
 import {
   BuilderError,
   buildEvmBinding,
@@ -50,7 +57,7 @@ export interface SignedTransaction {
 
 export interface BuildAndSignOptions {
   nonce?: number;
-  chainId?: number;
+  chainId?: number | null;
   baseFee?: number;
   gasLimit?: number;
   priorityFeePerGas?: number;
@@ -247,14 +254,47 @@ export class StellereumClient {
    * supplied: `max(opcode_gas, base_fee) + 45_000 (explicit PQ1) + priority`.
    */
   async buildAndSign(intent: TxIntent, options: BuildAndSignOptions = {}): Promise<SignedTransaction> {
-    const chainId =
-      options.chainId ?? intent.chain_id ?? (await this.chainId());
+    if (intent.kind === "contractDeploy" || intent.kind === "contract_deploy") {
+      const code = intent.code ?? intent.code_hex;
+      if (code === undefined) {
+        throw new SignerError("invalid_argument", "contractDeploy requires code or code_hex");
+      }
+      return this.contractDeploy(code, {
+        nonce: options.nonce ?? intent.nonce,
+        chainId: options.chainId ?? intent.chainId ?? intent.chain_id,
+        baseFee: options.baseFee ?? intent.base_fee,
+        gasLimit: options.gasLimit ?? intent.gas ?? intent.gas_limit,
+        priorityFeePerGas: options.priorityFeePerGas ?? intent.priority_fee_per_gas,
+        implicit: options.implicit ?? intent.implicit,
+        unbound: options.unbound ?? intent.unbound,
+        abi: intent.abi ?? intent.abi_json,
+      });
+    }
+    const isUnbound = (options.unbound ?? intent.unbound) === true;
+    if (!isUnbound && (options.chainId === null || intent.chain_id === null)) {
+      throw new SignerError("invalid_argument", "chainId: null requires unbound: true");
+    }
+    const chainId = isUnbound
+      ? null
+      : (options.chainId ?? intent.chain_id ?? (await this.chainId()));
     const nonce =
       options.nonce ?? intent.nonce ?? (await this.nonce(this.address()));
     const baseFee = options.baseFee ?? intent.base_fee ?? (await this.baseFee());
 
+    const normalizedIntent: TxIntent =
+      intent.kind === "contract_call_raw" && intent.rawCalldata !== undefined && intent.calldata_hex === undefined
+        ? {
+            ...intent,
+            calldata_hex:
+              typeof intent.rawCalldata === "string"
+                ? intent.rawCalldata
+                : Array.from(intent.rawCalldata, (b) => b.toString(16).padStart(2, "0")).join(""),
+          }
+        : intent;
+
+    const isImplicit = (options.implicit ?? intent.implicit) === true;
     const tx: TxIntent = {
-      ...intent,
+      ...normalizedIntent,
       nonce,
       chain_id: chainId,
       base_fee: baseFee,
@@ -263,8 +303,8 @@ export class StellereumClient {
       ...(options.gasLimit !== undefined || intent.gas_limit !== undefined
         ? { gas_limit: options.gasLimit ?? intent.gas_limit }
         : {}),
-      ...(options.implicit === true ? { implicit: true } : {}),
-      ...(options.unbound === true ? { unbound: true } : {}),
+      ...(isImplicit ? { implicit: true } : {}),
+      ...(isUnbound ? { unbound: true } : {}),
     };
 
     const resp = await this.signer.sign({ tx });
@@ -274,6 +314,46 @@ export class StellereumClient {
   /** Convenience: native transfer. */
   transfer(to: string, amount: number, options: BuildAndSignOptions = {}): Promise<SignedTransaction> {
     return this.buildAndSign({ kind: "transfer", to, amount }, options);
+  }
+
+  /** Convenience: WASM contract deploy (`OpCode::SysCallDeployContract` or `SysCallDeployContractWithAbi` when `options.abi` is set). */
+  async contractDeploy(
+    code: Uint8Array | string,
+    options: BuildAndSignOptions & { abi?: string | Record<string, unknown> } = {},
+  ): Promise<SignedTransaction> {
+    const from = this.address();
+    const isUnbound = options.unbound === true;
+    if (!isUnbound && options.chainId === null) {
+      throw new SignerError("invalid_argument", "chainId: null requires unbound: true");
+    }
+    const chainId = isUnbound ? null : await this.guardedChainId(options);
+    const nonce = options.nonce ?? (await this.nonce(from));
+    const baseFee =
+      options.baseFee ?? (options.gasLimit === undefined ? await this.baseFee() : undefined);
+    const intent: ContractDeployIntent & { from: string } = {
+      kind: "contractDeploy",
+      code,
+      ...(options.abi !== undefined ? { abi: options.abi } : {}),
+      from,
+      nonce,
+      chainId,
+      base_fee: baseFee,
+      gas_limit: options.gasLimit,
+      priority_fee_per_gas: options.priorityFeePerGas,
+      implicit: options.implicit,
+      unbound: options.unbound,
+    };
+    const unsigned = buildContractDeployTransaction(intent);
+    return this.signPrepared(unsigned, options.implicit === true, isUnbound);
+  }
+
+  /** Convenience: WASM contract deploy with inline ABI manifest (`OpCode::SysCallDeployContractWithAbi`). */
+  contractDeployWithAbi(
+    code: Uint8Array | string,
+    abi: string | Record<string, unknown>,
+    options: BuildAndSignOptions = {},
+  ): Promise<SignedTransaction> {
+    return this.contractDeploy(code, { ...options, abi });
   }
 
   /** Convenience: WASM contract call. */
@@ -286,6 +366,28 @@ export class StellereumClient {
   ): Promise<SignedTransaction> {
     return this.buildAndSign(
       { kind: "contract_call", contract, method, args, value },
+      options,
+    );
+  }
+
+  /**
+   * Convenience: WASM contract call with raw binary `host.calldata` bytes
+   * (e.g. for `*_pq` entrypoints).
+   */
+  contractCallRaw(
+    contract: string,
+    method: string,
+    rawCalldata: Uint8Array | string,
+    value = 0,
+    args: number[] = [],
+    options: BuildAndSignOptions = {},
+  ): Promise<SignedTransaction> {
+    const calldata_hex =
+      typeof rawCalldata === "string"
+        ? rawCalldata
+        : Array.from(rawCalldata, (b) => b.toString(16).padStart(2, "0")).join("");
+    return this.buildAndSign(
+      { kind: "contract_call_raw", contract, method, args, calldata_hex, value },
       options,
     );
   }
@@ -314,19 +416,26 @@ export class StellereumClient {
    * The Rust signer owns the Falcon key and refuses an unsigned transaction
    * whose `from` is not its address.
    */
-  async signPrepared(unsigned: UnsignedTransaction): Promise<SignedTransaction> {
+  async signPrepared(
+    unsigned: UnsignedTransaction,
+    implicit = false,
+    unbound = unsigned.chainId === null,
+  ): Promise<SignedTransaction> {
+    const isUnbound = unbound || unsigned.chainId === null;
     const resp = await this.signer.sign({
       tx: {
         kind: "prepared",
         tx_hex: unsigned.txHex,
-        chain_id: unsigned.chainId,
+        chain_id: isUnbound ? null : unsigned.chainId,
         priority_fee_per_gas: unsigned.priorityFeePerGas,
+        ...(implicit ? { implicit: true } : {}),
+        ...(isUnbound ? { unbound: true } : {}),
       },
     });
     return toSignedTransaction(resp);
   }
 
-  private async guardedChainId(options: { chainId?: number }): Promise<number> {
+  private async guardedChainId(options: { chainId?: number | null }): Promise<number> {
     const identity = this.configuredIdentity;
     const nodeChain = await this.chainId();
     const chain = options.chainId ?? identity.chainId;
@@ -365,6 +474,11 @@ export class StellereumClient {
       bindingSignature?: string;
       nonce?: number;
       chainId?: number;
+      baseFee?: number;
+      gasLimit?: number;
+      priorityFeePerGas?: number;
+      implicit?: boolean;
+      unbound?: boolean;
     },
   ): Promise<SignedTransaction> {
     const from = this.address();
@@ -383,7 +497,7 @@ export class StellereumClient {
       nonce,
       bindingSignature,
     });
-    return this.signPrepared(unsigned);
+    return this.signPrepared(unsigned, options.implicit === true, options.unbound === true);
   }
 
   /**
@@ -397,6 +511,11 @@ export class StellereumClient {
     options: Omit<EvmCarrierOptions, "from" | "chainId" | "intentSignature"> & {
       intentSignature?: string;
       chainId?: number;
+      baseFee?: number;
+      gasLimit?: number;
+      priorityFeePerGas?: number;
+      implicit?: boolean;
+      unbound?: boolean;
     },
   ): Promise<{ signed: SignedTransaction; plan: EvmCarrierPlan }> {
     const from = this.address();
@@ -407,30 +526,50 @@ export class StellereumClient {
       "intentSignature",
     );
     const plan = buildEvmCarrier({ ...options, from, chainId, intentSignature });
-    const signed = await this.signPrepared(plan);
+    const signed = await this.signPrepared(
+      plan,
+      options.implicit === true,
+      options.unbound === true,
+    );
     return { signed, plan };
   }
 
   /** Build, sign and return a block-carried governance proposal. */
   async govPropose(
-    options: Omit<GovProposeOptions, "from" | "nonce" | "chainId"> & { nonce?: number; chainId?: number },
+    options: Omit<GovProposeOptions, "from" | "nonce" | "chainId"> & {
+      nonce?: number;
+      chainId?: number;
+      baseFee?: number;
+      gasLimit?: number;
+      priorityFeePerGas?: number;
+      implicit?: boolean;
+      unbound?: boolean;
+    },
   ): Promise<SignedTransaction> {
     const from = this.address();
     const chainId = await this.guardedChainId(options);
     const nonce = options.nonce ?? (await this.nonce(from));
     const unsigned = buildGovPropose({ ...options, from, chainId, nonce });
-    return this.signPrepared(unsigned);
+    return this.signPrepared(unsigned, options.implicit === true, options.unbound === true);
   }
 
   /** Build, sign and return a block-carried governance vote. */
   async govVote(
-    options: Omit<GovVoteOptions, "from" | "nonce" | "chainId"> & { nonce?: number; chainId?: number },
+    options: Omit<GovVoteOptions, "from" | "nonce" | "chainId"> & {
+      nonce?: number;
+      chainId?: number;
+      baseFee?: number;
+      gasLimit?: number;
+      priorityFeePerGas?: number;
+      implicit?: boolean;
+      unbound?: boolean;
+    },
   ): Promise<SignedTransaction> {
     const from = this.address();
     const chainId = await this.guardedChainId(options);
     const nonce = options.nonce ?? (await this.nonce(from));
     const unsigned = buildGovVote({ ...options, from, chainId, nonce });
-    return this.signPrepared(unsigned);
+    return this.signPrepared(unsigned, options.implicit === true, options.unbound === true);
   }
 
   // ------------------------------------------------------------------

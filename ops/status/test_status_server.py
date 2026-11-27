@@ -47,6 +47,10 @@ class MockNodeState:
         self.block_interval_count = block_interval_count
         self.block_interval_sum = block_interval_sum
         self.validators_override = validators_override
+        self.jailed = False
+        self.known = True
+        self.validator_status_unsupported = False
+        self.node_id: str | None = None
         self.down = False
         self.drop_connection = False
 
@@ -101,7 +105,20 @@ class _MockNodeHandler(BaseHTTPRequestHandler):
             elif method == "stell_chainId":
                 res = st.chain_id
             elif method == "stell_nodeId":
-                res = st.validator_id
+                res = st.node_id if st.node_id is not None else st.validator_id
+            elif method == "stell_getValidatorStatus" and not st.validator_status_unsupported:
+                params = req.get("params") or {}
+                vid_req = params.get("validator", st.validator_id) if isinstance(params, dict) else st.validator_id
+                if st.validators_override is not None:
+                    active_ids = [e["validator"] for e in st.validators_override]
+                else:
+                    active_ids = self.server.all_validator_ids
+                res = {
+                    "validator": vid_req,
+                    "known": st.known,
+                    "jailed": st.jailed,
+                    "in_set": vid_req in active_ids,
+                }
             else:
                 payload = json.dumps(
                     {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": "not found"}}
@@ -341,7 +358,7 @@ class StatusServerTests(unittest.TestCase):
             self.assertIsNotNone(nd["error"])
 
     def test_jailed_validator_detected_via_validator_set(self) -> None:
-        # Remove validator D from active set returned by nodes
+        # Remove validator D from active set and mark it jailed in staking status
         subset = [
             {"validator": vid, "power": "1000"}
             for vid in self.validator_ids[:3]
@@ -349,6 +366,8 @@ class StatusServerTests(unittest.TestCase):
         for st in self.states:
             with st.lock:
                 st.validators_override = subset
+        with self.states[3].lock:
+            self.states[3].jailed = True
 
         monitor = status_server.StatusMonitor(
             targets=self.targets,
@@ -363,6 +382,79 @@ class StatusServerTests(unittest.TestCase):
         self.assertFalse(node_d["in_set"])
         self.assertTrue(node_d["jailed"])
         self.assertTrue(any("validator_jailed (D)" in r for r in snap["reasons"]))
+
+    def test_out_of_set_unjailed_validator_not_marked_jailed(self) -> None:
+        # Remove validator D from active set, but D is NOT jailed (e.g. unbonded / standby)
+        subset = [
+            {"validator": vid, "power": "1000"}
+            for vid in self.validator_ids[:3]
+        ]
+        for st in self.states:
+            with st.lock:
+                st.validators_override = subset
+        with self.states[3].lock:
+            self.states[3].jailed = False
+            self.states[3].known = True
+            self.states[3].efficiency = 0.0
+
+        monitor = status_server.StatusMonitor(
+            targets=self.targets,
+            interval_secs=15.0,
+            timeout_secs=2.0,
+            expected_validators=4,
+        )
+        snap = monitor.poll_once(now_ts=1_700_000_000)
+        self.assertEqual(snap["verdict"], "DEGRADED")
+        node_d = next(n for n in snap["nodes"] if n["node"] == "D")
+        self.assertTrue(node_d["ok"])
+        self.assertFalse(node_d["in_set"])
+        self.assertIs(node_d["jailed"], False)
+        self.assertTrue(any("validator_not_in_set (D)" in r for r in snap["reasons"]))
+        self.assertFalse(any("validator_jailed (D)" in r for r in snap["reasons"]))
+
+        # When unbonded (known=False), jailed must be None (not True)
+        with self.states[3].lock:
+            self.states[3].known = False
+        snap_unbonded = monitor.poll_once(now_ts=1_700_000_015)
+        node_d_unbonded = next(n for n in snap_unbonded["nodes"] if n["node"] == "D")
+        self.assertFalse(node_d_unbonded["in_set"])
+        self.assertIsNone(node_d_unbonded["jailed"])
+        self.assertFalse(any("validator_jailed (D)" in r for r in snap_unbonded["reasons"]))
+
+        # When stell_getValidatorStatus is unavailable, jailed must be None (not falsely True)
+        with self.states[3].lock:
+            self.states[3].known = True
+            self.states[3].validator_status_unsupported = True
+        snap_unavail = monitor.poll_once(now_ts=1_700_000_030)
+        node_d_unavail = next(n for n in snap_unavail["nodes"] if n["node"] == "D")
+        self.assertFalse(node_d_unavail["in_set"])
+        self.assertIsNone(node_d_unavail["jailed"])
+        self.assertTrue(any("validator_not_in_set (D)" in r for r in snap_unavail["reasons"]))
+        self.assertFalse(any("validator_jailed (D)" in r for r in snap_unavail["reasons"]))
+
+    def test_no_fallback_from_validator_id_to_node_id(self) -> None:
+        # Target without validator_id must NOT fall back to stell_nodeId (transport ID != ValidatorId)
+        targets_no_vid = [dict(t) for t in self.targets]
+        targets_no_vid[3]["validator_id"] = None
+        with self.states[3].lock:
+            self.states[3].node_id = "ff" * 32
+
+        monitor = status_server.StatusMonitor(
+            targets=targets_no_vid,
+            interval_secs=15.0,
+            timeout_secs=2.0,
+            expected_validators=4,
+        )
+        snap = monitor.poll_once(now_ts=1_700_000_000)
+        node_d = next(n for n in snap["nodes"] if n["node"] == "D")
+        self.assertTrue(node_d["ok"])
+        self.assertIsNone(node_d["validator_id"])
+        self.assertIsNone(node_d["in_set"])
+        self.assertIsNone(node_d["jailed"])
+        self.assertEqual(snap["cluster"]["active_validators"], 3)
+        self.assertEqual(snap["cluster"]["reachable_validators"], 4)
+        self.assertEqual(snap["verdict"], "DEGRADED")
+        self.assertTrue(any("validator_id_unknown (D)" in r for r in snap["reasons"]))
 
     def test_http_endpoints_html_json_health_readyz_metrics(self) -> None:
         monitor = status_server.StatusMonitor(
@@ -407,7 +499,16 @@ class StatusServerTests(unittest.TestCase):
             self.assertIn("Validator A", html_body)
             self.assertIn("30.00 / min", html_body)
 
-            for json_path in ("/api/status.json", "/status.json"):
+            for json_path in (
+                "/api/status.json",
+                "/status.json",
+                "/api/status",
+                "/status",
+                "/api/status/",
+                "/status/",
+                "/api/status.json/",
+                "/status.json/",
+            ):
                 code, headers, raw_json = _http_get(f"{base_url}{json_path}")
                 self.assertEqual(code, 200)
                 self.assertIn("application/json", headers["Content-Type"])
@@ -417,25 +518,27 @@ class StatusServerTests(unittest.TestCase):
                 self.assertAlmostEqual(data["cluster"]["finals_rate_10m"], 30.0, places=2)
                 self.assertEqual(len(data["nodes"]), 4)
 
-            for health_path in ("/health", "/healthz"):
+            for health_path in ("/health", "/healthz", "/health/", "/healthz/"):
                 code, _, raw_health = _http_get(f"{base_url}{health_path}")
                 self.assertEqual(code, 200)
                 self.assertEqual(json.loads(raw_health)["status"], "ok")
 
-            code, _, raw_ready = _http_get(f"{base_url}/readyz")
-            self.assertEqual(code, 200)
-            ready_obj = json.loads(raw_ready)
-            self.assertTrue(ready_obj["ready"])
-            self.assertEqual(ready_obj["verdict"], "HEALTHY")
+            for ready_path in ("/readyz", "/readyz/"):
+                code, _, raw_ready = _http_get(f"{base_url}{ready_path}")
+                self.assertEqual(code, 200)
+                ready_obj = json.loads(raw_ready)
+                self.assertTrue(ready_obj["ready"])
+                self.assertEqual(ready_obj["verdict"], "HEALTHY")
 
-            code, headers, metrics_body = _http_get(f"{base_url}/metrics")
-            self.assertEqual(code, 200)
-            self.assertIn("text/plain", headers["Content-Type"])
-            self.assertIn("stell_status_up 1", metrics_body)
-            self.assertIn("stell_status_cluster_healthy 1", metrics_body)
-            self.assertIn("stell_status_active_validators 4", metrics_body)
-            self.assertIn("stell_status_finals_rate_per_min 30.0", metrics_body)
-            self.assertIn('stell_status_target_up{node="A",role="validator"} 1', metrics_body)
+            for metrics_path in ("/metrics", "/metrics/"):
+                code, headers, metrics_body = _http_get(f"{base_url}{metrics_path}")
+                self.assertEqual(code, 200)
+                self.assertIn("text/plain", headers["Content-Type"])
+                self.assertIn("stell_status_up 1", metrics_body)
+                self.assertIn("stell_status_cluster_healthy 1", metrics_body)
+                self.assertIn("stell_status_active_validators 4", metrics_body)
+                self.assertIn("stell_status_finals_rate_per_min 30.0", metrics_body)
+                self.assertIn('stell_status_target_up{node="A",role="validator"} 1', metrics_body)
 
             code, _, _ = _http_get(f"{base_url}/health", method="HEAD")
             self.assertEqual(code, 200)
@@ -538,6 +641,132 @@ class StatusServerTests(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+    def test_validator_id_none_and_reachable_power_zero_quorum_lost(self) -> None:
+        # When all targets lack validator_id, active_validators must be 0 (not 4/4)
+        # and reachable_power == 0 must trigger reachable_power_below_quorum.
+        targets_no_vids = [{**t, "validator_id": None} for t in self.targets]
+        monitor_none = status_server.StatusMonitor(
+            targets=targets_no_vids,
+            interval_secs=15.0,
+            timeout_secs=2.0,
+            expected_validators=4,
+        )
+        snap_none = monitor_none.poll_once(now_ts=1_700_000_000)
+        self.assertEqual(snap_none["cluster"]["reachable_validators"], 4)
+        self.assertEqual(snap_none["cluster"]["active_validators"], 0)
+        self.assertEqual(snap_none["verdict"], "DOWN")
+        self.assertTrue(any("reachable_power_below_quorum (0 <" in r for r in snap_none["reasons"]))
+        self.assertTrue(any("quorum_lost (0/4" in r for r in snap_none["reasons"]))
+
+        # When validators have IDs but none are in the active set (reachable_power == 0),
+        # power quorum must not be bypassed.
+        other_set = [{"validator": f"{i:02x}" * 32, "power": "1000"} for i in range(1, 5)]
+        for st in self.states:
+            with st.lock:
+                st.validators_override = other_set
+
+        monitor_out = status_server.StatusMonitor(
+            targets=self.targets,
+            interval_secs=15.0,
+            timeout_secs=2.0,
+            expected_validators=4,
+        )
+        snap_out = monitor_out.poll_once(now_ts=1_700_000_015)
+        self.assertEqual(snap_out["cluster"]["active_validators"], 0)
+        self.assertEqual(snap_out["verdict"], "DOWN")
+        self.assertTrue(any("reachable_power_below_quorum (0 <" in r for r in snap_out["reasons"]))
+
+    def test_partial_rpc_and_http_error_recording(self) -> None:
+        class _PartialErrorHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                return
+
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                req = json.loads(self.rfile.read(length).decode("utf-8"))
+                method = req.get("method")
+                req_id = req.get("id", 1)
+                if method == "eth_blockNumber":
+                    body = json.dumps({"jsonrpc": "2.0", "id": req_id, "result": "0x64"}).encode("utf-8")
+                elif method == "stell_syncing":
+                    body = json.dumps(
+                        {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": "sync fail"}}
+                    ).encode("utf-8")
+                else:
+                    body = json.dumps({"jsonrpc": "2.0", "id": req_id, "result": None}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path == "/api/version":
+                    code = 500
+                elif self.path == "/readyz":
+                    code = 404
+                elif self.path == "/metrics":
+                    code = 503
+                else:
+                    code = 404
+                self.send_response(code)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _PartialErrorHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            base = f"http://127.0.0.1:{srv.server_port}"
+            res = status_server.probe_target(
+                {
+                    "node": "P",
+                    "name": "Partial",
+                    "role": "validator",
+                    "rpc_url": base,
+                    "explorer_url": base,
+                    "validator_id": None,
+                },
+                timeout=2.0,
+            )
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["height"], 100)
+            err = res["error"] or ""
+            self.assertIn("stell_syncing", err)
+            self.assertIn("explorer /api/version HTTP 500", err)
+            self.assertIn("explorer /readyz HTTP 404", err)
+            self.assertIn("explorer /metrics HTTP 503", err)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_broken_pipe_resilience_and_server_limits(self) -> None:
+        from unittest.mock import MagicMock
+
+        self.assertEqual(status_server.StatusHTTPServer.request_queue_size, 64)
+        self.assertGreater(status_server.StatusHTTPServer.timeout, 0)
+
+        for exc_cls in (BrokenPipeError, ConnectionResetError):
+            handler = status_server.StatusRequestHandler.__new__(status_server.StatusRequestHandler)
+            handler.path = "/api/status"
+            handler.command = "GET"
+            handler.close_connection = False
+            handler.send_response = MagicMock()
+            handler.send_header = MagicMock()
+            handler.end_headers = MagicMock()
+            handler.wfile = MagicMock()
+            handler.wfile.write.side_effect = exc_cls("client gone")
+            handler._send(200, "application/json", b"{}")
+            self.assertTrue(handler.close_connection)
+
+    def test_main_handles_bad_config_without_traceback(self) -> None:
+        self.assertEqual(status_server.main(["--targets", "["]), 1)
+        self.assertEqual(
+            status_server.main(["--targets-file", "/nonexistent/stell-status-targets.json"]),
+            1,
+        )
+        self.assertEqual(status_server.main(["--listen", "127.0.0.1:notaport"]), 1)
 
 
 if __name__ == "__main__":

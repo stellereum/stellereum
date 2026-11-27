@@ -13,22 +13,41 @@
 //! If `STELL_SDK_SIGNER_TOKEN` is set, `POST /sign` requires
 //! `Authorization: Bearer <token>`.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::key::FalconKeypair;
 use crate::signer::{sign_request, SignErrorResponse, SignRequest};
+
+/// Maximum number of concurrent connection handler threads served by [`SignerServer`].
+pub const MAX_CONCURRENT_CONNS: usize = 32;
+
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// A running signing helper.
 pub struct SignerServer {
     address: String,
     handle: Option<std::thread::JoinHandle<()>>,
+    #[cfg(test)]
+    active_conns: Arc<AtomicUsize>,
 }
 
 impl SignerServer {
     /// Start the helper on `listener`. Returns immediately; connections are
-    /// served on detached threads.
+    /// served on bounded worker threads (up to [`MAX_CONCURRENT_CONNS`]).
     pub fn start(
         listener: TcpListener,
         key: FalconKeypair,
@@ -51,15 +70,48 @@ impl SignerServer {
         let key = Arc::new(key);
         let token = Arc::new(token);
         let allowed_origins = Arc::new(allowed_origins);
+        let active_conns = Arc::new(AtomicUsize::new(0));
+        let active_conns_loop = Arc::clone(&active_conns);
         let address = key.address_stl57();
         let handle = std::thread::spawn(move || {
             for stream in listener.incoming() {
                 match stream {
-                    Ok(s) => {
+                    Ok(mut s) => {
+                        let acquired = active_conns_loop
+                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                                if cur < MAX_CONCURRENT_CONNS {
+                                    Some(cur + 1)
+                                } else {
+                                    None
+                                }
+                            })
+                            .is_ok();
+                        if !acquired {
+                            let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
+                            let _ = respond_json(
+                                &mut s,
+                                503,
+                                &serde_json::json!({
+                                    "ok": false,
+                                    "error": {
+                                        "code": "service_unavailable",
+                                        "message": "too many concurrent connections",
+                                        "retryable": true
+                                    }
+                                }),
+                            );
+                            let _ = s.shutdown(std::net::Shutdown::Write);
+                            let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
+                            let mut drain = [0u8; 512];
+                            let _ = s.read(&mut drain);
+                            continue;
+                        }
+                        let guard = ConnGuard(Arc::clone(&active_conns_loop));
                         let key = Arc::clone(&key);
                         let token = Arc::clone(&token);
                         let allowed_origins = Arc::clone(&allowed_origins);
                         std::thread::spawn(move || {
+                            let _guard = guard;
                             let _ = handle_connection(s, &key, token.as_deref(), &allowed_origins);
                         });
                     }
@@ -71,7 +123,14 @@ impl SignerServer {
         Ok(Self {
             address,
             handle: Some(handle),
+            #[cfg(test)]
+            active_conns,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_connections(&self) -> usize {
+        self.active_conns.load(Ordering::Acquire)
     }
 
     /// Bind and start on `127.0.0.1:0`, returning the helper and its URL.
@@ -110,22 +169,84 @@ impl Drop for SignerServer {
     }
 }
 
+fn read_with_deadline(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<Option<usize>> {
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(None);
+        };
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        match stream.read(buf) {
+            Ok(n) => return Ok(Some(n)),
+            Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn respond_timeout(stream: &mut TcpStream) -> std::io::Result<()> {
+    respond_json(
+        stream,
+        408,
+        &serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "request_timeout",
+                "message": "request deadline exceeded",
+                "retryable": false
+            }
+        }),
+    )
+}
+
+fn respond_bad_request(stream: &mut TcpStream, msg: &str) -> std::io::Result<()> {
+    respond_json(
+        stream,
+        400,
+        &serde_json::json!({
+            "ok": false,
+            "error": { "code": "bad_request", "message": msg, "retryable": false }
+        }),
+    )
+}
+
+fn parse_content_length_value(raw: &str) -> Option<usize> {
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse::<usize>().ok()
+}
+
 fn handle_connection(
     mut stream: TcpStream,
     key: &FalconKeypair,
     token: Option<&str>,
     allowed_origins: &[String],
 ) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    let deadline = Instant::now() + REQUEST_DEADLINE;
+    stream.set_write_timeout(Some(REQUEST_DEADLINE))?;
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let header_end = loop {
-        let n = stream.read(&mut tmp)?;
+        let Some(n) = read_with_deadline(&mut stream, &mut tmp, deadline)? else {
+            return respond_timeout(&mut stream);
+        };
         if n == 0 {
             return Ok(());
         }
         buf.extend_from_slice(&tmp[..n]);
-        if buf.len() > 64 * 1024 {
+        if buf.len() > MAX_HEADER_BYTES {
             return respond(&mut stream, 413, "text/plain", b"request too large");
         }
         if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
@@ -138,7 +259,9 @@ fn handle_connection(
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default();
     let path = parts.next().unwrap_or_default();
-    let mut content_length = 0usize;
+    let mut content_length: Option<usize> = None;
+    let mut bad_content_length = false;
+    let mut has_transfer_encoding = false;
     let mut content_type: Option<String> = None;
     let mut authorization: Option<String> = None;
     let mut host: Option<String> = None;
@@ -150,7 +273,15 @@ fn handle_connection(
             let k = k.trim().to_ascii_lowercase();
             let v = v.trim();
             if k == "content-length" {
-                content_length = v.parse().unwrap_or(0);
+                if content_length.is_some() {
+                    bad_content_length = true;
+                } else if let Some(parsed) = parse_content_length_value(v) {
+                    content_length = Some(parsed);
+                } else {
+                    bad_content_length = true;
+                }
+            } else if k == "transfer-encoding" {
+                has_transfer_encoding = true;
             } else if k == "content-type" {
                 content_type = Some(v.to_string());
             } else if k == "authorization" {
@@ -163,6 +294,13 @@ fn handle_connection(
                 origin = Some(v.to_string());
             }
         }
+    }
+
+    if bad_content_length {
+        return respond_bad_request(&mut stream, "malformed or duplicate Content-Length");
+    }
+    if has_transfer_encoding {
+        return respond_bad_request(&mut stream, "Transfer-Encoding is not supported");
     }
 
     // DNS rebinding protection: require a single loopback Host header.
@@ -193,16 +331,22 @@ fn handle_connection(
         );
     }
 
-    if content_length > 1024 * 1024 {
+    let content_length = content_length.unwrap_or(0);
+    if content_length > MAX_BODY_BYTES {
         return respond(&mut stream, 413, "text/plain", b"request too large");
     }
     let mut body = buf[header_end..].to_vec();
     while body.len() < content_length {
-        let n = stream.read(&mut tmp)?;
+        let Some(n) = read_with_deadline(&mut stream, &mut tmp, deadline)? else {
+            return respond_timeout(&mut stream);
+        };
         if n == 0 {
             break;
         }
         body.extend_from_slice(&tmp[..n]);
+    }
+    if body.len() < content_length {
+        return respond_bad_request(&mut stream, "truncated request body");
     }
     if body.len() > content_length {
         body.truncate(content_length);
@@ -404,8 +548,10 @@ fn respond(
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        408 => "Request Timeout",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let head = format!(
@@ -580,5 +726,78 @@ mod tests {
             .into_json()
             .unwrap();
         assert_eq!(resp["ok"], true);
+    }
+
+    #[test]
+    fn rejects_malformed_overflowing_duplicate_content_length_and_chunked_with_400() {
+        let key = FalconKeypair::generate().unwrap();
+        let (_server, url) = SignerServer::bind_ephemeral(key, None).unwrap();
+        let host_port = url.strip_prefix("http://").unwrap();
+
+        for bad_cl in [
+            "abc",
+            "-1",
+            "+5",
+            "",
+            "10, 10",
+            "9999999999999999999999999999999999999999",
+        ] {
+            let raw = format!(
+                "POST /sign HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {bad_cl}\r\n\r\n"
+            );
+            let (status, _) = send_raw_http(&url, &raw);
+            assert_eq!(status, 400, "expected 400 for Content-Length={bad_cl:?}");
+        }
+
+        // Duplicate Content-Length (same or different values) -> 400.
+        let dup_same = format!(
+            "POST /sign HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{{}}"
+        );
+        assert_eq!(send_raw_http(&url, &dup_same).0, 400);
+
+        let dup_diff = format!(
+            "POST /sign HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nContent-Length: 5\r\n\r\n{{}}"
+        );
+        assert_eq!(send_raw_http(&url, &dup_diff).0, 400);
+
+        // Transfer-Encoding: chunked -> 400.
+        let chunked = format!(
+            "POST /sign HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{{}}\r\n0\r\n\r\n"
+        );
+        assert_eq!(send_raw_http(&url, &chunked).0, 400);
+    }
+
+    #[test]
+    fn returns_503_when_max_concurrent_conns_saturated() {
+        let key = FalconKeypair::generate().unwrap();
+        let (server, url) = SignerServer::bind_ephemeral(key, None).unwrap();
+        let host_port = url.strip_prefix("http://").unwrap();
+
+        let mut held = Vec::with_capacity(MAX_CONCURRENT_CONNS);
+        for _ in 0..MAX_CONCURRENT_CONNS {
+            let mut s = TcpStream::connect(host_port).unwrap();
+            s.write_all(b"GET /health HTTP/1.1\r\n").unwrap();
+            s.flush().unwrap();
+            held.push(s);
+        }
+
+        let start = Instant::now();
+        while server.active_connections() < MAX_CONCURRENT_CONNS
+            && start.elapsed() < Duration::from_secs(2)
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(server.active_connections(), MAX_CONCURRENT_CONNS);
+
+        let raw = format!("GET /health HTTP/1.1\r\nHost: {host_port}\r\n\r\n");
+        let (status, _) = send_raw_http(&url, &raw);
+        assert_eq!(status, 503);
+
+        drop(held);
+        let start = Instant::now();
+        while server.active_connections() > 0 && start.elapsed() < Duration::from_secs(2) {
+            std::thread::yield_now();
+        }
+        assert_eq!(server.active_connections(), 0);
     }
 }

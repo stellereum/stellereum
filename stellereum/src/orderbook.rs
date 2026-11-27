@@ -492,4 +492,14 @@ impl OrderbookManager {
     pub fn get_book(&self, pair_id: u32) -> Option<&OrderbookActor> {
         self.books.get(&pair_id)
     }
+
+    /// Snapshot a single trading pair's orderbook without cloning unrelated pairs.
+    pub fn clone_pair(&self, pair_id: u32) -> Option<OrderbookActor> {
+        self.books.get(&pair_id).cloned()
+    }
+
+    /// Commit an updated orderbook for a single trading pair.
+    pub fn apply_pair_book(&mut self, pair_id: u32, book: OrderbookActor) {
+        self.books.insert(pair_id, book);
+    }
 }

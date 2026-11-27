@@ -144,6 +144,7 @@ pub enum NodeSseEvent {
         hash: String,
     },
     Invalidation {
+        shard_id: Option<u32>,
         height: Option<u64>,
         orphaned_blocks: Vec<String>,
         reason: Option<String>,
@@ -196,7 +197,13 @@ pub fn parse_node_sse_frame(frame: &SseFrame) -> Option<NodeSseEvent> {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect();
+        let shard_id = payload
+            .get("shard_id")
+            .or_else(|| val.get("shard_id"))
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok());
         return Some(NodeSseEvent::Invalidation {
+            shard_id,
             height: payload.get("height").and_then(|v| v.as_u64()),
             orphaned_blocks,
             reason: payload
@@ -254,6 +261,7 @@ pub struct Syncer {
     abis: Arc<AbiCache>,
     sync_status: Arc<RwLock<SyncStatus>>,
     stream_hub: Arc<IndexerStreamHub>,
+    last_sse_event_id: std::sync::Mutex<Option<String>>,
 }
 
 /// How many receipts of one block are fetched at the same time.
@@ -261,7 +269,7 @@ const RECEIPT_FETCH_CONCURRENCY: usize = 8;
 
 /// Upper bound on the receipts fetched per block (a pathological block cannot
 /// make the indexer open an unbounded number of connections).
-const MAX_RECEIPTS_PER_BLOCK: usize = 256;
+const MAX_RECEIPTS_PER_BLOCK: usize = 10_000;
 
 /// Maximum blocks backfilled in a single sync tick so catch-up stays bounded.
 const MAX_BACKFILL_PER_TICK: u64 = 64;
@@ -313,6 +321,7 @@ impl Syncer {
             abis,
             sync_status,
             stream_hub: Arc::new(IndexerStreamHub::new()),
+            last_sse_event_id: std::sync::Mutex::new(None),
         }
     }
 
@@ -413,7 +422,25 @@ impl Syncer {
         idle_timeout: Duration,
         wake: Option<&Notify>,
     ) -> Result<SseDisconnectReason> {
-        let mut resp = self.sse_client.get(sse_url).send().await?;
+        let mut req = self.sse_client.get(sse_url);
+        let last_id = self
+            .last_sse_event_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(ref id) = last_id {
+            if !id.trim().is_empty() {
+                req = req.header("Last-Event-ID", id.trim());
+            }
+        }
+        let mut resp = req.send().await?;
+        if resp.status() == reqwest::StatusCode::GONE {
+            *self
+                .last_sse_event_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            anyhow::bail!("SSE endpoint {sse_url} returned HTTP 410 Gone");
+        }
         if !resp.status().is_success() {
             anyhow::bail!("SSE endpoint {sse_url} returned HTTP {}", resp.status());
         }
@@ -431,11 +458,32 @@ impl Syncer {
                 .feed(&chunk)
                 .map_err(|e| anyhow::anyhow!("SSE parse error: {e}"))?;
             for frame in frames {
+                let frame_id = frame
+                    .id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
                 if let Some(ev) = parse_node_sse_frame(&frame) {
                     let keep_going = self.handle_node_sse_event(ev, wake).await?;
                     if !keep_going {
+                        *self
+                            .last_sse_event_id
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = None;
                         return Ok(SseDisconnectReason::Lagged);
                     }
+                    if let Some(id) = frame_id {
+                        *self
+                            .last_sse_event_id
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = Some(id);
+                    }
+                } else if let Some(id) = frame_id {
+                    *self
+                        .last_sse_event_id
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(id);
                 }
             }
         }
@@ -458,6 +506,7 @@ impl Syncer {
                 Ok(true)
             }
             NodeSseEvent::Invalidation {
+                shard_id,
                 height,
                 orphaned_blocks,
                 reason,
@@ -479,16 +528,16 @@ impl Syncer {
                     });
                 }
                 if invalidated.is_empty() {
-                    if let Some(h) = height {
-                        if self.db.invalidate_shard_height(0, h)? {
+                    if let (Some(sid), Some(h)) = (shard_id, height) {
+                        if self.db.invalidate_shard_height(sid, h)? {
                             self.stream_hub.publish(StreamPublishInput {
                                 topic: "invalidations",
-                                shard_id: 0,
+                                shard_id: sid,
                                 height: h,
                                 contract: None,
                                 addresses: Vec::new(),
                                 payload: json!({
-                                    "shard_id": 0,
+                                    "shard_id": sid,
                                     "height": h,
                                     "orphaned_blocks": orphaned_blocks,
                                     "reason": reason,
@@ -619,87 +668,37 @@ impl Syncer {
             (a, b) => a.or(b),
         };
 
-        // 2. Backfill any missed heights for the node's local shard via RPC (concurrently)
-        let mut backfill_progressed = false;
-        let mut more_backfill = false;
+        // 2. Backfill any missed heights for the node's local shard and every active
+        //    non-local shard reported by `stell_getShards` via RPC (concurrently).
+        let mut any_shard_more_backfill = false;
         if let Some(target_tip) = node_tip {
-            let db_tip = self.db.get_shard_tip_height(local_shard).unwrap_or(0);
-            if db_tip < target_tip {
-                let start_h = db_tip + 1;
-                let end_h = target_tip.min(start_h.saturating_add(MAX_BACKFILL_PER_TICK - 1));
-                more_backfill = end_h < target_tip;
-                let mut fetched: Vec<RpcBlockSummary> = Vec::new();
-                let mut chunk_start = start_h;
-                while chunk_start <= end_h {
-                    let chunk_end = end_h
-                        .min(chunk_start.saturating_add(BACKFILL_FETCH_CONCURRENCY as u64 - 1));
-                    let mut set = tokio::task::JoinSet::new();
-                    for h in chunk_start..=chunk_end {
-                        let client = self.client.clone();
-                        let rpc_url = self.rpc_url.clone();
-                        set.spawn(async move {
-                            fetch_rpc_block_with(&client, &rpc_url, h, local_shard).await
-                        });
-                    }
-                    while let Some(res) = set.join_next().await {
-                        if let Ok(Some(blk)) = res {
-                            fetched.push(blk);
-                        }
-                    }
-                    chunk_start = chunk_end.saturating_add(1);
+            let outcome = self
+                .backfill_shard_range(local_shard, target_tip, true, None, None)
+                .await?;
+            if outcome.more_backfill && outcome.progressed {
+                any_shard_more_backfill = true;
+            }
+        }
+
+        let mut remote_shard_outcomes: HashMap<u32, ShardBackfillOutcome> = HashMap::new();
+        if let Some((_, ref shards)) = shards_info {
+            for sh in shards {
+                if sh.local || sh.shard_id == local_shard || sh.tip_height == 0 {
+                    continue;
                 }
-                fetched.sort_by_key(|b| b.height);
-                for blk in fetched {
-                    let should_index = match self
-                        .db
-                        .get_block_by_shard_and_height(blk.shard_id, blk.height)?
-                    {
-                        Some(known) => known.hash != blk.hash,
-                        None => true,
-                    };
-                    if should_index {
-                        let proposer_stl57 = blk.proposer.as_deref().and_then(crate::db::to_stl57);
-                        let block_record = BlockRecord {
-                            shard_id: blk.shard_id,
-                            height: blk.height,
-                            hash: blk.hash.clone(),
-                            timestamp: blk.timestamp,
-                            tx_count: blk.tx_count,
-                            proposer: blk.proposer,
-                            proposer_stl57,
-                            state_root: blk.state_root,
-                        };
-                        self.db.insert_block(&block_record)?;
-                        self.publish_block_event(&block_record);
-                        backfill_progressed = true;
-                        info!(
-                            "[syncer] Backfilled Block Shard {} #{} ({} txs, {})",
-                            blk.shard_id, blk.height, blk.tx_count, blk.hash
-                        );
-                        if blk.tx_count > 0 {
-                            self.index_block_transactions_in_shard(
-                                blk.shard_id,
-                                blk.height,
-                                &blk.hash,
-                                blk.timestamp,
-                            )
-                            .await;
-                        }
-                    } else {
-                        // Block row already present and identical: its
-                        // transaction/event rows may still be incomplete if a
-                        // previous run stopped between `insert_block` and the
-                        // receipt indexing (the two are separate commits).
-                        self.repair_block_transactions_if_incomplete(
-                            blk.shard_id,
-                            blk.height,
-                            &blk.hash,
-                            blk.timestamp,
-                            blk.tx_count,
-                        )
-                        .await;
-                    }
+                let outcome = self
+                    .backfill_shard_range(
+                        sh.shard_id,
+                        sh.tip_height,
+                        false,
+                        sh.tip_hash.as_deref(),
+                        sh.state_root.as_deref(),
+                    )
+                    .await?;
+                if outcome.more_backfill && outcome.progressed {
+                    any_shard_more_backfill = true;
                 }
+                remote_shard_outcomes.insert(sh.shard_id, outcome);
             }
         }
 
@@ -771,11 +770,32 @@ impl Syncer {
             .unwrap_or_default()
             .as_secs();
 
-        // 4. Record committed heads for non-local shards reported by `stell_getShards`
-        //    (e.g. shard 1 when node runs with `STELL_SHARDS=0,1`).
+        // 4. Fallback for pruned/summary-only non-local shards reported by `stell_getShards`
+        //    (e.g. shard 1 when node runs with `STELL_SHARDS=0,1` and `stell_getBlock`
+        //    returns `None`): record committed head ONLY when RPC explicitly reported
+        //    `sh.tip_height` unavailable/pruned, `db_tip == 0 || sh.tip_height > db_tip`,
+        //    and the shard is not still catching up across batches.
         if let Some((_, shards)) = shards_info {
             for sh in shards {
                 if sh.local || sh.shard_id == local_shard || sh.tip_height == 0 {
+                    continue;
+                }
+                let outcome = remote_shard_outcomes
+                    .get(&sh.shard_id)
+                    .copied()
+                    .unwrap_or_default();
+                if outcome.target_tip_available || (outcome.more_backfill && outcome.progressed) {
+                    continue;
+                }
+                if !outcome.target_tip_unavailable {
+                    warn!(
+                        "[syncer] skipping summary-only head fallback for shard {} #{}: RPC did not explicitly report block unavailable",
+                        sh.shard_id, sh.tip_height
+                    );
+                    continue;
+                }
+                let db_tip = self.db.get_shard_tip_height(sh.shard_id)?;
+                if db_tip > 0 && sh.tip_height <= db_tip {
                     continue;
                 }
                 let Some(tip_hash) = sh.tip_hash else {
@@ -801,8 +821,8 @@ impl Syncer {
                     };
                     self.db.insert_block(&block_record)?;
                     self.publish_block_event(&block_record);
-                    info!(
-                        "[syncer] Indexed Shard {} committed head #{} ({})",
+                    warn!(
+                        "[syncer] Indexed Shard {} summary-only committed head #{} ({}) after RPC reported block unavailable",
                         sh.shard_id, sh.tip_height, tip_hash
                     );
                 }
@@ -814,7 +834,222 @@ impl Syncer {
         st.last_sync_at = Some(now);
         st.last_error = None;
 
-        Ok(!(more_backfill && backfill_progressed))
+        Ok(!any_shard_more_backfill)
+    }
+
+    async fn backfill_shard_range(
+        &self,
+        shard_id: u32,
+        target_tip: u64,
+        is_local: bool,
+        expected_tip_hash: Option<&str>,
+        expected_tip_state_root: Option<&str>,
+    ) -> Result<ShardBackfillOutcome> {
+        let db_tip = self.db.get_shard_tip_height(shard_id)?;
+        if db_tip >= target_tip {
+            let tip_matches = match expected_tip_hash {
+                Some(tip_hash) => self
+                    .db
+                    .get_block_by_shard_and_height(shard_id, target_tip)?
+                    .is_some_and(|known| known.hash == tip_hash),
+                None => true,
+            };
+            if tip_matches || is_local {
+                return Ok(ShardBackfillOutcome {
+                    progressed: false,
+                    more_backfill: false,
+                    target_tip_available: tip_matches,
+                    target_tip_unavailable: false,
+                });
+            }
+            // Same-height reorg on a non-local shard: try fetching the new tip block first
+            // before falling back to recording the committed head in step 4.
+            let mut fetched = Vec::new();
+            let mut target_tip_unavailable = false;
+            match fetch_rpc_block_with(&self.client, &self.rpc_url, target_tip, shard_id).await {
+                RpcBlockFetch::Found(blk) => fetched.push(blk),
+                RpcBlockFetch::Unavailable => target_tip_unavailable = true,
+                RpcBlockFetch::TransientError => {}
+            }
+            return self
+                .apply_fetched_backfill_blocks(
+                    shard_id,
+                    target_tip,
+                    is_local,
+                    expected_tip_hash,
+                    expected_tip_state_root,
+                    false,
+                    target_tip_unavailable,
+                    fetched,
+                )
+                .await;
+        }
+
+        let start_h = db_tip + 1;
+        let end_h = target_tip.min(start_h.saturating_add(MAX_BACKFILL_PER_TICK - 1));
+        let more_backfill = end_h < target_tip;
+        let mut fetched: Vec<RpcBlockSummary> = Vec::new();
+        let mut target_tip_unavailable = false;
+        let mut any_transient_error = false;
+        let mut chunk_start = start_h;
+        while chunk_start <= end_h {
+            let chunk_end =
+                end_h.min(chunk_start.saturating_add(BACKFILL_FETCH_CONCURRENCY as u64 - 1));
+            let mut set = tokio::task::JoinSet::new();
+            for h in chunk_start..=chunk_end {
+                let client = self.client.clone();
+                let rpc_url = self.rpc_url.clone();
+                set.spawn(async move {
+                    (
+                        h,
+                        fetch_rpc_block_with(&client, &rpc_url, h, shard_id).await,
+                    )
+                });
+            }
+            while let Some(res) = set.join_next().await {
+                match res {
+                    Ok((_, RpcBlockFetch::Found(blk))) => fetched.push(blk),
+                    Ok((h, RpcBlockFetch::Unavailable)) => {
+                        if h == target_tip {
+                            target_tip_unavailable = true;
+                        }
+                    }
+                    Ok((_, RpcBlockFetch::TransientError)) | Err(_) => {
+                        any_transient_error = true;
+                    }
+                }
+            }
+            chunk_start = chunk_end.saturating_add(1);
+        }
+        if any_transient_error {
+            target_tip_unavailable = false;
+        } else if !is_local && more_backfill && fetched.is_empty() {
+            match fetch_rpc_block_with(&self.client, &self.rpc_url, target_tip, shard_id).await {
+                RpcBlockFetch::Found(blk) => fetched.push(blk),
+                RpcBlockFetch::Unavailable => target_tip_unavailable = true,
+                RpcBlockFetch::TransientError => {}
+            }
+        }
+        fetched.sort_by_key(|b| b.height);
+
+        self.apply_fetched_backfill_blocks(
+            shard_id,
+            target_tip,
+            is_local,
+            expected_tip_hash,
+            expected_tip_state_root,
+            more_backfill,
+            target_tip_unavailable,
+            fetched,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // GATE: internal helper grouping shard backfill batch state
+    async fn apply_fetched_backfill_blocks(
+        &self,
+        shard_id: u32,
+        target_tip: u64,
+        is_local: bool,
+        expected_tip_hash: Option<&str>,
+        expected_tip_state_root: Option<&str>,
+        more_backfill: bool,
+        mut target_tip_unavailable: bool,
+        fetched: Vec<RpcBlockSummary>,
+    ) -> Result<ShardBackfillOutcome> {
+        let mut progressed = false;
+        let mut target_tip_available = false;
+
+        for mut blk in fetched {
+            if !is_local {
+                // Guard against non-shard-aware nodes returning the local shard's block
+                // when `shard_id != local_shard` (which would otherwise violate
+                // `blocks.hash UNIQUE` or pollute the remote shard with local blocks).
+                if !blk.explicit_shard {
+                    if let Some(existing) = self.db.get_block_by_hash(&blk.hash)? {
+                        if existing.shard_id != shard_id {
+                            if blk.height == target_tip {
+                                target_tip_unavailable = true;
+                            }
+                            continue;
+                        }
+                    }
+                    if blk.height == target_tip {
+                        if let Some(tip_hash) = expected_tip_hash {
+                            if blk.hash != tip_hash {
+                                target_tip_unavailable = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if blk.height == target_tip && blk.state_root.is_none() {
+                    blk.state_root = expected_tip_state_root.map(str::to_string);
+                }
+            }
+
+            if blk.height == target_tip {
+                target_tip_available = true;
+                target_tip_unavailable = false;
+            }
+
+            let should_index = match self
+                .db
+                .get_block_by_shard_and_height(blk.shard_id, blk.height)?
+            {
+                Some(known) => known.hash != blk.hash,
+                None => true,
+            };
+            if should_index {
+                let proposer_stl57 = blk.proposer.as_deref().and_then(crate::db::to_stl57);
+                let block_record = BlockRecord {
+                    shard_id: blk.shard_id,
+                    height: blk.height,
+                    hash: blk.hash.clone(),
+                    timestamp: blk.timestamp,
+                    tx_count: blk.tx_count,
+                    proposer: blk.proposer,
+                    proposer_stl57,
+                    state_root: blk.state_root,
+                };
+                self.db.insert_block(&block_record)?;
+                self.publish_block_event(&block_record);
+                progressed = true;
+                info!(
+                    "[syncer] Backfilled Block Shard {} #{} ({} txs, {})",
+                    blk.shard_id, blk.height, blk.tx_count, blk.hash
+                );
+                if blk.tx_count > 0 {
+                    self.index_block_transactions_in_shard(
+                        blk.shard_id,
+                        blk.height,
+                        &blk.hash,
+                        blk.timestamp,
+                    )
+                    .await;
+                }
+            } else {
+                // Block row already present and identical: its
+                // transaction/event rows may still be incomplete if a
+                // previous run stopped between `insert_block` and the
+                // receipt indexing (the two are separate commits).
+                self.repair_block_transactions_if_incomplete(
+                    blk.shard_id,
+                    blk.height,
+                    &blk.hash,
+                    blk.timestamp,
+                    blk.tx_count,
+                )
+                .await;
+            }
+        }
+
+        Ok(ShardBackfillOutcome {
+            progressed,
+            more_backfill,
+            target_tip_available,
+            target_tip_unavailable,
+        })
     }
 
     fn publish_block_event(&self, b: &BlockRecord) {
@@ -906,8 +1141,8 @@ impl Syncer {
         let mut indexed_hashes: Vec<String> =
             native_metas.iter().map(|m| m.tx_hash.clone()).collect();
 
-        if indexed_hashes.is_empty() {
-            // Fallback: try eth_getBlockByNumber with full txs
+        if indexed_hashes.is_empty() && shard_id == 0 {
+            // Fallback: try eth_getBlockByNumber with full txs (shard 0 EVM adapter only)
             let payload = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "eth_getBlockByNumber",
@@ -952,13 +1187,21 @@ impl Syncer {
                                     status: "success".to_string(),
                                     timestamp,
                                 };
-                                let _ = self.db.insert_transaction_in_shard(shard_id, &tx_rec);
+                                if let Err(e) =
+                                    self.db.insert_transaction_in_shard(shard_id, &tx_rec)
+                                {
+                                    warn!(
+                                        "[syncer] failed to store evm fallback tx {} in shard {shard_id}: {e}",
+                                        tx_rec.tx_hash
+                                    );
+                                }
                                 self.publish_tx_event(shard_id, &tx_rec);
                                 native_metas.push(NativeTxMeta {
                                     tx_hash: tx_hash.clone(),
                                     from_addr,
                                     succeeded: true,
                                     deployed_code_hash: None,
+                                    deployed_abi: None,
                                     token_touches: Vec::new(),
                                 });
                                 indexed_hashes.push(tx_hash);
@@ -1008,7 +1251,12 @@ impl Syncer {
             let Some((rec, meta)) = decode_native_tx_with_meta(height, i, t, timestamp) else {
                 continue;
             };
-            let _ = self.db.insert_transaction_in_shard(shard_id, &rec);
+            if let Err(e) = self.db.insert_transaction_in_shard(shard_id, &rec) {
+                warn!(
+                    "[syncer] failed to store native tx {} in shard {shard_id}: {e}",
+                    rec.tx_hash
+                );
+            }
             self.publish_tx_event(shard_id, &rec);
             metas.push(meta);
         }
@@ -1032,27 +1280,34 @@ impl Syncer {
 
         let mut set = tokio::task::JoinSet::new();
         let mut pending = 0usize;
-        for meta in tx_metas.iter().take(MAX_RECEIPTS_PER_BLOCK) {
+        let mut fetched_receipts: Vec<(usize, ReceiptDetails)> = Vec::new();
+        for (idx, meta) in tx_metas.iter().take(MAX_RECEIPTS_PER_BLOCK).enumerate() {
             if pending >= RECEIPT_FETCH_CONCURRENCY {
                 while let Some(res) = set.join_next().await {
                     pending = pending.saturating_sub(1);
-                    if let Ok(Some(details)) = res {
-                        self.apply_receipt_details(shard_id, height, &meta_by_hash, details)
-                            .await;
+                    if let Ok((i, Some(details))) = res {
+                        fetched_receipts.push((i, details));
                     }
                 }
             }
             let hash = meta.tx_hash.clone();
             let client = self.client.clone();
             let rpc_url = self.rpc_url.clone();
-            set.spawn(async move { fetch_receipt_details(&client, &rpc_url, &hash).await });
+            set.spawn(async move {
+                let details = fetch_receipt_details(&client, &rpc_url, shard_id, &hash).await;
+                (idx, details)
+            });
             pending += 1;
         }
         while let Some(res) = set.join_next().await {
-            if let Ok(Some(details)) = res {
-                self.apply_receipt_details(shard_id, height, &meta_by_hash, details)
-                    .await;
+            if let Ok((i, Some(details))) = res {
+                fetched_receipts.push((i, details));
             }
+        }
+        fetched_receipts.sort_by_key(|(idx, _)| *idx);
+        for (_, details) in fetched_receipts {
+            self.apply_receipt_details(shard_id, height, &meta_by_hash, details)
+                .await;
         }
 
         // Refresh touched token balances from the node's authoritative state.
@@ -1075,7 +1330,8 @@ impl Syncer {
             }
         }
         for (tok, owner) in unique_touches {
-            if let Some(bal) = fetch_token_balance(&self.client, &self.rpc_url, &tok, &owner).await
+            if let Some(bal) =
+                fetch_token_balance(&self.client, &self.rpc_url, shard_id, &tok, &owner).await
             {
                 let rec = TokenBalanceRecord {
                     shard_id,
@@ -1102,12 +1358,20 @@ impl Syncer {
         if let Some(contract_addr) = details.contract_address.as_deref() {
             let norm_addr = normalize_contract_key(contract_addr);
             if !norm_addr.is_empty() {
-                if !self.abis.contains(&norm_addr) {
-                    let abi = self.fetch_abi(&norm_addr).await;
-                    self.abis.put(&norm_addr, abi);
+                let meta = meta_by_hash.get(details.tx_hash.as_str()).copied();
+                if let Some(abi) = meta
+                    .filter(|m| m.succeeded)
+                    .and_then(|m| m.deployed_abi.clone())
+                {
+                    self.abis.put(&norm_addr, Some(abi));
+                } else if !self.abis.contains(&norm_addr) {
+                    match self.fetch_abi(shard_id, &norm_addr).await {
+                        AbiFetchResult::Found(abi) => self.abis.put(&norm_addr, Some(abi)),
+                        AbiFetchResult::Absent => self.abis.put(&norm_addr, None),
+                        AbiFetchResult::TransientError => {}
+                    }
                 }
                 let has_abi = self.abis.get(&norm_addr).is_some();
-                let meta = meta_by_hash.get(details.tx_hash.as_str()).copied();
                 let creator = meta
                     .map(|m| normalize_contract_key(&m.from_addr))
                     .filter(|s| !s.is_empty());
@@ -1146,8 +1410,11 @@ impl Syncer {
             // The manifest is fetched once per contract and then cached, so a
             // busy contract does not turn into an RPC storm.
             if !self.abis.contains(&contract) {
-                let abi = self.fetch_abi(&contract).await;
-                self.abis.put(&contract, abi);
+                match self.fetch_abi(shard_id, &contract).await {
+                    AbiFetchResult::Found(abi) => self.abis.put(&contract, Some(abi)),
+                    AbiFetchResult::Absent => self.abis.put(&contract, None),
+                    AbiFetchResult::TransientError => {}
+                }
             }
             let abi = self.abis.get(&contract);
             if abi.is_some() {
@@ -1185,7 +1452,14 @@ impl Syncer {
             warn!("[syncer] failed to store contract events: {e}");
         } else {
             for contract in abi_contracts {
-                let _ = self.db.mark_contract_has_abi(&contract, true);
+                if let Err(e) = self
+                    .db
+                    .mark_contract_has_abi_in_shard(shard_id, &contract, true)
+                {
+                    warn!(
+                        "[syncer] failed to mark contract {contract} has_abi in shard {shard_id}: {e}"
+                    );
+                }
             }
             for r in &records {
                 self.stream_hub.publish(StreamPublishInput {
@@ -1211,29 +1485,77 @@ impl Syncer {
     /// The manifest is committed to the state trie, so every node serves the
     /// SAME one — the explorer's decoder and the contract agree by
     /// construction.
-    async fn fetch_abi(&self, contract: &str) -> Option<stellereum::contract_abi::ContractAbi> {
+    ///
+    /// Transient HTTP/network/JSON/RPC errors return `AbiFetchResult::TransientError`
+    /// so callers do NOT poison `AbiCache` with `None` for a temporarily
+    /// unreachable node.
+    async fn fetch_abi(&self, shard_id: u32, contract: &str) -> AbiFetchResult {
         let payload = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "stell_getContractAbi",
-            "params": { "contract": contract },
+            "params": { "contract": contract, "shard_id": shard_id },
             "id": 1
         });
         let resp = match self.client.post(&self.rpc_url).json(&payload).send().await {
             Ok(r) => r,
             Err(e) => {
                 warn!("[syncer] ABI fetch failed for {contract}: {e}");
-                return None;
+                return AbiFetchResult::TransientError;
             }
         };
+        if !resp.status().is_success() {
+            warn!(
+                "[syncer] ABI fetch for {contract} returned HTTP {}",
+                resp.status()
+            );
+            return AbiFetchResult::TransientError;
+        }
         let data: Value = match resp.json().await {
             Ok(d) => d,
             Err(e) => {
                 warn!("[syncer] ABI fetch gave no JSON for {contract}: {e}");
-                return None;
+                return AbiFetchResult::TransientError;
             }
         };
-        AbiCache::parse_abi(&data)
+        if data.get("error").is_some_and(|e| !e.is_null()) {
+            warn!(
+                "[syncer] ABI fetch JSON-RPC error for {contract}: {}",
+                data["error"]
+            );
+            return AbiFetchResult::TransientError;
+        }
+        let Some(result) = data.get("result") else {
+            warn!("[syncer] ABI fetch missing result field for {contract}");
+            return AbiFetchResult::TransientError;
+        };
+        if result.is_null() {
+            return AbiFetchResult::Absent;
+        }
+        match AbiCache::parse_abi(result) {
+            Some(abi) => AbiFetchResult::Found(abi),
+            None => AbiFetchResult::Absent,
+        }
     }
+}
+
+enum AbiFetchResult {
+    Found(stellereum::contract_abi::ContractAbi),
+    Absent,
+    TransientError,
+}
+
+#[derive(Default, Clone, Copy)]
+struct ShardBackfillOutcome {
+    progressed: bool,
+    more_backfill: bool,
+    target_tip_available: bool,
+    target_tip_unavailable: bool,
+}
+
+enum RpcBlockFetch {
+    Found(RpcBlockSummary),
+    Unavailable,
+    TransientError,
 }
 
 struct ShardHeadInfo {
@@ -1252,6 +1574,7 @@ struct RpcBlockSummary {
     tx_count: u64,
     proposer: Option<String>,
     state_root: Option<String>,
+    explicit_shard: bool,
 }
 
 struct NativeTxMeta {
@@ -1259,6 +1582,7 @@ struct NativeTxMeta {
     from_addr: String,
     succeeded: bool,
     deployed_code_hash: Option<String>,
+    deployed_abi: Option<stellereum::contract_abi::ContractAbi>,
     token_touches: Vec<(String, String)>,
 }
 
@@ -1273,27 +1597,53 @@ async fn fetch_rpc_block_with(
     rpc_url: &str,
     height: u64,
     default_shard_id: u32,
-) -> Option<RpcBlockSummary> {
+) -> RpcBlockFetch {
+    let params = if default_shard_id == 0 {
+        serde_json::json!({ "height": height })
+    } else {
+        serde_json::json!({ "height": height, "shard_id": default_shard_id })
+    };
     let payload = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "stell_getBlock",
-        "params": { "height": height },
+        "params": params,
         "id": 1
     });
-    let resp = client.post(rpc_url).json(&payload).send().await.ok()?;
-    let data: Value = resp.json().await.ok()?;
-    let res = data.get("result")?;
+    let Ok(resp) = client.post(rpc_url).json(&payload).send().await else {
+        return RpcBlockFetch::TransientError;
+    };
+    if !resp.status().is_success() {
+        return RpcBlockFetch::TransientError;
+    }
+    let Ok(data) = resp.json::<Value>().await else {
+        return RpcBlockFetch::TransientError;
+    };
+    if let Some(err) = data.get("error").filter(|v| !v.is_null()) {
+        let code = err.get("code").and_then(|c| c.as_i64());
+        if matches!(code, Some(-32004) | Some(-32602)) {
+            return RpcBlockFetch::Unavailable;
+        }
+        return RpcBlockFetch::TransientError;
+    }
+    let Some(res) = data.get("result") else {
+        return RpcBlockFetch::TransientError;
+    };
     if res.is_null() {
-        return None;
+        return RpcBlockFetch::Unavailable;
     }
-    let hash = res["hash"].as_str()?.to_string();
+    let Some(hash) = res["hash"].as_str().map(str::to_string) else {
+        return RpcBlockFetch::Unavailable;
+    };
     if hash.is_empty() {
-        return None;
+        return RpcBlockFetch::Unavailable;
     }
-    let shard_id = res["shard_id"]
-        .as_u64()
-        .and_then(|v| u32::try_from(v).ok())
-        .unwrap_or(default_shard_id);
+    let explicit_shard_id = res["shard_id"].as_u64().and_then(|v| u32::try_from(v).ok());
+    if let Some(sid) = explicit_shard_id {
+        if sid != default_shard_id {
+            return RpcBlockFetch::Unavailable;
+        }
+    }
+    let shard_id = explicit_shard_id.unwrap_or(default_shard_id);
     let timestamp = res["timestamp"].as_u64().unwrap_or(0);
     let tx_count = res["txs"].as_u64().unwrap_or(0);
     let proposer = res["proposer"]
@@ -1306,7 +1656,7 @@ async fn fetch_rpc_block_with(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    Some(RpcBlockSummary {
+    RpcBlockFetch::Found(RpcBlockSummary {
         shard_id,
         height,
         hash,
@@ -1314,6 +1664,7 @@ async fn fetch_rpc_block_with(
         tx_count,
         proposer,
         state_root,
+        explicit_shard: explicit_shard_id.is_some(),
     })
 }
 
@@ -1355,6 +1706,7 @@ fn decode_native_tx_with_meta(
     let gas_limit = t["gas_limit"].as_str().unwrap_or("0").to_string();
 
     let mut deployed_code_hash: Option<String> = None;
+    let mut deployed_abi: Option<stellereum::contract_abi::ContractAbi> = None;
     let mut token_touches: Vec<(String, String)> = Vec::new();
 
     let raw = &t["raw_tx"];
@@ -1363,56 +1715,68 @@ fn decode_native_tx_with_meta(
             .strip_prefix("0x")
             .or_else(|| raw_hex.strip_prefix("0X"))
             .unwrap_or(raw_hex);
-        if clean.len() <= 512 * 1024 {
-            if let Ok(bytes) = hex::decode(clean) {
-                let opts = bincode::DefaultOptions::new()
-                    .with_fixint_encoding()
-                    .allow_trailing_bytes()
-                    .with_limit(262_144);
-                if let Ok(tx) = opts.deserialize::<stellereum::sharding::Transaction>(&bytes) {
-                    if succeeded {
-                        for op in &tx.payload {
-                            match op {
-                                OpCode::SysCallDeployContract { code } => {
-                                    deployed_code_hash = Some(hex::encode(
-                                        stellereum::contract_source::code_hash_sha256(code),
-                                    ));
+        if clean.is_empty() {
+            (String::new(), String::new(), "0".to_string())
+        } else if clean.len() <= 512 * 1024 {
+            let bytes = hex::decode(clean).ok()?;
+            let opts = bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .reject_trailing_bytes()
+                .with_limit(262_144);
+            let tx = opts
+                .deserialize::<stellereum::sharding::Transaction>(&bytes)
+                .ok()?;
+            if succeeded {
+                for op in &tx.payload {
+                    match op {
+                        OpCode::SysCallDeployContract { code } => {
+                            deployed_code_hash = Some(hex::encode(
+                                stellereum::contract_source::code_hash_sha256(code),
+                            ));
+                        }
+                        OpCode::SysCallDeployContractWithAbi { code, abi_json } => {
+                            deployed_code_hash = Some(hex::encode(
+                                stellereum::contract_source::code_hash_sha256(code),
+                            ));
+                            if abi_json.len() <= stellereum::svm::MAX_CONTRACT_ABI_BYTES {
+                                if let Ok(abi_str) = std::str::from_utf8(abi_json) {
+                                    if let Ok(abi) =
+                                        stellereum::contract_abi::ContractAbi::from_json(abi_str)
+                                    {
+                                        deployed_abi = Some(abi);
+                                    }
                                 }
-                                OpCode::SysCallTokenTransfer { token_id, to, .. } => {
-                                    let tid = hex::encode(token_id);
-                                    token_touches.push((tid.clone(), hex::encode(tx.from)));
-                                    token_touches.push((tid, hex::encode(to)));
-                                }
-                                OpCode::SysCallTokenTransferFrom {
-                                    token_id, from, to, ..
-                                } => {
-                                    let tid = hex::encode(token_id);
-                                    token_touches.push((tid.clone(), hex::encode(from)));
-                                    token_touches.push((tid, hex::encode(to)));
-                                }
-                                OpCode::SysCallTokenMint { token_id, to, .. } => {
-                                    token_touches.push((hex::encode(token_id), hex::encode(to)));
-                                }
-                                OpCode::SysCallTokenBurn { token_id, from, .. } => {
-                                    token_touches.push((hex::encode(token_id), hex::encode(from)));
-                                }
-                                _ => {}
                             }
                         }
+                        OpCode::SysCallTokenTransfer { token_id, to, .. } => {
+                            let tid = hex::encode(token_id);
+                            token_touches.push((tid.clone(), hex::encode(tx.from)));
+                            token_touches.push((tid, hex::encode(to)));
+                        }
+                        OpCode::SysCallTokenTransferFrom {
+                            token_id, from, to, ..
+                        } => {
+                            let tid = hex::encode(token_id);
+                            token_touches.push((tid.clone(), hex::encode(from)));
+                            token_touches.push((tid, hex::encode(to)));
+                        }
+                        OpCode::SysCallTokenMint { token_id, to, .. } => {
+                            token_touches.push((hex::encode(token_id), hex::encode(to)));
+                        }
+                        OpCode::SysCallTokenBurn { token_id, from, .. } => {
+                            token_touches.push((hex::encode(token_id), hex::encode(from)));
+                        }
+                        _ => {}
                     }
-                    (
-                        format!("0x{}", hex::encode(tx.from)),
-                        format!("0x{}", hex::encode(tx.to)),
-                        tx.amount.to_string(),
-                    )
-                } else {
-                    (String::new(), String::new(), "0".to_string())
                 }
-            } else {
-                (String::new(), String::new(), "0".to_string())
             }
+            (
+                format!("0x{}", hex::encode(tx.from)),
+                format!("0x{}", hex::encode(tx.to)),
+                tx.amount.to_string(),
+            )
         } else {
-            (String::new(), String::new(), "0".to_string())
+            return None;
         }
     } else {
         let raw_from = raw["from"].as_str().unwrap_or("");
@@ -1445,6 +1809,7 @@ fn decode_native_tx_with_meta(
         from_addr: from_addr.clone(),
         succeeded,
         deployed_code_hash,
+        deployed_abi,
         token_touches,
     };
 
@@ -1470,12 +1835,13 @@ fn decode_native_tx_with_meta(
 async fn fetch_receipt_details(
     client: &Client,
     rpc_url: &str,
+    shard_id: u32,
     tx_hash: &str,
 ) -> Option<ReceiptDetails> {
     let payload = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "stell_getTransactionReceipt",
-        "params": { "hash": tx_hash },
+        "params": { "hash": tx_hash, "shard_id": shard_id },
         "id": 1
     });
     let resp = client.post(rpc_url).json(&payload).send().await.ok()?;
@@ -1509,13 +1875,14 @@ async fn fetch_receipt_details(
 async fn fetch_token_balance(
     client: &Client,
     rpc_url: &str,
+    shard_id: u32,
     token: &str,
     account: &str,
 ) -> Option<String> {
     let payload = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "stell_tokenBalance",
-        "params": { "token": token, "account": account },
+        "params": { "token": token, "account": account, "shard_id": shard_id },
         "id": 1
     });
     let resp = client.post(rpc_url).json(&payload).send().await.ok()?;
@@ -1627,13 +1994,18 @@ mod tests {
                         "routing_prefix_bits": 1
                     }),
                     "stell_getBlock" => {
-                        let h = body["params"]["height"].as_u64().unwrap_or(0);
-                        serde_json::json!({
-                            "height": h,
-                            "hash": format!("0xs0_b{h}"),
-                            "txs": 0,
-                            "timestamp": 1792000000 + h
-                        })
+                        let req_shard = body["params"]["shard_id"].as_u64().unwrap_or(0);
+                        if req_shard != 0 {
+                            Value::Null
+                        } else {
+                            let h = body["params"]["height"].as_u64().unwrap_or(0);
+                            serde_json::json!({
+                                "height": h,
+                                "hash": format!("0xs0_b{h}"),
+                                "txs": 0,
+                                "timestamp": 1792000000 + h
+                            })
+                        }
                     }
                     _ => Value::Null,
                 };

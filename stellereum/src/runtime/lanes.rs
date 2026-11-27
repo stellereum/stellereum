@@ -211,11 +211,17 @@ pub(super) fn block_actor_sends_exceed_cap(block: &Block) -> bool {
 /// One execution job for the sequenced worker: the decided block plus the
 /// already-resolved reward, so the worker never reads governance or consensus
 /// state — only the engine it was spawned with and the bytes it was sent.
+pub(super) type ApplyJobResult = (
+    crate::state_engine::BlockTransitionOutcome,
+    [u8; 32],
+    HashMap<[u8; 32], u64>,
+);
+
 pub(super) struct ApplyJob {
     pub(super) block: Block,
     pub(super) reward: u64,
-    pub(super) done:
-        tokio::sync::oneshot::Sender<(crate::state_engine::BlockTransitionOutcome, [u8; 32])>,
+    pub(super) sweep_gov_in_worker: bool,
+    pub(super) done: tokio::sync::oneshot::Sender<ApplyJobResult>,
 }
 
 /// A quiescent state capture: every root-committed domain cloned at a FIFO
@@ -296,16 +302,30 @@ impl ApplyLane {
                         let outcome = std::panic::AssertUnwindSafe(async {
                             let outcome =
                                 state.apply_block_transition(&job.block, job.reward).await;
+                            // EXECUTION_PIPELINE_V1: run deterministic governance
+                            // finalization inside the worker BEFORE certifying
+                            // `root`, so `try_poll_apply` receives the exact
+                            // post-(block + gov sweep) state root without touching
+                            // live state on the tick.
+                            if job.sweep_gov_in_worker {
+                                super::apply::sweep_gov_finalize(
+                                    &state,
+                                    job.block.height,
+                                    job.block.timestamp,
+                                )
+                                .await;
+                            }
                             // Captured HERE, on the worker, so the submitter learns the
-                            // certified post-H root without recomputing the commitment a
-                            // second time on the tick.
+                            // certified post-H root and consensus penalty map without
+                            // racing live state on the tick.
                             let root = state.get_state_root().await;
-                            (outcome, root)
+                            let penalties = state.consensus_floor_snapshot().await.1;
+                            (outcome, root, penalties)
                         });
                         let result = outcome.catch_unwind().await;
                         match result {
-                            Ok((outcome, root)) => {
-                                let _ = job.done.send((outcome, root));
+                            Ok(payload) => {
+                                let _ = job.done.send(payload);
                             }
                             Err(_) => {
                                 tracing::error!(
@@ -343,28 +363,38 @@ impl ApplyLane {
                         // between the separate clone calls. Read locks only;
                         // uncontended (nothing else mutates mid-capture).
                         let accounts = crate::storage::clone_account_snapshot(&state).await;
-                        let ledger = state.staking_read().await.clone();
-                        let gov = state.governance_read().await.clone();
-                        let domains =
-                            crate::storage::DomainSnapshot::capture(&state, &ledger, &gov).await;
+                        let domains = crate::storage::DomainSnapshot {
+                            tokens: state.tokens_read().await.clone(),
+                            contracts: state.contracts_read().await.clone(),
+                            orderbooks: state.orderbooks_read().await.clone(),
+                            pmm: state.pmm_read().await.clone(),
+                            pmm_usdt_token: *state.pmm_usdt_token_read().await,
+                            pmm_treasury: *state.pmm_treasury_read().await,
+                            order_escrow: state.order_escrow_read().await.clone(),
+                            staking: state.staking_read().await.clone(),
+                            governance: state.governance_read().await.clone(),
+                            oracle: state.oracle_read().await.clone(),
+                        };
                         let session_keys = state.session_keys_snapshot().await;
                         let bridge = state.bridge_snapshot().await;
                         let zkml_models = state.zkml_models_snapshot().await;
-                        let cnvrf_v3 = bincode::serialize(&state.cnvrf_v3_snapshot().await)
-                            .unwrap_or_default();
+                        let cnvrf_v3_snap = state.cnvrf_v3_snapshot().await;
                         let evm_bindings = state.evm_bindings_snapshot().await;
                         let pq_registry = state.pq_registry_snapshot().await;
-                        let _ = job.done.send(Some(SnapBundle {
-                            height: job.height,
-                            accounts,
-                            domains,
-                            session_keys,
-                            bridge,
-                            zkml_models,
-                            cnvrf_v3,
-                            evm_bindings,
-                            pq_registry,
-                        }));
+                        tokio::task::spawn_blocking(move || {
+                            let cnvrf_v3 = bincode::serialize(&cnvrf_v3_snap).unwrap_or_default();
+                            let _ = job.done.send(Some(SnapBundle {
+                                height: job.height,
+                                accounts,
+                                domains,
+                                session_keys,
+                                bridge,
+                                zkml_models,
+                                cnvrf_v3,
+                                evm_bindings,
+                                pq_registry,
+                            }));
+                        });
                     }
                 }
             }
@@ -381,8 +411,7 @@ pub(super) struct ApplyInflight {
     pub(super) height: Height,
     pub(super) hash: BlockHash,
     pub(super) block: Block,
-    pub(super) done:
-        tokio::sync::oneshot::Receiver<(crate::state_engine::BlockTransitionOutcome, [u8; 32])>,
+    pub(super) done: tokio::sync::oneshot::Receiver<ApplyJobResult>,
 }
 
 /// What the worker reported back once its outcome is installed: the executed

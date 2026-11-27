@@ -570,11 +570,14 @@ impl TeamVestingSchedule {
 
     /// Calculate unlocked tokens at current timestamp
     pub fn unlocked_amount(&self, current_timestamp: u64) -> u64 {
-        if current_timestamp < self.start_timestamp + self.cliff_duration_secs {
+        let cliff_end = self
+            .start_timestamp
+            .saturating_add(self.cliff_duration_secs);
+        if current_timestamp < cliff_end {
             return 0;
         }
 
-        let elapsed = current_timestamp - (self.start_timestamp + self.cliff_duration_secs);
+        let elapsed = current_timestamp - cliff_end;
         if elapsed >= self.vesting_duration_secs {
             return self.total_allocation;
         }
@@ -1594,5 +1597,30 @@ mod w4_economics_tests {
         assert_eq!(emit_with_q64_carry(0, 10, 10, 7), (0, 7));
         // At height 0 the whole reward is emitted and nothing is carried.
         assert_eq!(emit_with_q64_carry(r0, half_life_blocks, 0, 0), (r0, 0));
+    }
+
+    #[test]
+    fn team_vesting_unlocked_amount_saturates_near_u64_max() {
+        let saturating = TeamVestingSchedule {
+            total_allocation: 1_000_000,
+            start_timestamp: u64::MAX - 10,
+            cliff_duration_secs: 100,
+            vesting_duration_secs: 200,
+            claimed_amount: 0,
+        };
+        assert_eq!(saturating.unlocked_amount(u64::MAX - 1), 0);
+        assert_eq!(saturating.unlocked_amount(u64::MAX), 0);
+
+        let linear = TeamVestingSchedule {
+            total_allocation: 1_000_000,
+            start_timestamp: u64::MAX - 100,
+            cliff_duration_secs: 50,
+            vesting_duration_secs: 50,
+            claimed_amount: 0,
+        };
+        assert_eq!(linear.unlocked_amount(u64::MAX - 51), 0);
+        assert_eq!(linear.unlocked_amount(u64::MAX - 50), 0);
+        assert_eq!(linear.unlocked_amount(u64::MAX - 25), 500_000);
+        assert_eq!(linear.unlocked_amount(u64::MAX), 1_000_000);
     }
 }

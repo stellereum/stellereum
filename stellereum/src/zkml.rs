@@ -1118,7 +1118,10 @@ pub struct QuantizedLayer {
 
 impl QuantizedLayer {
     pub fn new(in_dim: usize, out_dim: usize, weights: Vec<i64>, biases: Vec<i64>) -> Self {
-        assert_eq!(weights.len(), in_dim * out_dim);
+        let expected_weights = in_dim
+            .checked_mul(out_dim)
+            .expect("QuantizedLayer dimensions overflow usize");
+        assert_eq!(weights.len(), expected_weights);
         assert_eq!(biases.len(), out_dim);
         Self {
             in_dim,
@@ -1241,10 +1244,9 @@ impl QuantizedLinearModel {
     /// arms price: registration writes them into committed state and
     /// verification re-executes them.
     pub fn param_count(&self) -> usize {
-        self.layers
-            .iter()
-            .map(|l| l.weights.len() + l.biases.len())
-            .sum()
+        self.layers.iter().fold(0usize, |a, l| {
+            a.saturating_add(l.weights.len().saturating_add(l.biases.len()))
+        })
     }
 
     pub fn compute_model_hash(&self) -> [u8; 32] {

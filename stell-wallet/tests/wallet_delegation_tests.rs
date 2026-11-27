@@ -285,7 +285,8 @@ fn test_tx_construction_delegate() {
         amount_nano,
         nonce,
         DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_delegate_tx");
 
     assert_eq!(tx1.from, delegator.address);
     assert_eq!(tx1.to, delegator.address);
@@ -324,7 +325,8 @@ fn test_tx_construction_begin_unbond() {
         amount_nano,
         nonce,
         DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_begin_unbond_tx");
 
     assert_eq!(tx.from, delegator.address);
     assert_eq!(
@@ -354,7 +356,8 @@ fn test_tx_construction_withdraw_unbond() {
     let nonce = 15;
 
     let tx =
-        LightClient::build_pq_withdraw_unbond_tx(&delegator.kp, validator, nonce, DEFAULT_CHAIN_ID);
+        LightClient::build_pq_withdraw_unbond_tx(&delegator.kp, validator, nonce, DEFAULT_CHAIN_ID)
+            .expect("build_pq_withdraw_unbond_tx");
 
     assert_eq!(tx.from, delegator.address);
     assert_eq!(
@@ -386,7 +389,8 @@ fn test_tx_construction_claim_rewards_validator_and_delegator() {
         false,
         nonce,
         DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_claim_rewards_tx val");
     assert_eq!(tx_val.from, account.address);
     assert_eq!(
         tx_val.gas_limit,
@@ -408,7 +412,8 @@ fn test_tx_construction_claim_rewards_validator_and_delegator() {
         true,
         nonce + 1,
         DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_claim_rewards_tx del");
     assert_eq!(tx_del.from, account.address);
     assert_eq!(
         tx_del.gas_limit,
@@ -527,7 +532,8 @@ async fn test_delegate_tx_admission_and_receipt_confirmation() {
         10_000_000_000,
         0,
         DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_delegate_tx");
 
     // Broadcast: admitted to mempool, reports Pending before block finalization
     let (tx_hash, finality) = client.broadcast_tx(&tx).await.expect("broadcast delegate");
@@ -568,7 +574,8 @@ async fn test_begin_unbond_admission_and_receipt_confirmation() {
         5_000_000_000,
         0,
         DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_begin_unbond_tx");
 
     let (tx_hash, finality) = client
         .broadcast_tx(&tx)
@@ -605,7 +612,8 @@ async fn test_withdraw_unbond_admission_and_receipt_confirmation() {
 
     let client = rpc_client(&node).await;
     let tx =
-        LightClient::build_pq_withdraw_unbond_tx(&delegator.kp, validator, 0, DEFAULT_CHAIN_ID);
+        LightClient::build_pq_withdraw_unbond_tx(&delegator.kp, validator, 0, DEFAULT_CHAIN_ID)
+            .expect("build_pq_withdraw_unbond_tx");
 
     let (tx_hash, finality) = client
         .broadcast_tx(&tx)
@@ -641,7 +649,8 @@ async fn test_claim_rewards_admission_and_receipt_confirmation() {
 
     let client = rpc_client(&node).await;
     let tx =
-        LightClient::build_pq_claim_rewards_tx(&delegator.kp, validator, true, 0, DEFAULT_CHAIN_ID);
+        LightClient::build_pq_claim_rewards_tx(&delegator.kp, validator, true, 0, DEFAULT_CHAIN_ID)
+            .expect("build_pq_claim_rewards_tx");
 
     let (tx_hash, finality) = client
         .broadcast_tx(&tx)
@@ -686,7 +695,8 @@ async fn test_receipt_polling_rejection_marks_failed_not_confirmed() {
         5_000_000_000,
         0,
         DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_delegate_tx");
     let (tx_hash, _) = client.broadcast_tx(&tx).await.unwrap();
 
     // Node reports receipt with success=false (SVM execution reverted)
@@ -727,7 +737,8 @@ async fn test_node_rejection_mempool_insufficient_funds() {
         1_000_000_000,
         0,
         DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_delegate_tx");
 
     // Node mempool admission rejects transactions with balance < gas_limit
     let res = client.broadcast_tx(&tx).await;
@@ -753,7 +764,8 @@ async fn test_node_rejection_corrupted_signature() {
         1_000_000_000,
         0,
         DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_delegate_tx");
 
     // Tamper with signature
     tx.signature[0] ^= 0xFF;
@@ -780,7 +792,8 @@ async fn test_receipt_polling_timeout_honestly_returns_pending() {
         1_000_000_000,
         0,
         DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_delegate_tx");
     let (tx_hash, _) = client.broadcast_tx(&tx).await.unwrap();
 
     let cfg = client.rpc.clone().unwrap();

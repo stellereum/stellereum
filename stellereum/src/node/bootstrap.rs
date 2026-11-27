@@ -39,6 +39,54 @@ use stellereum::state_engine::InMemoryStateEngine;
 // (`FAUCET_PERSIST_FAILURES`) at the refusal site, where the RAM rollback is
 // also applied. A failed write never yields a granted drip.
 
+/// BLAKE3 derive-key domain separating the node's MEV ML-KEM seed from every
+/// other use of the node secret.
+///
+/// Bumping this string invalidates every node's existing KEM identity (the
+/// registry entry would no longer match the derived encapsulation key), so it
+/// is a protocol-visible constant: change only with a registry rotation plan.
+pub(crate) const MEV_KEM_SEED_DOMAIN: &str = "STELL_MEV_KEM_SEED_V1";
+
+/// Derive this node's 64-byte ML-KEM-768 seed (`d || z`) from its persisted
+/// Ed25519 consensus secret.
+///
+/// Deterministic BLAKE3 derive-key over the domain above, expanded through the
+/// XOF to the FIPS-203 seed length. The seed is returned in a `Zeroizing`
+/// buffer and must never be logged or serialized.
+pub(crate) fn derive_mev_kem_seed(node_secret: &[u8; 32]) -> zeroize::Zeroizing<[u8; 64]> {
+    let mut seed = zeroize::Zeroizing::new([0u8; 64]);
+    let mut hasher = blake3::Hasher::new_derive_key(MEV_KEM_SEED_DOMAIN);
+    hasher.update(node_secret);
+    hasher.finalize_xof().fill(&mut seed[..]);
+    seed
+}
+
+/// Build the node-local MEV KEM registry bootstrap can install today.
+///
+/// The registry is a PUBLIC-key map and there is no on-chain KEM-key source in
+/// this tree yet, so bootstrap can only register THIS node's derived key. A
+/// committee member with no registered key makes every registry-wired DKG call
+/// fail closed — deliberately: inventing a peer key would be worse than no
+/// epoch sealing. Once KEM registrations ride the chain, they are inserted into
+/// this same registry handle.
+pub(crate) fn mev_kem_registry_for_node(
+    our_id: [u8; 32],
+    validators: &ValidatorSet,
+    kem_seed: &[u8; 64],
+) -> stellereum::mev_kem_registry::MevKemRegistry {
+    let mut registry = stellereum::mev_kem_registry::MevKemRegistry::new();
+    if validators.contains(&our_id) {
+        let ek = stellereum::mev_epoch::pq_kem_ek_from_seed(kem_seed);
+        if let Err(e) = registry.register(our_id, ek, 0, 0, true) {
+            tracing::warn!(
+                "[mev-seal] cannot register this node's MEV KEM key (epoch sealing stays \
+                 fail-closed): {e}"
+            );
+        }
+    }
+    registry
+}
+
 /// Read the persisted genesis fingerprint, refusing on an I/O error.
 ///
 /// An unreadable store is NOT "no fingerprint": treating the two the same
@@ -279,9 +327,14 @@ pub(crate) async fn start_workchain_shard(
     header_registry: Arc<std::sync::RwLock<stellereum::sharding::FinalizedHeaderRegistry>>,
     master_staking: stellereum::sharding::MasterStakingLedger,
     shutdown_targets: Arc<ShutdownTargets>,
+    shard_router: Option<stellereum::rpc::ShardRpcRouter>,
 ) -> anyhow::Result<()> {
     install_genesis_chain_spec_from_env();
     let state_engine = Arc::new(InMemoryStateEngine::new());
+    state_engine.set_shard_id(shard);
+    // Node-local MEV KEM seed: derived from the persisted consensus secret so
+    // the same node always presents the same ML-KEM identity. Never logged.
+    let mev_kem_seed = derive_mev_kem_seed(&validator_key.to_bytes());
     // The dev/faucet account is the ONLY funded account on a workchain.
     // Key file (STELL_FAUCET_KEY_FILE, 0600-checked, zeroized) wins when set;
     // the public test key is refused without STELL_DEV_UNSAFE_TESTKEY=1.
@@ -450,6 +503,11 @@ pub(crate) async fn start_workchain_shard(
         .flatten()
         .map(|(h, _)| h)
         .unwrap_or(0);
+    let mev_kem_registry = Arc::new(mev_kem_registry_for_node(
+        validator_key.verifying_key().to_bytes(),
+        &vset,
+        &mev_kem_seed,
+    ));
     let rpc_state = Arc::new(stellereum::rpc::RpcState {
         engine: state_engine.clone(),
         mempool: Arc::new(tokio::sync::RwLock::new(
@@ -457,6 +515,10 @@ pub(crate) async fn start_workchain_shard(
                 .with_mev_engine(mev_engine)
                 .with_base_fee(base_fee)
                 .with_session_registry(state_engine.session_keys_handle())
+                // Node-local MEV KEM wiring for the epoch-seal DKG. The
+                // runtime reads it from this shared pool; without the seed
+                // and registry it fails closed (no classical fallback).
+                .with_mev_kem(mev_kem_registry, *mev_kem_seed)
                 // P2 shard gate (pool level): a sharded workchain pool admits
                 // only its own shard on EVERY path (RPC, gossip, restore).
                 // Single-shard stays unpinned (legacy traffic).
@@ -492,7 +554,15 @@ pub(crate) async fn start_workchain_shard(
         // shard-filtered and could never execute).
         shard_registry: registry.clone(),
     });
+    // The seed now lives inside the shared pool (wrapped in `Zeroizing`); drop
+    // this bootstrap copy as soon as possible so it is not resident longer
+    // than the wiring needs.
+    drop(mev_kem_seed);
     stellereum::rpc::hydrate_rpc_from_store(&rpc_state, &persistence.storage()).await;
+    if let Some(ref router) = shard_router {
+        rpc_state.set_peer_shards(router.clone());
+        router.write().await.insert(shard, rpc_state.clone());
+    }
     shutdown_targets.register_mempool(
         rpc_state.mempool.clone(),
         mempool_path_for_shard(shard, registry.is_sharded()),
@@ -863,7 +933,9 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
     // the consensus-only Ed25519 validator key (`validator.key`, migrated
     // once from a legacy identity.key). The consensus key never touches
     // infnode transport/auth.
-    let data_dir = PathBuf::from("./data");
+    let data_dir = data_dir_from_env();
+    let data_dir_path = data_dir.clone();
+    let _node_dir_lock = acquire_node_dir_lock(&data_dir)?;
     let keys_dir = PathBuf::from("./keys");
     let remote_signer_url = std::env::var(stellereum::remote_signer::REMOTE_SIGNER_URL_ENV)
         .ok()
@@ -875,6 +947,9 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
         .filter(|s| !s.is_empty());
     let validator_key = stellereum::node_keys::load_or_generate_consensus_key(&keys_dir)?;
     let validator_pub = validator_key.verifying_key().to_bytes();
+    // Node-local MEV KEM seed: BLAKE3 derive-key over the persisted consensus
+    // secret. Deterministic across restarts, wiped on drop, never logged.
+    let mev_kem_seed = derive_mev_kem_seed(&validator_key.to_bytes());
 
     // Remote / HSM signing v2. When `STELL_REMOTE_SIGNER_URL` is configured,
     // we MUST NOT open or generate `./keys/falcon.key` and MUST NOT fall back
@@ -1004,10 +1079,9 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
         // sync, then promote — otherwise it mints a private 3-member
         // genesis and can never validate live QCs (structural trap).
         {
-            // `data_dir` moved into `Node::new` above; this is the same
-            // historical `./data` it was built from.
-            let dir_clean =
-                stellereum::bootstrap::data_dir_is_clean_fs(std::path::Path::new("./data"));
+            // `data_dir` moved into `Node::new` above; `data_dir_path` holds
+            // the same `STELL_DATA_DIR` (or `./data`) path.
+            let dir_clean = stellereum::bootstrap::data_dir_is_clean_fs(&data_dir_path);
             let peer_pointer = !adapter.node.cfg.peers.is_empty()
                 || !stellereum::dns_seeds::seed_domains_from_env().is_empty();
             let observer = std::env::var("STELL_OBSERVER")
@@ -1100,9 +1174,9 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
         // silent fallback. On a DIRTY dir (restart) the old path
         // stands and the genesis-fingerprint guard below owns
         // consistency (it bails on any recomputed-root mismatch).
-        // Freshness reuses the same `./data` clean check as the
+        // Freshness reuses the same `data_dir_path` clean check as the
         // fresh-join guard above, so the two gates can never disagree.
-        let fresh_dir = stellereum::bootstrap::data_dir_is_clean_fs(std::path::Path::new("./data"));
+        let fresh_dir = stellereum::bootstrap::data_dir_is_clean_fs(&data_dir_path);
         let faucet_seed_opt = match stellereum::rpc::try_load_faucet_seed_opt_for_genesis() {
             Ok(opt) => opt,
             Err(e) => {
@@ -1416,9 +1490,17 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                     let _ = tokio::signal::ctrl_c().await;
                 }
                 let (mempools, persists) = targets.snapshot();
-                for (mp, path) in mempools {
-                    mp.read().await.save(&path);
-                }
+                let mempool_saves = mempools.into_iter().map(|(mp, path)| async move {
+                    let snapshot = {
+                        let pool = mp.read().await;
+                        pool.save_snapshot()
+                    };
+                    let _ = tokio::task::spawn_blocking(move || {
+                        stellereum::mempool::Mempool::write_save_snapshot(&path, snapshot);
+                    })
+                    .await;
+                });
+                futures::future::join_all(mempool_saves).await;
                 eprintln!("[storage] signal received; flushing persistence...");
                 for ap in &persists {
                     ap.request_flush();
@@ -1430,10 +1512,11 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 // the persist queue with an overall cap (240s) plus a
                 // settle grace after it reads empty, staying inside
                 // systemd's TimeoutStopSec=300s. Keeps exit(0).
-                for ap in &persists {
+                let drain_futs = persists.into_iter().map(|ap| async move {
                     let outcome =
                         stellereum::storage::wait_for_persist_drain(|| ap.pending()).await;
-                    let _ = ap.storage().flush();
+                    let store = ap.storage();
+                    let _ = tokio::task::spawn_blocking(move || store.flush()).await;
                     if outcome.drained {
                         eprintln!("[storage] persistence drained; exiting");
                     } else {
@@ -1442,7 +1525,8 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                             outcome.last_pending
                         );
                     }
-                }
+                });
+                futures::future::join_all(drain_futs).await;
                 done.notify_waiters();
                 std::process::exit(0);
             });
@@ -1516,6 +1600,15 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 stellereum::pq_registry::pq_lifecycle_active_at(init_height),
             )?
         };
+        // Node-local MEV KEM wiring for the epoch-seal DKG. Registered keys
+        // are PUBLIC encapsulation keys; only this node's derived key is known
+        // at bootstrap today, so a committee with an unregistered peer fails
+        // closed (never a fabricated key).
+        let mev_kem_registry = Arc::new(mev_kem_registry_for_node(
+            validator_key.verifying_key().to_bytes(),
+            &vset,
+            &mev_kem_seed,
+        ));
         // JSON-RPC + explorer/gateway state. Shared with the consensus
         // loop so the finalized height and recent-block feed stay live.
         let rpc_state = Arc::new(stellereum::rpc::RpcState {
@@ -1535,6 +1628,11 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                     // the engine's registry is what lets admission see a
                     // revocation the moment it lands in a block.
                     .with_session_registry(state_engine.session_keys_handle())
+                    // The node-local MEV KEM registry + derived ML-KEM seed.
+                    // The runtime shares this pool and resolves the wiring
+                    // from it; a pool without both halves keeps node-side DKG
+                    // fail-closed.
+                    .with_mev_kem(mev_kem_registry, *mev_kem_seed)
                     // P2 shard gate (pool level): the main flow is the
                     // masterchain; when sharded, its pool admits only
                     // shard 0 on EVERY path (RPC, gossip, restore).
@@ -1663,6 +1761,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 eprintln!("{msg}");
             }
         }
+
+        // The seed now lives inside the shared pool (wrapped in `Zeroizing`);
+        // drop this bootstrap copy so it is not resident longer than needed.
+        drop(mev_kem_seed);
 
         stellereum::rpc::hydrate_rpc_from_store(&rpc_state, &persistence.storage()).await;
 
@@ -1812,6 +1914,20 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             rpc_state.mempool.clone(),
             mempool_path_for_shard(stellereum::sharding::MASTERCHAIN_SHARD, sharded),
         );
+        // Shared ShardRpcRouter across all hosted shards so shard 0's HTTP/WS
+        // JSON-RPC and Explorer gateway can delegate shard-scoped queries and
+        // writes to hosted workchain shards (single-shard `{0}` keeps `None`).
+        let shard_router: Option<stellereum::rpc::ShardRpcRouter> = if registry.is_sharded() {
+            let router = Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new()));
+            router
+                .write()
+                .await
+                .insert(stellereum::sharding::MASTERCHAIN_SHARD, rpc_state.clone());
+            rpc_state.set_peer_shards(router.clone());
+            Some(router)
+        } else {
+            None
+        };
         // Additional shards in this process (`STELL_SHARDS=0,1[,2...]`):
         // EACH configured workchain runs its own run_consensus_node
         // instance over the SAME infnode node, so their
@@ -1856,6 +1972,7 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 // boundary.
                 master_staking.clone(),
                 Arc::clone(&shutdown_targets),
+                shard_router.clone(),
             )
             .await?;
         }

@@ -1,8 +1,14 @@
-use super::types::{write_contract_trie_entries_for_addrs, PayloadDomainSnapshot};
+use super::settlement::PlannedClobEffects;
+use super::types::{
+    token_balance_key, token_supply_key, write_contract_trie_entries_for_addrs, ActorSendBody,
+    ClobQuoteMode, PayloadDomainSnapshot,
+};
 use super::verify_once::verify_block_tx_signatures_at_height;
 use super::{AccountState, ExecPostActions, InMemoryStateEngine, PQ_ACTIVATION_SURCHARGE_GAS};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Minimum number of transactions a wave must carry before the CONCURRENT
 /// path (optimistic snapshot -> parallel plan on the rayon pool ->
@@ -51,6 +57,24 @@ fn parallel_plan_chunk() -> usize {
         .unwrap_or(PARALLEL_PLAN_CHUNK)
 }
 
+/// Maximum number of Block-STM validation/re-execution retries for dirty
+/// contract transactions in a single wave before falling back to sequential
+/// execution for the remainder of the wave.
+const MAX_STM_RETRIES: usize = 3;
+
+/// Runtime toggle for Phase 13a/13b fine-grained parallel payload execution
+/// (`STELL_PARALLEL_EXEC_V2`, default `true` when `parallel_exec` is enabled;
+/// `0` or `false` falls back to the legacy sequential payload loop).
+fn parallel_exec_v2_enabled() -> bool {
+    match std::env::var("STELL_PARALLEL_EXEC_V2") {
+        Ok(v) => {
+            let trimmed = v.trim();
+            !(trimmed == "0" || trimmed.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => true,
+    }
+}
+
 /// Wave planning for one block (O13).
 ///
 /// The `DisjointScheduler` partition is a pure function of the transactions,
@@ -65,6 +89,838 @@ fn planned_waves(parallel_enabled: bool, txs: &[crate::sharding::Transaction]) -
     #[cfg(test)]
     o13_schedule_probe_note_call();
     crate::parallel_exec::DisjointScheduler::schedule(txs)
+}
+
+/// Fine-grained Phase 13a/13b wave planning (`DisjointScheduler::schedule_v2`)
+/// gated behind `parallel_enabled` (O13).
+fn planned_waves_v2(
+    parallel_enabled: bool,
+    txs: &[crate::sharding::Transaction],
+    stm_contracts: bool,
+    exec_hardening: bool,
+) -> Vec<Vec<usize>> {
+    if !parallel_enabled {
+        return Vec::new();
+    }
+    #[cfg(test)]
+    o13_schedule_probe_note_call();
+    crate::parallel_exec::DisjointScheduler::schedule_v2(txs, stm_contracts, exec_hardening)
+}
+
+#[derive(Clone)]
+enum TxWaveKind<'a> {
+    Plain,
+    Token,
+    Market {
+        pair_id: u32,
+    },
+    Staking,
+    Contract {
+        contract: [u8; 32],
+        method: &'a [u8],
+        args: Vec<i64>,
+        calldata: &'a [u8],
+        nop_gas: u64,
+    },
+    Unsupported,
+}
+
+/// Deferred contract-call description gathered while classifying one tx.
+///
+/// Extracted into a struct so the classifier's local state stays readable and
+/// clippy's `type_complexity` gate stays meaningful for real tuples.
+struct ContractCallPlan<'a> {
+    contract: [u8; 32],
+    method: &'a [u8],
+    args: Vec<i64>,
+    calldata: &'a [u8],
+}
+
+fn classify_tx_v2(tx: &crate::sharding::Transaction, exec_hardening: bool) -> TxWaveKind<'_> {
+    use crate::svm::OpCode;
+
+    if tx.is_pq_activation() {
+        return TxWaveKind::Unsupported;
+    }
+    if tx.payload.is_empty() {
+        return TxWaveKind::Plain;
+    }
+    // Check EVM payload invariant up front (unsupported if any EVM carrier/mixed).
+    if crate::evm_adapter::carrier_intent_digest(tx).is_some()
+        || crate::evm_adapter::verify_evm_payload_against_tx(tx).is_err()
+    {
+        return TxWaveKind::Unsupported;
+    }
+
+    let mut has_token = false;
+    let mut market_pair: Option<u32> = None;
+    let mut staking_count = 0usize;
+    let mut contract_call: Option<ContractCallPlan<'_>> = None;
+    let mut nop_gas: u64 = 0;
+
+    for op in &tx.payload {
+        if matches!(op, OpCode::Halt) {
+            if exec_hardening {
+                break;
+            } else {
+                // Pre-hardening still halts at OpCode::Halt in VM, but scheduler
+                // inspected post-Halt ops unless exec_hardening is true; be conservative.
+                return TxWaveKind::Unsupported;
+            }
+        }
+        match op {
+            OpCode::Nop => {
+                nop_gas = nop_gas.saturating_add(crate::svm::GAS_NOP);
+            }
+            OpCode::SysCallTokenTransfer { .. }
+            | OpCode::SysCallTokenTransferFrom { .. }
+            | OpCode::SysCallTokenApprove { .. }
+            | OpCode::SysCallTokenMint { .. }
+            | OpCode::SysCallTokenBurn { .. }
+            | OpCode::SysCallTokenBalanceOf { .. } => {
+                has_token = true;
+            }
+            OpCode::SysCallPlaceOrder { pair_id, .. } => match market_pair {
+                None => market_pair = Some(*pair_id),
+                Some(p) if p == *pair_id => {}
+                Some(_) => return TxWaveKind::Unsupported,
+            },
+            OpCode::SysCallDelegate { .. }
+            | OpCode::SysCallUnbond { .. }
+            | OpCode::SysCallBeginUndelegate { .. }
+            | OpCode::SysCallUndelegate { .. }
+            | OpCode::SysCallClaimRewards { .. }
+            | OpCode::SysCallClaimDelegatorRewards { .. }
+            | OpCode::SysCallWithdrawSelfBond { .. } => {
+                staking_count += 1;
+            }
+            OpCode::SysCallCallContract {
+                contract,
+                method,
+                arg,
+            } => {
+                if contract_call.is_some() {
+                    return TxWaveKind::Unsupported;
+                }
+                contract_call = Some(ContractCallPlan {
+                    contract: *contract,
+                    method: method.as_slice(),
+                    args: vec![*arg],
+                    calldata: &[],
+                });
+            }
+            OpCode::SysCallCallContractArgs {
+                contract,
+                method,
+                args,
+                calldata,
+            } => {
+                if contract_call.is_some() {
+                    return TxWaveKind::Unsupported;
+                }
+                contract_call = Some(ContractCallPlan {
+                    contract: *contract,
+                    method: method.as_slice(),
+                    args: args.clone(),
+                    calldata: calldata.as_slice(),
+                });
+            }
+            _ => return TxWaveKind::Unsupported,
+        }
+    }
+
+    let domain_kinds = usize::from(has_token)
+        + usize::from(market_pair.is_some())
+        + usize::from(staking_count > 0)
+        + usize::from(contract_call.is_some());
+    if domain_kinds != 1 {
+        return TxWaveKind::Unsupported;
+    }
+
+    if has_token {
+        return TxWaveKind::Token;
+    }
+    if let Some(pair_id) = market_pair {
+        if nop_gas > 0 {
+            return TxWaveKind::Unsupported;
+        }
+        return TxWaveKind::Market { pair_id };
+    }
+    if staking_count > 0 {
+        if staking_count != 1 || nop_gas > 0 {
+            return TxWaveKind::Unsupported;
+        }
+        return TxWaveKind::Staking;
+    }
+    if let Some(plan) = contract_call {
+        return TxWaveKind::Contract {
+            contract: plan.contract,
+            method: plan.method,
+            args: plan.args,
+            calldata: plan.calldata,
+            nop_gas,
+        };
+    }
+    TxWaveKind::Unsupported
+}
+
+#[derive(Clone, Copy)]
+enum PreGate {
+    NotAdmitted,
+    MissingSender,
+    PrecheckFail,
+    GateFail,
+    Ready { sender_balance: u64 },
+}
+
+enum Phase13aPlan {
+    Token {
+        delta: crate::token::TokenTxDelta,
+        token_ids: Vec<[u8; 32]>,
+        gas_used: u64,
+    },
+    Market {
+        pair_id: u32,
+        book_after: crate::orderbook::OrderbookActor,
+        clob: PlannedClobEffects,
+        gas_used: u64,
+    },
+    MarketFailed {
+        makers: HashSet<[u8; 32]>,
+    },
+    Staking {
+        delta: crate::staking::StakingTxDelta,
+        transfers: Vec<([u8; 32], u64)>,
+        payouts: Vec<([u8; 32], [u8; 32], u64)>,
+        gas_used: u64,
+    },
+    Failed,
+}
+
+fn plan_token_tx(
+    tx: &crate::sharding::Transaction,
+    tokens: &crate::token::TokenRegistry,
+    timestamp: u64,
+    exec_hardening: bool,
+) -> Phase13aPlan {
+    use crate::svm::OpCode;
+
+    let mut gas_remaining = tx.gas_limit;
+    let mut delta = crate::token::TokenTxDelta::default();
+    let mut token_ids: Vec<[u8; 32]> = Vec::new();
+
+    for op in &tx.payload {
+        if exec_hardening && matches!(op, OpCode::Halt) {
+            break;
+        }
+        match op {
+            OpCode::Nop => {
+                if gas_remaining < crate::svm::GAS_NOP {
+                    return Phase13aPlan::Failed;
+                }
+                gas_remaining -= crate::svm::GAS_NOP;
+            }
+            OpCode::Halt => break,
+            OpCode::SysCallTokenTransfer {
+                token_id,
+                to,
+                amount,
+            } => {
+                if gas_remaining < crate::svm::GAS_TOKEN_TRANSFER {
+                    return Phase13aPlan::Failed;
+                }
+                gas_remaining -= crate::svm::GAS_TOKEN_TRANSFER;
+                if tokens
+                    .plan_transfer_into(&mut delta, token_id, tx.from, *to, *amount)
+                    .is_err()
+                {
+                    return Phase13aPlan::Failed;
+                }
+                if !token_ids.contains(token_id) {
+                    token_ids.push(*token_id);
+                }
+            }
+            OpCode::SysCallTokenTransferFrom {
+                token_id,
+                from,
+                to,
+                amount,
+            } => {
+                if gas_remaining < crate::svm::GAS_TOKEN_TRANSFER {
+                    return Phase13aPlan::Failed;
+                }
+                gas_remaining -= crate::svm::GAS_TOKEN_TRANSFER;
+                if tokens
+                    .plan_transfer_from_into(&mut delta, token_id, tx.from, *from, *to, *amount)
+                    .is_err()
+                {
+                    return Phase13aPlan::Failed;
+                }
+                if !token_ids.contains(token_id) {
+                    token_ids.push(*token_id);
+                }
+            }
+            OpCode::SysCallTokenApprove {
+                token_id,
+                spender,
+                amount,
+            } => {
+                if gas_remaining < crate::svm::GAS_TOKEN_APPROVE {
+                    return Phase13aPlan::Failed;
+                }
+                gas_remaining -= crate::svm::GAS_TOKEN_APPROVE;
+                if tokens
+                    .plan_approve_into(&mut delta, token_id, tx.from, *spender, *amount)
+                    .is_err()
+                {
+                    return Phase13aPlan::Failed;
+                }
+                if !token_ids.contains(token_id) {
+                    token_ids.push(*token_id);
+                }
+            }
+            OpCode::SysCallTokenMint {
+                token_id,
+                to,
+                amount,
+            } => {
+                if gas_remaining < crate::svm::GAS_TOKEN_MINT {
+                    return Phase13aPlan::Failed;
+                }
+                gas_remaining -= crate::svm::GAS_TOKEN_MINT;
+                if tokens
+                    .plan_mint_into(&mut delta, token_id, tx.from, *to, *amount)
+                    .is_err()
+                {
+                    return Phase13aPlan::Failed;
+                }
+                if !token_ids.contains(token_id) {
+                    token_ids.push(*token_id);
+                }
+            }
+            OpCode::SysCallTokenBurn {
+                token_id,
+                from,
+                amount,
+            } => {
+                if gas_remaining < crate::svm::GAS_TOKEN_BURN {
+                    return Phase13aPlan::Failed;
+                }
+                gas_remaining -= crate::svm::GAS_TOKEN_BURN;
+                if tokens
+                    .plan_burn_into(&mut delta, token_id, tx.from, *from, *amount)
+                    .is_err()
+                {
+                    return Phase13aPlan::Failed;
+                }
+                if !token_ids.contains(token_id) {
+                    token_ids.push(*token_id);
+                }
+            }
+            OpCode::SysCallTokenBalanceOf { .. } => {
+                if gas_remaining < crate::svm::GAS_TOKEN_BALANCE {
+                    return Phase13aPlan::Failed;
+                }
+                gas_remaining -= crate::svm::GAS_TOKEN_BALANCE;
+            }
+            _ => return Phase13aPlan::Failed,
+        }
+    }
+
+    let gas_used = tx.gas_limit - gas_remaining;
+    if let Some(mut auth) = tx.delegation() {
+        if auth.verify_and_spend_gas(gas_used, timestamp).is_err() {
+            return Phase13aPlan::Failed;
+        }
+    }
+
+    Phase13aPlan::Token {
+        delta,
+        token_ids,
+        gas_used,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+// GATE: market planner mirrors Svm::execute_inner + settle_clob_effects context for bit-exact parity.
+fn plan_market_tx(
+    tx: &crate::sharding::Transaction,
+    target_pair_id: u32,
+    sender_balance: u64,
+    timestamp: u64,
+    exec_hardening: bool,
+    tokens: &crate::token::TokenRegistry,
+    orderbooks: &crate::orderbook::OrderbookManager,
+    escrow: &HashMap<(u32, u64), super::EscrowRecord>,
+    oracle: &crate::oracle::OracleState,
+    accounts: &HashMap<[u8; 32], AccountState>,
+    quote_id: Option<[u8; 32]>,
+) -> Phase13aPlan {
+    use crate::orderbook::{ClobEvent, OrderSide, OrderType, OrderbookActor};
+    use crate::svm::{OpCode, GAS_ORDER_PLACE, GAS_PER_MATCH_LEVEL, MAX_MATCH_LEVELS};
+
+    let mut gas_remaining = tx.gas_limit;
+    let mut current_balance = sender_balance;
+    let mut clob_events: Vec<ClobEvent> = Vec::new();
+    let mut book = orderbooks
+        .clone_pair(target_pair_id)
+        .unwrap_or_else(|| OrderbookActor::new(target_pair_id, 1000));
+    let mut makers: HashSet<[u8; 32]> = HashSet::new();
+
+    for op in &tx.payload {
+        if exec_hardening && matches!(op, OpCode::Halt) {
+            break;
+        }
+        match op {
+            OpCode::Halt => break,
+            OpCode::SysCallPlaceOrder {
+                pair_id,
+                is_buy,
+                price,
+                amount,
+            } => {
+                if *pair_id != target_pair_id || gas_remaining < GAS_ORDER_PLACE {
+                    return Phase13aPlan::MarketFailed { makers };
+                }
+                gas_remaining -= GAS_ORDER_PLACE;
+                if oracle.gate_order(*pair_id, *price).is_err() {
+                    return Phase13aPlan::MarketFailed { makers };
+                }
+                let side = if *is_buy {
+                    OrderSide::Buy
+                } else {
+                    OrderSide::Sell
+                };
+                let order_cost = if *is_buy {
+                    let prod = (*price as u128) * (*amount as u128);
+                    (prod / 1_000_000u128).min(u64::MAX as u128) as u64
+                } else {
+                    *amount
+                };
+                if order_cost > current_balance {
+                    return Phase13aPlan::MarketFailed { makers };
+                }
+                let (placed_order, trade_events) = if exec_hardening {
+                    book.submit_order_bounded_with_fills(
+                        tx.from,
+                        side.clone(),
+                        OrderType::Limit,
+                        *price,
+                        *amount,
+                        timestamp,
+                        MAX_MATCH_LEVELS,
+                        crate::orderbook::MAX_MATCH_FILLS_PER_ORDER,
+                    )
+                } else {
+                    book.submit_order_bounded(
+                        tx.from,
+                        side.clone(),
+                        OrderType::Limit,
+                        *price,
+                        *amount,
+                        timestamp,
+                        MAX_MATCH_LEVELS,
+                    )
+                };
+                for t in &trade_events {
+                    makers.insert(t.maker);
+                }
+                let level_gas = if exec_hardening {
+                    (trade_events.len() as u64).saturating_mul(GAS_PER_MATCH_LEVEL)
+                } else {
+                    (trade_events.len() as u64).min(MAX_MATCH_LEVELS as u64) * GAS_PER_MATCH_LEVEL
+                };
+                if gas_remaining < level_gas {
+                    return Phase13aPlan::MarketFailed { makers };
+                }
+                gas_remaining -= level_gas;
+                current_balance -= order_cost;
+                clob_events.push(ClobEvent::Place {
+                    pair_id: *pair_id,
+                    order_id: placed_order.order_id,
+                    trader: tx.from,
+                    side,
+                    order_type: OrderType::Limit,
+                    price: *price,
+                    amount: *amount,
+                    filled: placed_order.filled,
+                    trades: trade_events,
+                });
+            }
+            _ => return Phase13aPlan::MarketFailed { makers },
+        }
+    }
+
+    let gas_used = tx.gas_limit - gas_remaining;
+    if let Some(mut auth) = tx.delegation() {
+        if auth.verify_and_spend_gas(gas_used, timestamp).is_err() {
+            return Phase13aPlan::MarketFailed { makers };
+        }
+    }
+
+    if clob_events.is_empty() {
+        return Phase13aPlan::MarketFailed { makers };
+    }
+
+    let reserve = tx.amount.saturating_add(tx.gas_limit);
+    match InMemoryStateEngine::plan_clob_effects(
+        &clob_events,
+        ClobQuoteMode::NativeSvm,
+        quote_id,
+        tokens,
+        escrow,
+        accounts,
+        tx.from,
+        reserve,
+        |pair, id| pair != target_pair_id || book.find_order(id).is_none(),
+    ) {
+        Ok(clob) => Phase13aPlan::Market {
+            pair_id: target_pair_id,
+            book_after: book,
+            clob,
+            gas_used,
+        },
+        Err(_) => Phase13aPlan::MarketFailed { makers },
+    }
+}
+
+fn plan_staking_tx(
+    tx: &crate::sharding::Transaction,
+    sender_balance: u64,
+    timestamp: u64,
+    exec_hardening: bool,
+    pq_lifecycle: bool,
+    staking: &crate::staking::StakingLedger,
+) -> Phase13aPlan {
+    use crate::staking::{StakingTxSliceOp, REWARDS_POOL, STAKING_POOL};
+    use crate::svm::{OpCode, GAS_STAKE_BOND, GAS_STAKE_CLAIM, GAS_STAKE_UNBOND};
+
+    let mut gas_remaining = tx.gas_limit;
+    let mut transfers: Vec<([u8; 32], u64)> = Vec::new();
+    let mut payouts: Vec<([u8; 32], [u8; 32], u64)> = Vec::new();
+    let mut planned_delta = None;
+
+    for op in &tx.payload {
+        if exec_hardening && matches!(op, OpCode::Halt) {
+            break;
+        }
+        match op {
+            OpCode::Halt => break,
+            OpCode::SysCallDelegate { validator, amount } => {
+                if gas_remaining < GAS_STAKE_BOND {
+                    return Phase13aPlan::Failed;
+                }
+                gas_remaining -= GAS_STAKE_BOND;
+                if *amount == 0 || *amount > sender_balance {
+                    return Phase13aPlan::Failed;
+                }
+                let Ok(delta) = staking.plan_tx_slice(StakingTxSliceOp::Delegate {
+                    delegator: tx.from,
+                    validator: *validator,
+                    amount: *amount,
+                }) else {
+                    return Phase13aPlan::Failed;
+                };
+                transfers.push((STAKING_POOL, *amount));
+                planned_delta = Some(delta);
+            }
+            OpCode::SysCallUnbond { validator, amount } => {
+                if gas_remaining < GAS_STAKE_UNBOND {
+                    return Phase13aPlan::Failed;
+                }
+                gas_remaining -= GAS_STAKE_UNBOND;
+                if !pq_lifecycle && tx.from != *validator {
+                    return Phase13aPlan::Failed;
+                }
+                if pq_lifecycle
+                    && staking
+                        .authorize_validator_owner(validator, &tx.from, true)
+                        .is_err()
+                {
+                    return Phase13aPlan::Failed;
+                }
+                let Ok(delta) = staking.plan_tx_slice(StakingTxSliceOp::Unbond {
+                    validator: *validator,
+                    amount: *amount,
+                    now: timestamp,
+                }) else {
+                    return Phase13aPlan::Failed;
+                };
+                planned_delta = Some(delta);
+            }
+            OpCode::SysCallBeginUndelegate { validator, amount } => {
+                if gas_remaining < GAS_STAKE_UNBOND {
+                    return Phase13aPlan::Failed;
+                }
+                gas_remaining -= GAS_STAKE_UNBOND;
+                if *amount == 0 {
+                    return Phase13aPlan::Failed;
+                }
+                let Ok(delta) = staking.plan_tx_slice(StakingTxSliceOp::BeginUndelegate {
+                    delegator: tx.from,
+                    validator: *validator,
+                    amount: *amount,
+                    now: timestamp,
+                }) else {
+                    return Phase13aPlan::Failed;
+                };
+                planned_delta = Some(delta);
+            }
+            OpCode::SysCallUndelegate { validator } => {
+                if gas_remaining < GAS_STAKE_UNBOND {
+                    return Phase13aPlan::Failed;
+                }
+                gas_remaining -= GAS_STAKE_UNBOND;
+                let Ok(delta) = staking.plan_tx_slice(StakingTxSliceOp::Undelegate {
+                    delegator: tx.from,
+                    validator: *validator,
+                }) else {
+                    return Phase13aPlan::Failed;
+                };
+                let amt = delta.withdrawn_amount();
+                payouts.push((STAKING_POOL, tx.from, amt));
+                planned_delta = Some(delta);
+            }
+            OpCode::SysCallClaimRewards { validator } => {
+                if gas_remaining < GAS_STAKE_CLAIM {
+                    return Phase13aPlan::Failed;
+                }
+                gas_remaining -= GAS_STAKE_CLAIM;
+                if !pq_lifecycle && tx.from != *validator {
+                    return Phase13aPlan::Failed;
+                }
+                if pq_lifecycle
+                    && staking
+                        .authorize_validator_owner(validator, &tx.from, true)
+                        .is_err()
+                {
+                    return Phase13aPlan::Failed;
+                }
+                let Ok(delta) = staking.plan_tx_slice(StakingTxSliceOp::ClaimRewards {
+                    validator: *validator,
+                }) else {
+                    return Phase13aPlan::Failed;
+                };
+                let amt = delta.claimed_rewards();
+                if amt > 0 {
+                    payouts.push((REWARDS_POOL, tx.from, amt));
+                }
+                planned_delta = Some(delta);
+            }
+            OpCode::SysCallClaimDelegatorRewards { validator } => {
+                if gas_remaining < GAS_STAKE_CLAIM {
+                    return Phase13aPlan::Failed;
+                }
+                gas_remaining -= GAS_STAKE_CLAIM;
+                let Ok(delta) = staking.plan_tx_slice(StakingTxSliceOp::ClaimDelegatorRewards {
+                    delegator: tx.from,
+                    validator: *validator,
+                }) else {
+                    return Phase13aPlan::Failed;
+                };
+                let amt = delta.claimed_rewards();
+                if amt == 0 {
+                    return Phase13aPlan::Failed;
+                }
+                payouts.push((REWARDS_POOL, tx.from, amt));
+                planned_delta = Some(delta);
+            }
+            OpCode::SysCallWithdrawSelfBond { validator } => {
+                if gas_remaining < GAS_STAKE_UNBOND {
+                    return Phase13aPlan::Failed;
+                }
+                gas_remaining -= GAS_STAKE_UNBOND;
+                if !pq_lifecycle && tx.from != *validator {
+                    return Phase13aPlan::Failed;
+                }
+                if pq_lifecycle
+                    && staking
+                        .authorize_validator_owner(validator, &tx.from, true)
+                        .is_err()
+                {
+                    return Phase13aPlan::Failed;
+                }
+                let Ok(delta) = staking.plan_tx_slice(StakingTxSliceOp::WithdrawSelfBond {
+                    validator: *validator,
+                }) else {
+                    return Phase13aPlan::Failed;
+                };
+                let amt = delta.withdrawn_amount();
+                payouts.push((STAKING_POOL, tx.from, amt));
+                planned_delta = Some(delta);
+            }
+            _ => return Phase13aPlan::Failed,
+        }
+    }
+
+    let Some(delta) = planned_delta else {
+        return Phase13aPlan::Failed;
+    };
+
+    let gas_used = tx.gas_limit - gas_remaining;
+    if let Some(mut auth) = tx.delegation() {
+        if auth.verify_and_spend_gas(gas_used, timestamp).is_err() {
+            return Phase13aPlan::Failed;
+        }
+    }
+
+    Phase13aPlan::Staking {
+        delta,
+        transfers,
+        payouts,
+        gas_used,
+    }
+}
+
+fn bill_outbound_actor_messages_v2(
+    outbound: &[crate::contract::ContractMessage],
+    gas_remaining: &mut u64,
+) -> bool {
+    use bincode::Options;
+    for msg in outbound {
+        if msg.payload.is_empty() {
+            if *gas_remaining < crate::svm::GAS_ACTOR_DELIVER {
+                return false;
+            }
+            *gas_remaining -= crate::svm::GAS_ACTOR_DELIVER;
+            continue;
+        }
+        if let Ok(body) = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(16 * 1024 * 1024)
+            .deserialize::<ActorSendBody>(&msg.payload)
+        {
+            if body.gas_budget > crate::svm::MAX_CONTRACT_ACTOR_GAS_BUDGET {
+                return false;
+            }
+            let prepay = crate::svm::GAS_ACTOR_DELIVER.saturating_add(body.gas_budget);
+            if *gas_remaining < prepay {
+                return false;
+            }
+            *gas_remaining -= prepay;
+        }
+    }
+    true
+}
+
+#[derive(Clone)]
+enum StmAttemptOutcome {
+    Ok {
+        outcome: crate::contract::ContractOutcome,
+        trace: crate::contract::StmExecutionTrace,
+        gas_used: u64,
+    },
+    SpeculativeFail,
+    PermanentFail,
+}
+
+#[allow(clippy::too_many_arguments)]
+// GATE: STM contract call executor mirrors Svm::execute_inner call_with_context_hardened_at parameters.
+fn execute_one_stm_tx(
+    contracts: &crate::contract::ContractRegistry,
+    mv_memory: &Arc<crate::contract::ContractMvMemory>,
+    tx: &crate::sharding::Transaction,
+    tx_idx: usize,
+    contract: &[u8; 32],
+    method: &[u8],
+    args: &[i64],
+    calldata: &[u8],
+    nop_gas: u64,
+    timestamp: u64,
+    contract_block_hash: [u8; 32],
+    wasm_pmm_hardening: bool,
+    enforce_table_cap: bool,
+    falcon_fuel_v2: bool,
+    actor_mailbox_hardening: bool,
+    contract_send_refusal: bool,
+    local_shard: u32,
+    sharded: bool,
+    topology: Option<&crate::sharding::ShardTopology>,
+) -> StmAttemptOutcome {
+    use crate::contract::{ContractCallOptions, ContractError, MAX_CONTRACT_CALL_ARGS};
+    use crate::svm::{contract_call_gas, MAX_CONTRACT_CALLDATA_BYTES, MAX_CONTRACT_METHOD_LEN};
+
+    if method.len() > MAX_CONTRACT_METHOD_LEN
+        || calldata.len() > MAX_CONTRACT_CALLDATA_BYTES
+        || args.len() > MAX_CONTRACT_CALL_ARGS
+    {
+        return StmAttemptOutcome::PermanentFail;
+    }
+
+    let base_gas =
+        nop_gas.saturating_add(contract_call_gas(method.len(), args.len(), calldata.len()));
+    if tx.gas_limit < base_gas {
+        return StmAttemptOutcome::PermanentFail;
+    }
+    let mut gas_remaining = tx.gas_limit - base_gas;
+
+    let Ok(method_str) = std::str::from_utf8(method) else {
+        return StmAttemptOutcome::PermanentFail;
+    };
+
+    let opts = ContractCallOptions {
+        caller: tx.from,
+        origin: tx.from,
+        value: 0,
+        block_time: timestamp,
+        block_hash: contract_block_hash,
+        hardened: wasm_pmm_hardening,
+    };
+
+    match contracts.call_with_stm_trace_with_gates(
+        contract,
+        method_str,
+        args,
+        calldata,
+        gas_remaining,
+        &opts,
+        tx_idx,
+        Arc::clone(mv_memory) as Arc<dyn crate::contract::StmStateView>,
+        enforce_table_cap,
+        falcon_fuel_v2,
+    ) {
+        Ok((outcome, trace)) => {
+            if gas_remaining < outcome.fuel_used {
+                return StmAttemptOutcome::SpeculativeFail;
+            }
+            gas_remaining -= outcome.fuel_used;
+            if actor_mailbox_hardening
+                && !bill_outbound_actor_messages_v2(&outcome.outbound_messages, &mut gas_remaining)
+            {
+                return StmAttemptOutcome::SpeculativeFail;
+            }
+            let gas_used = tx.gas_limit - gas_remaining;
+            if let Some(mut auth) = tx.delegation() {
+                if auth.verify_and_spend_gas(gas_used, timestamp).is_err() {
+                    return StmAttemptOutcome::SpeculativeFail;
+                }
+            }
+            if contract_send_refusal {
+                if let Some(topo) = topology {
+                    if outcome.outbound_messages.iter().any(|m| {
+                        crate::svm::contract_recipient_is_cross_shard(
+                            &m.recipient,
+                            local_shard,
+                            sharded,
+                            topo,
+                        )
+                    }) {
+                        return StmAttemptOutcome::SpeculativeFail;
+                    }
+                }
+            }
+            StmAttemptOutcome::Ok {
+                outcome,
+                trace,
+                gas_used,
+            }
+        }
+        Err(ContractError::OutOfFuel | ContractError::Trapped) => {
+            StmAttemptOutcome::SpeculativeFail
+        }
+        Err(_) => StmAttemptOutcome::PermanentFail,
+    }
 }
 
 // TEST-ONLY probe (O13): counts how many times the wave scheduler was
@@ -701,6 +1557,1512 @@ impl InMemoryStateEngine {
         }
     }
 
+    /// Execute ONE transaction sequentially against live engine state.
+    /// Shared by the sequential block path, legacy payload waves, and Phase 13a/13b
+    /// collision/retry fallbacks so every path executes identical semantics.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: per-tx sequential apply mirrors block-loop accumulators and floor inputs for bit-exact parity.
+    async fn apply_single_tx_sequential(
+        &self,
+        tx: &crate::sharding::Transaction,
+        i: usize,
+        timestamp: u64,
+        chain_height: u64,
+        parent_block_hash: [u8; 32],
+        admitted: bool,
+        fee_floor: (u64, u64),
+        vesting_floors: &HashMap<[u8; 32], u64>,
+        exec_hardening: bool,
+        fee_market_v2: bool,
+        applied: &mut usize,
+        failed: &mut usize,
+        fees_collected: &mut u64,
+        status: &mut [bool],
+        fees: &mut [u64],
+        events: &mut [Vec<crate::contract::ContractEvent>],
+        trie_dirty: &mut Vec<([u8; 32], u64, u64)>,
+        pq_keys_pinned: &mut bool,
+    ) {
+        macro_rules! fail_with_floor {
+            ($tx:expr, $idx:expr) => {{
+                *failed += 1;
+                let (floor_base, surcharge) = fee_floor;
+                let fee = Self::failure_fee_for_v2($tx, floor_base, surcharge, fee_market_v2);
+                if let Some(auth) = $tx.sponsored_grant() {
+                    let (debited, charged_state) = self
+                        .charge_sponsored_failure_fee($tx, &auth.sponsor, fee)
+                        .await;
+                    if let Some((user_balance, user_nonce, sponsor_balance, sponsor_nonce)) =
+                        charged_state
+                    {
+                        trie_dirty.push(($tx.from, user_balance, user_nonce));
+                        trie_dirty.push((auth.sponsor, sponsor_balance, sponsor_nonce));
+                    }
+                    *fees_collected = fees_collected.saturating_add(debited);
+                    fees[$idx] = debited;
+                } else {
+                    let (debited, charged_state) = self.charge_failure_fee($tx, fee).await;
+                    if let Some((balance, nonce)) = charged_state {
+                        trie_dirty.push(($tx.from, balance, nonce));
+                    }
+                    *fees_collected = fees_collected.saturating_add(debited);
+                    fees[$idx] = debited;
+                }
+            }};
+        }
+
+        if !admitted {
+            *failed += 1;
+            return;
+        }
+        if !tx.payload.is_empty() {
+            let precheck = {
+                let map = self.accounts.read().await;
+                if let Some(auth) = tx.sponsored_grant() {
+                    if let Some(sender) = map.get(&tx.from) {
+                        if tx.nonce != sender.nonce {
+                            2
+                        } else if sender.balance < tx.amount {
+                            4
+                        } else {
+                            let (floor_base, surcharge) = fee_floor;
+                            let fee_total = tx.gas_limit.max(floor_base).saturating_add(surcharge);
+                            let sponsor_balance =
+                                map.get(&auth.sponsor).map(|a| a.balance).unwrap_or(0);
+                            if sponsor_balance < fee_total {
+                                4
+                            } else {
+                                0
+                            }
+                        }
+                    } else {
+                        1
+                    }
+                } else if let Some(sender) = map.get(&tx.from) {
+                    if tx.nonce != sender.nonce {
+                        2
+                    } else {
+                        let surcharge = if tx.is_pq_activation() {
+                            PQ_ACTIVATION_SURCHARGE_GAS
+                        } else {
+                            0
+                        };
+                        let total = tx
+                            .amount
+                            .checked_add(tx.gas_limit)
+                            .and_then(|t| t.checked_add(surcharge));
+                        match total {
+                            None => 3,
+                            Some(tot) if sender.balance < tot => 4,
+                            _ => 0,
+                        }
+                    }
+                } else {
+                    1
+                }
+            };
+            match precheck {
+                1 => {
+                    *failed += 1;
+                    return;
+                }
+                2..=4 => {
+                    fail_with_floor!(tx, i);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if let Err(e) = self.session_gate(tx, timestamp).await {
+            tracing::debug!(tx = i, "session gate: {e}");
+            fail_with_floor!(tx, i);
+            return;
+        }
+        let mut domain_snap: Option<PayloadDomainSnapshot> = None;
+        let mut post_actions: Option<ExecPostActions> = None;
+        let (transfers, payouts, burns, gas_used, tx_events) = if tx.payload.is_empty() {
+            (Vec::new(), Vec::new(), Vec::new(), 0, Vec::new())
+        } else {
+            domain_snap = Some(
+                self.snapshot_payload_domains_at(&tx.payload, exec_hardening)
+                    .await,
+            );
+            match self
+                .execute_payload_with_preverify_at_height_and_parent_restorable(
+                    tx,
+                    timestamp,
+                    chain_height,
+                    parent_block_hash,
+                )
+                .await
+            {
+                Ok((
+                    crate::svm::VmExecutionResult::Success {
+                        transfers,
+                        payouts,
+                        burns,
+                        gas_used,
+                        events: evts,
+                        ..
+                    },
+                    actions,
+                )) => {
+                    post_actions = Some(actions);
+                    (transfers, payouts, burns, gas_used, evts)
+                }
+                Ok((crate::svm::VmExecutionResult::OutOfGas, _)) => {
+                    fail_with_floor!(tx, i);
+                    return;
+                }
+                Ok((crate::svm::VmExecutionResult::Reverted(e), _)) => {
+                    tracing::debug!(tx = i, "payload reverted: {e}");
+                    fail_with_floor!(tx, i);
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!(tx = i, "payload rejected: {e}");
+                    if let Some(snap) = domain_snap {
+                        self.rollback_payload(
+                            snap,
+                            ExecPostActions {
+                                bridge_snapshot: None,
+                                actor_snapshot: None,
+                                pmm_native_snapshot: Vec::new(),
+                                pmm_minted_nano: 0,
+                                clob_native_snapshot: Vec::new(),
+                                outbound_messages: Vec::new(),
+                            },
+                        )
+                        .await;
+                    }
+                    fail_with_floor!(tx, i);
+                    return;
+                }
+            }
+        };
+        match self
+            .commit_native_with_floor_at_opts(
+                tx,
+                gas_used,
+                &transfers,
+                &payouts,
+                &burns,
+                fee_floor.0,
+                fee_floor.1,
+                vesting_floors.get(&tx.from).copied(),
+                vesting_floors,
+                chain_height,
+                false,
+            )
+            .await
+        {
+            Ok((mut touched, fee)) => {
+                if tx.is_pq_activation() {
+                    if let Some(env) = tx.pq_envelope_at_height(chain_height) {
+                        if !env.is_implicit && env.pubkey.is_some() {
+                            *pq_keys_pinned = true;
+                        }
+                    }
+                }
+                if let Some(ref actions) = post_actions {
+                    if !actions.outbound_messages.is_empty() {
+                        let outbound_touched = self
+                            .process_contract_outbound_messages_hardened(
+                                &actions.outbound_messages,
+                                chain_height,
+                            )
+                            .await;
+                        touched.extend(outbound_touched);
+                    }
+                }
+                trie_dirty.extend(touched);
+                *fees_collected = fees_collected.saturating_add(fee);
+                *applied += 1;
+                status[i] = true;
+                fees[i] = fee;
+                events[i] = tx_events;
+                self.session_note_applied(
+                    tx,
+                    InMemoryStateEngine::billed_gas_at(tx, gas_used, exec_hardening),
+                )
+                .await;
+            }
+            Err(e) => {
+                if let (Some(snap), Some(actions)) = (domain_snap, post_actions) {
+                    self.rollback_payload(snap, actions).await;
+                }
+                tracing::debug!(tx = i, "native commit rejected: {e}");
+                fail_with_floor!(tx, i);
+            }
+        }
+    }
+
+    /// Execute one non-plain payload wave with Phase 13a (parallel Token/Market/Staking)
+    /// and Phase 13b (Block-STM `ContractMvMemory` for `CallContract`/`CallContractArgs`).
+    ///
+    /// Returns `true` if the wave was handled by v2, or `false` if any transaction
+    /// in the wave uses an unsupported opcode / PQ activation and should fall back
+    /// to the legacy sequential loop.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: v2 wave executor mirrors block-loop accumulators and height-gated VM flags.
+    async fn apply_v2_payload_wave(
+        &self,
+        txs: &[crate::sharding::Transaction],
+        wave: &[usize],
+        admitted: &[bool],
+        fee_floors: &[(u64, u64)],
+        vesting_floors: &HashMap<[u8; 32], u64>,
+        timestamp: u64,
+        chain_height: u64,
+        parent_block_hash: [u8; 32],
+        exec_hardening: bool,
+        fee_market_v2: bool,
+        applied: &mut usize,
+        failed: &mut usize,
+        fees_collected: &mut u64,
+        status: &mut [bool],
+        fees: &mut [u64],
+        events: &mut [Vec<crate::contract::ContractEvent>],
+        trie_dirty: &mut Vec<([u8; 32], u64, u64)>,
+        pq_keys_pinned: &mut bool,
+    ) -> bool {
+        let wasm_pmm_hardening =
+            crate::chain_spec::wasm_xshard_pmm_hardening_active_at(chain_height);
+        let mut kinds: Vec<TxWaveKind<'_>> = Vec::with_capacity(wave.len());
+        let mut has_token = false;
+        let mut has_market = false;
+        let mut has_staking = false;
+        let mut has_contract = false;
+        let mut called_contracts: HashSet<[u8; 32]> = HashSet::new();
+
+        for &i in wave {
+            let kind = classify_tx_v2(&txs[i], exec_hardening);
+            match &kind {
+                TxWaveKind::Unsupported => return false,
+                TxWaveKind::Plain => {}
+                TxWaveKind::Token => has_token = true,
+                TxWaveKind::Market { .. } => has_market = true,
+                TxWaveKind::Staking => has_staking = true,
+                TxWaveKind::Contract { contract, .. } => {
+                    if !wasm_pmm_hardening {
+                        return false;
+                    }
+                    has_contract = true;
+                    called_contracts.insert(*contract);
+                }
+            }
+            kinds.push(kind);
+        }
+
+        // 1) Precheck & session gate in deterministic order.
+        let mut pre_gates: Vec<PreGate> = Vec::with_capacity(wave.len());
+        {
+            let map = self.accounts.read().await;
+            for (pos, &i) in wave.iter().enumerate() {
+                let tx = &txs[i];
+                if !admitted[i] {
+                    pre_gates.push(PreGate::NotAdmitted);
+                    continue;
+                }
+                if matches!(kinds[pos], TxWaveKind::Plain) {
+                    let sbal = map.get(&tx.from).map(|a| a.balance).unwrap_or(0);
+                    pre_gates.push(PreGate::Ready {
+                        sender_balance: sbal,
+                    });
+                    continue;
+                }
+                let precheck = if let Some(auth) = tx.sponsored_grant() {
+                    if let Some(sender) = map.get(&tx.from) {
+                        if tx.nonce != sender.nonce {
+                            2
+                        } else if sender.balance < tx.amount {
+                            4
+                        } else {
+                            let (floor_base, surcharge) = fee_floors[i];
+                            let fee_total = tx.gas_limit.max(floor_base).saturating_add(surcharge);
+                            let sponsor_balance =
+                                map.get(&auth.sponsor).map(|a| a.balance).unwrap_or(0);
+                            if sponsor_balance < fee_total {
+                                4
+                            } else {
+                                0
+                            }
+                        }
+                    } else {
+                        1
+                    }
+                } else if let Some(sender) = map.get(&tx.from) {
+                    if tx.nonce != sender.nonce {
+                        2
+                    } else {
+                        let surcharge = if tx.is_pq_activation() {
+                            PQ_ACTIVATION_SURCHARGE_GAS
+                        } else {
+                            0
+                        };
+                        let total = tx
+                            .amount
+                            .checked_add(tx.gas_limit)
+                            .and_then(|t| t.checked_add(surcharge));
+                        match total {
+                            None => 3,
+                            Some(tot) if sender.balance < tot => 4,
+                            _ => 0,
+                        }
+                    }
+                } else {
+                    1
+                };
+                match precheck {
+                    1 => pre_gates.push(PreGate::MissingSender),
+                    2..=4 => pre_gates.push(PreGate::PrecheckFail),
+                    _ => {
+                        let sbal = map.get(&tx.from).map(|a| a.balance).unwrap_or(0);
+                        pre_gates.push(PreGate::Ready {
+                            sender_balance: sbal,
+                        });
+                    }
+                }
+            }
+        }
+        for (pos, &i) in wave.iter().enumerate() {
+            if matches!(pre_gates[pos], PreGate::Ready { .. })
+                && txs[i].delegation().is_some()
+                && self.session_gate(&txs[i], timestamp).await.is_err()
+            {
+                pre_gates[pos] = PreGate::GateFail;
+            }
+        }
+
+        // 2) Phase 13a: parallel planning for Token, Market, and Staking txs.
+        let p13a_indices: Vec<usize> = wave
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, _)| {
+                if !matches!(pre_gates[pos], PreGate::Ready { .. }) {
+                    return None;
+                }
+                match kinds[pos] {
+                    TxWaveKind::Token | TxWaveKind::Market { .. } | TxWaveKind::Staking => {
+                        Some(pos)
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+
+        let mut p13a_plans: Vec<Option<Phase13aPlan>> = (0..wave.len()).map(|_| None).collect();
+        let mut initial_rewards_pool: u64 = 0;
+        let mut market_quote_id: Option<[u8; 32]> = None;
+
+        if !p13a_indices.is_empty() {
+            let pq_lifecycle = crate::pq_registry::pq_lifecycle_active_at(chain_height);
+            let tokens_guard = if has_token || has_market {
+                Some(self.tokens.read().await)
+            } else {
+                None
+            };
+            let orderbooks_guard = if has_market {
+                Some(self.orderbooks.read().await)
+            } else {
+                None
+            };
+            let staking_guard = if has_staking {
+                let g = self.staking.read().await;
+                initial_rewards_pool = g.rewards_pool;
+                Some(g)
+            } else {
+                None
+            };
+            let oracle_guard = if has_market {
+                Some(self.oracle.read().await)
+            } else {
+                None
+            };
+            let escrow_guard = if has_market {
+                Some(self.order_escrow.read().await)
+            } else {
+                None
+            };
+            let accounts_guard = if has_market {
+                Some(self.accounts.read().await)
+            } else {
+                None
+            };
+            if has_market {
+                market_quote_id = *self.pmm_usdt_token.read().await;
+            }
+
+            let tokens_ref = tokens_guard.as_deref();
+            let orderbooks_ref = orderbooks_guard.as_deref();
+            let staking_ref = staking_guard.as_deref();
+            let oracle_ref = oracle_guard.as_deref();
+            let escrow_ref = escrow_guard.as_deref();
+            let accounts_ref = accounts_guard.as_deref();
+
+            let results: Vec<(usize, Phase13aPlan)> = p13a_indices
+                .par_iter()
+                .map(|&pos| {
+                    let i = wave[pos];
+                    let tx = &txs[i];
+                    let PreGate::Ready { sender_balance } = pre_gates[pos] else {
+                        return (pos, Phase13aPlan::Failed);
+                    };
+                    let plan = match kinds[pos] {
+                        TxWaveKind::Token => {
+                            if let Some(tokens) = tokens_ref {
+                                plan_token_tx(tx, tokens, timestamp, exec_hardening)
+                            } else {
+                                Phase13aPlan::Failed
+                            }
+                        }
+                        TxWaveKind::Market { pair_id } => {
+                            if let (
+                                Some(tokens),
+                                Some(books),
+                                Some(escrow),
+                                Some(oracle),
+                                Some(accts),
+                            ) = (
+                                tokens_ref,
+                                orderbooks_ref,
+                                escrow_ref,
+                                oracle_ref,
+                                accounts_ref,
+                            ) {
+                                plan_market_tx(
+                                    tx,
+                                    pair_id,
+                                    sender_balance,
+                                    timestamp,
+                                    exec_hardening,
+                                    tokens,
+                                    books,
+                                    escrow,
+                                    oracle,
+                                    accts,
+                                    market_quote_id,
+                                )
+                            } else {
+                                Phase13aPlan::Failed
+                            }
+                        }
+                        TxWaveKind::Staking => {
+                            if let Some(staking) = staking_ref {
+                                plan_staking_tx(
+                                    tx,
+                                    sender_balance,
+                                    timestamp,
+                                    exec_hardening,
+                                    pq_lifecycle,
+                                    staking,
+                                )
+                            } else {
+                                Phase13aPlan::Failed
+                            }
+                        }
+                        _ => Phase13aPlan::Failed,
+                    };
+                    (pos, plan)
+                })
+                .collect();
+
+            for (pos, plan) in results {
+                p13a_plans[pos] = Some(plan);
+            }
+        } else if has_staking {
+            initial_rewards_pool = self.staking.read().await.rewards_pool;
+        }
+
+        // 3) Phase 13b: Block-STM parallel execution for CallContract / CallContractArgs.
+        struct StmSlot {
+            pos: usize,
+            tx_idx: usize,
+            contract: [u8; 32],
+            incarnation: u32,
+            finalized: bool,
+            finalized_round: usize,
+            ran_at_round: usize,
+            needs_rerun: bool,
+            fallback_seq: bool,
+            last_attempt: Option<StmAttemptOutcome>,
+        }
+
+        let mut stm_slots: Vec<StmSlot> = Vec::new();
+        let mut stm_pos_to_slot: HashMap<usize, usize> = HashMap::new();
+        for (pos, &i) in wave.iter().enumerate() {
+            if matches!(pre_gates[pos], PreGate::Ready { .. }) {
+                if let TxWaveKind::Contract { contract, .. } = kinds[pos] {
+                    let sidx = stm_slots.len();
+                    stm_pos_to_slot.insert(pos, sidx);
+                    stm_slots.push(StmSlot {
+                        pos,
+                        tx_idx: i,
+                        contract,
+                        incarnation: 0,
+                        finalized: false,
+                        finalized_round: 0,
+                        ran_at_round: 0,
+                        needs_rerun: true,
+                        fallback_seq: false,
+                        last_attempt: None,
+                    });
+                }
+            }
+        }
+
+        let mut synced_base_balances: HashMap<[u8; 32], u64> = HashMap::new();
+        // Outbound `value` spent by each contract's committed STM calls, used
+        // to land the same registry balance the sequential path would hold.
+        let mut contract_balance_spent: HashMap<[u8; 32], u64> = HashMap::new();
+        let mut mv_memory_opt: Option<Arc<crate::contract::ContractMvMemory>> = None;
+
+        if has_contract && !stm_slots.is_empty() {
+            let enforce_table_cap =
+                crate::chain_spec::wasm_table_elements_cap_active_at(chain_height);
+            let falcon_fuel_v2 = crate::chain_spec::falcon_host_fuel_v2_active_at(chain_height);
+            let actor_mailbox_hardening =
+                crate::chain_spec::actor_mailbox_hardening_active_at(chain_height);
+            let contract_send_refusal =
+                crate::chain_spec::wasm_xshard_contract_send_refusal_active_at(chain_height);
+            let contract_block_hash =
+                if crate::chain_spec::contract_block_hash_active_at(chain_height) {
+                    parent_block_hash
+                } else {
+                    [0u8; 32]
+                };
+            let local_shard = self.shard_id();
+            let sharded = self.cross_shard_enabled();
+            let topology = if contract_send_refusal {
+                Some(self.shard_topology.read().await.clone())
+            } else {
+                None
+            };
+
+            let contracts_guard = self.contracts.read().await;
+            {
+                let accts = self.accounts.read().await;
+                for &addr in &called_contracts {
+                    if let (Some(acc), Some(c)) = (accts.get(&addr), contracts_guard.get(&addr)) {
+                        if acc.balance > c.balance {
+                            synced_base_balances.insert(addr, acc.balance);
+                        }
+                    }
+                }
+            }
+
+            let base_reg: Cow<'_, crate::contract::ContractRegistry> =
+                if synced_base_balances.is_empty() {
+                    Cow::Borrowed(&*contracts_guard)
+                } else {
+                    let mut cloned = (*contracts_guard).clone();
+                    for (&addr, &bal) in &synced_base_balances {
+                        if let Some(c) = cloned.contracts.get_mut(&addr) {
+                            c.balance = bal;
+                        }
+                    }
+                    Cow::Owned(cloned)
+                };
+
+            let mv_memory = Arc::new(crate::contract::ContractMvMemory::new(base_reg.as_ref()));
+            drop(base_reg);
+
+            for round in 0..=MAX_STM_RETRIES {
+                let to_run: Vec<usize> = stm_slots
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(sidx, s)| (!s.finalized && s.needs_rerun).then_some(sidx))
+                    .collect();
+                if to_run.is_empty() {
+                    break;
+                }
+
+                let round_results: Vec<(usize, StmAttemptOutcome)> = to_run
+                    .par_iter()
+                    .map(|&sidx| {
+                        let slot = &stm_slots[sidx];
+                        let tx = &txs[slot.tx_idx];
+                        let TxWaveKind::Contract {
+                            contract,
+                            method,
+                            args,
+                            calldata,
+                            nop_gas,
+                        } = &kinds[slot.pos]
+                        else {
+                            return (sidx, StmAttemptOutcome::PermanentFail);
+                        };
+                        let out = execute_one_stm_tx(
+                            &contracts_guard,
+                            &mv_memory,
+                            tx,
+                            slot.tx_idx,
+                            contract,
+                            method,
+                            args,
+                            calldata,
+                            *nop_gas,
+                            timestamp,
+                            contract_block_hash,
+                            wasm_pmm_hardening,
+                            enforce_table_cap,
+                            falcon_fuel_v2,
+                            actor_mailbox_hardening,
+                            contract_send_refusal,
+                            local_shard,
+                            sharded,
+                            topology.as_ref(),
+                        );
+                        (sidx, out)
+                    })
+                    .collect();
+
+                for (sidx, out) in round_results {
+                    let slot = &mut stm_slots[sidx];
+                    slot.last_attempt = Some(out);
+                    slot.ran_at_round = round;
+                    slot.needs_rerun = false;
+                }
+
+                // Validate in ascending tx_idx order per contract.
+                let mut blocked_by_unfinalized: HashSet<[u8; 32]> = HashSet::new();
+                let mut last_write_round_below: HashMap<[u8; 32], usize> = HashMap::new();
+
+                for slot in &mut stm_slots {
+                    if slot.finalized {
+                        if matches!(slot.last_attempt, Some(StmAttemptOutcome::Ok { .. })) {
+                            let entry = last_write_round_below
+                                .entry(slot.contract)
+                                .or_insert(slot.finalized_round);
+                            *entry = (*entry).max(slot.finalized_round);
+                        }
+                        continue;
+                    }
+                    if blocked_by_unfinalized.contains(&slot.contract) {
+                        if round == MAX_STM_RETRIES {
+                            slot.fallback_seq = true;
+                        }
+                        continue;
+                    }
+                    match slot.last_attempt.as_ref() {
+                        None => {
+                            slot.needs_rerun = true;
+                            blocked_by_unfinalized.insert(slot.contract);
+                        }
+                        Some(StmAttemptOutcome::PermanentFail) => {
+                            slot.finalized = true;
+                        }
+                        Some(StmAttemptOutcome::SpeculativeFail) => {
+                            let earlier_wrote_since = last_write_round_below
+                                .get(&slot.contract)
+                                .is_some_and(|&w_round| w_round >= slot.ran_at_round);
+                            if earlier_wrote_since {
+                                mv_memory.invalidate_tx(slot.tx_idx);
+                                slot.incarnation += 1;
+                                slot.needs_rerun = true;
+                                blocked_by_unfinalized.insert(slot.contract);
+                            } else {
+                                slot.finalized = true;
+                            }
+                        }
+                        Some(StmAttemptOutcome::Ok { trace, .. }) => {
+                            if mv_memory.validate_reads(slot.tx_idx, trace) {
+                                mv_memory.record_incarnation(
+                                    slot.tx_idx,
+                                    slot.incarnation,
+                                    slot.contract,
+                                    trace,
+                                );
+                                slot.finalized = true;
+                                slot.finalized_round = round;
+                                last_write_round_below.insert(slot.contract, round);
+                            } else {
+                                mv_memory.invalidate_tx(slot.tx_idx);
+                                slot.incarnation += 1;
+                                slot.needs_rerun = true;
+                                blocked_by_unfinalized.insert(slot.contract);
+                            }
+                        }
+                    }
+                    if !slot.finalized && round == MAX_STM_RETRIES {
+                        slot.fallback_seq = true;
+                    }
+                }
+            }
+
+            drop(contracts_guard);
+            mv_memory_opt = Some(mv_memory);
+        }
+
+        // 4) Deterministic ascending tx_idx commit pass.
+        let mut committed_native_addrs: HashSet<[u8; 32]> = HashSet::new();
+        let mut native_credited_contracts: HashSet<[u8; 32]> = HashSet::new();
+        let mut wusdt_touched_in_wave = false;
+        let mut committed_token_ids: HashSet<[u8; 32]> = HashSet::new();
+        let mut remaining_rewards_pool = initial_rewards_pool;
+
+        let mut pending_token_deltas: Vec<(crate::token::TokenTxDelta, Vec<[u8; 32]>)> = Vec::new();
+        let mut pending_market_commits: Vec<(
+            u32,
+            crate::orderbook::OrderbookActor,
+            PlannedClobEffects,
+        )> = Vec::new();
+        let mut pending_staking_deltas: Vec<crate::staking::StakingTxDelta> = Vec::new();
+        let mut stm_committed_indices: Vec<(usize, [u8; 32], Vec<u8>)> = Vec::new();
+        let mut stm_fallback_remainder = false;
+
+        macro_rules! record_tx_addrs {
+            ($tx:expr) => {{
+                committed_native_addrs.insert($tx.from);
+                committed_native_addrs.insert($tx.to);
+                if let Some(sp) = $tx.effective_sponsor() {
+                    committed_native_addrs.insert(sp);
+                }
+                if $tx.amount > 0 && called_contracts.contains(&$tx.to) {
+                    native_credited_contracts.insert($tx.to);
+                }
+                if called_contracts.contains(&$tx.from) {
+                    native_credited_contracts.insert($tx.from);
+                }
+                if let Some(sp) = $tx.effective_sponsor() {
+                    if called_contracts.contains(&sp) {
+                        native_credited_contracts.insert(sp);
+                    }
+                }
+            }};
+        }
+
+        macro_rules! fail_tx_with_floor {
+            ($tx:expr, $idx:expr) => {{
+                *failed += 1;
+                let (floor_base, surcharge) = fee_floors[$idx];
+                let fee = Self::failure_fee_for_v2($tx, floor_base, surcharge, fee_market_v2);
+                if let Some(auth) = $tx.sponsored_grant() {
+                    let (debited, charged_state) = self
+                        .charge_sponsored_failure_fee($tx, &auth.sponsor, fee)
+                        .await;
+                    if let Some((user_balance, user_nonce, sponsor_balance, sponsor_nonce)) =
+                        charged_state
+                    {
+                        trie_dirty.push(($tx.from, user_balance, user_nonce));
+                        trie_dirty.push((auth.sponsor, sponsor_balance, sponsor_nonce));
+                    }
+                    *fees_collected = fees_collected.saturating_add(debited);
+                    fees[$idx] = debited;
+                } else {
+                    let (debited, charged_state) = self.charge_failure_fee($tx, fee).await;
+                    if let Some((balance, nonce)) = charged_state {
+                        trie_dirty.push(($tx.from, balance, nonce));
+                    }
+                    *fees_collected = fees_collected.saturating_add(debited);
+                    fees[$idx] = debited;
+                }
+                committed_native_addrs.insert($tx.from);
+                if let Some(sp) = $tx.effective_sponsor() {
+                    committed_native_addrs.insert(sp);
+                }
+            }};
+        }
+
+        macro_rules! flush_pending_domains {
+            () => {{
+                if !pending_token_deltas.is_empty() {
+                    let mut tokens = self.tokens_write().await;
+                    for (delta, _ids) in pending_token_deltas.drain(..) {
+                        tokens.apply_tx_delta(delta);
+                    }
+                }
+                if !pending_market_commits.is_empty() {
+                    let mut books = self.orderbooks_write().await;
+                    let mut escrow = self.order_escrow_write().await;
+                    let has_tok = pending_market_commits
+                        .iter()
+                        .any(|(_, _, c)| c.token_delta.is_some());
+                    let mut tokens_opt = if has_tok {
+                        Some(self.tokens_write().await)
+                    } else {
+                        None
+                    };
+                    let mut trie_opt = if has_tok {
+                        Some(self.state_trie.write().await)
+                    } else {
+                        None
+                    };
+                    for (pair_id, book_after, clob) in pending_market_commits.drain(..) {
+                        books.apply_pair_book(pair_id, book_after);
+                        for (k, v_opt) in clob.escrow_updates {
+                            match v_opt {
+                                Some(rec) => {
+                                    escrow.insert(k, rec);
+                                }
+                                None => {
+                                    escrow.remove(&k);
+                                }
+                            }
+                        }
+                        if let (Some(td), Some(tokens), Some(trie)) =
+                            (clob.token_delta, tokens_opt.as_mut(), trie_opt.as_mut())
+                        {
+                            tokens.apply_tx_delta(td);
+                            if let Some(q) = clob.quote_id {
+                                for acct in &clob.token_touched {
+                                    let bal = tokens.balance_of(&q, acct);
+                                    let key = token_balance_key(&q, acct);
+                                    if bal == 0 {
+                                        trie.remove(&key);
+                                    } else {
+                                        trie.insert(&key, &bal.to_be_bytes());
+                                    }
+                                }
+                                if clob.supply_dirty {
+                                    if let Some(supply) =
+                                        tokens.get(&q).map(|t| t.metadata.total_supply)
+                                    {
+                                        trie.insert(&token_supply_key(&q), &supply.to_be_bytes());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !pending_staking_deltas.is_empty() {
+                    let mut ledger = self.staking_write().await;
+                    for delta in pending_staking_deltas.drain(..) {
+                        let _ = ledger.apply_tx_delta(delta);
+                    }
+                }
+                if !stm_committed_indices.is_empty() {
+                    if let Some(ref mv) = mv_memory_opt {
+                        let mut contracts = self.contracts_write().await;
+                        mv.commit_into_registry(&mut contracts);
+                        for (idx, caddr, ret_data) in stm_committed_indices.drain(..) {
+                            if let Some(&bal) = synced_base_balances.get(&caddr) {
+                                if let Some(c) = contracts.contracts.get_mut(&caddr) {
+                                    // Sequential `ensure_working` commits the
+                                    // account-synced base and then debits the
+                                    // value each call sent out. Reproduce that
+                                    // exact registry balance (absolute writes,
+                                    // so re-applying a flush is idempotent).
+                                    let spent =
+                                        contract_balance_spent.get(&caddr).copied().unwrap_or(0);
+                                    c.balance = bal.saturating_sub(spent);
+                                }
+                            }
+                            contracts.last_return_data = ret_data;
+                            mv.invalidate_tx(idx);
+                        }
+                    }
+                }
+            }};
+        }
+
+        for (pos, &i) in wave.iter().enumerate() {
+            let tx = &txs[i];
+
+            if stm_fallback_remainder && matches!(kinds[pos], TxWaveKind::Contract { .. }) {
+                flush_pending_domains!();
+                self.apply_single_tx_sequential(
+                    tx,
+                    i,
+                    timestamp,
+                    chain_height,
+                    parent_block_hash,
+                    admitted[i],
+                    fee_floors[i],
+                    vesting_floors,
+                    exec_hardening,
+                    fee_market_v2,
+                    applied,
+                    failed,
+                    fees_collected,
+                    status,
+                    fees,
+                    events,
+                    trie_dirty,
+                    pq_keys_pinned,
+                )
+                .await;
+                if let TxWaveKind::Contract { contract, .. } = &kinds[pos] {
+                    committed_native_addrs.insert(*contract);
+                }
+                record_tx_addrs!(tx);
+                continue;
+            }
+
+            let sender_collided = committed_native_addrs.contains(&tx.from)
+                || tx
+                    .effective_sponsor()
+                    .is_some_and(|s| committed_native_addrs.contains(&s));
+
+            match &kinds[pos] {
+                TxWaveKind::Plain => {
+                    if sender_collided || committed_native_addrs.contains(&tx.to) {
+                        flush_pending_domains!();
+                    }
+                    self.apply_single_tx_sequential(
+                        tx,
+                        i,
+                        timestamp,
+                        chain_height,
+                        parent_block_hash,
+                        admitted[i],
+                        fee_floors[i],
+                        vesting_floors,
+                        exec_hardening,
+                        fee_market_v2,
+                        applied,
+                        failed,
+                        fees_collected,
+                        status,
+                        fees,
+                        events,
+                        trie_dirty,
+                        pq_keys_pinned,
+                    )
+                    .await;
+                    record_tx_addrs!(tx);
+                    continue;
+                }
+                TxWaveKind::Token => {
+                    let touches_wusdt = market_quote_id.is_some_and(|qid| {
+                        tx.payload.iter().any(|op| {
+                            matches!(
+                                op,
+                                crate::svm::OpCode::SysCallTokenTransfer { token_id, .. }
+                                    | crate::svm::OpCode::SysCallTokenTransferFrom { token_id, .. }
+                                    | crate::svm::OpCode::SysCallTokenApprove { token_id, .. }
+                                    | crate::svm::OpCode::SysCallTokenMint { token_id, .. }
+                                    | crate::svm::OpCode::SysCallTokenBurn { token_id, .. }
+                                    | crate::svm::OpCode::SysCallTokenBalanceOf { token_id, .. }
+                                    if *token_id == qid
+                            )
+                        })
+                    });
+                    if sender_collided || (wusdt_touched_in_wave && touches_wusdt) {
+                        flush_pending_domains!();
+                        self.apply_single_tx_sequential(
+                            tx,
+                            i,
+                            timestamp,
+                            chain_height,
+                            parent_block_hash,
+                            admitted[i],
+                            fee_floors[i],
+                            vesting_floors,
+                            exec_hardening,
+                            fee_market_v2,
+                            applied,
+                            failed,
+                            fees_collected,
+                            status,
+                            fees,
+                            events,
+                            trie_dirty,
+                            pq_keys_pinned,
+                        )
+                        .await;
+                        record_tx_addrs!(tx);
+                        if touches_wusdt {
+                            wusdt_touched_in_wave = true;
+                        }
+                        continue;
+                    }
+                }
+                TxWaveKind::Market { .. } => {
+                    let plan_collides = match p13a_plans[pos].as_ref() {
+                        Some(Phase13aPlan::Market { clob, .. }) => {
+                            sender_collided
+                                || clob
+                                    .native_touched_addrs
+                                    .iter()
+                                    .any(|a| committed_native_addrs.contains(a))
+                                || ((clob.token_delta.is_some()
+                                    || market_quote_id
+                                        .is_some_and(|q| committed_token_ids.contains(&q)))
+                                    && (wusdt_touched_in_wave
+                                        || market_quote_id
+                                            .is_some_and(|q| committed_token_ids.contains(&q))))
+                        }
+                        Some(Phase13aPlan::MarketFailed { makers }) => {
+                            sender_collided
+                                || makers.iter().any(|m| committed_native_addrs.contains(m))
+                                || wusdt_touched_in_wave
+                                || market_quote_id.is_some_and(|q| committed_token_ids.contains(&q))
+                        }
+                        _ => sender_collided || wusdt_touched_in_wave,
+                    };
+                    if plan_collides {
+                        flush_pending_domains!();
+                        self.apply_single_tx_sequential(
+                            tx,
+                            i,
+                            timestamp,
+                            chain_height,
+                            parent_block_hash,
+                            admitted[i],
+                            fee_floors[i],
+                            vesting_floors,
+                            exec_hardening,
+                            fee_market_v2,
+                            applied,
+                            failed,
+                            fees_collected,
+                            status,
+                            fees,
+                            events,
+                            trie_dirty,
+                            pq_keys_pinned,
+                        )
+                        .await;
+                        record_tx_addrs!(tx);
+                        if let Some(Phase13aPlan::Market { clob, .. }) = p13a_plans[pos].as_ref() {
+                            committed_native_addrs.extend(&clob.native_touched_addrs);
+                            for &addr in &clob.native_touched_addrs {
+                                if called_contracts.contains(&addr) {
+                                    native_credited_contracts.insert(addr);
+                                }
+                            }
+                            if clob.token_delta.is_some() {
+                                wusdt_touched_in_wave = true;
+                            }
+                        } else {
+                            if let Some(Phase13aPlan::MarketFailed { makers }) =
+                                p13a_plans[pos].as_ref()
+                            {
+                                committed_native_addrs.extend(makers);
+                            }
+                            native_credited_contracts.extend(&called_contracts);
+                            wusdt_touched_in_wave = true;
+                        }
+                        continue;
+                    }
+                }
+                TxWaveKind::Staking => {
+                    if sender_collided {
+                        flush_pending_domains!();
+                        self.apply_single_tx_sequential(
+                            tx,
+                            i,
+                            timestamp,
+                            chain_height,
+                            parent_block_hash,
+                            admitted[i],
+                            fee_floors[i],
+                            vesting_floors,
+                            exec_hardening,
+                            fee_market_v2,
+                            applied,
+                            failed,
+                            fees_collected,
+                            status,
+                            fees,
+                            events,
+                            trie_dirty,
+                            pq_keys_pinned,
+                        )
+                        .await;
+                        record_tx_addrs!(tx);
+                        if let Some(Phase13aPlan::Staking {
+                            transfers, payouts, ..
+                        }) = p13a_plans[pos].as_ref()
+                        {
+                            for (to, amt) in transfers {
+                                if *amt > 0 {
+                                    committed_native_addrs.insert(*to);
+                                    if called_contracts.contains(to) {
+                                        native_credited_contracts.insert(*to);
+                                    }
+                                }
+                            }
+                            for (payer, bene, amt) in payouts {
+                                if *amt > 0 {
+                                    committed_native_addrs.insert(*payer);
+                                    committed_native_addrs.insert(*bene);
+                                    if called_contracts.contains(payer) {
+                                        native_credited_contracts.insert(*payer);
+                                    }
+                                    if called_contracts.contains(bene) {
+                                        native_credited_contracts.insert(*bene);
+                                    }
+                                }
+                            }
+                        }
+                        remaining_rewards_pool = self.staking.read().await.rewards_pool;
+                        continue;
+                    }
+                }
+                TxWaveKind::Contract { contract, .. } => {
+                    let slot = stm_pos_to_slot.get(&pos).map(|&sidx| &stm_slots[sidx]);
+                    let need_fallback = sender_collided
+                        || native_credited_contracts.contains(contract)
+                        || slot.is_some_and(|s| s.fallback_seq);
+                    if need_fallback {
+                        stm_fallback_remainder = true;
+                        // This contract tx and every LATER contract tx in the
+                        // wave will run through the sequential executor. Drop
+                        // their speculative mv write-sets first: the flush
+                        // below would otherwise publish a not-yet-committed
+                        // write-set into the live registry, and the sequential
+                        // re-execution would apply it a second time.
+                        if let Some(ref mv) = mv_memory_opt {
+                            for s in &stm_slots {
+                                if s.pos >= pos {
+                                    mv.invalidate_tx(s.tx_idx);
+                                }
+                            }
+                        }
+                        flush_pending_domains!();
+                        self.apply_single_tx_sequential(
+                            tx,
+                            i,
+                            timestamp,
+                            chain_height,
+                            parent_block_hash,
+                            admitted[i],
+                            fee_floors[i],
+                            vesting_floors,
+                            exec_hardening,
+                            fee_market_v2,
+                            applied,
+                            failed,
+                            fees_collected,
+                            status,
+                            fees,
+                            events,
+                            trie_dirty,
+                            pq_keys_pinned,
+                        )
+                        .await;
+                        committed_native_addrs.insert(*contract);
+                        record_tx_addrs!(tx);
+                        continue;
+                    }
+                }
+                TxWaveKind::Unsupported => unreachable!("checked above"),
+            }
+
+            // Pre-gate failures (identical to sequential).
+            match pre_gates[pos] {
+                PreGate::NotAdmitted | PreGate::MissingSender => {
+                    *failed += 1;
+                    continue;
+                }
+                PreGate::PrecheckFail | PreGate::GateFail => {
+                    fail_tx_with_floor!(tx, i);
+                    continue;
+                }
+                PreGate::Ready { .. } => {}
+            }
+
+            // Commit Phase 13a or Phase 13b outcome.
+            match &kinds[pos] {
+                TxWaveKind::Token => match p13a_plans[pos].take() {
+                    Some(Phase13aPlan::Token {
+                        delta,
+                        token_ids,
+                        gas_used,
+                    }) => {
+                        match self
+                            .commit_native_with_floor_at_opts(
+                                tx,
+                                gas_used,
+                                &[],
+                                &[],
+                                &[],
+                                fee_floors[i].0,
+                                fee_floors[i].1,
+                                vesting_floors.get(&tx.from).copied(),
+                                vesting_floors,
+                                chain_height,
+                                false,
+                            )
+                            .await
+                        {
+                            Ok((touched, fee)) => {
+                                for tid in &token_ids {
+                                    committed_token_ids.insert(*tid);
+                                }
+                                pending_token_deltas.push((delta, token_ids));
+                                trie_dirty.extend(touched);
+                                *fees_collected = fees_collected.saturating_add(fee);
+                                *applied += 1;
+                                status[i] = true;
+                                fees[i] = fee;
+                                self.session_note_applied(
+                                    tx,
+                                    InMemoryStateEngine::billed_gas_at(
+                                        tx,
+                                        gas_used,
+                                        exec_hardening,
+                                    ),
+                                )
+                                .await;
+                                record_tx_addrs!(tx);
+                            }
+                            Err(_) => {
+                                flush_pending_domains!();
+                                self.sync_aux_trie().await;
+                                fail_tx_with_floor!(tx, i);
+                            }
+                        }
+                    }
+                    _ => {
+                        fail_tx_with_floor!(tx, i);
+                    }
+                },
+                TxWaveKind::Market { .. } => match p13a_plans[pos].take() {
+                    Some(Phase13aPlan::Market {
+                        pair_id,
+                        book_after,
+                        clob,
+                        gas_used,
+                    }) => {
+                        let native_res = self
+                            .apply_planned_clob_native_moves(&clob.native_moves)
+                            .await;
+                        match native_res {
+                            Err(_) => {
+                                fail_tx_with_floor!(tx, i);
+                            }
+                            Ok((clob_touched, clob_snap)) => {
+                                match self
+                                    .commit_native_with_floor_at_opts(
+                                        tx,
+                                        gas_used,
+                                        &[],
+                                        &[],
+                                        &[],
+                                        fee_floors[i].0,
+                                        fee_floors[i].1,
+                                        vesting_floors.get(&tx.from).copied(),
+                                        vesting_floors,
+                                        chain_height,
+                                        false,
+                                    )
+                                    .await
+                                {
+                                    Ok((commit_touched, fee)) => {
+                                        committed_native_addrs.extend(&clob.native_touched_addrs);
+                                        for &addr in &clob.native_touched_addrs {
+                                            if called_contracts.contains(&addr) {
+                                                native_credited_contracts.insert(addr);
+                                            }
+                                        }
+                                        if clob.token_delta.is_some() {
+                                            wusdt_touched_in_wave = true;
+                                        }
+                                        trie_dirty.extend(clob_touched);
+                                        trie_dirty.extend(commit_touched);
+                                        pending_market_commits.push((pair_id, book_after, clob));
+                                        *fees_collected = fees_collected.saturating_add(fee);
+                                        *applied += 1;
+                                        status[i] = true;
+                                        fees[i] = fee;
+                                        self.session_note_applied(
+                                            tx,
+                                            InMemoryStateEngine::billed_gas_at(
+                                                tx,
+                                                gas_used,
+                                                exec_hardening,
+                                            ),
+                                        )
+                                        .await;
+                                        record_tx_addrs!(tx);
+                                    }
+                                    Err(_) => {
+                                        self.restore_native_accounts_snapshot(&clob_snap).await;
+                                        fail_tx_with_floor!(tx, i);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        fail_tx_with_floor!(tx, i);
+                    }
+                },
+                TxWaveKind::Staking => match p13a_plans[pos].take() {
+                    Some(Phase13aPlan::Staking {
+                        delta,
+                        transfers,
+                        payouts,
+                        gas_used,
+                    }) => {
+                        if delta.rewards_pool_debit > remaining_rewards_pool {
+                            fail_tx_with_floor!(tx, i);
+                        } else {
+                            match self
+                                .commit_native_with_floor_at_opts(
+                                    tx,
+                                    gas_used,
+                                    &transfers,
+                                    &payouts,
+                                    &[],
+                                    fee_floors[i].0,
+                                    fee_floors[i].1,
+                                    vesting_floors.get(&tx.from).copied(),
+                                    vesting_floors,
+                                    chain_height,
+                                    false,
+                                )
+                                .await
+                            {
+                                Ok((touched, fee)) => {
+                                    remaining_rewards_pool -= delta.rewards_pool_debit;
+                                    for (to, amt) in &transfers {
+                                        if *amt > 0 {
+                                            committed_native_addrs.insert(*to);
+                                            if called_contracts.contains(to) {
+                                                native_credited_contracts.insert(*to);
+                                            }
+                                        }
+                                    }
+                                    for (payer, bene, amt) in &payouts {
+                                        if *amt > 0 {
+                                            committed_native_addrs.insert(*payer);
+                                            committed_native_addrs.insert(*bene);
+                                            if called_contracts.contains(payer) {
+                                                native_credited_contracts.insert(*payer);
+                                            }
+                                            if called_contracts.contains(bene) {
+                                                native_credited_contracts.insert(*bene);
+                                            }
+                                        }
+                                    }
+                                    pending_staking_deltas.push(delta);
+                                    trie_dirty.extend(touched);
+                                    *fees_collected = fees_collected.saturating_add(fee);
+                                    *applied += 1;
+                                    status[i] = true;
+                                    fees[i] = fee;
+                                    self.session_note_applied(
+                                        tx,
+                                        InMemoryStateEngine::billed_gas_at(
+                                            tx,
+                                            gas_used,
+                                            exec_hardening,
+                                        ),
+                                    )
+                                    .await;
+                                    record_tx_addrs!(tx);
+                                }
+                                Err(_) => {
+                                    fail_tx_with_floor!(tx, i);
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        fail_tx_with_floor!(tx, i);
+                    }
+                },
+                TxWaveKind::Contract { .. } => {
+                    let sidx = stm_pos_to_slot[&pos];
+                    // Copy the address out and take the owned outcome: no
+                    // mutable borrow of `stm_slots` spills into the arms, so
+                    // the fallback path below can invalidate later slots.
+                    let slot_contract = stm_slots[sidx].contract;
+                    let taken = stm_slots[sidx].last_attempt.take();
+                    match taken {
+                        Some(StmAttemptOutcome::Ok {
+                            outcome,
+                            trace,
+                            gas_used,
+                        }) => {
+                            match self
+                                .commit_native_with_floor_at_opts(
+                                    tx,
+                                    gas_used,
+                                    &[],
+                                    &[],
+                                    &[],
+                                    fee_floors[i].0,
+                                    fee_floors[i].1,
+                                    vesting_floors.get(&tx.from).copied(),
+                                    vesting_floors,
+                                    chain_height,
+                                    false,
+                                )
+                                .await
+                            {
+                                Ok((mut touched, fee)) => {
+                                    committed_native_addrs.insert(slot_contract);
+                                    if !outcome.outbound_messages.is_empty() {
+                                        let valued_outbound_count = outcome
+                                            .outbound_messages
+                                            .iter()
+                                            .filter(|m| m.value > 0)
+                                            .count();
+                                        let outbound_touched = self
+                                            .process_contract_outbound_messages_hardened(
+                                                &outcome.outbound_messages,
+                                                chain_height,
+                                            )
+                                            .await;
+                                        if outbound_touched.len() < valued_outbound_count {
+                                            native_credited_contracts.insert(slot_contract);
+                                        }
+                                        for &(addr, _, _) in &outbound_touched {
+                                            committed_native_addrs.insert(addr);
+                                        }
+                                        touched.extend(outbound_touched);
+                                    }
+                                    let spent =
+                                        contract_balance_spent.entry(slot_contract).or_insert(0);
+                                    *spent = spent.saturating_add(trace.balance_delta_spent);
+                                    stm_committed_indices.push((
+                                        i,
+                                        slot_contract,
+                                        outcome.return_data,
+                                    ));
+                                    trie_dirty.extend(touched);
+                                    *fees_collected = fees_collected.saturating_add(fee);
+                                    *applied += 1;
+                                    status[i] = true;
+                                    fees[i] = fee;
+                                    events[i] = outcome.events;
+                                    self.session_note_applied(
+                                        tx,
+                                        InMemoryStateEngine::billed_gas_at(
+                                            tx,
+                                            gas_used,
+                                            exec_hardening,
+                                        ),
+                                    )
+                                    .await;
+                                    record_tx_addrs!(tx);
+                                }
+                                Err(_) => {
+                                    // The remainder of this wave runs
+                                    // sequentially: drop the speculative
+                                    // write-sets (this tx and every later
+                                    // contract slot) so the flush below cannot
+                                    // publish one that will be re-executed.
+                                    if let Some(ref mv) = mv_memory_opt {
+                                        for s in &stm_slots {
+                                            if s.pos >= pos {
+                                                mv.invalidate_tx(s.tx_idx);
+                                            }
+                                        }
+                                    }
+                                    stm_fallback_remainder = true;
+                                    fail_tx_with_floor!(tx, i);
+                                }
+                            }
+                        }
+                        _ => {
+                            fail_tx_with_floor!(tx, i);
+                        }
+                    }
+                }
+                TxWaveKind::Plain | TxWaveKind::Unsupported => unreachable!("handled above"),
+            }
+        }
+
+        flush_pending_domains!();
+        true
+    }
+
     /// Apply a block's transactions, returning per-transaction success flags for
     /// receipts alongside the aggregate counters.
     ///
@@ -1128,9 +3490,13 @@ impl InMemoryStateEngine {
         let mut fees_collected = 0u64;
         let mut pq_keys_pinned = false;
         let pre_deploy_addrs: Option<HashSet<[u8; 32]>> = if txs.iter().any(|tx| {
-            tx.payload
-                .iter()
-                .any(|op| matches!(op, crate::svm::OpCode::SysCallDeployContract { .. }))
+            tx.payload.iter().any(|op| {
+                matches!(
+                    op,
+                    crate::svm::OpCode::SysCallDeployContract { .. }
+                        | crate::svm::OpCode::SysCallDeployContractWithAbi { .. }
+                )
+            })
         }) {
             Some(
                 self.contracts_read()
@@ -1213,7 +3579,13 @@ impl InMemoryStateEngine {
         // scheduler result was previously computed unconditionally and then
         // discarded by the `&&` short-circuit on the flag, paying a full
         // access-key partition for every block on a sequential node.
-        let waves = planned_waves(self.is_parallel_exec_enabled(), txs);
+        let parallel_enabled = self.is_parallel_exec_enabled();
+        let v2_enabled = parallel_exec_v2_enabled();
+        let waves = if v2_enabled {
+            planned_waves_v2(parallel_enabled, txs, true, exec_hardening)
+        } else {
+            planned_waves(parallel_enabled, txs)
+        };
         // The wave path is used for EVERY block when parallel execution is
         // on - including a single-wave block, which is the most parallel
         // shape there is (all of its transactions are disjoint, so the wave
@@ -1269,232 +3641,54 @@ impl InMemoryStateEngine {
                     )
                     .await;
                 } else {
-                    // DOMAIN ROLLBACK CLOBBERING FIX: a wave that carries a
-                    // PAYLOAD never runs concurrently. `execute_payload`
-                    // mutates live consensus domains in place (the VM
-                    // clone-commits them WHOLESALE) and `rollback_payload`
-                    // restores WHOLE domains, so two payload-bearing
-                    // transactions running at the same time would let one
-                    // tx's rollback wipe a sibling's committed effects
-                    // (plus snapshot races and stale session-gate reads).
-                    // The wave scheduler is now per-resource (a token, a
-                    // pair, a contract), so such a wave may well hold
-                    // several payload transactions - they still apply
-                    // strictly in block order, with the same live checks as
-                    // the sequential path below: bit-identical by
-                    // construction. Concurrency is allowed ONLY for
-                    // `wave_all_plain` waves above, whose transactions touch
-                    // accounts and no consensus domain at all.
-                    for &i in &wave {
-                        let tx = &txs[i];
-                        if !admitted[i] {
-                            failed += 1;
-                            continue;
-                        }
-                        if !tx.payload.is_empty() {
-                            let precheck = {
-                                let map = self.accounts.read().await;
-                                // PAYMASTER v1: split-leg precheck — the user
-                                // pre-covers VALUE (`amount`), the sponsor
-                                // pre-covers FEE. A short sponsor (missing or
-                                // spent down since admission) reports 4: the
-                                // failure-fee core then moves NOTHING (the
-                                // grief rule on the fee-payer leg), exactly
-                                // like an uncoverable sender on the legacy
-                                // path.
-                                if let Some(auth) = tx.sponsored_grant() {
-                                    if let Some(sender) = map.get(&tx.from) {
-                                        if tx.nonce != sender.nonce {
-                                            2
-                                        } else if sender.balance < tx.amount {
-                                            4
-                                        } else {
-                                            let (floor_base, surcharge) = fee_floors[i];
-                                            let fee_total = tx
-                                                .gas_limit
-                                                .max(floor_base)
-                                                .saturating_add(surcharge);
-                                            let sponsor_balance = map
-                                                .get(&auth.sponsor)
-                                                .map(|a| a.balance)
-                                                .unwrap_or(0);
-                                            if sponsor_balance < fee_total {
-                                                4
-                                            } else {
-                                                0
-                                            }
-                                        }
-                                    } else {
-                                        1
-                                    }
-                                } else if let Some(sender) = map.get(&tx.from) {
-                                    if tx.nonce != sender.nonce {
-                                        2
-                                    } else {
-                                        let surcharge = if tx.is_pq_activation() {
-                                            PQ_ACTIVATION_SURCHARGE_GAS
-                                        } else {
-                                            0
-                                        };
-                                        let total = tx
-                                            .amount
-                                            .checked_add(tx.gas_limit)
-                                            .and_then(|t| t.checked_add(surcharge));
-                                        match total {
-                                            None => 3,
-                                            Some(tot) if sender.balance < tot => 4,
-                                            _ => 0,
-                                        }
-                                    }
-                                } else {
-                                    1
-                                }
-                            };
-                            match precheck {
-                                1 => {
-                                    failed += 1;
-                                    continue;
-                                }
-                                2..=4 => {
-                                    fail_with_floor!(tx, i);
-                                    continue;
-                                }
-                                _ => {}
-                            }
-                        }
-                        if let Err(e) = self.session_gate(tx, timestamp).await {
-                            tracing::debug!(tx = i, "session gate: {e}");
-                            fail_with_floor!(tx, i);
-                            continue;
-                        }
-                        let mut domain_snap: Option<PayloadDomainSnapshot> = None;
-                        let mut post_actions: Option<ExecPostActions> = None;
-                        let (transfers, payouts, burns, gas_used, tx_events) =
-                            if tx.payload.is_empty() {
-                                // FEE-01: no VM ran, so execution measured 0
-                                // gas; `billed_gas` adds the intrinsic
-                                // envelope cost at the commit.
-                                (Vec::new(), Vec::new(), Vec::new(), 0, Vec::new())
-                            } else {
-                                domain_snap = Some(
-                                    self.snapshot_payload_domains_at(&tx.payload, exec_hardening)
-                                        .await,
-                                );
-                                match self
-                                    .execute_payload_with_preverify_at_height_and_parent_restorable(
-                                        tx,
-                                        timestamp,
-                                        chain_height,
-                                        parent_block_hash,
-                                    )
-                                    .await
-                                {
-                                    Ok((
-                                        crate::svm::VmExecutionResult::Success {
-                                            transfers,
-                                            payouts,
-                                            burns,
-                                            gas_used,
-                                            events: evts,
-                                            ..
-                                        },
-                                        actions,
-                                    )) => {
-                                        post_actions = Some(actions);
-                                        (transfers, payouts, burns, gas_used, evts)
-                                    }
-                                    Ok((crate::svm::VmExecutionResult::OutOfGas, _)) => {
-                                        fail_with_floor!(tx, i);
-                                        continue;
-                                    }
-                                    Ok((crate::svm::VmExecutionResult::Reverted(e), _)) => {
-                                        tracing::debug!(tx = i, "payload reverted: {e}");
-                                        fail_with_floor!(tx, i);
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        tracing::debug!(tx = i, "payload rejected: {e}");
-                                        if let Some(snap) = domain_snap {
-                                            self.rollback_payload(
-                                                snap,
-                                                ExecPostActions {
-                                                    bridge_snapshot: None,
-                                                    actor_snapshot: None,
-                                                    pmm_native_snapshot: Vec::new(),
-                                                    pmm_minted_nano: 0,
-                                                    clob_native_snapshot: Vec::new(),
-                                                    outbound_messages: Vec::new(),
-                                                },
-                                            )
-                                            .await;
-                                        }
-                                        fail_with_floor!(tx, i);
-                                        continue;
-                                    }
-                                }
-                            };
-                        // FEE-01: the fee is priced from what execution
-                        // MEASURED (`gas_used`), never from the declared
-                        // limit — `commit_native_with_floor_at` caps it at the
-                        // limit and refunds the rest.
-                        match self
-                            .commit_native_with_floor_at_opts(
-                                tx,
-                                gas_used,
-                                &transfers,
-                                &payouts,
-                                &burns,
-                                fee_floors[i].0,
-                                fee_floors[i].1,
-                                vesting_floors.get(&tx.from).copied(),
-                                &vesting_floors,
+                    let handled_v2 = if v2_enabled && wave.len() >= 2 {
+                        self.apply_v2_payload_wave(
+                            txs,
+                            &wave,
+                            &admitted,
+                            &fee_floors,
+                            &vesting_floors,
+                            timestamp,
+                            chain_height,
+                            parent_block_hash,
+                            exec_hardening,
+                            fee_market_v2,
+                            &mut applied,
+                            &mut failed,
+                            &mut fees_collected,
+                            &mut status,
+                            &mut fees,
+                            &mut events,
+                            &mut trie_dirty,
+                            &mut pq_keys_pinned,
+                        )
+                        .await
+                    } else {
+                        false
+                    };
+                    if !handled_v2 {
+                        for &i in &wave {
+                            self.apply_single_tx_sequential(
+                                &txs[i],
+                                i,
+                                timestamp,
                                 chain_height,
-                                false,
+                                parent_block_hash,
+                                admitted[i],
+                                fee_floors[i],
+                                &vesting_floors,
+                                exec_hardening,
+                                fee_market_v2,
+                                &mut applied,
+                                &mut failed,
+                                &mut fees_collected,
+                                &mut status,
+                                &mut fees,
+                                &mut events,
+                                &mut trie_dirty,
+                                &mut pq_keys_pinned,
                             )
-                            .await
-                        {
-                            Ok((mut touched, fee)) => {
-                                if tx.is_pq_activation() {
-                                    if let Some(env) = tx.pq_envelope_at_height(chain_height) {
-                                        if !env.is_implicit && env.pubkey.is_some() {
-                                            pq_keys_pinned = true;
-                                        }
-                                    }
-                                }
-                                if let Some(ref actions) = post_actions {
-                                    if !actions.outbound_messages.is_empty() {
-                                        let outbound_touched = self
-                                            .process_contract_outbound_messages_hardened(
-                                                &actions.outbound_messages,
-                                                chain_height,
-                                            )
-                                            .await;
-                                        touched.extend(outbound_touched);
-                                    }
-                                }
-                                trie_dirty.extend(touched);
-                                fees_collected = fees_collected.saturating_add(fee);
-                                applied += 1;
-                                status[i] = true;
-                                fees[i] = fee;
-                                events[i] = tx_events;
-                                self.session_note_applied(
-                                    tx,
-                                    InMemoryStateEngine::billed_gas_at(
-                                        tx,
-                                        gas_used,
-                                        exec_hardening,
-                                    ),
-                                )
-                                .await;
-                            }
-                            Err(e) => {
-                                if let (Some(snap), Some(actions)) = (domain_snap, post_actions) {
-                                    self.rollback_payload(snap, actions).await;
-                                }
-                                tracing::debug!(tx = i, "native commit rejected: {e}");
-                                fail_with_floor!(tx, i);
-                            }
+                            .await;
                         }
                     }
                 }

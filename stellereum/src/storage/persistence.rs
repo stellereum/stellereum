@@ -6,8 +6,10 @@ use std::sync::Arc;
 
 /// A background flusher that decouples the consensus hot path from disk I/O.
 ///
-/// Finalized blocks and periodic state snapshots are pushed into an unbounded
-/// channel; a spawned task writes them. The hot path never waits on `sled`.
+/// Finalized blocks and periodic state snapshots are pushed into a bounded
+/// channel (`PERSIST_QUEUE_CAP = 8192`); a dedicated OS thread (`"stell-persist"`)
+/// writes them so synchronous `sled` I/O, pruning, and `fsync` never block Tokio
+/// runtime worker threads. The hot path never waits on `sled`.
 /// Max pending persist jobs. Bounds memory so a slow disk cannot grow the queue
 /// without limit (anti-DoS).
 pub const PERSIST_QUEUE_CAP: usize = 8192;
@@ -45,6 +47,24 @@ pub enum PersistJob {
         bridge: Vec<u8>,
         zkml_models: Vec<u8>,
         cross_shard: Vec<u8>,
+    },
+    /// Complete root-committed domain snapshot bundle for `height`: carries the
+    /// core `Domains` fields PLUS all 5 root-committed auxiliary domains
+    /// (`cnvrf_v3`, `cnvrf_freeze_inputs`, `evm_bindings_state`, `pq_registry`,
+    /// `evm_settled_state`) in ONE queue item so a full `PERSIST_QUEUE_CAP`
+    /// queue or crash cannot drop half of height `height`.
+    DomainsBundle {
+        height: u64,
+        bytes: Vec<u8>,
+        session_keys: Vec<u8>,
+        bridge: Vec<u8>,
+        zkml_models: Vec<u8>,
+        cross_shard: Vec<u8>,
+        cnvrf_v3: Vec<u8>,
+        cnvrf_freeze_inputs: Vec<u8>,
+        evm_bindings_state: Vec<u8>,
+        pq_registry: Vec<u8>,
+        evm_settled_state: Vec<u8>,
     },
     CnVrfV3 {
         height: u64,
@@ -141,7 +161,7 @@ pub fn persist_job_label(job: &PersistJob) -> &'static str {
     match job {
         PersistJob::Block(_) => "Block (finalized body)",
         PersistJob::State { .. } => "State snapshot",
-        PersistJob::Domains { .. } => "Domains snapshot",
+        PersistJob::Domains { .. } | PersistJob::DomainsBundle { .. } => "Domains snapshot",
         PersistJob::CnVrfV3 { .. } => "CN-VRF v3 snapshot",
         PersistJob::CnVrfFreezeInputs { .. } => "CN-VRF v3 freeze inputs snapshot",
         PersistJob::EvmBindingsState { .. } => "EVM bindings state snapshot",
@@ -165,7 +185,9 @@ pub fn persist_drop_consequence(job: &PersistJob) -> &'static str {
         PersistJob::Prune { .. } => {
             "nothing durable is lost; the next snapshot cadence re-schedules the prune"
         }
-        PersistJob::State { .. } | PersistJob::Domains { .. } => {
+        PersistJob::State { .. }
+        | PersistJob::Domains { .. }
+        | PersistJob::DomainsBundle { .. } => {
             "one periodic snapshot is lost; the next cadence captures a newer height, widening the crash-recovery gap by at most one interval (half-pairs are refused loudly on restore)"
         }
         PersistJob::Block(_) => {
@@ -259,92 +281,136 @@ impl AsyncPersistence {
     /// Start the background writer. Returns a handle for enqueuing jobs and the
     /// shared storage for reads.
     pub fn start(storage: Arc<Storage>) -> Self {
+        Self::start_inner(storage, None)
+    }
+
+    /// Test-only helper that starts the `"stell-persist"` worker thread gated
+    /// behind `gate`, allowing deterministic queue-saturation testing without
+    /// racing concurrent worker drains.
+    #[doc(hidden)]
+    pub fn start_gated_for_test(storage: Arc<Storage>) -> (Self, std::sync::mpsc::SyncSender<()>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        (Self::start_inner(storage, Some(rx)), tx)
+    }
+
+    fn start_inner(storage: Arc<Storage>, gate: Option<std::sync::mpsc::Receiver<()>>) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<PersistJob>(PERSIST_QUEUE_CAP);
         let st = storage.clone();
         let depth = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let depth_worker = depth.clone();
-        tokio::spawn(async move {
-            while let Some(job) = rx.recv().await {
-                // Dequeued: one fewer job waiting, even before the write
-                // lands. `saturating` — a missed count must never wrap the
-                // gauge to u64::MAX.
-                // L-04: `fetch_update` is deprecated on newer toolchains; the
-                // explicit CAS loop in `decrement_queue_depth` is exactly its
-                // body for an always-Some closure (same race-safety:
-                // concurrent dequeues serialize on the compare-exchange, the
-                // counter saturates at 0 instead of wrapping).
-                decrement_queue_depth(&depth_worker);
-                let res = match job {
-                    PersistJob::Block(b) => st.put_block(&b).map(|_| ()),
-                    PersistJob::State { height, snapshot } => st.put_state(height, &snapshot),
-                    // Audit F1(c): `cross_shard` is written FIRST. The old
-                    // order wrote it LAST (domains→session→bridge→
-                    // zkml→cross_shard), so an I/O error anywhere
-                    // in the chain silently skipped the replay set while
-                    // keeping the rest — the exact partial write that
-                    // re-opens consumed inbounds. Replay-first inverts the
-                    // failure shape: a later error now leaves replay state
-                    // WITHOUT its domains, which the paired-snapshot loader
-                    // REFUSES loudly (unpaired/half snapshot) instead of
-                    // installing a double-mint. Replay data without domains
-                    // is fail-closed; domains without replay data was the
-                    // corruption.
-                    PersistJob::Domains {
-                        height,
-                        bytes,
-                        session_keys,
-                        bridge,
-                        zkml_models,
-                        cross_shard,
-                    } => st
-                        .put_cross_shard(height, &cross_shard)
-                        .and_then(|()| st.put_domains(height, &bytes))
-                        .and_then(|()| st.put_session_keys(height, &session_keys))
-                        .and_then(|()| st.put_bridge(height, &bridge))
-                        .and_then(|()| st.put_zkml_models(height, &zkml_models)),
-                    PersistJob::CnVrfV3 { height, bytes } => st.put_cnvrf_v3(height, &bytes),
-                    PersistJob::CnVrfFreezeInputs { height, bytes } => {
-                        st.put_cnvrf_freeze_inputs(height, &bytes)
-                    }
-                    PersistJob::EvmBindingsState { height, bytes } => {
-                        st.put_evm_bindings_state(height, &bytes)
-                    }
-                    PersistJob::PqRegistry { height, bytes } => st.put_pq_registry(height, &bytes),
-                    PersistJob::EvmSettledState { height, bytes } => {
-                        st.put_evm_settled_state(height, &bytes)
-                    }
-                    PersistJob::XshardHeaders { bytes } => st.put_xshard_headers(&bytes),
-                    PersistJob::ValidatorSetHistory(history) => {
-                        st.put_validator_set_history(&history)
-                    }
-                    PersistJob::Consensus(cp) => st.set_consensus(&cp),
-                    PersistJob::Finalized { height, hash } => st.set_finalized(height, &hash),
-                    PersistJob::Receipts {
-                        height,
-                        hash,
-                        txs,
-                        statuses,
-                        fees,
-                        events,
-                    } => st
-                        .put_receipts_for_block_with_events(
-                            height, &hash, &txs, &statuses, &fees, &events,
-                        )
-                        .map(|_| ()),
-                    // Bounded per job: the flusher is the only writer, so an
-                    // unbounded scan here would stall every other write.
-                    // Receipts ride the same retention window (audit 2026-10-06).
-                    PersistJob::Prune { keep_from } => st
-                        .prune_blocks_below(keep_from)
-                        .and_then(|_| st.prune_receipts_below(keep_from))
-                        .map(|_| ()),
-                    PersistJob::Flush => st.flush(),
-                };
-                if let Err(e) = res {
-                    eprintln!("[storage] persist error: {e}");
+        std::thread::Builder::new()
+            .name("stell-persist".into())
+            .spawn(move || {
+                if let Some(gate_rx) = gate {
+                    let _ = gate_rx.recv();
                 }
-            }
-        });
+                while let Some(job) = rx.blocking_recv() {
+                    // Dequeued: one fewer job waiting, even before the write
+                    // lands. `saturating` — a missed count must never wrap the
+                    // gauge to u64::MAX.
+                    // L-04: `fetch_update` is deprecated on newer toolchains; the
+                    // explicit CAS loop in `decrement_queue_depth` is exactly its
+                    // body for an always-Some closure (same race-safety:
+                    // concurrent dequeues serialize on the compare-exchange, the
+                    // counter saturates at 0 instead of wrapping).
+                    decrement_queue_depth(&depth_worker);
+                    let res = match job {
+                        PersistJob::Block(b) => st.put_block(&b).map(|_| ()),
+                        PersistJob::State { height, snapshot } => st.put_state(height, &snapshot),
+                        // Audit F1(c): `cross_shard` is written FIRST. The old
+                        // order wrote it LAST (domains→session→bridge→
+                        // zkml→cross_shard), so an I/O error anywhere
+                        // in the chain silently skipped the replay set while
+                        // keeping the rest — the exact partial write that
+                        // re-opens consumed inbounds. Replay-first inverts the
+                        // failure shape: a later error now leaves replay state
+                        // WITHOUT its domains, which the paired-snapshot loader
+                        // REFUSES loudly (unpaired/half snapshot) instead of
+                        // installing a double-mint. Replay data without domains
+                        // is fail-closed; domains without replay data was the
+                        // corruption.
+                        PersistJob::Domains {
+                            height,
+                            bytes,
+                            session_keys,
+                            bridge,
+                            zkml_models,
+                            cross_shard,
+                        } => st
+                            .put_cross_shard(height, &cross_shard)
+                            .and_then(|()| st.put_domains(height, &bytes))
+                            .and_then(|()| st.put_session_keys(height, &session_keys))
+                            .and_then(|()| st.put_bridge(height, &bridge))
+                            .and_then(|()| st.put_zkml_models(height, &zkml_models)),
+                        PersistJob::DomainsBundle {
+                            height,
+                            bytes,
+                            session_keys,
+                            bridge,
+                            zkml_models,
+                            cross_shard,
+                            cnvrf_v3,
+                            cnvrf_freeze_inputs,
+                            evm_bindings_state,
+                            pq_registry,
+                            evm_settled_state,
+                        } => st
+                            .put_cross_shard(height, &cross_shard)
+                            .and_then(|()| st.put_cnvrf_v3(height, &cnvrf_v3))
+                            .and_then(|()| st.put_cnvrf_freeze_inputs(height, &cnvrf_freeze_inputs))
+                            .and_then(|()| st.put_evm_bindings_state(height, &evm_bindings_state))
+                            .and_then(|()| st.put_pq_registry(height, &pq_registry))
+                            .and_then(|()| st.put_evm_settled_state(height, &evm_settled_state))
+                            .and_then(|()| st.put_domains(height, &bytes))
+                            .and_then(|()| st.put_session_keys(height, &session_keys))
+                            .and_then(|()| st.put_bridge(height, &bridge))
+                            .and_then(|()| st.put_zkml_models(height, &zkml_models)),
+                        PersistJob::CnVrfV3 { height, bytes } => st.put_cnvrf_v3(height, &bytes),
+                        PersistJob::CnVrfFreezeInputs { height, bytes } => {
+                            st.put_cnvrf_freeze_inputs(height, &bytes)
+                        }
+                        PersistJob::EvmBindingsState { height, bytes } => {
+                            st.put_evm_bindings_state(height, &bytes)
+                        }
+                        PersistJob::PqRegistry { height, bytes } => {
+                            st.put_pq_registry(height, &bytes)
+                        }
+                        PersistJob::EvmSettledState { height, bytes } => {
+                            st.put_evm_settled_state(height, &bytes)
+                        }
+                        PersistJob::XshardHeaders { bytes } => st.put_xshard_headers(&bytes),
+                        PersistJob::ValidatorSetHistory(history) => {
+                            st.put_validator_set_history(&history)
+                        }
+                        PersistJob::Consensus(cp) => st.set_consensus(&cp),
+                        PersistJob::Finalized { height, hash } => st.set_finalized(height, &hash),
+                        PersistJob::Receipts {
+                            height,
+                            hash,
+                            txs,
+                            statuses,
+                            fees,
+                            events,
+                        } => st
+                            .put_receipts_for_block_with_events(
+                                height, &hash, &txs, &statuses, &fees, &events,
+                            )
+                            .map(|_| ()),
+                        // Bounded per job: the flusher is the only writer, so an
+                        // unbounded scan here would stall every other write.
+                        // Receipts ride the same retention window (audit 2026-10-06).
+                        PersistJob::Prune { keep_from } => st
+                            .prune_blocks_below(keep_from)
+                            .and_then(|_| st.prune_receipts_below(keep_from))
+                            .map(|_| ()),
+                        PersistJob::Flush => st.flush(),
+                    };
+                    if let Err(e) = res {
+                        eprintln!("[storage] persist error: {e}");
+                    }
+                }
+            })
+            .expect("failed to spawn stell-persist thread");
         Self {
             tx,
             storage,
@@ -642,7 +708,8 @@ impl AsyncPersistence {
         let session_keys = engine.session_keys_snapshot().await;
         let bridge = engine.bridge_snapshot().await;
         let zkml_models = engine.zkml_models_snapshot().await;
-        let cnvrf_v3 = bincode::serialize(&engine.cnvrf_v3_snapshot().await).unwrap_or_default();
+        let cnvrf_v3 =
+            bincode::serialize(&engine.cnvrf_v3_snapshot().await).map_err(|e| e.to_string());
         let cnvrf_freeze_inputs = engine.cnvrf_freeze_inputs_snapshot().await;
         let evm_bindings = engine.evm_bindings_snapshot().await;
         let pq_registry = engine.pq_registry_snapshot().await;
@@ -676,25 +743,107 @@ impl AsyncPersistence {
                 xpc,
                 ..Default::default()
             })
-            .unwrap_or_default()
+            .map_err(|e| e.to_string())
         };
         // Serialize OFF the executor (bincode of every domain is real CPU work);
-        // skip on error exactly like the old inline `if let Ok(bytes)` did.
-        if let Some(bytes) = serialize_off_tick(snap).await {
-            self.enqueue_cnvrf_v3(height, cnvrf_v3);
-            self.enqueue_cnvrf_freeze_inputs(height, cnvrf_freeze_inputs);
-            self.enqueue_evm_bindings_state(height, evm_bindings);
-            self.enqueue_pq_registry(height, pq_registry);
-            self.enqueue_evm_settled_state(height, evm_settled);
-            self.enqueue_domains(
-                height,
-                bytes,
-                session_keys,
-                bridge,
-                zkml_models,
-                cross_shard,
-            );
-        }
+        // abort loudly on any encode failure instead of writing 0-byte snapshots.
+        let bytes = serialize_off_tick(snap).await;
+        self.enqueue_encoded_domains_bundle(
+            height,
+            bytes,
+            session_keys,
+            bridge,
+            zkml_models,
+            cross_shard,
+            cnvrf_v3,
+            cnvrf_freeze_inputs,
+            evm_bindings,
+            pq_registry,
+            evm_settled,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    // GATE: internal helper bundling all same-height root-committed domains after encoding.
+    fn enqueue_encoded_domains_bundle(
+        &self,
+        height: u64,
+        bytes: Option<Vec<u8>>,
+        session_keys: Vec<u8>,
+        bridge: Vec<u8>,
+        zkml_models: Vec<u8>,
+        cross_shard: Result<Vec<u8>, String>,
+        cnvrf_v3: Result<Vec<u8>, String>,
+        cnvrf_freeze_inputs: Vec<u8>,
+        evm_bindings_state: Vec<u8>,
+        pq_registry: Vec<u8>,
+        evm_settled_state: Vec<u8>,
+    ) -> bool {
+        let cnvrf_v3 = match cnvrf_v3 {
+            Ok(b) if !b.is_empty() => b,
+            Ok(_) => {
+                tracing::error!(
+                    height,
+                    "[storage] snapshot_domains: cnvrf_v3 encoded to 0 bytes; aborting domain snapshot"
+                );
+                return false;
+            }
+            Err(e) => {
+                tracing::error!(
+                    height,
+                    "[storage] snapshot_domains: cnvrf_v3 serialize failed: {e}; aborting domain snapshot"
+                );
+                return false;
+            }
+        };
+        let cross_shard = match cross_shard {
+            Ok(b) if !b.is_empty() => b,
+            Ok(_) => {
+                tracing::error!(
+                    height,
+                    "[storage] snapshot_domains: cross_shard encoded to 0 bytes; aborting domain snapshot"
+                );
+                return false;
+            }
+            Err(e) => {
+                tracing::error!(
+                    height,
+                    "[storage] snapshot_domains: cross_shard serialize failed: {e}; aborting domain snapshot"
+                );
+                return false;
+            }
+        };
+        let bytes = match bytes {
+            Some(b) if !b.is_empty() => b,
+            Some(_) => {
+                tracing::error!(
+                    height,
+                    "[storage] snapshot_domains: domains encoded to 0 bytes; aborting domain snapshot"
+                );
+                return false;
+            }
+            None => {
+                tracing::error!(
+                    height,
+                    "[storage] snapshot_domains: domains serialize failed; aborting domain snapshot"
+                );
+                return false;
+            }
+        };
+        self.push(PersistJob::DomainsBundle {
+            height,
+            bytes,
+            session_keys,
+            bridge,
+            zkml_models,
+            cross_shard,
+            cnvrf_v3,
+            cnvrf_freeze_inputs,
+            evm_bindings_state,
+            pq_registry,
+            evm_settled_state,
+        });
+        true
     }
 
     /// Non-blocking: persist the consensus safety checkpoint.
@@ -777,8 +926,31 @@ impl AsyncPersistence {
     /// blocking pool (see [`serialize_off_tick`]).
     pub async fn snapshot_state(&self, engine: &InMemoryStateEngine, height: u64) {
         let accounts = clone_account_snapshot(engine).await;
-        let snap = serialize_off_tick(accounts).await.unwrap_or_default();
-        self.enqueue_state(height, snap);
+        let encoded = serialize_off_tick(accounts).await;
+        self.enqueue_encoded_state(height, encoded);
+    }
+
+    fn enqueue_encoded_state(&self, height: u64, encoded: Option<Vec<u8>>) -> bool {
+        match encoded {
+            Some(snap) if !snap.is_empty() => {
+                self.enqueue_state(height, snap);
+                true
+            }
+            Some(_) => {
+                tracing::error!(
+                    height,
+                    "[storage] snapshot_state: state serialized to 0 bytes; skipping State enqueue"
+                );
+                false
+            }
+            None => {
+                tracing::error!(
+                    height,
+                    "[storage] snapshot_state: state serialization failed; skipping State enqueue"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -929,4 +1101,167 @@ pub async fn serialize_off_tick<T: Serialize + Send + 'static>(value: T) -> Opti
     tokio::task::spawn_blocking(move || bincode::serialize(&value).ok())
         .await
         .unwrap_or(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "stell_persist_unit_{tag}_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    #[tokio::test]
+    async fn snapshot_state_never_writes_zero_bytes_on_encode_failure() {
+        let dir = tmpdir("state_fail");
+        let st = Arc::new(Storage::open(&dir).expect("open storage"));
+        let ap = AsyncPersistence::start(Arc::clone(&st));
+
+        assert!(!ap.enqueue_encoded_state(10, None));
+        assert!(!ap.enqueue_encoded_state(11, Some(Vec::new())));
+        ap.request_flush();
+        let _ = wait_for_persist_drain_with(
+            || ap.pending(),
+            ShutdownDrainConfig {
+                cap: std::time::Duration::from_secs(2),
+                poll: std::time::Duration::from_millis(2),
+                log_every: std::time::Duration::from_secs(60),
+                settle_grace: std::time::Duration::from_millis(10),
+            },
+        )
+        .await;
+        let _ = st.flush();
+
+        assert!(st.get_state(10).unwrap().is_none());
+        assert!(st.get_state(11).unwrap().is_none());
+
+        let engine = InMemoryStateEngine::new();
+        ap.snapshot_state(&engine, 12).await;
+        ap.request_flush();
+        let _ = wait_for_persist_drain_with(
+            || ap.pending(),
+            ShutdownDrainConfig {
+                cap: std::time::Duration::from_secs(2),
+                poll: std::time::Duration::from_millis(2),
+                log_every: std::time::Duration::from_secs(60),
+                settle_grace: std::time::Duration::from_millis(10),
+            },
+        )
+        .await;
+        let _ = st.flush();
+        let saved = st.get_state(12).unwrap().expect("valid state written");
+        assert!(!saved.is_empty());
+
+        drop(ap);
+        drop(st);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn snapshot_domains_never_writes_zero_bytes_on_encode_failure() {
+        let dir = tmpdir("domains_fail");
+        let st = Arc::new(Storage::open(&dir).expect("open storage"));
+        let ap = AsyncPersistence::start(Arc::clone(&st));
+
+        // Failure in cnvrf_v3 aborts entire height 10 domain snapshot.
+        assert!(!ap.enqueue_encoded_domains_bundle(
+            10,
+            Some(vec![1, 2, 3]),
+            vec![4],
+            vec![5],
+            vec![6],
+            Ok(vec![7]),
+            Err("cnvrf encode failure".into()),
+            vec![8],
+            vec![9],
+            vec![10],
+            vec![11],
+        ));
+        // Failure in CrossShardReplaySnapshot aborts entire height 11 domain snapshot.
+        assert!(!ap.enqueue_encoded_domains_bundle(
+            11,
+            Some(vec![1, 2, 3]),
+            vec![4],
+            vec![5],
+            vec![6],
+            Err("xshard encode failure".into()),
+            Ok(vec![7]),
+            vec![8],
+            vec![9],
+            vec![10],
+            vec![11],
+        ));
+        // Failure in DomainSnapshot off-tick encode aborts entire height 12 domain snapshot.
+        assert!(!ap.enqueue_encoded_domains_bundle(
+            12,
+            None,
+            vec![4],
+            vec![5],
+            vec![6],
+            Ok(vec![7]),
+            Ok(vec![8]),
+            vec![9],
+            vec![10],
+            vec![11],
+            vec![12],
+        ));
+        ap.request_flush();
+        let _ = wait_for_persist_drain_with(
+            || ap.pending(),
+            ShutdownDrainConfig {
+                cap: std::time::Duration::from_secs(2),
+                poll: std::time::Duration::from_millis(2),
+                log_every: std::time::Duration::from_secs(60),
+                settle_grace: std::time::Duration::from_millis(10),
+            },
+        )
+        .await;
+        let _ = st.flush();
+
+        for h in [10u64, 11, 12] {
+            assert!(st.domain_at(h).unwrap().is_none());
+            assert!(st.cnvrf_v3_at(h).unwrap().is_none());
+            assert!(st.cross_shard_at(h).unwrap().is_none());
+            assert!(st.pq_registry_at(h).unwrap().is_none());
+        }
+
+        drop(ap);
+        drop(st);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn snapshot_domains_bundles_all_root_domains_in_single_job() {
+        let dir = tmpdir("domains_bundle");
+        let st = Arc::new(Storage::open(&dir).expect("open storage"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<PersistJob>(4);
+        let ap = AsyncPersistence {
+            tx,
+            storage: Arc::clone(&st),
+            queue_depth: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+
+        let engine = InMemoryStateEngine::new();
+        let staking = crate::staking::StakingLedger::new();
+        let gov = crate::governance::Governance::new();
+        ap.snapshot_domains(&engine, &staking, &gov, 42).await;
+
+        assert_eq!(ap.pending(), 1, "all domains must occupy one queue slot");
+        let job = rx.try_recv().expect("exactly one job enqueued");
+        assert!(matches!(job, PersistJob::DomainsBundle { height: 42, .. }));
+        assert!(
+            rx.try_recv().is_err(),
+            "no separate aux jobs may be enqueued by snapshot_domains"
+        );
+
+        drop(ap);
+        drop(st);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

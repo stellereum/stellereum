@@ -878,16 +878,18 @@ pub(super) async fn handle_get_proof(
         Err(e) => return err(id, -32602, format!("bad address: {e}")),
     };
     // A proof from THIS shard's trie cannot authenticate another shard's
-    // state: an exclusion proof would tell a light client (verifiably!) that a
-    // foreign-shard account does not exist. Refuse, never fabricate.
-    if let Some(denied) = foreign_shard_refusal(st, &id, address, shard_hint).await {
-        return denied;
-    }
+    // state unless this process hosts that shard and delegates to its trie.
+    // Refuse unhosted shards fail-closed, never fabricate.
+    let peer_opt = match resolve_shard_target_for_address(st, &id, address, shard_hint).await {
+        Ok(p) => p,
+        Err(denied) => return denied,
+    };
+    let target_st = peer_opt.as_deref().unwrap_or(st);
 
     // Optional height. This node keeps no historical state, so the only
     // height it can answer for is the one it is currently serving — saying
     // so is better than serving today's proof under an old height's label.
-    let cur_height = st.height.load(std::sync::atomic::Ordering::Relaxed);
+    let cur_height = target_st.height.load(std::sync::atomic::Ordering::Relaxed);
     let want_height = p
         .get("block_height")
         .or_else(|| p.get("height"))
@@ -945,12 +947,12 @@ pub(super) async fn handle_get_proof(
     // Fold the consensus-domain digest first: it is the canonical root, and
     // the fold is a write, so it must not happen while the read lock below
     // is held.
-    let _ = st.engine.get_state_root().await;
+    let _ = target_st.engine.get_state_root().await;
     // Clone the compressed trie snapshot under a brief read lock, then release
     // the lock before offloading proof generation + verification onto
     // `spawn_blocking`.
     let compressed = {
-        let trie = st.engine.state_trie.read().await;
+        let trie = target_st.engine.state_trie.read().await;
         trie.compressed().clone()
     };
     let proof_res = tokio::task::spawn_blocking(move || {
@@ -1125,11 +1127,13 @@ pub(super) async fn handle_get_archive_proof(
         Ok(a) => a,
         Err(e) => return err(id, -32602, format!("bad address: {e}")),
     };
-    // Historical proofs come from THIS shard's snapshots; a foreign-shard
-    // address is not provable here (see `foreign_shard_refusal`).
-    if let Some(denied) = foreign_shard_refusal(st, &id, address, shard_hint).await {
-        return denied;
-    }
+    // Historical proofs come from the owning shard's snapshots; delegate when
+    // hosted on this process, refuse unhosted shards fail-closed.
+    let peer_opt = match resolve_shard_target_for_address(st, &id, address, shard_hint).await {
+        Ok(p) => p,
+        Err(denied) => return denied,
+    };
+    let target_st = peer_opt.as_deref().unwrap_or(st);
     let key: [u8; 32] = match p.get("key") {
         None | Some(Value::Null) => address,
         Some(Value::String(s)) => match parse_hash(s) {
@@ -1151,7 +1155,7 @@ pub(super) async fn handle_get_archive_proof(
         None => return err(id, -32602, "missing height"),
     };
 
-    let Some(store) = st.archive_store.clone() else {
+    let Some(store) = target_st.archive_store.clone() else {
         return err(
             id,
             -32004,
@@ -1159,7 +1163,7 @@ pub(super) async fn handle_get_archive_proof(
              it cannot consult its snapshot history, so it refuses rather than proving from memory",
         );
     };
-    let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
+    let tip = target_st.height.load(std::sync::atomic::Ordering::Relaxed);
     let handle = tokio::runtime::Handle::current();
     match tokio::task::spawn_blocking(move || {
         handle.block_on(store.serve_archive_proof(height, &key, tip))
@@ -1418,6 +1422,108 @@ pub(crate) async fn foreign_shard_refusal(
     ))
 }
 
+/// Resolve an address to a hosted shard's [`RpcState`] when `target != local`.
+///
+/// * `Ok(None)`: handle locally against `st` (either unsharded node, or `target == local`).
+/// * `Ok(Some(peer))`: delegate to `peer` (hosted shard on this process).
+/// * `Err(resp)`: refuse fail-closed (foreign shard not hosted by this node).
+pub(crate) async fn resolve_shard_target_for_address(
+    st: &RpcState,
+    id: &Value,
+    address: [u8; 32],
+    hint: Option<u32>,
+) -> Result<Option<std::sync::Arc<RpcState>>, Json<RpcResponse>> {
+    if !st.shard_registry.is_sharded() {
+        return Ok(None);
+    }
+    let target = resolve_shard_for_address(st, address, hint).await;
+    let local = st.engine.shard_id();
+    if target == local {
+        return Ok(None);
+    }
+    if let Some(peer) = st.state_for_shard(target).await {
+        if peer.engine.shard_id() == target {
+            return Ok(Some(peer));
+        }
+    }
+    Err(err(
+        id.clone(),
+        -32004,
+        format!(
+            "address belongs to shard {target}, but this node serves shard {local}: \
+             the local state does not hold it (query the RPC endpoint of shard {target})"
+        ),
+    ))
+}
+
+fn optional_shard_id_param(params: &Value) -> Result<Option<u32>, String> {
+    let obj = if params.is_array() {
+        match params.get(0) {
+            Some(v) if v.is_object() => v,
+            _ => return Ok(None),
+        }
+    } else if params.is_object() {
+        params
+    } else {
+        return Ok(None);
+    };
+    for key in ["shard_id", "shardId"] {
+        match obj.get(key) {
+            None | Some(Value::Null) => continue,
+            Some(v) => {
+                let raw = parse_u64_loose(v)
+                    .ok_or_else(|| format!("invalid {key}: expected a non-negative integer"))?;
+                let sid = u32::try_from(raw)
+                    .map_err(|_| format!("invalid {key}: {raw} out of bounds for u32"))?;
+                return Ok(Some(sid));
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn resolve_shard_target_by_id(
+    st: &RpcState,
+    id: &Value,
+    params: &Value,
+) -> Result<(Option<std::sync::Arc<RpcState>>, Option<u32>), Json<RpcResponse>> {
+    let want = match optional_shard_id_param(params) {
+        Ok(s) => s,
+        Err(e) => return Err(err(id.clone(), -32602, e)),
+    };
+    let Some(target) = want else {
+        return Ok((None, None));
+    };
+    if target == st.engine.shard_id() {
+        return Ok((None, Some(target)));
+    }
+    if let Some(peer) = st.state_for_shard(target).await {
+        if peer.engine.shard_id() == target {
+            return Ok((Some(peer), Some(target)));
+        }
+    }
+    Err(err(
+        id.clone(),
+        -32004,
+        format!(
+            "shard {target} is not hosted on this node (local shard {})",
+            st.engine.shard_id()
+        ),
+    ))
+}
+
+fn shard_scoped_cache_params<'a>(
+    target_st: &RpcState,
+    params: &'a Value,
+) -> std::borrow::Cow<'a, Value> {
+    let sid = target_st.engine.shard_id();
+    if sid == crate::sharding::MASTERCHAIN_SHARD {
+        std::borrow::Cow::Borrowed(params)
+    } else {
+        std::borrow::Cow::Owned(json!({ "__shard": sid, "params": params }))
+    }
+}
+
 pub(super) async fn dispatch_reads(
     st: &RpcState,
     id: Value,
@@ -1455,13 +1561,18 @@ pub(super) async fn dispatch_reads(
             ok(id, json!(hex::encode(root)))
         }
         "stell_latestBlocks" => {
+            let (peer_opt, _) = match resolve_shard_target_by_id(st, &id, params).await {
+                Ok(v) => v,
+                Err(denied) => return denied,
+            };
+            let target_st = peer_opt.as_deref().unwrap_or(st);
             let limit = params["limit"]
                 .as_u64()
                 .or_else(|| params.as_u64())
                 .or_else(|| params.get(0).and_then(|v| v.as_u64()))
                 .map(|l| (l as usize).min(MAX_RECENT_BLOCKS))
                 .unwrap_or(MAX_RECENT_BLOCKS);
-            let rb = st.recent_blocks.read().await;
+            let rb = target_st.recent_blocks.read().await;
             let mut list: Vec<Value> = rb
                 .iter()
                 .take(limit)
@@ -1476,7 +1587,7 @@ pub(super) async fn dispatch_reads(
                 .collect();
             drop(rb);
             if list.is_empty() && limit > 0 {
-                if let Some(store) = st.archive_store.as_ref() {
+                if let Some(store) = target_st.archive_store.as_ref() {
                     if let Ok(Some(tip_rec)) = store.latest_header() {
                         let tip = tip_rec.height;
                         let lo = tip.saturating_sub(limit as u64 - 1);
@@ -1562,28 +1673,36 @@ pub(super) async fn dispatch_reads(
             //
             // The selector accepts everything the `eth_*` path accepts:
             // `{"height": 42}`, `{"height": "latest"}`, `"latest"`, `42`,
-            // `["0x2a"]`, ... Tags resolve against this node's finalized tip.
+            // `["0x2a"]`, ... Tags resolve against the target shard's finalized tip.
             //
             // Finalized-read cache: the summary for a finalized height is
             // immutable (any republish evicts via `record_block`), so a fresh
             // `Ok` is cached keyed by (method, height, params-hash). Errors
             // bypass: an unknown height can still arrive via replication.
+            let (peer_opt, _) = match resolve_shard_target_by_id(st, &id, params).await {
+                Ok(v) => v,
+                Err(denied) => return denied,
+            };
+            let target_st = peer_opt.as_deref().unwrap_or(st);
             let tag = match stell_block_tag_param(params) {
                 Ok(t) => t,
                 Err(e) if e == "missing height" => return err(id, -32602, e),
                 Err(e) => return err(id, -32602, e),
             };
-            let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
+            let tip = target_st.height.load(std::sync::atomic::Ordering::Relaxed);
             let want = tag.resolve(tip);
+            let cache_params = shard_scoped_cache_params(target_st, params);
             // Only finalized heights may consult the cache. An above-tip read
             // is an error, and errors bypass the cache entirely (no lookup, no
             // miss counter): it may resolve as replication catches up.
             if want <= tip {
-                if let Some(hit) = finalized_read_cache_get("stell_getBlock", want, params, tip) {
+                if let Some(hit) =
+                    finalized_read_cache_get("stell_getBlock", want, &cache_params, tip)
+                {
                     return ok(id, hit);
                 }
             }
-            let rb = st.recent_blocks.read().await;
+            let rb = target_st.recent_blocks.read().await;
             let found = rb.iter().find(|b| b.height == want);
             if let Some(b) = found {
                 let v = json!({
@@ -1593,11 +1712,11 @@ pub(super) async fn dispatch_reads(
                     "timestamp": b.timestamp,
                 });
                 drop(rb);
-                finalized_read_cache_put("stell_getBlock", want, params, tip, v.clone());
+                finalized_read_cache_put("stell_getBlock", want, &cache_params, tip, v.clone());
                 return ok(id, v);
             }
             drop(rb);
-            if let Some(rec) = st
+            if let Some(rec) = target_st
                 .archive_store
                 .as_ref()
                 .and_then(|s| s.header_at(want).ok().flatten())
@@ -1608,27 +1727,40 @@ pub(super) async fn dispatch_reads(
                     "txs": rec.tx_count,
                     "timestamp": rec.timestamp,
                 });
-                finalized_read_cache_put("stell_getBlock", want, params, tip, v.clone());
+                finalized_read_cache_put("stell_getBlock", want, &cache_params, tip, v.clone());
                 return ok(id, v);
             }
-            // Same source the `eth_*` adapter serves: the shared adapter maps.
-            let numeric_tag = format!("0x{want:x}");
-            if let Ok(Some(b)) = st.eth_get_block_by_number(&numeric_tag, false).await {
-                if let Some(mut summary) = evm_block_to_stell_summary(&b) {
-                    // An adapter block summary can carry an empty hashes list;
-                    // the receipt index is the authoritative tx count for a
-                    // height this node committed.
-                    if summary.tx_count == 0 {
-                        summary.tx_count = st.receipts.read().await.for_height(want).len();
+            // Same source the `eth_*` adapter serves: the shared adapter maps
+            // (masterchain / single-shard only — workchains never fall back to
+            // the masterchain's EVM block map).
+            if !target_st.shard_registry.is_sharded()
+                || target_st.engine.shard_id() == crate::sharding::MASTERCHAIN_SHARD
+            {
+                let numeric_tag = format!("0x{want:x}");
+                if let Ok(Some(b)) = target_st.eth_get_block_by_number(&numeric_tag, false).await {
+                    if let Some(mut summary) = evm_block_to_stell_summary(&b) {
+                        // An adapter block summary can carry an empty hashes list;
+                        // the receipt index is the authoritative tx count for a
+                        // height this node committed.
+                        if summary.tx_count == 0 {
+                            summary.tx_count =
+                                target_st.receipts.read().await.for_height(want).len();
+                        }
+                        let v = json!({
+                            "height": summary.height,
+                            "hash": summary.hash,
+                            "txs": summary.tx_count,
+                            "timestamp": summary.timestamp,
+                        });
+                        finalized_read_cache_put(
+                            "stell_getBlock",
+                            want,
+                            &cache_params,
+                            tip,
+                            v.clone(),
+                        );
+                        return ok(id, v);
                     }
-                    let v = json!({
-                        "height": summary.height,
-                        "hash": summary.hash,
-                        "txs": summary.tx_count,
-                        "timestamp": summary.timestamp,
-                    });
-                    finalized_read_cache_put("stell_getBlock", want, params, tip, v.clone());
-                    return ok(id, v);
                 }
             }
             if want > tip {
@@ -1650,6 +1782,11 @@ pub(super) async fn dispatch_reads(
         // fabricated (an empty list is only returned when the block is KNOWN
         // with zero transactions, not when it is unknown).
         "stell_getBlockTransactions" => {
+            let (peer_opt, _) = match resolve_shard_target_by_id(st, &id, params).await {
+                Ok(v) => v,
+                Err(denied) => return denied,
+            };
+            let target_st = peer_opt.as_deref().unwrap_or(st);
             // Same selector shapes as `stell_getBlock` (number, hex, tag,
             // positional): a client should not need two different height
             // dialects for two reads of the same block.
@@ -1657,8 +1794,9 @@ pub(super) async fn dispatch_reads(
                 Ok(t) => t,
                 Err(e) => return err(id, -32602, e),
             };
-            let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
+            let tip = target_st.height.load(std::sync::atomic::Ordering::Relaxed);
             let want = tag.resolve(tip);
+            let cache_params = shard_scoped_cache_params(target_st, params);
             // Finalized-read cache FIRST: receipts for a finalized height are
             // filed once (before the height publishes — see `record_*`
             // ordering) and any late filing evicts via
@@ -1666,20 +1804,20 @@ pub(super) async fn dispatch_reads(
             // and errors bypass.
             if want <= tip {
                 if let Some(hit) =
-                    finalized_read_cache_get("stell_getBlockTransactions", want, params, tip)
+                    finalized_read_cache_get("stell_getBlockTransactions", want, &cache_params, tip)
                 {
                     return ok(id, hit);
                 }
             }
             // Known height = in the recent window (committed locally or adopted).
-            let known_mem = st
+            let known_mem = target_st
                 .recent_blocks
                 .read()
                 .await
                 .iter()
                 .any(|b| b.height == want);
             let known = known_mem
-                || st
+                || target_st
                     .archive_store
                     .as_ref()
                     .and_then(|s| s.header_at(want).ok().flatten())
@@ -1687,7 +1825,7 @@ pub(super) async fn dispatch_reads(
             if !known {
                 return err(id, -32004, "block transactions not available yet (height not adopted/replicated on this node)");
             }
-            let idx = st.receipts.read().await;
+            let idx = target_st.receipts.read().await;
             let rows = idx.for_height(want);
             let list: Vec<Value> = rows
                 .iter()
@@ -1707,11 +1845,11 @@ pub(super) async fn dispatch_reads(
                 .collect();
             let v = json!({ "height": want, "txs": list });
             if want <= tip && !rows.is_empty() {
-                let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
+                let tip = target_st.height.load(std::sync::atomic::Ordering::Relaxed);
                 finalized_read_cache_put(
                     "stell_getBlockTransactions",
                     want,
-                    params,
+                    &cache_params,
                     tip,
                     v.clone(),
                 );
@@ -1792,17 +1930,19 @@ pub(super) async fn dispatch_reads(
                 None => return err(id, -32602, "missing address"),
             };
             // Accept the shard-aware forms (`-1:` / `N:`) like every other
-            // address-taking read, and REFUSE a foreign-shard address rather
-            // than serving the local trie's zero as that shard's balance.
+            // address-taking read, delegate when the target shard is hosted on
+            // this node, and REFUSE unhosted foreign-shard addresses.
             let (hint, addr_body) = crate::sharding::split_shard_prefix(addr);
             let a = match parse_addr_or_hash(addr_body) {
                 Ok(a) => a,
                 Err(e) => return err(id, -32602, e),
             };
-            if let Some(denied) = foreign_shard_refusal(st, &id, a, hint).await {
-                return denied;
-            }
-            let acc = st.engine.get_account(&a).await;
+            let peer_opt = match resolve_shard_target_for_address(st, &id, a, hint).await {
+                Ok(p) => p,
+                Err(denied) => return denied,
+            };
+            let target_st = peer_opt.as_deref().unwrap_or(st);
+            let acc = target_st.engine.get_account(&a).await;
             let (bal, nonce) = acc.map(|x| (x.balance, x.nonce)).unwrap_or((0, 0));
             ok(id, json!({ "balance": bal.to_string(), "nonce": nonce }))
         }
@@ -1817,16 +1957,18 @@ pub(super) async fn dispatch_reads(
                 Ok(a) => a,
                 Err(e) => return err(id, -32602, e),
             };
-            // A proof built from another shard's trie is a false claim; the
-            // client must ask the shard that owns the account.
-            if let Some(denied) = foreign_shard_refusal(st, &id, a, hint).await {
-                return denied;
-            }
-            let acc = st.engine.get_account(&a).await;
+            // A proof built from another shard's trie is a false claim; delegate
+            // to the hosted shard that owns the account, or refuse fail-closed.
+            let peer_opt = match resolve_shard_target_for_address(st, &id, a, hint).await {
+                Ok(p) => p,
+                Err(denied) => return denied,
+            };
+            let target_st = peer_opt.as_deref().unwrap_or(st);
+            let acc = target_st.engine.get_account(&a).await;
             let (balance, nonce) = acc.as_ref().map(|x| (x.balance, x.nonce)).unwrap_or((0, 0));
-            let root = st.engine.get_state_root().await;
+            let root = target_st.engine.get_state_root().await;
             let root_hex = hex::encode(root);
-            let proof = st.engine.get_account_proof(&a).await;
+            let proof = target_st.engine.get_account_proof(&a).await;
             let leaf_data = acc.as_ref().map(|x| hex::encode(x.to_trie_bytes()));
             ok(
                 id,
@@ -1870,32 +2012,47 @@ pub(super) async fn dispatch_reads(
         // header that commits to them is the one at height+1 — which is why
         // the CLI anchors a served proof with the header at `h+1`.
         "stell_getFinalizedHeader" => {
+            let (peer_opt, explicit_shard) = match resolve_shard_target_by_id(st, &id, params).await
+            {
+                Ok(v) => v,
+                Err(denied) => return denied,
+            };
+            let target_st = peer_opt.as_deref().unwrap_or(st);
             let want = match params["height"].as_u64().or_else(|| params.as_u64()) {
                 Some(h) => h,
                 None => return err(id, -32602, "missing height"),
             };
+            let cache_params = shard_scoped_cache_params(target_st, params);
             // Finalized-read cache: a quorum-certified header is immutable (any
             // republish evicts via `record_finalized_header`). Errors bypass:
             // a pruned/too-old height stays an honest miss.
-            let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
+            let tip = target_st.height.load(std::sync::atomic::Ordering::Relaxed);
             if want <= tip {
                 if let Some(hit) =
-                    finalized_read_cache_get("stell_getFinalizedHeader", want, params, tip)
+                    finalized_read_cache_get("stell_getFinalizedHeader", want, &cache_params, tip)
                 {
                     return ok(id, hit);
                 }
             }
+            let target_shard = target_st.engine.shard_id();
+            let filter_by_shard = target_st.shard_registry.is_sharded() || explicit_shard.is_some();
             let store = finalized_headers();
             let hs = store.read().await;
-            match hs.iter().find(|h| h.height == want) {
+            let matched = if filter_by_shard {
+                hs.iter()
+                    .find(|h| h.height == want && h.shard_id == target_shard)
+            } else {
+                hs.iter().find(|h| h.height == want)
+            };
+            match matched {
                 Some(h) => {
                     let v = h.to_json();
                     if want <= tip {
-                        let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
+                        let tip = target_st.height.load(std::sync::atomic::Ordering::Relaxed);
                         finalized_read_cache_put(
                             "stell_getFinalizedHeader",
                             want,
-                            params,
+                            &cache_params,
                             tip,
                             v.clone(),
                         );
@@ -2199,17 +2356,24 @@ pub(super) async fn dispatch_reads(
             }
         }
         "stell_tokenBalanceSpv" => {
-            let token = params["token"]
-                .as_str()
-                .and_then(|s| parse_addr_or_hash(s).ok());
-            let account = params["account"]
-                .as_str()
-                .and_then(|s| parse_addr_or_hash(s).ok());
+            let token = params["token"].as_str().and_then(|s| {
+                let (_, body) = crate::sharding::split_shard_prefix(s);
+                parse_addr_or_hash(body).ok()
+            });
+            let account = params["account"].as_str().and_then(|s| {
+                let (hint, body) = crate::sharding::split_shard_prefix(s);
+                parse_addr_or_hash(body).ok().map(|a| (hint, a))
+            });
             match (token, account) {
-                (Some(t), Some(a)) => {
-                    let bal = st.engine.token_balance(&t, &a).await;
-                    let root = st.engine.get_state_root().await;
-                    let proof = st.engine.get_token_balance_proof(&t, &a).await;
+                (Some(t), Some((hint, a))) => {
+                    let peer_opt = match resolve_shard_target_for_address(st, &id, a, hint).await {
+                        Ok(p) => p,
+                        Err(denied) => return denied,
+                    };
+                    let target_st = peer_opt.as_deref().unwrap_or(st);
+                    let bal = target_st.engine.token_balance(&t, &a).await;
+                    let root = target_st.engine.get_state_root().await;
+                    let proof = target_st.engine.get_token_balance_proof(&t, &a).await;
                     let key = hex::encode(token_balance_key(&t, &a));
                     ok(
                         id,
@@ -2287,16 +2451,34 @@ pub(super) async fn dispatch_reads(
                 Some(h) => h,
                 None => return err(id, -32602, "missing tx hash"),
             };
-            let idx = st.receipts.read().await;
-            match idx.get(&h) {
-                Some(r) => {
+            let (peer_opt, explicit_shard) = match resolve_shard_target_by_id(st, &id, params).await
+            {
+                Ok(v) => v,
+                Err(denied) => return denied,
+            };
+            let hosted = if explicit_shard.is_none() {
+                st.all_hosted_shards().await
+            } else {
+                Vec::new()
+            };
+            let primary = peer_opt.as_deref().unwrap_or(st);
+            let mut candidates: Vec<&RpcState> = Vec::with_capacity(1 + hosted.len());
+            candidates.push(primary);
+            for (_, peer) in &hosted {
+                if !std::ptr::eq(&**peer as *const RpcState, primary as *const RpcState) {
+                    candidates.push(&**peer);
+                }
+            }
+            for cand in &candidates {
+                let idx = cand.receipts.read().await;
+                if let Some(r) = idx.get(&h) {
                     // E1 confirmations rule: depth of the inclusion block
                     // under the node's current finalized head, inclusion
                     // block included (1 at finality — single-block BFT
                     // finality means finality already holds there; depth
                     // buys operational assurance, never safety — see the
                     // "Confirmations" tiers in RPC.md).
-                    let head = st.height.load(std::sync::atomic::Ordering::Relaxed);
+                    let head = cand.height.load(std::sync::atomic::Ordering::Relaxed);
                     let confirmations = head.saturating_sub(r.height).saturating_add(1);
                     let mut obj = json!({
                         "tx_hash": hex::encode(r.tx_hash),
@@ -2336,39 +2518,39 @@ pub(super) async fn dispatch_reads(
                         })
                         .collect();
                     obj["events"] = json!(events_view);
-                    ok(id, obj)
-                }
-                None => {
-                    drop(idx);
-                    if let Some(sr) = st
-                        .archive_store
-                        .as_ref()
-                        .and_then(|s| s.get_receipt(&h).ok().flatten())
-                    {
-                        let head = st.height.load(std::sync::atomic::Ordering::Relaxed);
-                        let confirmations = head.saturating_sub(sr.height).saturating_add(1);
-                        return ok(
-                            id,
-                            json!({
-                                "tx_hash": hex::encode(sr.tx_hash),
-                                "height": sr.height,
-                                "block_hash": hex::encode(sr.block_hash),
-                                "index": sr.index,
-                                "status": if sr.success { "success" } else { "failed" },
-                                "gas_limit": sr.gas_limit.to_string(),
-                                "fee_charged": sr.fee_charged.to_string(),
-                                "confirmations": confirmations,
-                                "events": [],
-                            }),
-                        );
-                    }
-                    let pending = st.mempool.read().await.contains(&h);
-                    ok(
-                        id,
-                        json!({ "status": if pending { "pending" } else { "unknown" } }),
-                    )
+                    return ok(id, obj);
                 }
             }
+            for cand in &candidates {
+                if let Some(sr) = cand
+                    .archive_store
+                    .as_ref()
+                    .and_then(|s| s.get_receipt(&h).ok().flatten())
+                {
+                    let head = cand.height.load(std::sync::atomic::Ordering::Relaxed);
+                    let confirmations = head.saturating_sub(sr.height).saturating_add(1);
+                    return ok(
+                        id,
+                        json!({
+                            "tx_hash": hex::encode(sr.tx_hash),
+                            "height": sr.height,
+                            "block_hash": hex::encode(sr.block_hash),
+                            "index": sr.index,
+                            "status": if sr.success { "success" } else { "failed" },
+                            "gas_limit": sr.gas_limit.to_string(),
+                            "fee_charged": sr.fee_charged.to_string(),
+                            "confirmations": confirmations,
+                            "events": [],
+                        }),
+                    );
+                }
+            }
+            for cand in &candidates {
+                if cand.mempool.read().await.contains(&h) {
+                    return ok(id, json!({ "status": "pending" }));
+                }
+            }
+            ok(id, json!({ "status": "unknown" }))
         }
         // Transaction lookup by hash (native namespace).
         //
@@ -2388,72 +2570,94 @@ pub(super) async fn dispatch_reads(
                 Some(h) => h,
                 None => return err(id, -32602, "missing tx hash"),
             };
+            let (peer_opt, explicit_shard) = match resolve_shard_target_by_id(st, &id, params).await
+            {
+                Ok(v) => v,
+                Err(denied) => return denied,
+            };
+            let hosted = if explicit_shard.is_none() {
+                st.all_hosted_shards().await
+            } else {
+                Vec::new()
+            };
+            let primary = peer_opt.as_deref().unwrap_or(st);
+            let mut candidates: Vec<&RpcState> = Vec::with_capacity(1 + hosted.len());
+            candidates.push(primary);
+            for (_, peer) in &hosted {
+                if !std::ptr::eq(&**peer as *const RpcState, primary as *const RpcState) {
+                    candidates.push(&**peer);
+                }
+            }
             let queried = format!("0x{}", hex::encode(h));
             let lookup = crate::evm_adapter::evm_to_stell_hash(&queried).unwrap_or(h);
-            let head = st.height.load(std::sync::atomic::Ordering::Relaxed);
-            let receipt = st.receipts.read().await.get(&lookup).cloned();
-            if let Some(r) = receipt {
-                let body = receipt_body_tx(st, &r).await;
-                let confirmations = head.saturating_sub(r.height).saturating_add(1);
-                let mut obj = json!({
-                    "tx_hash": hex::encode(r.tx_hash),
-                    "status": if r.success { "success" } else { "failed" },
-                    "height": r.height,
-                    "block_hash": hex::encode(r.block_hash),
-                    "index": r.index,
-                    "confirmations": confirmations,
-                    "gas_limit": r.gas_limit.to_string(),
-                    "fee_charged": r.fee_charged.to_string(),
-                    "body_available": body.is_some(),
-                });
-                if queried != format!("0x{}", hex::encode(r.tx_hash)) {
-                    obj["evm_hash"] = json!(queried);
-                }
-                if let Some(ref raw) = r.raw_tx {
-                    obj["raw_tx"] = json!(raw);
-                }
-                match body {
-                    Some(tx) => {
-                        obj["from"] = json!(hex::encode(tx.from));
-                        obj["to"] = json!(hex::encode(tx.to));
-                        obj["amount"] = json!(tx.amount.to_string());
-                        obj["nonce"] = json!(tx.nonce);
-                        obj["source_shard"] = json!(tx.source_shard);
-                        obj["target_shard"] = json!(tx.target_shard);
-                        obj["payload_ops"] = json!(tx.payload.len());
+            for cand in &candidates {
+                let head = cand.height.load(std::sync::atomic::Ordering::Relaxed);
+                let receipt = cand.receipts.read().await.get(&lookup).cloned();
+                if let Some(r) = receipt {
+                    let body = receipt_body_tx(cand, &r).await;
+                    let confirmations = head.saturating_sub(r.height).saturating_add(1);
+                    let mut obj = json!({
+                        "tx_hash": hex::encode(r.tx_hash),
+                        "status": if r.success { "success" } else { "failed" },
+                        "height": r.height,
+                        "block_hash": hex::encode(r.block_hash),
+                        "index": r.index,
+                        "confirmations": confirmations,
+                        "gas_limit": r.gas_limit.to_string(),
+                        "fee_charged": r.fee_charged.to_string(),
+                        "body_available": body.is_some(),
+                    });
+                    if queried != format!("0x{}", hex::encode(r.tx_hash)) {
+                        obj["evm_hash"] = json!(queried);
                     }
-                    None => {
-                        obj["from"] = Value::Null;
-                        obj["to"] = Value::Null;
-                        obj["amount"] = Value::Null;
-                        obj["nonce"] = Value::Null;
+                    if let Some(ref raw) = r.raw_tx {
+                        obj["raw_tx"] = json!(raw);
                     }
+                    match body {
+                        Some(tx) => {
+                            obj["from"] = json!(hex::encode(tx.from));
+                            obj["to"] = json!(hex::encode(tx.to));
+                            obj["amount"] = json!(tx.amount.to_string());
+                            obj["nonce"] = json!(tx.nonce);
+                            obj["source_shard"] = json!(tx.source_shard);
+                            obj["target_shard"] = json!(tx.target_shard);
+                            obj["payload_ops"] = json!(tx.payload.len());
+                        }
+                        None => {
+                            obj["from"] = Value::Null;
+                            obj["to"] = Value::Null;
+                            obj["amount"] = Value::Null;
+                            obj["nonce"] = Value::Null;
+                        }
+                    }
+                    return ok(id, obj);
                 }
-                return ok(id, obj);
             }
-            let pending_tx = st.mempool.read().await.get(&lookup).cloned();
-            if let Some(tx) = pending_tx {
-                return ok(
-                    id,
-                    json!({
-                        "tx_hash": hex::encode(lookup),
-                        "status": "pending",
-                        "height": Value::Null,
-                        "block_hash": Value::Null,
-                        "index": Value::Null,
-                        "confirmations": 0,
-                        "from": hex::encode(tx.from),
-                        "to": hex::encode(tx.to),
-                        "amount": tx.amount.to_string(),
-                        "nonce": tx.nonce,
-                        "gas_limit": tx.gas_limit.to_string(),
-                        "fee_charged": Value::Null,
-                        "source_shard": tx.source_shard,
-                        "target_shard": tx.target_shard,
-                        "payload_ops": tx.payload.len(),
-                        "body_available": true,
-                    }),
-                );
+            for cand in &candidates {
+                let pending_tx = cand.mempool.read().await.get(&lookup).cloned();
+                if let Some(tx) = pending_tx {
+                    return ok(
+                        id,
+                        json!({
+                            "tx_hash": hex::encode(lookup),
+                            "status": "pending",
+                            "height": Value::Null,
+                            "block_hash": Value::Null,
+                            "index": Value::Null,
+                            "confirmations": 0,
+                            "from": hex::encode(tx.from),
+                            "to": hex::encode(tx.to),
+                            "amount": tx.amount.to_string(),
+                            "nonce": tx.nonce,
+                            "gas_limit": tx.gas_limit.to_string(),
+                            "fee_charged": Value::Null,
+                            "source_shard": tx.source_shard,
+                            "target_shard": tx.target_shard,
+                            "payload_ops": tx.payload.len(),
+                            "body_available": true,
+                        }),
+                    );
+                }
             }
             ok(id, json!({ "status": "unknown" }))
         }
@@ -2999,30 +3203,37 @@ pub(super) async fn dispatch_reads(
                     scan_truncated = page.truncated;
                     has_more = page.has_more;
                     next_in = page.next_cursor.map(hex::encode);
-                    for holding in page.items {
-                        if owner_filter.is_some_and(|owner| holding.holder != owner) {
-                            continue;
-                        }
+                    let decimals = actor.metadata.decimals;
+                    let symbol = actor.metadata.symbol.clone();
+                    let name = actor.metadata.name.clone();
+                    let holdings: Vec<([u8; 32], u64)> = page
+                        .items
+                        .into_iter()
+                        .filter(|holding| owner_filter.is_none_or(|owner| holding.holder == owner))
+                        .map(|holding| (holding.holder, holding.balance))
+                        .collect();
+                    drop(tokens);
+                    let token_hex = hex::encode(tid);
+                    let token_stl57 = crate::address::encode_stl57_address(&tid);
+                    for (holder, balance) in holdings {
                         let mut item = json!({
                             "program": "token",
-                            "token": hex::encode(tid),
-                            "token_stl57": crate::address::encode_stl57_address(&tid),
-                            "owner": hex::encode(holding.holder),
-                            "owner_stl57": crate::address::encode_stl57_address(&holding.holder),
-                            "balance": holding.balance.to_string(),
-                            "decimals": actor.metadata.decimals,
-                            "symbol": actor.metadata.symbol,
-                            "name": actor.metadata.name,
+                            "token": &token_hex,
+                            "token_stl57": &token_stl57,
+                            "owner": hex::encode(holder),
+                            "owner_stl57": crate::address::encode_stl57_address(&holder),
+                            "balance": balance.to_string(),
+                            "decimals": decimals,
+                            "symbol": &symbol,
+                            "name": &name,
                         });
                         if with_proof {
                             item["proof"] = serde_json::to_value(
-                                st.engine
-                                    .get_token_balance_proof(&tid, &holding.holder)
-                                    .await,
+                                st.engine.get_token_balance_proof(&tid, &holder).await,
                             )
                             .unwrap_or(Value::Null);
                         }
-                        entries.push((item, hex::encode(holding.holder)));
+                        entries.push((item, hex::encode(holder)));
                     }
                 } else {
                     let owner = owner_filter.expect("checked above");
@@ -3038,30 +3249,51 @@ pub(super) async fn dispatch_reads(
                     scan_truncated = page.truncated;
                     has_more = page.has_more;
                     next_in = page.next_cursor.map(hex::encode);
-                    for holding in page.items {
-                        let Some(actor) = tokens.get(&holding.token_id) else {
-                            continue;
-                        };
+                    struct OwnerTokenRow {
+                        token_id: [u8; 32],
+                        balance: u64,
+                        decimals: u8,
+                        symbol: String,
+                        name: String,
+                    }
+                    let rows: Vec<OwnerTokenRow> = page
+                        .items
+                        .into_iter()
+                        .filter_map(|holding| {
+                            let actor = tokens.get(&holding.token_id)?;
+                            Some(OwnerTokenRow {
+                                token_id: holding.token_id,
+                                balance: holding.balance,
+                                decimals: actor.metadata.decimals,
+                                symbol: actor.metadata.symbol.clone(),
+                                name: actor.metadata.name.clone(),
+                            })
+                        })
+                        .collect();
+                    drop(tokens);
+                    let owner_hex = hex::encode(owner);
+                    let owner_stl57 = crate::address::encode_stl57_address(&owner);
+                    for row in rows {
                         let mut item = json!({
                             "program": "token",
-                            "token": hex::encode(holding.token_id),
-                            "token_stl57": crate::address::encode_stl57_address(&holding.token_id),
-                            "owner": hex::encode(owner),
-                            "owner_stl57": crate::address::encode_stl57_address(&owner),
-                            "balance": holding.balance.to_string(),
-                            "decimals": actor.metadata.decimals,
-                            "symbol": actor.metadata.symbol,
-                            "name": actor.metadata.name,
+                            "token": hex::encode(row.token_id),
+                            "token_stl57": crate::address::encode_stl57_address(&row.token_id),
+                            "owner": &owner_hex,
+                            "owner_stl57": &owner_stl57,
+                            "balance": row.balance.to_string(),
+                            "decimals": row.decimals,
+                            "symbol": row.symbol,
+                            "name": row.name,
                         });
                         if with_proof {
                             item["proof"] = serde_json::to_value(
                                 st.engine
-                                    .get_token_balance_proof(&holding.token_id, &owner)
+                                    .get_token_balance_proof(&row.token_id, &owner)
                                     .await,
                             )
                             .unwrap_or(Value::Null);
                         }
-                        entries.push((item, hex::encode(holding.token_id)));
+                        entries.push((item, hex::encode(row.token_id)));
                     }
                 }
             } else if program == "contract" {
@@ -3108,6 +3340,7 @@ pub(super) async fn dispatch_reads(
                         limit,
                         MAX_PROGRAM_ACCOUNTS_SCAN,
                     );
+                    drop(contracts);
                     scanned = page.scanned;
                     scan_truncated = page.truncated;
                     has_more = page.has_more;
@@ -3151,7 +3384,23 @@ pub(super) async fn dispatch_reads(
                     scan_truncated = page.truncated;
                     has_more = page.has_more;
                     next_in = page.next_cursor.map(hex::encode);
-                    for summary in page.items {
+                    let rows: Vec<_> = page
+                        .items
+                        .into_iter()
+                        .map(|summary| {
+                            let code = if include_code {
+                                contracts
+                                    .contracts
+                                    .get(&summary.address)
+                                    .map(|c| hex::encode(&c.code))
+                            } else {
+                                None
+                            };
+                            (summary, code)
+                        })
+                        .collect();
+                    drop(contracts);
+                    for (summary, code) in rows {
                         let mut item = json!({
                             "program": "contract",
                             "contract": hex::encode(summary.address),
@@ -3167,10 +3416,6 @@ pub(super) async fn dispatch_reads(
                             "source_hash": summary.source_hash.map(hex::encode),
                         });
                         if include_code {
-                            let code = contracts
-                                .contracts
-                                .get(&summary.address)
-                                .map(|c| hex::encode(&c.code));
                             item["code"] = code.map(Value::String).unwrap_or(Value::Null);
                         }
                         if with_proof {
@@ -3182,6 +3427,7 @@ pub(super) async fn dispatch_reads(
                         entries.push((item, hex::encode(summary.address)));
                     }
                 } else {
+                    drop(contracts);
                     return err(
                         id,
                         -32602,

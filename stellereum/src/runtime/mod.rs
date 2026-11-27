@@ -16,7 +16,7 @@ use crate::sharding::{
 use crate::state_engine::InMemoryStateEngine;
 use ed25519_dalek::SigningKey;
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 // =============================================================================
@@ -222,11 +222,40 @@ pub const MAX_BLOCK_TXS: usize = 10_000;
 /// unbounded signature-verification loop.
 pub const MAX_COMMIT_CERT_SIGNERS: usize = 4_096;
 
+/// Maximum number of DECIDED-but-not-yet-installed blocks the execution
+/// pipeline keeps queued when
+/// [`crate::chain_spec::EXECUTION_PIPELINE_V1_ACTIVATION_HEIGHT`] is armed.
+/// Below the gate the effective depth is 1 (a single in-flight apply), which is
+/// exactly the historical single-slot behaviour.
+///
+/// The queue is drained strictly FIFO by [`ValidatorRuntime::try_poll_apply`] /
+/// [`ValidatorRuntime::await_apply_completion`], so the committed state is
+/// always the post-state of the last INSTALLED height while at most this many
+/// decided heights sit ahead of it.
+pub const MAX_APPLY_IN_FLIGHT_DEPTH: usize = 2;
+
+/// Capacity of the bounded post-state history rings
+/// ([`ValidatorRuntime::post_state_roots`] /
+/// [`ValidatorRuntime::consensus_penalties_at`]). The newest entry always
+/// survives; older entries are pruned oldest-first so a long-lived runtime
+/// cannot accumulate unbounded history.
+pub const POST_STATE_HISTORY_CAP: usize = 64;
+
 /// Cap on the validator-set activation history ([`ValidatorRuntime::validator_set_history`]).
 /// Only actual set changes are recorded, so this is barely touched in
 /// practice (a bond/slash/eject every entry); the cap only bounds a pathological
 /// flapping registry. 1024 entries cover ~3M heights of churn at worst.
 pub const VALIDATOR_SET_HISTORY_CAP: usize = 1024;
+
+/// Retention window for in-memory block bodies ([`ValidatorRuntime::blocks`]).
+/// Entries at or above `committed_height.saturating_sub(RUNTIME_BLOCK_CACHE_WINDOW as u64)`
+/// and any block still referenced by active pipeline/consensus state are never evicted.
+pub const RUNTIME_BLOCK_CACHE_WINDOW: usize = 2048;
+
+/// Retention window for in-memory finalized `(height, hash)` entries
+/// ([`ValidatorRuntime::finalized`]). Keeps the newest entries in monotonic order
+/// with the finalized tip always intact.
+pub const RUNTIME_FINALIZED_CACHE_WINDOW: usize = 4096;
 
 /// Gas cap per block (A11). Bounds block work independently of tx count.
 ///
@@ -328,6 +357,131 @@ pub struct DecidedParentVotes {
     pub decision_block_hash: BlockHash,
 }
 
+/// Node-local projection of the committed accounts as they will be once every
+/// decided-but-not-yet-installed block has executed.
+///
+/// The sequenced worker is the only writer of committed state and it reports
+/// back strictly FIFO, so at any instant `self.state` holds the post-state of
+/// the last INSTALLED block while up to [`MAX_APPLY_IN_FLIGHT_DEPTH`] decided
+/// blocks may still be queued ahead of it. A proposer that needs "the state my
+/// next block will build on" can read this projection instead of waiting for
+/// the queue to drain: it starts from the applied accounts and folds each
+/// queued block's worst-case effects in submission order.
+///
+/// Everything here is a PURE projection of data already on this node (applied
+/// accounts + decided block bytes). It is never hashed into a root and never
+/// feeds block validity. Below `EXECUTION_PIPELINE_V1` the queue is empty
+/// whenever this view is consulted, so the view is empty and every reader sees
+/// exactly the committed state (the historical behaviour).
+#[derive(Clone, Debug, Default)]
+pub struct PendingExecView {
+    /// address -> (predicted next nonce, predicted balance) after every
+    /// decided-but-uninstalled transaction.
+    accounts: BTreeMap<[u8; 32], (u64, u64)>,
+    /// Hashes of transactions riding decided-but-uninstalled blocks.
+    in_flight_txs: BTreeSet<[u8; 32]>,
+}
+
+impl PendingExecView {
+    /// Drop every prediction (the committed state is authoritative again).
+    pub fn clear(&mut self) {
+        self.accounts.clear();
+        self.in_flight_txs.clear();
+    }
+
+    /// Seed one committed account into the projection if not already tracked.
+    pub fn seed_account(&mut self, addr: [u8; 32], nonce: u64, balance: u64) {
+        self.accounts.entry(addr).or_insert((nonce, balance));
+    }
+
+    /// Fold one DECIDED block into the projection, in execution order.
+    ///
+    /// A transaction is marked in-flight unconditionally. Its nonce/balance
+    /// effect is applied only to accounts already seeded from committed state
+    /// (`seed_account` / `rebuild`) — unknown accounts are never fabricated
+    /// with a zero balance — and its nonce advances only when it carries the
+    /// sender's PREDICTED nonce AND the fee payer(s) cover the worst-case
+    /// cost. For sponsored transactions, `tx.amount` is debited from `tx.from`
+    /// and the fee leg is debited from `auth.sponsor`. Saturating throughout:
+    /// the projection never underflows.
+    ///
+    /// `_height` is the decided height (kept for call-site symmetry and future
+    /// per-height bookkeeping); ordering comes from the caller's FIFO.
+    pub fn note_decided(&mut self, _height: u64, block: &Block) {
+        for tx in &block.transactions {
+            self.in_flight_txs.insert(tx.compute_tx_hash());
+            if let Some(auth) = tx.sponsored_grant() {
+                if let Some((user_cost, sponsor_cost)) = Mempool::sponsored_pure_legs(tx) {
+                    let Some(&(u_nonce, u_bal)) = self.accounts.get(&tx.from) else {
+                        continue;
+                    };
+                    if tx.nonce != u_nonce {
+                        continue;
+                    }
+                    let user_ok = u_bal >= user_cost;
+                    let sponsor_ok = self
+                        .accounts
+                        .get(&auth.sponsor)
+                        .is_some_and(|&(_, s_bal)| s_bal >= sponsor_cost);
+                    if let Some(u_entry) = self.accounts.get_mut(&tx.from) {
+                        if user_ok && sponsor_ok {
+                            u_entry.0 = u_entry.0.saturating_add(1);
+                        }
+                        u_entry.1 = u_entry.1.saturating_sub(user_cost);
+                    }
+                    if let Some(s_entry) = self.accounts.get_mut(&auth.sponsor) {
+                        s_entry.1 = s_entry.1.saturating_sub(sponsor_cost);
+                    }
+                }
+            } else {
+                let cost = Mempool::tx_cost(tx);
+                if let Some(entry) = self.accounts.get_mut(&tx.from) {
+                    if tx.nonce == entry.0 {
+                        if entry.1 >= cost {
+                            entry.0 = entry.0.saturating_add(1);
+                        }
+                        entry.1 = entry.1.saturating_sub(cost);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rebuild from the APPLIED accounts plus the blocks still queued, oldest
+    /// first. The applied map is the committed source of truth; the queued
+    /// blocks are then folded over it in FIFO order.
+    pub fn rebuild(
+        &mut self,
+        applied_accounts: &BTreeMap<[u8; 32], (u64, u64)>,
+        blocks_in_flight: &[Block],
+    ) {
+        self.clear();
+        for (addr, (nonce, balance)) in applied_accounts {
+            self.accounts.insert(*addr, (*nonce, *balance));
+        }
+        for block in blocks_in_flight {
+            self.note_decided(block.height, block);
+        }
+    }
+
+    /// Predicted next nonce for `addr`, or `None` when the account is unknown
+    /// to the projection.
+    pub fn predicted_nonce(&self, addr: &[u8; 32]) -> Option<u64> {
+        self.accounts.get(addr).map(|(nonce, _)| *nonce)
+    }
+
+    /// Predicted balance for `addr`, or `None` when the account is unknown to
+    /// the projection.
+    pub fn predicted_balance(&self, addr: &[u8; 32]) -> Option<u64> {
+        self.accounts.get(addr).map(|(_, balance)| *balance)
+    }
+
+    /// True while `tx_hash` rides a decided-but-uninstalled block.
+    pub fn is_in_flight(&self, tx_hash: &[u8; 32]) -> bool {
+        self.in_flight_txs.contains(tx_hash)
+    }
+}
+
 pub struct ValidatorRuntime {
     pub key: SigningKey,
     /// Optional out-of-process signer (HSM / KMS / remote service). When present it
@@ -347,6 +501,22 @@ pub struct ValidatorRuntime {
     /// simulator): the epoch-seal protocol then runs node-locally and the
     /// plain path is unaffected.
     pub tx_gossip: Option<Arc<crate::consensus_net::TxGossip>>,
+    /// Node-local MEV committee KEM registry (ML-KEM-768 encapsulation keys by
+    /// validator id). `None` is the fail-closed default: node-side epoch DKG
+    /// is refused, exactly as before this wiring existed.
+    ///
+    /// Supplied either directly via [`ValidatorRuntime::with_mev_kem`] or by
+    /// bootstrap on the shared mempool (see
+    /// [`crate::mempool::MevKemWiring`]).
+    pub mev_kem_registry: Option<Arc<crate::mev_kem_registry::MevKemRegistry>>,
+    /// THIS node's 64-byte ML-KEM-768 seed (`d || z`), derived by bootstrap
+    /// from the node's persisted secret under the
+    /// `STELL_MEV_KEM_SEED_V1` BLAKE3 derive-key domain.
+    ///
+    /// Wrapped in `Zeroizing` so the bytes are wiped on drop; the runtime has
+    /// no `Clone` impl and its `Debug` prints only `[REDACTED]`, so the seed
+    /// cannot be copied into a plain array or leaked into a log line.
+    pub mev_kem_seed: Option<zeroize::Zeroizing<[u8; 64]>>,
     pub blocks: HashMap<BlockHash, Block>,
     /// VALUES our locked peers are stuck on (learned from nil-vote lock
     /// hints), keyed by the round-free [`crate::sharding::Block::value_id`]
@@ -492,12 +662,33 @@ pub struct ValidatorRuntime {
     /// it is not hashed into the root and never changes block validity.
     xpc_mailbox_seen: HashMap<[u8; 32], u64>,
     /// §7 Phase 2: the single ordered execution worker (spawned lazily on the
-    /// first submit, so construction never needs a tokio context) and the one
-    /// in-flight apply, if any. At most one decided block is ever queued or
-    /// executing: a second submit while this is set is refused, and every
-    /// reader of post-H state checks this first.
+    /// first submit, so construction never needs a tokio context) and the
+    /// bounded FIFO of decided-but-not-yet-installed applies. Below
+    /// `EXECUTION_PIPELINE_V1` the queue holds at most ONE entry (the historical
+    /// single slot: a second submit is refused); at/above the gate it holds up
+    /// to [`MAX_APPLY_IN_FLIGHT_DEPTH`] and a new decision is admitted only when
+    /// the committed post-state it builds on is already recorded (see
+    /// [`Self::can_accept_consensus_height`]). Every reader of post-H state
+    /// checks [`Self::has_pending_apply`] first.
     apply_lane: Option<ApplyLane>,
-    apply_in_flight: Option<ApplyInflight>,
+    apply_in_flight: std::collections::VecDeque<ApplyInflight>,
+    /// Worker-certified post-state roots by height, newest
+    /// [`POST_STATE_HISTORY_CAP`] entries only (oldest pruned first).
+    ///
+    /// This is the "has the committed post-state this decision builds on been
+    /// produced yet?" oracle used by
+    /// [`Self::can_accept_consensus_height`] at/above the gate. Node-local
+    /// bookkeeping: never hashed, never on the wire.
+    pub post_state_roots: BTreeMap<u64, [u8; 32]>,
+    /// D2 consensus-penalty snapshot by height (the exact map shape the engine
+    /// exposes), newest [`POST_STATE_HISTORY_CAP`] entries only. Travels with
+    /// [`Self::post_state_roots`] so a reader can reconstruct the consensus fee
+    /// floor as of a recorded post-state. Local mirror only: never hashed.
+    pub consensus_penalties_at: BTreeMap<u64, HashMap<[u8; 32], u64>>,
+    /// Node-local projection over the committed accounts plus every queued
+    /// decided block (see [`PendingExecView`]). Rebuilt on each install; also
+    /// advanced optimistically by [`Self::try_finalize_submit`].
+    pub pending_exec_view: PendingExecView,
     /// PARK-AND-REPLAY slots (liveness): the newest proposal / peer commit
     /// that arrived while `apply_in_flight` held post-H state. Each slot holds
     /// at most ONE item (a newer arrival overwrites the older one), so the
@@ -690,6 +881,57 @@ pub struct ValidatorRuntime {
     /// Single serialized safety authority owning lock, floors, cross-kind
     /// prevote/precommit guard, and durable write-ahead persistence.
     pub safety: crate::safety::SafetyAuthority,
+}
+
+impl std::fmt::Debug for ValidatorRuntime {
+    /// Deliberately NOT derived: the runtime owns signing keys and the
+    /// node-local MEV KEM seed. Only non-secret identity/progress plus the
+    /// WIRING PRESENCE is rendered; the seed itself is always redacted.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidatorRuntime")
+            .field("id", &hex::encode(self.id))
+            .field("height", &self.hc.height)
+            .field("round", &self.hc.round)
+            .field(
+                "mev_kem_registry_entries",
+                &self.mev_kem_registry.as_ref().map(|r| r.len()),
+            )
+            .field(
+                "mev_kem_seed",
+                &self.mev_kem_seed.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl ValidatorRuntime {
+    /// Install the node-local MEV KEM material explicitly.
+    ///
+    /// Bootstrap derives the seed from the node's persisted secret under the
+    /// `STELL_MEV_KEM_SEED_V1` BLAKE3 derive-key domain and passes the registry
+    /// handle; callers that already built a runtime can use this builder.
+    /// Without it (and without the shared-pool wiring) node-side epoch DKG
+    /// stays fail-closed exactly as before.
+    pub fn with_mev_kem(
+        mut self,
+        registry: Arc<crate::mev_kem_registry::MevKemRegistry>,
+        seed: [u8; 64],
+    ) -> Self {
+        self.mev_kem_registry = Some(registry);
+        self.mev_kem_seed = Some(zeroize::Zeroizing::new(seed));
+        self
+    }
+
+    /// Mutable setter for an already-built runtime (same contract as
+    /// [`Self::with_mev_kem`]).
+    pub fn set_mev_kem(
+        &mut self,
+        registry: Arc<crate::mev_kem_registry::MevKemRegistry>,
+        seed: [u8; 64],
+    ) {
+        self.mev_kem_registry = Some(registry);
+        self.mev_kem_seed = Some(zeroize::Zeroizing::new(seed));
+    }
 }
 
 /// Hard cap on queued outbound CN-VRF v3 commitments held in memory.

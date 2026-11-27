@@ -503,6 +503,15 @@ impl ReceiptIndex {
         }
     }
 
+    /// Import a batch of pre-built receipts under a single write lock
+    /// (restart hydration), preserving insertion order and the `MAX_RECEIPTS`
+    /// eviction bound.
+    pub fn import_batch(&mut self, receipts: Vec<TxReceipt>) {
+        for r in receipts {
+            self.insert(r);
+        }
+    }
+
     pub fn get(&self, hash: &[u8; 32]) -> Option<&TxReceipt> {
         self.map.get(hash)
     }
@@ -563,6 +572,23 @@ impl ReceiptIndex {
     }
 }
 
+/// Shared map of all shards hosted by this node (`shard_id -> RpcState`),
+/// allowing the masterchain/gateway RPC and Explorer to delegate shard-scoped
+/// queries and writes to the hosted workchain shard `RpcState`s without
+/// breaking existing `RpcState` struct literals.
+pub type ShardRpcRouter = Arc<RwLock<std::collections::BTreeMap<u32, Arc<RpcState>>>>;
+
+struct PeerShardsSlot {
+    owner: std::sync::Weak<RwLock<ReceiptIndex>>,
+    router: ShardRpcRouter,
+}
+
+fn peer_shards_slots() -> &'static std::sync::Mutex<HashMap<usize, PeerShardsSlot>> {
+    static SLOTS: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, PeerShardsSlot>>> =
+        std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
 struct MempoolSaveSlot {
     owner: std::sync::Weak<RwLock<Mempool>>,
     last_ms: std::sync::atomic::AtomicU64,
@@ -577,6 +603,81 @@ fn mempool_save_slots() -> &'static std::sync::Mutex<HashMap<usize, Arc<MempoolS
 }
 
 impl RpcState {
+    /// Attach a shared [`ShardRpcRouter`] to this [`RpcState`] instance.
+    pub fn set_peer_shards(&self, router: ShardRpcRouter) {
+        let key = Arc::as_ptr(&self.receipts) as usize;
+        let mut guard = peer_shards_slots()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if guard.len() > 64 {
+            guard.retain(|_, slot| slot.owner.strong_count() > 0);
+        }
+        guard.insert(
+            key,
+            PeerShardsSlot {
+                owner: Arc::downgrade(&self.receipts),
+                router,
+            },
+        );
+    }
+
+    /// Return the shared [`ShardRpcRouter`] attached to this [`RpcState`], if any.
+    pub fn peer_shards(&self) -> Option<ShardRpcRouter> {
+        let key = Arc::as_ptr(&self.receipts) as usize;
+        let guard = peer_shards_slots()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let slot = guard.get(&key)?;
+        if slot.owner.strong_count() > 0
+            && std::ptr::eq(slot.owner.as_ptr(), Arc::as_ptr(&self.receipts))
+        {
+            Some(Arc::clone(&slot.router))
+        } else {
+            None
+        }
+    }
+
+    /// Register a hosted shard's [`RpcState`] into this node's [`ShardRpcRouter`],
+    /// creating and attaching the router if one is not yet attached.
+    pub async fn register_peer_shard(&self, shard_id: u32, state: Arc<RpcState>) {
+        let router = match self.peer_shards() {
+            Some(r) => r,
+            None => {
+                let r = Arc::new(RwLock::new(std::collections::BTreeMap::new()));
+                self.set_peer_shards(Arc::clone(&r));
+                r
+            }
+        };
+        router.write().await.insert(shard_id, state);
+    }
+
+    /// Look up the [`RpcState`] for a hosted `shard_id`.
+    pub async fn state_for_shard(&self, shard_id: u32) -> Option<Arc<RpcState>> {
+        let router = self.peer_shards()?;
+        let map = router.read().await;
+        map.get(&shard_id).cloned()
+    }
+
+    /// Look up the [`RpcState`] for the shard owning `addr` under this node's
+    /// shard topology (`self.engine.route_address`).
+    pub async fn state_for_address(&self, addr: &[u8; 32]) -> Option<Arc<RpcState>> {
+        let shard_id = self
+            .engine
+            .route_address(&crate::sharding::ShardAddress::Workchain(*addr))
+            .await;
+        self.state_for_shard(shard_id).await
+    }
+
+    /// Snapshot all hosted `(shard_id, RpcState)` entries registered in
+    /// `peer_shards`, ordered by shard id. Empty when no router is attached.
+    pub async fn all_hosted_shards(&self) -> Vec<(u32, Arc<RpcState>)> {
+        let Some(router) = self.peer_shards() else {
+            return Vec::new();
+        };
+        let map = router.read().await;
+        map.iter().map(|(&id, st)| (id, Arc::clone(st))).collect()
+    }
+
     fn mempool_save_slot(&self) -> Arc<MempoolSaveSlot> {
         let key = Arc::as_ptr(&self.mempool) as usize;
         let mut guard = mempool_save_slots()
@@ -995,6 +1096,16 @@ impl RpcState {
         });
     }
 
+    /// Import a batch of pre-built receipts (restart hydration) while holding
+    /// the receipt-index write lock once. Bounded by the same `MAX_RECEIPTS`
+    /// cap as live inserts (oldest evicted first).
+    pub async fn import_stored_receipts_batch(&self, receipts: Vec<TxReceipt>) {
+        if receipts.is_empty() {
+            return;
+        }
+        self.receipts.write().await.import_batch(receipts);
+    }
+
     /// Programmatic RPC call helper (for testing and embedded harnesses).
     pub async fn call(&self, method: &str, params: serde_json::Value) -> serde_json::Value {
         let r = dispatch(
@@ -1012,6 +1123,14 @@ impl RpcState {
     }
 }
 
+struct HydratePrepared {
+    receipts: Vec<TxReceipt>,
+    stored_bindings: Vec<([u8; 20], [u8; 32])>,
+    catchup_bindings: Vec<([u8; 20], [u8; 32])>,
+    observed_evm_txs: Vec<Transaction>,
+    recent_blocks: Option<(u64, Vec<BlockSummary>)>,
+}
+
 /// Refill an RPC index from the durable receipt store (restart hydration).
 ///
 /// Reads at most `MAX_RECEIPTS` receipts tip-ward (highest height first, so a
@@ -1019,134 +1138,182 @@ impl RpcState {
 /// never more than the in-memory cap. Pure orchestration over the two stores;
 /// the durable side stays the source of truth.
 pub async fn hydrate_rpc_from_store(st: &RpcState, store: &crate::storage::Storage) {
-    // Tip-ordered: the additive `receipts_by_height` index yields a genuine
-    // newest-first window (`(height, index)` descending). Capping a raw
-    // `receipts` scan (tx-hash order) used to hand back an arbitrary prefix and
-    // silently drop the newest receipts — and with them the EVM bindings below
-    // — once the store passed `MAX_RECEIPTS`. The legacy scan remains the
-    // documented fallback inside `latest_receipts_capped`.
-    let mut all = store
-        .latest_receipts_capped(MAX_RECEIPTS)
-        .unwrap_or_default();
-    all.sort_by_key(|r| std::cmp::Reverse((r.height, r.index)));
-    all.truncate(MAX_RECEIPTS);
-    // Insert oldest-first so the index's VecDeque order ends tip-last like the
-    // live path (insertion order = inclusion order within the window).
-    all.reverse();
-    for r in &all {
-        st.import_stored_receipt(r).await;
-    }
-    drop(all);
+    let store = store.clone();
+    let is_masterchain = st.engine.shard_id() == crate::sharding::MASTERCHAIN_SHARD;
+    let Ok(prepared) = tokio::task::spawn_blocking(move || {
+        // Tip-ordered: the additive `receipts_by_height` index yields a genuine
+        // newest-first window (`(height, index)` descending). Capping a raw
+        // `receipts` scan (tx-hash order) used to hand back an arbitrary prefix and
+        // silently drop the newest receipts — and with them the EVM bindings below
+        // — once the store passed `MAX_RECEIPTS`. The legacy scan remains the
+        // documented fallback inside `latest_receipts_capped`.
+        let mut all = store
+            .latest_receipts_capped(MAX_RECEIPTS)
+            .unwrap_or_default();
+        all.sort_by_key(|r| std::cmp::Reverse((r.height, r.index)));
+        all.truncate(MAX_RECEIPTS);
+        // Insert oldest-first so the index's VecDeque order ends tip-last like the
+        // live path (insertion order = inclusion order within the window).
+        all.reverse();
+        let receipts: Vec<TxReceipt> = all
+            .into_iter()
+            .map(|r| TxReceipt {
+                tx_hash: r.tx_hash,
+                height: r.height,
+                block_hash: r.block_hash,
+                index: r.index,
+                success: r.success,
+                gas_limit: r.gas_limit,
+                fee_charged: r.fee_charged,
+                raw_tx: None,
+                return_value: None,
+                gas_used: None,
+                events: r.events,
+                contract_address: None,
+            })
+            .collect();
+
+        let stored_bindings = store.iter_evm_bindings().unwrap_or_default();
+        let mut catchup_bindings: Vec<([u8; 20], [u8; 32])> = Vec::new();
+        let mut observed_evm_txs: Vec<Transaction> = Vec::new();
+
+        // EVM carriers/bindings are masterchain payloads; a workchain hydrate must
+        // never clear or overwrite masterchain entries.
+        if is_masterchain {
+            const EVM_INDEX_REPLAY_WINDOW: u64 = 50_000;
+            if let Ok(Some(tip_rec)) = store.latest_header() {
+                let tip = tip_rec.height;
+                let cursor = store.evm_bindings_cursor().ok().flatten();
+                let start_h = match cursor {
+                    Some(c) => c.saturating_add(1),
+                    None => {
+                        if tip > EVM_INDEX_REPLAY_WINDOW
+                            && store.header_at(1).ok().flatten().is_none()
+                        {
+                            tip.saturating_sub(EVM_INDEX_REPLAY_WINDOW - 1)
+                        } else {
+                            0
+                        }
+                    }
+                };
+                if start_h <= tip {
+                    let mut last_cursor_written = cursor;
+                    for h in start_h..=tip {
+                        if let Ok(Some(rec)) = store.header_at(h) {
+                            if rec.tx_count > 0 {
+                                if let Ok(Some(block)) = store.get_block(&rec.block_hash) {
+                                    let has_evm_or_secp = block.transactions.iter().any(|tx| {
+                                        crate::evm_adapter::classify_evm_payload(tx).is_some()
+                                            || crate::evm_adapter::is_secp_settlement_tx(tx)
+                                    });
+                                    if has_evm_or_secp {
+                                        let exec_hardening =
+                                            crate::chain_spec::exec_hardening_v1_active_at(
+                                                block.height,
+                                            );
+                                        for tx in block.transactions {
+                                            let is_evm =
+                                                crate::evm_adapter::classify_evm_payload(&tx)
+                                                    .is_some();
+                                            let is_secp =
+                                                crate::evm_adapter::is_secp_settlement_tx(&tx);
+                                            if !is_evm && !is_secp {
+                                                continue;
+                                            }
+                                            let tx_hash = tx.compute_tx_hash();
+                                            let succeeded = store
+                                                .get_receipt(&tx_hash)
+                                                .ok()
+                                                .flatten()
+                                                .map(|r| r.success)
+                                                .unwrap_or(false);
+                                            if !succeeded {
+                                                continue;
+                                            }
+                                            if let Some((evm, pq)) =
+                                                crate::evm_adapter::verified_binding_from_tx_at(
+                                                    &tx,
+                                                    exec_hardening,
+                                                )
+                                            {
+                                                let _ = store.put_evm_binding_if_absent(&evm, &pq);
+                                                catchup_bindings.push((evm, pq));
+                                            }
+                                            observed_evm_txs.push(tx);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (h == tip || h.saturating_sub(last_cursor_written.unwrap_or(0)) >= 256)
+                            && store.set_evm_bindings_cursor(h).is_ok()
+                        {
+                            last_cursor_written = Some(h);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Rebuild the explorer window from header records (which survive body
+        // pruning), tip-ward, newest-first like `record_block` maintains.
+        let recent_blocks = if let Ok(Some(tip_rec)) = store.latest_header() {
+            let tip = tip_rec.height;
+            let mut summaries: Vec<BlockSummary> = Vec::new();
+            let lo = tip.saturating_sub(MAX_RECENT_BLOCKS as u64 - 1);
+            for h in (lo..=tip).rev() {
+                if let Ok(Some(rec)) = store.header_at(h) {
+                    summaries.push(BlockSummary {
+                        height: rec.height,
+                        hash: hex::encode(rec.block_hash),
+                        tx_count: rec.tx_count as usize,
+                        timestamp: rec.timestamp,
+                    });
+                }
+            }
+            Some((tip, summaries))
+        } else {
+            None
+        };
+
+        HydratePrepared {
+            receipts,
+            stored_bindings,
+            catchup_bindings,
+            observed_evm_txs,
+            recent_blocks,
+        }
+    })
+    .await
+    else {
+        return;
+    };
+
+    st.import_stored_receipts_batch(prepared.receipts).await;
 
     // Streaming O(1)-RAM hydration of EVM bindings & settlements:
     //   1. Sync canonical `Domain::EvmBindings` state -> process `EvmBindingRegistry`.
     //   2. Stream persistent `"evm_bindings"` tree -> `EvmBindingRegistry`
     //      (survives arbitrary block/receipt pruning; NEVER calls `clear_evm_bindings()`).
-    //   3. Incrementally catch up `(cursor + 1)..=tip` ONE block at a time (0 `Vec<Block>`),
-    //      extracting successful bindings/settlements via point lookups in `receipts_v1`,
-    //      persisting data-before-cursor into `"evm_bindings"`, and advancing `meta:cursor`.
+    //   3. Apply incrementally caught-up `(cursor + 1)..=tip` bindings and observed EVM txs.
     st.engine.sync_canonical_evm_bindings_to_index().await;
-    if let Ok(entries) = store.iter_evm_bindings() {
-        if !entries.is_empty() {
-            if let Ok(mut idx) = crate::evm_adapter::evm_binding_index().write() {
-                for (evm, pq) in entries {
-                    let _ = idx.bind(evm, pq);
-                }
+    if !prepared.stored_bindings.is_empty() || !prepared.catchup_bindings.is_empty() {
+        if let Ok(mut idx) = crate::evm_adapter::evm_binding_index().write() {
+            for (evm, pq) in prepared.stored_bindings {
+                let _ = idx.bind(evm, pq);
+            }
+            for (evm, pq) in prepared.catchup_bindings {
+                let _ = idx.bind(evm, pq);
             }
         }
     }
-    // EVM carriers/bindings are masterchain payloads; a workchain hydrate must
-    // never clear or overwrite masterchain entries.
-    if st.engine.shard_id() == crate::sharding::MASTERCHAIN_SHARD {
-        const EVM_INDEX_REPLAY_WINDOW: u64 = 50_000;
-        if let Ok(Some(tip_rec)) = store.latest_header() {
-            let tip = tip_rec.height;
-            let cursor = store.evm_bindings_cursor().ok().flatten();
-            let start_h = match cursor {
-                Some(c) => c.saturating_add(1),
-                None => {
-                    if tip > EVM_INDEX_REPLAY_WINDOW && store.header_at(1).ok().flatten().is_none()
-                    {
-                        tip.saturating_sub(EVM_INDEX_REPLAY_WINDOW - 1)
-                    } else {
-                        0
-                    }
-                }
-            };
-            if start_h <= tip {
-                let mut last_cursor_written = cursor;
-                for h in start_h..=tip {
-                    if let Ok(Some(rec)) = store.header_at(h) {
-                        if rec.tx_count > 0 {
-                            if let Ok(Some(block)) = store.get_block(&rec.block_hash) {
-                                let has_evm_or_secp = block.transactions.iter().any(|tx| {
-                                    crate::evm_adapter::classify_evm_payload(tx).is_some()
-                                        || crate::evm_adapter::is_secp_settlement_tx(tx)
-                                });
-                                if has_evm_or_secp {
-                                    let exec_hardening =
-                                        crate::chain_spec::exec_hardening_v1_active_at(
-                                            block.height,
-                                        );
-                                    for tx in &block.transactions {
-                                        let is_evm =
-                                            crate::evm_adapter::classify_evm_payload(tx).is_some();
-                                        let is_secp = crate::evm_adapter::is_secp_settlement_tx(tx);
-                                        if !is_evm && !is_secp {
-                                            continue;
-                                        }
-                                        let tx_hash = tx.compute_tx_hash();
-                                        let succeeded = store
-                                            .get_receipt(&tx_hash)
-                                            .ok()
-                                            .flatten()
-                                            .map(|r| r.success)
-                                            .unwrap_or(false);
-                                        if !succeeded {
-                                            continue;
-                                        }
-                                        if let Some((evm, pq)) =
-                                            crate::evm_adapter::verified_binding_from_tx_at(
-                                                tx,
-                                                exec_hardening,
-                                            )
-                                        {
-                                            let _ = store.put_evm_binding_if_absent(&evm, &pq);
-                                        }
-                                        st.engine.observe_committed_evm_tx(tx);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if (h == tip || h.saturating_sub(last_cursor_written.unwrap_or(0)) >= 256)
-                        && store.set_evm_bindings_cursor(h).is_ok()
-                    {
-                        last_cursor_written = Some(h);
-                    }
-                    if h % 1024 == 0 {
-                        tokio::task::yield_now().await;
-                    }
-                }
-            }
+    for (i, tx) in prepared.observed_evm_txs.iter().enumerate() {
+        st.engine.observe_committed_evm_tx(tx);
+        if i > 0 && i.is_multiple_of(1024) {
+            tokio::task::yield_now().await;
         }
     }
-    // Rebuild the explorer window from header records (which survive body
-    // pruning), tip-ward, newest-first like `record_block` maintains.
-    if let Ok(Some(tip_rec)) = store.latest_header() {
-        let tip = tip_rec.height;
-        let mut summaries: Vec<BlockSummary> = Vec::new();
-        let lo = tip.saturating_sub(MAX_RECENT_BLOCKS as u64 - 1);
-        for h in (lo..=tip).rev() {
-            if let Ok(Some(rec)) = store.header_at(h) {
-                summaries.push(BlockSummary {
-                    height: rec.height,
-                    hash: hex::encode(rec.block_hash),
-                    tx_count: rec.tx_count as usize,
-                    timestamp: rec.timestamp,
-                });
-            }
-        }
+    if let Some((tip, summaries)) = prepared.recent_blocks {
         let mut rb = st.recent_blocks.write().await;
         rb.clear();
         for s in summaries {

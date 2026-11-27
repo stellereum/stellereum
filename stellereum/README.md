@@ -127,7 +127,7 @@ With four equal validators, one may be offline and the chain still finalizes.
 Two offline and it stalls at the last finalized height rather than producing a
 shorter or conflicting history. Finalized blocks do not roll back.
 
-Further reading: [consensus and finality](../docs-site/core-concepts/consensus-finality.md),
+Further reading: [consensus and finality](../docs/site/02-concepts.md#finality-confirmations-invalidations),
 [BFT comparison](../docs/BFT_COMPARISON.md), and the protocol entry point
 [`PROTOCOL.md`](PROTOCOL.md).
 
@@ -175,7 +175,7 @@ the organisational shape of the 32-byte validator id.
 There is no dual-stack mode on a running node: a classical transaction is
 refused at intake with `invalid transaction signature`, not downgraded. For the
 full envelope layout and key hierarchy, see
-[post-quantum](../docs-site/core-concepts/post-quantum.md) and
+[post-quantum and accounts](../docs/site/02-concepts.md#accounts-and-addresses) and
 [`docs/specs/02_CRYPTO_AND_PQ.md`](../docs/specs/02_CRYPTO_AND_PQ.md).
 
 ## Execution and the native market
@@ -251,7 +251,7 @@ curl -sS http://127.0.0.1:8545 \
 ```
 
 Full method reference: [`docs/RPC.md`](docs/RPC.md) and the
-[JSON-RPC guide](../docs-site/api/json-rpc.md).
+[developer quickstart](../docs/site/01-quickstart.md).
 
 ## CLI
 
@@ -262,16 +262,19 @@ commands accept `--chain-id`, `--nonce`, `--dry-run` and `--token`.
 | Group | Commands |
 | --- | --- |
 | Node lifecycle | `run`, `node-bootstrap`, `devnet`, `sim`, `sim-replay`, `keys`, `safety-init`, `upgrade-status`, `network` |
-| Wallet | `wallet generate`, `wallet balance`, `wallet address`, `wallet send-pq`, `wallet delegate-session`, signing and verification helpers |
+| Wallet | `wallet generate`, `wallet balance`, `wallet address`, `wallet send`, `wallet send-pq`, `wallet unjail`, `wallet delegate-session`, signing and verification helpers |
 | Market | `orderbook`, `pmm`, `oracle` |
 | Bridge | `bridge` |
 | Light client | `light-client`, `light-anchor`, `light-verify`, `light-rotate` |
 | Governance | `gov list`, `gov show`, `gov params`, `gov propose`, `gov vote` |
 | Validator | `validator register-validator`, `rotate-voting-key`, `change-withdrawal`, `claim-withdrawal`, `announce-commission`, `apply-commission`, `status`, `stake`, `unbond`, `withdraw`, `delegate`, `begin-undelegate`, `withdraw-delegation`, `claim-rewards`, `unjail` |
 
-Use `wallet send-pq` for value. The legacy `wallet send` builds an Ed25519
-transaction, which a pure-PQ node refuses; it exists for historical/dev flows,
-not for the live network.
+Both `wallet send` (via `--from-key <hex-seed>`) and `wallet send-pq` (via
+`--falcon-seed-file`, `STELL_FALCON_SEED`, or `--falcon-seed`) derive a
+Falcon-512 keypair from the 32-byte seed and sign an explicit `PQ1`
+transaction (`src/cli/handlers.rs`). For interactive keystore management and
+SPV-verified balance/transfer workflows, see the separate `stell` binary in
+`../stell-wallet/`.
 
 ### Governance
 
@@ -440,14 +443,14 @@ Common operator entry points:
 
 - [Node setup and ports](NODE.md)
 - [Validator onboarding](VALIDATOR.md) and
-  [validator guide](../docs-site/nodes/validator.md)
+  [validator guide](../docs/site/04-validators.md)
 - [Operations runbook](docs/OPERATIONS.md) and
-  [operations guide](../docs-site/nodes/operations.md)
+  [operations guide](../docs/site/05-operators.md)
 - [Multi-node testnet stand](testnet/README.md)
 - [Observer onboarding](../scripts/join-testnet.sh) and
   [cluster scripts](../scripts/README.md)
-- [Monitoring](../docs-site/nodes/monitoring.md) and
-  [upgrades](../docs-site/nodes/upgrades.md)
+- [Monitoring](../docs/site/05-operators.md#the-pipeline) and
+  [upgrades](../docs/UPGRADE_AND_RECOVERY.md)
 - [JSON-RPC reference](docs/RPC.md)
 - [CI and test policy](../docs/CI.md)
 
@@ -465,7 +468,7 @@ suspected vulnerabilities privately through [`SECURITY.md`](SECURITY.md) and
 never open a public issue with a proof of concept. Threat model and known issues:
 [`docs/audits/THREAT_MODEL.md`](docs/audits/THREAT_MODEL.md),
 [`docs/audits/KNOWN_ISSUES.md`](docs/audits/KNOWN_ISSUES.md) and the
-[public security status](../docs-site/security/status.md).
+[public security status](../docs/site/06-security.md).
 
 Stellereum is dual-licensed under **MIT OR Apache-2.0**. See
 [`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE).

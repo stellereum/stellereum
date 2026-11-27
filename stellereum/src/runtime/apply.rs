@@ -1,10 +1,25 @@
 use super::lanes::{
     count_block_actor_sends, ApplyInflight, ApplyJob, ApplyLane, LaneJob, SnapshotJob,
 };
-use super::{ApplyCompleted, BlockHash, DecidedParentVotes, SnapBundle, ValidatorRuntime};
+use super::{
+    ApplyCompleted, BlockHash, DecidedParentVotes, SnapBundle, ValidatorRuntime,
+    MAX_APPLY_IN_FLIGHT_DEPTH, POST_STATE_HISTORY_CAP, RUNTIME_BLOCK_CACHE_WINDOW,
+    RUNTIME_FINALIZED_CACHE_WINDOW,
+};
 use crate::consensus::{Height, HeightConsensus};
 use crate::sharding::{Block, CrossShardKey, CrossShardMessage};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+/// Prune a height-keyed ring to its newest [`POST_STATE_HISTORY_CAP`] entries.
+/// `BTreeMap` iterates ascending, so the first keys are the oldest heights.
+fn prune_post_state_history<V>(ring: &mut BTreeMap<u64, V>) {
+    while ring.len() > POST_STATE_HISTORY_CAP {
+        let Some(oldest) = ring.keys().next().copied() else {
+            break;
+        };
+        ring.remove(&oldest);
+    }
+}
 
 /// Height-driven governance finalization on the live path (neural audit
 /// 2026-11-04 C-02, P0: `gov_finalize` was never called on the live path, so
@@ -74,7 +89,239 @@ impl ValidatorRuntime {
     /// first: while set, our observable consensus state (height, `finalized`,
     /// the root a new proposal is checked against) is still PRE-H.
     pub fn has_pending_apply(&self) -> bool {
-        self.apply_in_flight.is_some()
+        !self.apply_in_flight.is_empty()
+    }
+
+    /// Depth of the decided-but-uninstalled apply queue (diagnostics/tests).
+    pub fn apply_in_flight_depth(&self) -> usize {
+        self.apply_in_flight.len()
+    }
+
+    /// Blueprint predicate for "may this node accept a consensus decision at
+    /// `height` right now?".
+    ///
+    /// * Below [`crate::chain_spec::execution_pipeline_v1_active_at`] this is
+    ///   exactly [`Self::has_pending_apply`] inverted: at most one apply in
+    ///   flight and no post-state history is required (today's rule,
+    ///   byte-identical behaviour).
+    /// * At/above the gate the queue may hold up to
+    ///   [`MAX_APPLY_IN_FLIGHT_DEPTH`] decided blocks, but only once the
+    ///   committed post-state the new decision builds on
+    ///   ([`crate::chain_spec::committed_state_height_at`]) has a recorded
+    ///   worker-certified root. That is the lag-2 binding: a decision is
+    ///   admitted only when its parent state is already committed, not merely
+    ///   queued.
+    ///
+    /// Seed `post_state_roots[0]` from the current genesis state root when
+    /// running at genesis (`finalized.is_empty()` and `apply_in_flight.is_empty()`)
+    /// and height `0` is not yet recorded.
+    pub async fn ensure_genesis_root_seeded(&mut self) {
+        if self.finalized.is_empty()
+            && self.apply_in_flight.is_empty()
+            && !self.post_state_roots.contains_key(&0)
+        {
+            let root = self.state.get_state_root().await;
+            self.note_post_state_root(0, root);
+        }
+    }
+
+    pub fn can_accept_consensus_height(&mut self, height: u64) -> bool {
+        if !crate::chain_spec::execution_pipeline_v1_active_at(height) {
+            return self.apply_in_flight.is_empty();
+        }
+        let committed_h = crate::chain_spec::committed_state_height_at(height);
+        let has_committed = self.post_state_roots.contains_key(&committed_h)
+            || (committed_h == 0 && self.finalized.is_empty() && self.apply_in_flight.is_empty());
+        self.apply_in_flight.len() < MAX_APPLY_IN_FLIGHT_DEPTH && has_committed
+    }
+
+    /// Record a worker-certified post-state root at `height` and prune the
+    /// bounded history to its newest [`POST_STATE_HISTORY_CAP`] entries.
+    pub fn note_post_state_root(&mut self, height: u64, root: [u8; 32]) {
+        self.post_state_roots.insert(height, root);
+        prune_post_state_history(&mut self.post_state_roots);
+    }
+
+    /// Prune bounded in-memory block and finalized-history caches after
+    /// committing `committed_height`.
+    ///
+    /// * Keeps the newest [`RUNTIME_FINALIZED_CACHE_WINDOW`] entries in
+    ///   `self.finalized`, preserving monotonic order and the finalized tip.
+    /// * When `self.blocks.len() > RUNTIME_BLOCK_CACHE_WINDOW`, evicts entries
+    ///   strictly below `committed_height.saturating_sub(RUNTIME_BLOCK_CACHE_WINDOW as u64)`
+    ///   while never evicting any block whose height or hash is still
+    ///   referenced by `apply_in_flight`, `parked_commit`, `parked_proposal`,
+    ///   `post_state_roots`, `last_decision`, `decided_parent_votes`, `hc`, or
+    ///   the retained `finalized` tip.
+    pub fn prune_runtime_history(&mut self, committed_height: u64) {
+        if self.finalized.len() > RUNTIME_FINALIZED_CACHE_WINDOW {
+            let excess = self.finalized.len() - RUNTIME_FINALIZED_CACHE_WINDOW;
+            self.finalized.drain(..excess);
+        }
+        if self.blocks.len() > RUNTIME_BLOCK_CACHE_WINDOW {
+            let min_keep_height =
+                committed_height.saturating_sub(RUNTIME_BLOCK_CACHE_WINDOW as u64);
+            let mut protected_hashes: HashSet<BlockHash> = HashSet::new();
+            let mut protected_heights: HashSet<u64> = HashSet::new();
+
+            for inflight in &self.apply_in_flight {
+                protected_hashes.insert(inflight.hash);
+                protected_hashes.insert(inflight.block.prev_hash);
+                protected_heights.insert(inflight.height);
+            }
+            if let Some(pc) = &self.parked_commit {
+                protected_hashes.insert(pc.block.prev_hash);
+                protected_hashes.insert(pc.block.compute_hash());
+                protected_heights.insert(pc.height);
+            }
+            if let Some(pp) = &self.parked_proposal {
+                protected_hashes.insert(pp.block.prev_hash);
+                protected_hashes.insert(pp.block.compute_hash());
+                protected_heights.insert(pp.block.height);
+            }
+            for &h in self.post_state_roots.keys() {
+                protected_heights.insert(h);
+            }
+            if let Some((h, blk, _)) = &self.last_decision {
+                protected_heights.insert(*h);
+                protected_hashes.insert(blk.compute_hash());
+            }
+            if let Some(dpv) = &self.decided_parent_votes {
+                protected_heights.insert(dpv.height);
+                protected_hashes.insert(dpv.block_hash);
+                protected_hashes.insert(dpv.decision_block_hash);
+            }
+            if let Some((h, _)) = self.hc.locked {
+                protected_hashes.insert(h);
+            }
+            if let Some((_, h)) = self.hc.proposal {
+                protected_hashes.insert(h);
+            }
+            if let Some(h) = self.hc.sortition_parent() {
+                protected_hashes.insert(*h);
+            }
+            if let Some((tip_h, tip_hash)) = self.finalized.last().copied() {
+                protected_heights.insert(tip_h);
+                protected_hashes.insert(tip_hash);
+            }
+            protected_heights.insert(self.hc.height);
+
+            self.blocks.retain(|hash, block| {
+                block.height >= min_keep_height
+                    || protected_hashes.contains(hash)
+                    || protected_heights.contains(&block.height)
+            });
+        }
+    }
+
+    /// Whether this node may build/propose a block at `height` right now.
+    ///
+    /// * Below [`crate::chain_spec::execution_pipeline_v1_active_at`]: identical
+    ///   to `self.apply_in_flight.is_empty()`.
+    /// * At/above the gate: up to [`MAX_APPLY_IN_FLIGHT_DEPTH`] applies may be
+    ///   in flight (lag-2 overlap allows 1 in flight while proposing the next),
+    ///   provided the committed post-state root for
+    ///   [`crate::chain_spec::committed_state_height_at`] is already recorded.
+    pub fn can_propose_at_height(&self, height: u64) -> bool {
+        if !crate::chain_spec::execution_pipeline_v1_active_at(height) {
+            return self.apply_in_flight.is_empty();
+        }
+        let committed_h = crate::chain_spec::committed_state_height_at(height);
+        let has_committed = self.post_state_roots.contains_key(&committed_h)
+            || (committed_h == 0 && self.finalized.is_empty() && self.apply_in_flight.is_empty());
+        self.apply_in_flight.len() < MAX_APPLY_IN_FLIGHT_DEPTH && has_committed
+    }
+
+    /// Worker-certified post-state root for the state height committed by a
+    /// block at `height` (`committed_state_height_at(height)`).
+    pub fn state_root_for_committed_height(&self, height: u64) -> Option<[u8; 32]> {
+        self.post_state_roots
+            .get(&crate::chain_spec::committed_state_height_at(height))
+            .copied()
+    }
+
+    /// Whether this node holds the committed post-state required to validate
+    /// a proposal (or commit) at `height` right now.
+    ///
+    /// * Below [`crate::chain_spec::execution_pipeline_v1_active_at`]: identical
+    ///   to `self.apply_in_flight.is_empty()`.
+    /// * At/above the gate: requires the worker-certified root for
+    ///   [`crate::chain_spec::committed_state_height_at`] to be recorded in
+    ///   [`Self::post_state_roots`].
+    pub fn can_validate_proposal_at_height(&self, height: u64) -> bool {
+        if !crate::chain_spec::execution_pipeline_v1_active_at(height) {
+            return self.apply_in_flight.is_empty();
+        }
+        let committed_h = crate::chain_spec::committed_state_height_at(height);
+        self.post_state_roots.contains_key(&committed_h)
+            || (committed_h == 0 && self.finalized.is_empty() && self.apply_in_flight.is_empty())
+    }
+
+    /// Decided parent tip height for `height`:
+    /// * Below the gate (or when `apply_in_flight` does not hold `height - 1`):
+    ///   the last installed entry in `self.finalized` (`0` at genesis).
+    /// * At/above the gate when `height - 1` is already decided in
+    ///   `self.apply_in_flight`: that queued parent's height.
+    pub fn decided_tip_height_for_height(&self, height: u64) -> u64 {
+        if crate::chain_spec::execution_pipeline_v1_active_at(height) {
+            if let Some(inflight) = self
+                .apply_in_flight
+                .back()
+                .filter(|a| a.height.checked_add(1) == Some(height))
+            {
+                return inflight.height;
+            }
+        }
+        self.finalized.last().map(|(h, _)| *h).unwrap_or(0)
+    }
+
+    /// Expected `prev_hash` for a block at `height`:
+    /// * Below the gate (or when `apply_in_flight` does not hold `height - 1`):
+    ///   the last installed entry in `self.finalized` (`[0u8; 32]` at genesis).
+    /// * At/above the gate when `height - 1` was already decided and queued in
+    ///   `self.apply_in_flight`: that queued parent's hash, so lag-2 consensus
+    ///   for `height` chains onto `height - 1` while `height - 1` executes.
+    pub fn expected_parent_hash_for_height(&self, height: u64) -> BlockHash {
+        if crate::chain_spec::execution_pipeline_v1_active_at(height) {
+            if let Some(inflight) = self
+                .apply_in_flight
+                .back()
+                .filter(|a| a.height.checked_add(1) == Some(height))
+            {
+                return inflight.hash;
+            }
+        }
+        self.finalized.last().map(|(_, h)| *h).unwrap_or([0u8; 32])
+    }
+
+    /// TEST/DEBUG-ONLY: seed the bounded in-flight queue with a synthetic entry
+    /// (no worker behind it) so integration tests can exercise the depth gates
+    /// without a live consensus round. The completion channel is already
+    /// closed, so the entry can only ever observe a depth predicate — it is
+    /// never production-reachable and is compiled out of release builds.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn debug_try_enqueue_apply_inflight(&mut self, height: u64, hash: BlockHash) -> bool {
+        // Mirror the production admission rule exactly: depth 1 below the
+        // gate, MAX_APPLY_IN_FLIGHT_DEPTH at/above it.
+        let limit = if crate::chain_spec::execution_pipeline_v1_active_at(height) {
+            MAX_APPLY_IN_FLIGHT_DEPTH
+        } else {
+            1
+        };
+        if self.apply_in_flight.len() >= limit {
+            return false;
+        }
+        let mut block = super::lanes::shard_genesis_block(self.shard_id, [0u8; 32], self.id, 0);
+        block.height = height;
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        self.apply_in_flight.push_back(ApplyInflight {
+            height,
+            hash,
+            block,
+            done: rx,
+        });
+        true
     }
 
     /// Messages currently queued in every inbox: defensive leftovers plus
@@ -178,13 +425,15 @@ impl ValidatorRuntime {
         &mut self,
         block: &Block,
         reward: u64,
-    ) -> (crate::state_engine::BlockTransitionOutcome, [u8; 32]) {
+    ) -> super::lanes::ApplyJobResult {
         let lane = self.ensure_apply_lane();
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let sweep_gov_in_worker = crate::chain_spec::execution_pipeline_v1_active_at(block.height);
         lane.tx
             .send(LaneJob::Apply(ApplyJob {
                 block: block.clone(),
                 reward,
+                sweep_gov_in_worker,
                 done: tx,
             }))
             .expect("apply worker lives as long as the runtime holds its lane sender");
@@ -211,8 +460,11 @@ impl ValidatorRuntime {
         // governed value itself from the committed pre-state (its own
         // governance read), so no caller-held copy can make this path mint a
         // different amount than the catch-up/walk path for the same block.
-        let (outcome, root) = self.run_on_apply_lane(block, self.block_reward).await;
+        let (outcome, root, penalties) = self.run_on_apply_lane(block, self.block_reward).await;
         self.record_apply_outcome(block, &outcome).await;
+        self.note_post_state_root(block.height, root);
+        self.consensus_penalties_at.insert(block.height, penalties);
+        prune_post_state_history(&mut self.consensus_penalties_at);
         (outcome, root)
     }
 
@@ -572,10 +824,11 @@ impl ValidatorRuntime {
         }
     }
 
-    /// Install a worker-reported outcome: the node-local bookkeeping above,
-    /// then the consensus advance the old inline path did (finalized entry,
-    /// validator-set rotation, next height). Runs exactly once per decided
-    /// block, whether the decision was awaited inline or collected later.
+    /// Install a worker-reported outcome when the caller does NOT have the
+    /// worker-certified root (direct/inline callers that applied on this
+    /// runtime, e.g. unit tests). The current engine root IS that post-state in
+    /// this case, so it is recorded verbatim.
+    #[allow(dead_code)] // GATE: direct/inline (unit-test) callers have no completion channel.
     pub(super) async fn install_apply_outcome(
         &mut self,
         height: Height,
@@ -583,10 +836,44 @@ impl ValidatorRuntime {
         block: &Block,
         outcome: &crate::state_engine::BlockTransitionOutcome,
     ) {
+        let root = self.state.get_state_root().await;
+        let penalties = self.state.consensus_floor_snapshot().await.1;
+        self.install_apply_outcome_with_root(height, bh, block, outcome, root, penalties)
+            .await;
+    }
+
+    /// Install a worker-reported outcome: the node-local bookkeeping above,
+    /// then the consensus advance the old inline path did (finalized entry,
+    /// validator-set rotation, next height). Runs exactly once per decided
+    /// block, whether the decision was awaited inline or collected later.
+    ///
+    /// `root` and `penalties` are captured by the WORKER immediately after
+    /// executing this block and reported over the completion channel, so they
+    /// never race a newer height already running on `ApplyLane`.
+    pub(super) async fn install_apply_outcome_with_root(
+        &mut self,
+        height: Height,
+        bh: BlockHash,
+        block: &Block,
+        outcome: &crate::state_engine::BlockTransitionOutcome,
+        root: [u8; 32],
+        penalties: HashMap<[u8; 32], u64>,
+    ) {
+        // Bounded post-state history: record this height's certified post-state
+        // (and the worker-captured consensus-penalty map that travels with it),
+        // pruning to the newest POST_STATE_HISTORY_CAP entries. Below the gate
+        // nothing reads these rings, so this is unobservable bookkeeping there.
+        self.note_post_state_root(height, root);
+        self.consensus_penalties_at.insert(height, penalties);
+        prune_post_state_history(&mut self.consensus_penalties_at);
         self.record_apply_outcome(block, outcome).await;
         // C-02: height-driven gov finalization (locks release, 7200-height
         // timelocks schedule). Deterministic in (height, block.timestamp).
-        sweep_gov_finalize(&self.state, height, block.timestamp).await;
+        // At/above EXECUTION_PIPELINE_V1, `ApplyLane` already swept this inside
+        // the worker BEFORE certifying `root`, so re-running here is skipped.
+        if !crate::chain_spec::execution_pipeline_v1_active_at(height) {
+            sweep_gov_finalize(&self.state, height, block.timestamp).await;
+        }
         self.finalized.push((height, bh));
         // The block is final: it anchors the fork-choice tree, and every
         // candidate branch it superseded is pruned (and signalled).
@@ -605,27 +892,38 @@ impl ValidatorRuntime {
         // the process-shared header registry its own and sibling shards read.
         self.note_finalized_header(block).await;
         self.note_light_anchor(block);
-        // Rotate the consensus validator set from bonded stake at the height
-        // boundary. Deterministic: every node derives it from the same consensus
-        // ledger, so all nodes agree on the new set/power for height+1.
-        // W10.5: the refresh only STAGES the change (activation height+1);
-        // it becomes in-force below, exactly when this node moves to the new
-        // height — never mid-flight.
-        self.refresh_validator_set_from_staking().await;
-        if let Err(e) = self.safety.advance_height(height + 1, height, bh) {
-            tracing::error!(height, error = %e, "[safety] advance_height failed; quarantining");
-            self.safety
-                .quarantine(format!("advance_height({} -> {}): {e}", height, height + 1));
+        // Rotate the consensus validator set from bonded stake at the applied
+        // height (`height`, never `self.hc.height` which may already have
+        // advanced under EXECUTION_PIPELINE_V1). At/above the gate this stages
+        // for `height + 2`, so `height + 1` is never mutated mid-flight.
+        self.refresh_validator_set_from_staking_at(height).await;
+        // At/above EXECUTION_PIPELINE_V1, `submit_prepared_block` already advanced
+        // `safety` and `hc` to `height + 1` on decide (`advance_consensus_pipeline_on_decide`)
+        // so consensus could overlap for `height + 1`. Re-advancing `safety` or
+        // resetting `hc` here would fail `HeightMismatch` or clobber live
+        // `height + 1` consensus state. Direct `install_apply_outcome` test
+        // callers (where `hc.height == height`) still take the full advance path.
+        let already_advanced_on_decide =
+            crate::chain_spec::execution_pipeline_v1_active_at(height) && self.hc.height > height;
+        if !already_advanced_on_decide {
+            if let Err(e) = self.safety.advance_height(height + 1, height, bh) {
+                tracing::error!(height, error = %e, "[safety] advance_height failed; quarantining");
+                self.safety.quarantine(format!(
+                    "advance_height({} -> {}): {e}",
+                    height,
+                    height + 1
+                ));
+            }
+            self.hc = HeightConsensus::new(height + 1, self.validators.clone());
+            self.install_due_validator_set();
+            self.hc.validators = self.validators.clone();
+            // The sortition committee of height+1 is elected from the PARENT
+            // block hash — the block we just finalized. Every node of the network
+            // must use the same parent, or they elect different committees.
+            self.hc.set_parent_hash(bh);
+            // CN-VRF v3: install the new height's committee schedule (review F2).
+            self.install_committee_schedule();
         }
-        self.hc = HeightConsensus::new(height + 1, self.validators.clone());
-        self.install_due_validator_set();
-        self.hc.validators = self.validators.clone();
-        // The sortition committee of height+1 is elected from the PARENT
-        // block hash — the block we just finalized. Every node of the network
-        // must use the same parent, or they elect different committees.
-        self.hc.set_parent_hash(bh);
-        // CN-VRF v3: install the new height's committee schedule (review F2).
-        self.install_committee_schedule();
         // PARITY with `try_finalize` and `apply_and_advance`: this is the
         // SEQUENCED/live finalize install (the node loop collects it with
         // `try_poll_apply`), and the epoch hooks are part of "every finalized
@@ -635,6 +933,44 @@ impl ValidatorRuntime {
         // activation the boundary block would have no beacon and the
         // fail-closed committee schedule would carry no proposer.
         self.prepare_cnvrf_v3_epoch_hooks(height, bh).await;
+        // The committed state has advanced to `height`; re-project the view
+        // over it plus whatever decided blocks are still queued (FIFO). With
+        // an empty queue below the gate this simply clears the view.
+        self.rebuild_pending_exec_view().await;
+        self.prune_runtime_history(height);
+    }
+
+    /// Rebuild [`PendingExecView`] from the committed accounts plus every
+    /// decided block still queued, in FIFO order.
+    ///
+    /// Only the senders/sponsors of the queued blocks are read from the committed
+    /// state (one short read lock, released before the view is touched), so the
+    /// cost is proportional to the queued transactions, not to the whole state.
+    async fn rebuild_pending_exec_view(&mut self) {
+        let blocks_in_flight: Vec<Block> = self
+            .apply_in_flight
+            .iter()
+            .map(|inflight| inflight.block.clone())
+            .collect();
+        let mut senders: BTreeSet<[u8; 32]> = BTreeSet::new();
+        for block in &blocks_in_flight {
+            for tx in &block.transactions {
+                senders.insert(tx.from);
+                if let Some(auth) = tx.sponsored_grant() {
+                    senders.insert(auth.sponsor);
+                }
+            }
+        }
+        let mut applied: BTreeMap<[u8; 32], (u64, u64)> = BTreeMap::new();
+        if !senders.is_empty() {
+            let guard = self.state.accounts.read().await;
+            for addr in &senders {
+                if let Some(acct) = guard.get(addr) {
+                    applied.insert(*addr, (acct.nonce, acct.balance));
+                }
+            }
+        }
+        self.pending_exec_view.rebuild(&applied, &blocks_in_flight);
     }
 
     /// Shared DECISION half of finalization: quorum, presence, order and cap
@@ -642,12 +978,22 @@ impl ValidatorRuntime {
     /// (await inline) and `try_finalize_submit` (queue on the worker) decide
     /// through here, so the two can never disagree about what is decidable.
     /// Returns the decided height, hash and block (QC attached).
-    pub(super) async fn prepare_decided_block(&mut self) -> Option<(Height, BlockHash, Block)> {
-        // One apply at a time, strictly height-ordered: while a decided block
-        // is still on the worker our height has not advanced, so deciding
-        // again now would queue the SAME height twice. Refuse; the next poll
-        // collects the pending outcome and this retries then.
-        if self.apply_in_flight.is_some() {
+    pub async fn prepare_decided_block(&mut self) -> Option<(Height, BlockHash, Block)> {
+        if crate::chain_spec::execution_pipeline_v1_active_at(self.hc.height) {
+            self.ensure_genesis_root_seeded().await;
+        }
+        // One apply at a time below the pipeline gate, bounded FIFO at/above
+        // it (also requiring the committed post-state root for
+        // `committed_state_height_at(self.hc.height)`). Guard against
+        // double-queuing the same height in `apply_in_flight`.
+        if !self.can_accept_consensus_height(self.hc.height) {
+            return None;
+        }
+        if self
+            .apply_in_flight
+            .iter()
+            .any(|inflight| inflight.height == self.hc.height)
+        {
             return None;
         }
         // The decision certificate this height produces must be drawn from the
@@ -824,7 +1170,11 @@ impl ValidatorRuntime {
         self.apply_block_fees_rewards(&block).await;
         // C-02: height-driven gov finalization (locks release, 7200-height
         // timelocks schedule). Deterministic in (height, block.timestamp).
-        sweep_gov_finalize(&self.state, height, block.timestamp).await;
+        // At/above EXECUTION_PIPELINE_V1, `ApplyLane` already swept this inside
+        // the worker BEFORE certifying `root`.
+        if !crate::chain_spec::execution_pipeline_v1_active_at(height) {
+            sweep_gov_finalize(&self.state, height, block.timestamp).await;
+        }
         self.finalized.push((height, bh));
         // The block is final: it anchors the fork-choice tree, and every
         // candidate branch it superseded is pruned (and signalled).
@@ -845,15 +1195,33 @@ impl ValidatorRuntime {
         // W10.5: the refresh only STAGES the change (activation height+1);
         // it becomes in-force below, exactly when this node moves to the new
         // height — never mid-flight.
-        self.refresh_validator_set_from_staking().await;
-        if let Err(e) = self.safety.advance_height(height + 1, height, bh) {
-            tracing::error!(height, error = %e, "[safety] advance_height failed; quarantining");
-            self.safety
-                .quarantine(format!("advance_height({} -> {}): {e}", height, height + 1));
+        if crate::chain_spec::execution_pipeline_v1_active_at(height) {
+            if let Err(e) = self.safety.advance_height(height + 1, height, bh) {
+                tracing::error!(height, error = %e, "[safety] advance_height failed; quarantining");
+                self.safety.quarantine(format!(
+                    "advance_height({} -> {}): {e}",
+                    height,
+                    height + 1
+                ));
+            }
+            self.hc = HeightConsensus::new(height + 1, self.validators.clone());
+            self.install_due_validator_set();
+            self.refresh_validator_set_from_staking_at(height).await;
+            self.hc.validators = self.validators.clone();
+        } else {
+            self.refresh_validator_set_from_staking_at(height).await;
+            if let Err(e) = self.safety.advance_height(height + 1, height, bh) {
+                tracing::error!(height, error = %e, "[safety] advance_height failed; quarantining");
+                self.safety.quarantine(format!(
+                    "advance_height({} -> {}): {e}",
+                    height,
+                    height + 1
+                ));
+            }
+            self.hc = HeightConsensus::new(height + 1, self.validators.clone());
+            self.install_due_validator_set();
+            self.hc.validators = self.validators.clone();
         }
-        self.hc = HeightConsensus::new(height + 1, self.validators.clone());
-        self.install_due_validator_set();
-        self.hc.validators = self.validators.clone();
         // The sortition committee of height+1 is elected from the PARENT
         // block hash — the block we just finalized. Every node of the network
         // must use the same parent, or they elect different committees.
@@ -864,6 +1232,116 @@ impl ValidatorRuntime {
         // its verifier attributes it with (review F2).
         self.install_committee_schedule();
         self.prepare_cnvrf_v3_epoch_hooks(height, bh).await;
+        self.prune_runtime_history(height);
+        Some(bh)
+    }
+
+    /// Advance the consensus state machine to `height + 1` immediately when
+    /// `height` is decided and queued on `ApplyLane` at/above
+    /// `EXECUTION_PIPELINE_V1`.
+    ///
+    /// Preserves all consensus invariants while `height` executes asynchronously:
+    /// * `safety.advance_height(height + 1, height, bh)` moves durable safety
+    ///   state to `height + 1` so the validator can sign proposals/votes for
+    ///   `height + 1` without `HeightMismatch`, and
+    ///   `install_apply_outcome_with_root` skips repeating `advance_height` /
+    ///   `hc` reset when `hc.height > height`.
+    /// * `hc` resets to `HeightConsensus::new(height + 1, ...)` with
+    ///   `set_parent_hash(bh)` and `install_committee_schedule()` so sortition
+    ///   for `height + 1` uses the decided parent `bh`.
+    /// * `finalized` and `post_state_roots` are NOT touched here — they remain
+    ///   strictly worker-certified on `try_poll_apply` ->
+    ///   `install_apply_outcome_with_root`.
+    fn advance_consensus_pipeline_on_decide(&mut self, height: Height, bh: BlockHash) {
+        if let Err(e) = self.safety.advance_height(height + 1, height, bh) {
+            tracing::error!(height, error = %e, "[safety] pipelined advance_height failed; quarantining");
+            self.safety
+                .quarantine(format!("advance_height({} -> {}): {e}", height, height + 1));
+        }
+        self.hc = HeightConsensus::new(height + 1, self.validators.clone());
+        self.install_due_validator_set();
+        self.hc.validators = self.validators.clone();
+        self.hc.set_parent_hash(bh);
+        self.install_committee_schedule();
+    }
+
+    /// Enqueue a block already decided by [`Self::prepare_decided_block`] on the
+    /// sequenced worker and advance consensus immediately when pipelined.
+    ///
+    /// Separating decision from submission lets the node driver persist the
+    /// write-ahead finalized block + pointer BEFORE `safety.advance_height`
+    /// flushes sled (`W6-A2-4`).
+    pub async fn submit_prepared_block(
+        &mut self,
+        height: Height,
+        bh: BlockHash,
+        block: Block,
+    ) -> Option<BlockHash> {
+        if self.parallel_exec {
+            self.state.set_parallel_exec(true);
+        }
+        // R1/DET-01: only the STATIC default travels to the worker; the
+        // governed reward is derived inside `apply_block_transition` from the
+        // committed pre-state, identically on every path.
+        let reward = self.block_reward;
+        let lane = self.ensure_apply_lane();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let sweep_gov_in_worker = crate::chain_spec::execution_pipeline_v1_active_at(height);
+        if lane
+            .tx
+            .send(LaneJob::Apply(ApplyJob {
+                block: block.clone(),
+                reward,
+                sweep_gov_in_worker,
+                done: tx,
+            }))
+            .is_err()
+        {
+            return None;
+        }
+        if self.apply_in_flight.is_empty() {
+            self.pending_exec_view.clear();
+        }
+        if !block.transactions.is_empty() {
+            let mut to_seed: BTreeSet<[u8; 32]> = BTreeSet::new();
+            for t in &block.transactions {
+                if self.pending_exec_view.predicted_nonce(&t.from).is_none() {
+                    to_seed.insert(t.from);
+                }
+                if let Some(auth) = t.sponsored_grant() {
+                    if self
+                        .pending_exec_view
+                        .predicted_nonce(&auth.sponsor)
+                        .is_none()
+                    {
+                        to_seed.insert(auth.sponsor);
+                    }
+                }
+            }
+            if !to_seed.is_empty() {
+                let guard = self.state.accounts.read().await;
+                for addr in to_seed {
+                    if let Some(acct) = guard.get(&addr) {
+                        self.pending_exec_view
+                            .seed_account(addr, acct.nonce, acct.balance);
+                    }
+                }
+            }
+        }
+        // Fold the newly decided block into the optimistic projection (FIFO:
+        // it is appended behind any older queued height). The view is
+        // authoritative only until the next install rebuilds it from committed
+        // state.
+        self.pending_exec_view.note_decided(height, &block);
+        self.apply_in_flight.push_back(ApplyInflight {
+            height,
+            hash: bh,
+            block,
+            done: rx,
+        });
+        if crate::chain_spec::execution_pipeline_v1_active_at(height) {
+            self.advance_consensus_pipeline_on_decide(height, bh);
+        }
         Some(bh)
     }
 
@@ -872,57 +1350,49 @@ impl ValidatorRuntime {
     /// the execution on the single ordered worker WITHOUT awaiting it and
     /// return the decided hash immediately.
     ///
-    /// Nothing observable moves here: no `finalized` entry, no height
-    /// advance, no receipts. The caller keeps draining inbound messages and
-    /// collects the outcome with [`Self::try_poll_apply`] (or
-    /// [`Self::await_apply_completion`]), which installs it and advances.
+    /// Below the gate, nothing observable moves here: no `finalized` entry,
+    /// no height advance, no receipts. At/above `EXECUTION_PIPELINE_V1`,
+    /// [`Self::advance_consensus_pipeline_on_decide`] moves `safety` and `hc`
+    /// to `height + 1` so consensus can overlap lag-2 execution while
+    /// `finalized` and `post_state_roots` still advance only when
+    /// [`Self::try_poll_apply`] installs the worker-certified outcome.
     /// Returns `None` when there is nothing to decide (no quorum, missing
-    /// body, failed order/cap gate) or when an apply is already in flight —
-    /// at most one decided block is ever queued or executing.
+    /// body, failed order/cap gate) or when the in-flight depth limit /
+    /// committed-root gate is not satisfied.
     pub async fn try_finalize_submit(&mut self) -> Option<BlockHash> {
         if self.parallel_exec {
             self.state.set_parallel_exec(true);
         }
         let (height, bh, block) = self.prepare_decided_block().await?;
-        // R1/DET-01: only the STATIC default travels to the worker; the
-        // governed reward is derived inside `apply_block_transition` from the
-        // committed pre-state, identically on every path.
-        let reward = self.block_reward;
-        let lane = self.ensure_apply_lane();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if lane
-            .tx
-            .send(LaneJob::Apply(ApplyJob {
-                block: block.clone(),
-                reward,
-                done: tx,
-            }))
-            .is_err()
-        {
-            return None;
-        }
-        self.apply_in_flight = Some(ApplyInflight {
-            height,
-            hash: bh,
-            block,
-            done: rx,
-        });
-        Some(bh)
+        self.submit_prepared_block(height, bh, block).await
+    }
+
+    /// Pipelined consensus step: poll any completed apply at the FIFO front
+    /// (freeing queue depth and recording its certified post-state root) and
+    /// submit the next decided block if consensus is ready to decide.
+    pub async fn try_finalize_pipelined_step(&mut self) -> Option<BlockHash> {
+        let _ = self.try_poll_apply().await;
+        self.try_finalize_submit().await
     }
 
     /// Non-blocking collect of the sequenced apply: when the worker has
     /// reported back, install the outcome (bookkeeping + height advance) and
     /// return it; when it is still executing, leave everything untouched and
     /// return `None` so the loop keeps draining. Safe to call every tick.
+    ///
+    /// Collects the FIFO FRONT only: the worker applies strictly in submission
+    /// order, so an earlier height must install before a later one can.
     pub async fn try_poll_apply(&mut self) -> Option<ApplyCompleted> {
-        let mut inflight = self.apply_in_flight.take()?;
+        let mut inflight = self.apply_in_flight.pop_front()?;
         match inflight.done.try_recv() {
-            Ok((outcome, root)) => {
-                self.install_apply_outcome(
+            Ok((outcome, root, penalties)) => {
+                self.install_apply_outcome_with_root(
                     inflight.height,
                     inflight.hash,
                     &inflight.block,
                     &outcome,
+                    root,
+                    penalties,
                 )
                 .await;
                 Some(ApplyCompleted {
@@ -932,7 +1402,8 @@ impl ValidatorRuntime {
                 })
             }
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                self.apply_in_flight = Some(inflight);
+                // Still executing: put it back at the FRONT (its FIFO slot).
+                self.apply_in_flight.push_front(inflight);
                 None
             }
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
@@ -944,7 +1415,7 @@ impl ValidatorRuntime {
                     "apply worker vanished mid-block at height {}; height stuck until restart",
                     inflight.height
                 );
-                self.apply_in_flight = Some(inflight);
+                self.apply_in_flight.push_front(inflight);
                 None
             }
         }
@@ -955,10 +1426,17 @@ impl ValidatorRuntime {
     /// exactly like [`Self::try_poll_apply`] and returns it with the
     /// certified post-apply root.
     pub async fn await_apply_completion(&mut self) -> Option<ApplyCompleted> {
-        let inflight = self.apply_in_flight.take()?;
-        let (outcome, root) = inflight.done.await.ok()?;
-        self.install_apply_outcome(inflight.height, inflight.hash, &inflight.block, &outcome)
-            .await;
+        let inflight = self.apply_in_flight.pop_front()?;
+        let (outcome, root, penalties) = inflight.done.await.ok()?;
+        self.install_apply_outcome_with_root(
+            inflight.height,
+            inflight.hash,
+            &inflight.block,
+            &outcome,
+            root,
+            penalties,
+        )
+        .await;
         Some(ApplyCompleted {
             height: inflight.height,
             hash: inflight.hash,
@@ -1158,7 +1636,11 @@ impl ValidatorRuntime {
         self.apply_block_fees_rewards(block).await;
         // C-02: same deterministic gov-finalization sweep as the live path,
         // so a replayed catch-up converges with live-finalized nodes.
-        sweep_gov_finalize(&self.state, block.height, block.timestamp).await;
+        // At/above EXECUTION_PIPELINE_V1, `ApplyLane` already swept this inside
+        // the worker BEFORE certifying `root`.
+        if !crate::chain_spec::execution_pipeline_v1_active_at(block.height) {
+            sweep_gov_finalize(&self.state, block.height, block.timestamp).await;
+        }
         // The replayed block is canonical, finalized history: the
         // fork-choice tree follows it, so the candidates seen afterwards
         // are compared against the right chain.
@@ -1189,6 +1671,7 @@ impl ValidatorRuntime {
                 }
             }
         }
+        self.prune_runtime_history(block.height);
         Ok(())
     }
 
@@ -1237,7 +1720,11 @@ impl ValidatorRuntime {
         let height = self.hc.height;
         // C-02: height-driven gov finalization (locks release, 7200-height
         // timelocks schedule). Deterministic in (height, block.timestamp).
-        sweep_gov_finalize(&self.state, height, block.timestamp).await;
+        // At/above EXECUTION_PIPELINE_V1, `ApplyLane` already swept this inside
+        // the worker BEFORE certifying `root`.
+        if !crate::chain_spec::execution_pipeline_v1_active_at(height) {
+            sweep_gov_finalize(&self.state, height, block.timestamp).await;
+        }
         self.finalized.push((height, bh));
         // The block is final: it anchors the fork-choice tree, and every
         // candidate branch it superseded is pruned (and signalled).
@@ -1245,16 +1732,36 @@ impl ValidatorRuntime {
         self.last_progress_at = std::time::Instant::now();
         self.note_finalized_header(block).await;
         self.note_light_anchor(block);
-        self.refresh_validator_set_from_staking().await;
-        if let Err(e) = self.safety.advance_height(height + 1, height, bh) {
-            tracing::error!(height, error = %e, "[safety] advance_height failed; quarantining");
-            self.safety
-                .quarantine(format!("advance_height({} -> {}): {e}", height, height + 1));
+        if crate::chain_spec::execution_pipeline_v1_active_at(height) {
+            if let Err(e) = self.safety.advance_height(height + 1, height, bh) {
+                tracing::error!(height, error = %e, "[safety] advance_height failed; quarantining");
+                self.safety.quarantine(format!(
+                    "advance_height({} -> {}): {e}",
+                    height,
+                    height + 1
+                ));
+            }
+            self.hc = HeightConsensus::new(height + 1, self.validators.clone());
+            // W10.5: activate any set staged for `height + 1` before staging
+            // `height`'s rotation for `height + 2`.
+            self.install_due_validator_set();
+            self.refresh_validator_set_from_staking_at(height).await;
+            self.hc.validators = self.validators.clone();
+        } else {
+            self.refresh_validator_set_from_staking_at(height).await;
+            if let Err(e) = self.safety.advance_height(height + 1, height, bh) {
+                tracing::error!(height, error = %e, "[safety] advance_height failed; quarantining");
+                self.safety.quarantine(format!(
+                    "advance_height({} -> {}): {e}",
+                    height,
+                    height + 1
+                ));
+            }
+            self.hc = HeightConsensus::new(height + 1, self.validators.clone());
+            // W10.5: activate the set staged for the new height (never mid-flight).
+            self.install_due_validator_set();
+            self.hc.validators = self.validators.clone();
         }
-        self.hc = HeightConsensus::new(height + 1, self.validators.clone());
-        // W10.5: activate the set staged for the new height (never mid-flight).
-        self.install_due_validator_set();
-        self.hc.validators = self.validators.clone();
         // The sortition committee of height+1 is elected from the PARENT
         // block hash — the block we just finalized. Every node of the network
         // must use the same parent, or they elect different committees.
@@ -1265,6 +1772,7 @@ impl ValidatorRuntime {
         // its verifier attributes it with (review F2).
         self.install_committee_schedule();
         self.prepare_cnvrf_v3_epoch_hooks(height, bh).await;
+        self.prune_runtime_history(height);
     }
 }
 
@@ -1494,5 +2002,117 @@ mod tests {
                 "shard {shard} restored root must match live root after 2PC"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn prune_runtime_history_bounds_caches_and_preserves_active_refs() {
+        use crate::consensus::{QuorumCertificate, VoteKind};
+        use crate::runtime::{
+            ParkedCommit, RUNTIME_BLOCK_CACHE_WINDOW, RUNTIME_FINALIZED_CACHE_WINDOW,
+        };
+
+        let key = SigningKey::from_bytes(&[0x33u8; 32]);
+        let id = key.verifying_key().to_bytes();
+        let validators = ValidatorSet::from_list(vec![(id, 1)]);
+        let state = Arc::new(InMemoryStateEngine::new());
+        let committed_height = (RUNTIME_FINALIZED_CACHE_WINDOW as u64) + 500;
+        let mut rt = ValidatorRuntime::new(key, validators, state, committed_height + 1);
+
+        let make_block = |height: u64, tag: u8| {
+            let mut prev = [0u8; 32];
+            prev[0] = tag;
+            prev[1..9].copy_from_slice(&height.to_le_bytes());
+            Block {
+                shard_id: MASTERCHAIN_SHARD,
+                height,
+                prev_hash: prev,
+                timestamp: 1_700_000_000 + height,
+                proposer: id,
+                ..Default::default()
+            }
+        };
+
+        let mut old_hashes: Vec<(u64, [u8; 32])> = Vec::new();
+        for h in 1..=committed_height {
+            let blk = make_block(h, 0x10);
+            let bh = blk.compute_hash();
+            rt.finalized.push((h, bh));
+            if h <= 100 || h >= committed_height - (RUNTIME_BLOCK_CACHE_WINDOW as u64) - 50 {
+                rt.blocks.insert(bh, blk);
+                old_hashes.push((h, bh));
+            }
+        }
+
+        // Pin three distinct old heights below the window via active runtime structures:
+        // 1) apply_in_flight, 2) parked_commit, 3) post_state_roots.
+        let inflight_h = 5u64;
+        let inflight_bh = old_hashes
+            .iter()
+            .find(|(h, _)| *h == inflight_h)
+            .map(|(_, bh)| *bh)
+            .expect("inflight block seeded");
+        assert!(rt.debug_try_enqueue_apply_inflight(inflight_h, inflight_bh));
+
+        let parked_h = 12u64;
+        let parked_blk = make_block(parked_h, 0x10);
+        let parked_bh = parked_blk.compute_hash();
+        assert!(rt.blocks.contains_key(&parked_bh));
+        rt.parked_commit = Some(ParkedCommit {
+            height: parked_h,
+            block: parked_blk,
+            certificate: QuorumCertificate {
+                height: parked_h,
+                round: 0,
+                kind: VoteKind::Precommit,
+                block_hash: Some(parked_bh),
+                signatures: Vec::new(),
+                shard_id: MASTERCHAIN_SHARD,
+            },
+            parked_at: (committed_height + 1, 0),
+        });
+
+        let root_pinned_h = 20u64;
+        let root_pinned_bh = old_hashes
+            .iter()
+            .find(|(h, _)| *h == root_pinned_h)
+            .map(|(_, bh)| *bh)
+            .expect("root-pinned block seeded");
+        rt.post_state_roots.insert(root_pinned_h, [0xAAu8; 32]);
+
+        let unreferenced_old_h = 30u64;
+        let unreferenced_old_bh = old_hashes
+            .iter()
+            .find(|(h, _)| *h == unreferenced_old_h)
+            .map(|(_, bh)| *bh)
+            .expect("unreferenced old block seeded");
+
+        let min_keep_h = committed_height.saturating_sub(RUNTIME_BLOCK_CACHE_WINDOW as u64);
+        let boundary_bh = old_hashes
+            .iter()
+            .find(|(h, _)| *h == min_keep_h)
+            .map(|(_, bh)| *bh)
+            .expect("boundary block seeded");
+        let tip = rt.finalized.last().copied().expect("tip present");
+
+        assert!(rt.blocks.len() > RUNTIME_BLOCK_CACHE_WINDOW);
+        assert!(rt.finalized.len() > RUNTIME_FINALIZED_CACHE_WINDOW);
+
+        rt.prune_runtime_history(committed_height);
+
+        // finalized is bounded, monotonic, and keeps the tip intact.
+        assert_eq!(rt.finalized.len(), RUNTIME_FINALIZED_CACHE_WINDOW);
+        assert_eq!(rt.finalized.last().copied(), Some(tip));
+        assert!(rt.finalized.windows(2).all(|w| w[0].0 < w[1].0));
+
+        // Unreferenced blocks below min_keep_h are evicted, while the safety
+        // window and all active references are preserved.
+        assert!(!rt.blocks.contains_key(&unreferenced_old_bh));
+        assert!(rt.blocks.contains_key(&boundary_bh));
+        assert!(rt.blocks.contains_key(&tip.1));
+        assert!(rt.blocks.contains_key(&inflight_bh));
+        assert!(rt.blocks.contains_key(&parked_bh));
+        assert!(rt.blocks.contains_key(&root_pinned_bh));
+        // Only the recent window (min_keep_h..=committed_height) + 3 pinned old blocks remain.
+        assert_eq!(rt.blocks.len(), RUNTIME_BLOCK_CACHE_WINDOW + 1 + 3);
     }
 }

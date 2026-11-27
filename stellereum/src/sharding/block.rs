@@ -6,7 +6,7 @@ use crate::post_quantum::FalconKeypair;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 /// The shard-head commitment published by a MASTERCHAIN block (the TON
@@ -1552,14 +1552,24 @@ impl Block {
     }
 }
 
+/// Maximum number of sequenced cross-shard entries retained in
+/// [`SharedSequencer::scheduled_cross_shard`] and its `O(1)` lookup index.
+pub const MAX_SHARED_SEQ_HISTORY: usize = 16_384;
+
+/// Maximum number of routed `msg_id`s retained in
+/// [`SharedLiquidityHub::seen_cross_shard`] before FIFO eviction.
+pub const MAX_HUB_SEEN_CROSS_SHARD: usize = 65_536;
+
 /// Shared Sequencer for unified cross-shard ordering and external L2 rollup scheduling
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SharedSequencer {
     pub current_sequence: u64,
     pub scheduled_cross_shard: Vec<(u64, CrossShardMessage)>,
     /// §5 M3: per-source sequenced-height watermark (see `assign_from_block`).
     /// Advanced ONLY from finalized block content — never by time/operator.
     pub watermark: std::collections::BTreeMap<ShardId, u64>,
+    #[serde(skip)]
+    msg_index: HashMap<[u8; 32], u64>,
 }
 
 impl SharedSequencer {
@@ -1568,13 +1578,36 @@ impl SharedSequencer {
             current_sequence: 1,
             scheduled_cross_shard: Vec::new(),
             watermark: std::collections::BTreeMap::new(),
+            msg_index: HashMap::new(),
+        }
+    }
+
+    fn ensure_msg_index(&mut self) {
+        if self.msg_index.is_empty() && !self.scheduled_cross_shard.is_empty() {
+            for (seq, msg) in &self.scheduled_cross_shard {
+                self.msg_index.insert(msg.msg_id, *seq);
+            }
+        }
+    }
+
+    fn push_scheduled(&mut self, seq: u64, msg: CrossShardMessage) {
+        self.ensure_msg_index();
+        self.msg_index.insert(msg.msg_id, seq);
+        self.scheduled_cross_shard.push((seq, msg));
+        if self.scheduled_cross_shard.len() > MAX_SHARED_SEQ_HISTORY {
+            let excess = self.scheduled_cross_shard.len() - MAX_SHARED_SEQ_HISTORY;
+            for (evicted_seq, evicted) in self.scheduled_cross_shard.drain(..excess) {
+                if self.msg_index.get(&evicted.msg_id) == Some(&evicted_seq) {
+                    self.msg_index.remove(&evicted.msg_id);
+                }
+            }
         }
     }
 
     pub fn sequence_message(&mut self, msg: CrossShardMessage) -> u64 {
         let seq = self.current_sequence;
-        self.current_sequence += 1;
-        self.scheduled_cross_shard.push((seq, msg));
+        self.current_sequence = self.current_sequence.saturating_add(1);
+        self.push_scheduled(seq, msg);
         seq
     }
 }
@@ -1585,7 +1618,9 @@ pub struct SharedLiquidityHub {
     pub pending_inbound_cross_shard: HashMap<ShardId, Vec<CrossShardMessage>>,
     pub sequencer: SharedSequencer,
     /// Replay protection: msg_id of every message already routed/delivered.
-    pub seen_cross_shard: std::collections::HashSet<[u8; 32]>,
+    pub seen_cross_shard: HashSet<[u8; 32]>,
+    /// FIFO eviction queue bounding [`Self::seen_cross_shard`] at [`MAX_HUB_SEEN_CROSS_SHARD`].
+    seen_cross_shard_order: VecDeque<[u8; 32]>,
 }
 
 impl SharedLiquidityHub {
@@ -1594,7 +1629,20 @@ impl SharedLiquidityHub {
             active_shards,
             pending_inbound_cross_shard: HashMap::new(),
             sequencer: SharedSequencer::new(),
-            seen_cross_shard: std::collections::HashSet::new(),
+            seen_cross_shard: HashSet::new(),
+            seen_cross_shard_order: VecDeque::new(),
+        }
+    }
+
+    fn mark_seen(&mut self, msg_id: [u8; 32]) {
+        if self.seen_cross_shard.insert(msg_id) {
+            self.seen_cross_shard_order.push_back(msg_id);
+            while self.seen_cross_shard.len() > MAX_HUB_SEEN_CROSS_SHARD {
+                let Some(oldest) = self.seen_cross_shard_order.pop_front() else {
+                    break;
+                };
+                self.seen_cross_shard.remove(&oldest);
+            }
         }
     }
 
@@ -1635,7 +1683,7 @@ impl SharedLiquidityHub {
             return 0;
         }
 
-        self.seen_cross_shard.insert(msg.msg_id);
+        self.mark_seen(msg.msg_id);
         let target = msg.target_shard;
         let seq = self.sequencer.sequence_message(msg.clone());
         self.pending_inbound_cross_shard
@@ -1708,7 +1756,7 @@ impl SharedLiquidityHub {
         }
 
         transport.broadcast_cross_shard(&msg).await?;
-        self.seen_cross_shard.insert(msg.msg_id);
+        self.mark_seen(msg.msg_id);
         let seq = self.sequencer.sequence_message(msg);
         Ok(seq)
     }
@@ -1728,6 +1776,7 @@ impl SharedSequencer {
     /// assignments from identical chains. Returns the assignments in global
     /// order.
     pub fn assign_from_block(&mut self, block: &Block) -> Vec<(u64, CrossShardKey)> {
+        self.ensure_msg_index();
         let mut keys: Vec<CrossShardKey> = block
             .cross_shard_out
             .iter()
@@ -1749,14 +1798,14 @@ impl SharedSequencer {
                 Some(s) => s,
                 None => {
                     let s = self.current_sequence;
-                    self.current_sequence += 1;
+                    self.current_sequence = self.current_sequence.saturating_add(1);
                     // Keep the legacy schedule vector consistent (Sim reads it).
                     if let Some(msg) = block
                         .cross_shard_out
                         .iter()
                         .find(|m| CrossShardKey::of(m) == key)
                     {
-                        self.scheduled_cross_shard.push((s, msg.clone()));
+                        self.push_scheduled(s, msg.clone());
                     }
                     s
                 }
@@ -1774,10 +1823,14 @@ impl SharedSequencer {
 
     /// The sequence number of an already-sequenced message, if any.
     pub fn sequence_of(&self, key: &CrossShardKey) -> Option<u64> {
-        self.scheduled_cross_shard
-            .iter()
-            .find(|(_, m)| CrossShardKey::of(m) == *key)
-            .map(|(s, _)| *s)
+        if self.msg_index.is_empty() && !self.scheduled_cross_shard.is_empty() {
+            return self
+                .scheduled_cross_shard
+                .iter()
+                .find(|(_, m)| CrossShardKey::of(m) == *key)
+                .map(|(s, _)| *s);
+        }
+        self.msg_index.get(&key.msg_id).copied()
     }
 
     /// The next sequence number to be assigned.
@@ -1800,5 +1853,101 @@ impl SharedSequencer {
         if height > *wm {
             *wm = height;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_tx(nonce: u64, source_shard: ShardId, target_shard: ShardId) -> Transaction {
+        Transaction {
+            from: [1u8; 32],
+            to: [2u8; 32],
+            amount: 10,
+            gas_limit: 21_000,
+            nonce,
+            source_shard,
+            target_shard,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        }
+    }
+
+    #[test]
+    fn shared_sequencer_bounds_history_and_indexes_in_o1() {
+        let mut seq = SharedSequencer::new();
+        let total = MAX_SHARED_SEQ_HISTORY + 10;
+        let mut keys = Vec::with_capacity(total);
+        for i in 0..total {
+            let msg =
+                CrossShardMessage::new_trusted(0, 1, test_tx(i as u64, 0, 1), [0u8; 32], [1u8; 32]);
+            let key = CrossShardKey::of(&msg);
+            let assigned = seq.sequence_message(msg);
+            assert_eq!(assigned, (i as u64) + 1);
+            keys.push((assigned, key));
+        }
+
+        assert_eq!(seq.scheduled_cross_shard.len(), MAX_SHARED_SEQ_HISTORY);
+        assert_eq!(seq.scheduled_cross_shard[0].0, 11);
+
+        // Oldest 10 entries were evicted from both history and index.
+        for (_, evicted_key) in &keys[..10] {
+            assert_eq!(seq.sequence_of(evicted_key), None);
+        }
+        // Retained entries resolve in O(1) via msg_index.
+        for (expected_seq, retained_key) in &keys[10..] {
+            assert_eq!(seq.sequence_of(retained_key), Some(*expected_seq));
+        }
+
+        // Deserializing clears #[serde(skip)] msg_index; lookups still succeed
+        // and assign_from_block rebuilds the index.
+        let encoded = bincode::serialize(&seq).expect("SharedSequencer serialize");
+        let mut decoded: SharedSequencer =
+            bincode::deserialize(&encoded).expect("SharedSequencer deserialize");
+        assert!(decoded.msg_index.is_empty());
+        let (last_seq, last_key) = keys.last().expect("non-empty keys");
+        assert_eq!(decoded.sequence_of(last_key), Some(*last_seq));
+
+        let next_msg =
+            CrossShardMessage::new_trusted(0, 1, test_tx(total as u64, 0, 1), [0u8; 32], [2u8; 32]);
+        let next_key = CrossShardKey::of(&next_msg);
+        let block = Block {
+            shard_id: 0,
+            height: 2,
+            cross_shard_out: vec![next_msg],
+            ..Default::default()
+        };
+        let assigned = decoded.assign_from_block(&block);
+        assert_eq!(assigned.len(), 1);
+        assert!(!decoded.msg_index.is_empty());
+        assert_eq!(decoded.sequence_of(&keys[10].1), None);
+        assert_eq!(decoded.sequence_of(last_key), Some(*last_seq));
+        assert_eq!(decoded.sequence_of(&next_key), Some(assigned[0].0));
+    }
+
+    #[test]
+    fn shared_liquidity_hub_bounds_seen_cross_shard_fifo() {
+        let mut hub = SharedLiquidityHub::new(vec![0, 1]);
+        let total = MAX_HUB_SEEN_CROSS_SHARD + 5;
+        let mut msgs = Vec::with_capacity(total);
+        for i in 0..total {
+            let msg =
+                CrossShardMessage::new_trusted(0, 1, test_tx(i as u64, 0, 1), [0u8; 32], [1u8; 32]);
+            let seq = hub.route_cross_shard_message(msg.clone());
+            assert!(seq > 0);
+            msgs.push(msg);
+        }
+
+        assert_eq!(hub.seen_cross_shard.len(), MAX_HUB_SEEN_CROSS_SHARD);
+        for evicted in &msgs[..5] {
+            assert!(!hub.seen_cross_shard.contains(&evicted.msg_id));
+        }
+        for retained in &msgs[5..] {
+            assert!(hub.seen_cross_shard.contains(&retained.msg_id));
+        }
+        // Retained entry still rejected as a replay.
+        assert_eq!(hub.route_cross_shard_message(msgs[5].clone()), 0);
     }
 }

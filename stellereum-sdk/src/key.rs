@@ -31,7 +31,7 @@ use pqcrypto_falcon::falconpadded512::{
 };
 use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _, SecretKey as _};
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::address;
 use crate::error::{Result, SdkError};
@@ -180,8 +180,16 @@ impl FalconKeypair {
     }
 
     /// Secret-key bytes. Handle with care; the buffer returned is a copy.
+    ///
+    /// Prefer [`FalconKeypair::secret_key_bytes_zeroizing`] when the caller can
+    /// hold a [`Zeroizing`] wrapper so the copy is scrubbed on drop.
     pub fn secret_key_bytes(&self) -> Vec<u8> {
         self.secret_key.to_vec()
+    }
+
+    /// Secret-key bytes wrapped in [`Zeroizing`] so the copy is scrubbed on drop.
+    pub fn secret_key_bytes_zeroizing(&self) -> Zeroizing<Vec<u8>> {
+        self.secret_key.clone()
     }
 
     /// Lower-case hex public key.
@@ -190,8 +198,17 @@ impl FalconKeypair {
     }
 
     /// Lower-case hex secret key (plaintext; export only to a protected file).
+    ///
+    /// Prefer [`FalconKeypair::secret_key_hex_zeroizing`] when the caller can
+    /// hold a [`Zeroizing`] wrapper so the hex copy is scrubbed on drop.
     pub fn secret_key_hex(&self) -> String {
         hex::encode(&*self.secret_key)
+    }
+
+    /// Lower-case hex secret key wrapped in [`Zeroizing`] so the hex copy is
+    /// scrubbed on drop.
+    pub fn secret_key_hex_zeroizing(&self) -> Zeroizing<String> {
+        Zeroizing::new(hex::encode(&*self.secret_key))
     }
 
     /// The 32-byte Stellereum address (`derive_pq_address` with the zero salt).
@@ -288,8 +305,10 @@ impl FalconKeypair {
         }
         let pk = hex::decode(&file.public_key)
             .map_err(|e| SdkError::InvalidKey(format!("public_key hex: {e}")))?;
-        let sk = hex::decode(&file.secret_key)
-            .map_err(|e| SdkError::InvalidKey(format!("secret_key hex: {e}")))?;
+        let sk = Zeroizing::new(
+            hex::decode(&file.secret_key)
+                .map_err(|e| SdkError::InvalidKey(format!("secret_key hex: {e}")))?,
+        );
         let kp = Self::from_parts(&pk, &sk)?;
         if !file.address.trim().is_empty() {
             let expected = address::parse_address(&file.address)?;
@@ -304,16 +323,21 @@ impl FalconKeypair {
 
     /// Write a JSON key file. The file is created with mode 0600 on Unix.
     pub fn save_key_file(&self, path: &std::path::Path) -> Result<()> {
-        let json = serde_json::to_vec_pretty(&self.to_key_file())
-            .map_err(|e| SdkError::InvalidKey(format!("serialize key file: {e}")))?;
+        let key_file = self.to_key_file();
+        let json = Zeroizing::new(
+            serde_json::to_vec_pretty(&key_file)
+                .map_err(|e| SdkError::InvalidKey(format!("serialize key file: {e}")))?,
+        );
         write_private(path, &json)
             .map_err(|e| SdkError::InvalidKey(format!("write {}: {e}", path.display())))
     }
 
     /// Read a JSON key file.
     pub fn load_key_file(path: &std::path::Path) -> Result<Self> {
-        let raw = std::fs::read(path)
-            .map_err(|e| SdkError::InvalidKey(format!("read {}: {e}", path.display())))?;
+        let raw = Zeroizing::new(
+            std::fs::read(path)
+                .map_err(|e| SdkError::InvalidKey(format!("read {}: {e}", path.display())))?,
+        );
         let file: KeyFile = serde_json::from_slice(&raw)
             .map_err(|e| SdkError::InvalidKey(format!("parse {}: {e}", path.display())))?;
         Self::from_key_file(&file)
@@ -342,6 +366,20 @@ pub struct KeyFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 }
+
+impl Zeroize for KeyFile {
+    fn zeroize(&mut self) {
+        self.secret_key.zeroize();
+    }
+}
+
+impl Drop for KeyFile {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for KeyFile {}
 
 impl std::fmt::Debug for KeyFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -451,5 +489,21 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keyfile_zeroizes_secret_key_and_zeroizing_variants_match() {
+        fn assert_zeroize_on_drop<T: Zeroize + ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<KeyFile>();
+
+        let kp = FalconKeypair::generate().unwrap();
+        assert_eq!(*kp.secret_key_bytes_zeroizing(), kp.secret_key_bytes());
+        assert_eq!(*kp.secret_key_hex_zeroizing(), kp.secret_key_hex());
+
+        let mut file = kp.to_key_file();
+        assert!(!file.secret_key.is_empty());
+        file.zeroize();
+        assert!(file.secret_key.is_empty());
+        assert!(!file.public_key.is_empty());
     }
 }

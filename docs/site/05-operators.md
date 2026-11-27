@@ -2,10 +2,10 @@
 
 Lifecycle: `install → configure → keygen → join → snapshot-sync →
 monitor → alert → prune → upgrade → rollback → disaster-recover`.
-Authority: `docs/OPERATIONS.md`; join scripts: `scripts/join-testnet.sh`,
-`stellereum/scripts/add-peer.sh`; health tooling: `scripts/stell-sync.sh`,
-`scripts/doctor.sh`, `scripts/cluster-watchdog.sh`,
-`scripts/node-prune-cron.sh`, `scripts/tools/stelops/`.
+Authority: `docs/OPERATIONS.md`; join scripts (from repo root): `./scripts/join-testnet.sh`,
+`./stellereum/scripts/add-peer.sh`; health tooling: `./scripts/stell-sync.sh`,
+`./scripts/doctor.sh`, `./scripts/cluster-watchdog.sh`,
+`./scripts/node-prune-cron.sh`, `./scripts/tools/stelops/`.
 
 ## The pipeline
 
@@ -13,9 +13,10 @@ Authority: `docs/OPERATIONS.md`; join scripts: `scripts/join-testnet.sh`,
    **outside** any cargo target dir (incident 4 — `cargo clean` deleted a
    live binary → 203/EXEC crash-loop).
 2. **Configure:** `node.yaml` (`peers:`, `validators:`, DNS seeds) + env
-   file (mode 600). Values that must match **every** node: `STELL_SHARDS`,
-   chain id, `STELL_MIN_BLOCK_MS` (live fleet **400**; code default 50),
-   `STELL_KEEP_BLOCKS`, admission
+   file (mode 600). Values that must match **every** node: `STELL_SHARDS=0`
+   (single-shard masterchain; shard 1 is parked), chain id (`5757`),
+   `STELL_MIN_BLOCK_MS=400` (live fleet; code default 50),
+   `STELL_KEEP_BLOCKS=50000` (code default in prune mode), admission
    base fee — drift = split or silent isolation (`OPERATIONS.md` §15.3). The
    base round timeout is **compiled** (`FROZEN_ROUND_TIMEOUT_BASE_MS = 3 000`);
    the former `STELL_ROUND_TIMEOUT_MS` env override is gone, so it must match
@@ -25,26 +26,31 @@ Authority: `docs/OPERATIONS.md`; join scripts: `scripts/join-testnet.sh`,
    default; passphrase via `STELL_NODE_PASSPHRASE`, never in history).
    Falcon pre-FIPS keys still load; migrate with
    `keys rotate-falcon --force` (changes the validator address → re-stake).
-4. **Join:** `scripts/join-testnet.sh --mode observer|validator` (writes
-   config + env, downloads the snapshot — pass `--skip-snapshot` when
-   `node-bootstrap` follows in step 5; systemd unit/firewall come from its
-   printed next steps) → send `peer-stanza.txt` to the admin → admin
-   `add-peer.sh` (observer: peers only; `--role validator` changes genesis =
-   coordinated restart).
+4. **Join:** from repo root, `./scripts/join-testnet.sh --mode observer|validator`
+   (accepts `--home`, `--name`, `--listen`, `--advertise`, `--rpc`, `--explorer`,
+   `--seeds`, `--peers-file`, `--snapshot-url`, `--sha256-url`, `--require-sha256`,
+   `--refresh-store`, `--skip-snapshot`, `--binary`, `--chain-id`,
+   `--commission-bps`, `--force`, `--start`, `--non-interactive`; writes
+   `node.yaml` + `node.env` with `STELL_SHARDS=0`, `STELL_OBSERVER=1`, and
+   downloads the snapshot — pass `--skip-snapshot` when `node-bootstrap` follows
+   in step 5) → send `peer-stanza.txt` to the admin → admin
+   `./stellereum/scripts/add-peer.sh` (observer: peers only; `--role validator`
+   changes genesis = coordinated restart).
 5. **Snapshot-sync:** `stellereum node-bootstrap` — fail-closed preflight
    (clean dir, `STELL_OBSERVER=1`, faucet key, peers, non-empty
    validators), then state + all domains with per-height QC proofs, then
    body walk, then live follow. Never join by copying another node's
    `./data`.
 6. **Monitor:** `/readyz` (readiness + `failed_checks`), `/metrics`
-   (alert on the **derivative** of `stellereum_block_height`), per-minute
+   (alert on the **derivative** of `stell_consensus_height`), per-minute
    `stell_getStateRoot` agreement across nodes (the single most valuable
    check), `stell_getValidators` quorum watch.
 7. **Alert:** `health_check.sh` (exit 0/1/2), `cluster-watchdog.sh`
    (auto-heals only safe cases: dead service, inode pressure).
 8. **Prune:** archive is the default (unbounded growth; local `./data`
-   measured 2.9 GB). Public-testnet starting point: `STELL_ARCHIVE=0`,
-   `STELL_KEEP_BLOCKS=1000000` — identical on every node.
+   measured 2.9 GB). Recommended prune starting point: `STELL_ARCHIVE=0`,
+   `STELL_KEEP_BLOCKS=50000` (code default) — keep retention settings
+   coherent across nodes.
 9. **Upgrade:** governance `SoftwareUpgrade` stages + hashes before exec
    (`stage_verified_upgrade_binary`); live `execve` only with
    `STELL_AUTO_UPGRADE=1`, else exit 42 for the supervisor

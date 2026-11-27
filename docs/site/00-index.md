@@ -46,7 +46,7 @@ verified against a live node is marked `TODO` with the exact command.
                                  │ longest-prefix routing
                     ┌────────────▼────────────┐  ┌────────────────────────┐
                     │ WORKCHAIN shard(s)      │  │ WASM contracts (SVM)   │
-                    │ accounts, CLOB, STS     │  │ 13 host fns, fuel      │
+                    │ accounts, CLOB, STS     │  │ 14 host fns, fuel      │
                     │ tokens, PMM, sessions   │  │ (03-contracts)         │
                     └─────────────────────────┘  └────────────────────────┘
 ```
@@ -65,7 +65,7 @@ verified against a live node is marked `TODO` with the exact command.
 | **Developer** | [01-quickstart](01-quickstart.md) (60-min loop) → [02-concepts](02-concepts.md) → [03-contracts](03-contracts.md) |
 | **Validator** | [04-validators](04-validators.md) → `VALIDATOR_ONBOARDING.md` in-tree → [05-operators](05-operators.md) §10–§11 |
 | **Auditor** | [06-security](06-security.md) → `audits/KNOWN_ISSUES.md` → `audits/THREAT_MODEL.md` → `PROTOCOL.md` invariants |
-| **Wallet integrator** | [02-concepts](02-concepts.md) (addresses, fees, confirmations) → `docs/RPC.md` §§2–4 → `docs/WALLET_SIGNING.md` → `../../stellereum-sdk/SDK-README.md` (canonical tx builders — use the SDK, don't hand-roll bincode) |
+| **Wallet integrator** | [02-concepts](02-concepts.md) (addresses, fees, confirmations) → `docs/RPC.md` §§2–4 → `docs/WALLET_SIGNING.md` → `../../stellereum-sdk/README.md` (canonical tx builders — use the SDK, don't hand-roll bincode) |
 
 Pages: 00 index · 01 quickstart · 02 concepts · 03 contracts ·
 04 validators · 05 operators · 06 security · 07 glossary.

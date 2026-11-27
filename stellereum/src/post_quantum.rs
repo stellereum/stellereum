@@ -1764,40 +1764,48 @@ impl FalconKeypair {
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut cur = 0usize;
         let take_u32 = |cur: &mut usize| -> Option<u32> {
-            if bytes.len() < *cur + 4 {
+            let end = cur.checked_add(4)?;
+            if bytes.len() < end {
                 return None;
             }
             let mut b = [0u8; 4];
-            b.copy_from_slice(&bytes[*cur..*cur + 4]);
-            *cur += 4;
+            b.copy_from_slice(&bytes[*cur..end]);
+            *cur = end;
             Some(u32::from_le_bytes(b))
         };
         let priv_len = take_u32(&mut cur)? as usize;
-        if bytes.len() < cur + priv_len * 2 {
+        let priv_bytes = priv_len.checked_mul(2)?;
+        let priv_end = cur.checked_add(priv_bytes)?;
+        if bytes.len() < priv_end {
             return None;
         }
         let mut private_key = Vec::with_capacity(priv_len);
         for _ in 0..priv_len {
+            let end = cur.checked_add(2)?;
             let mut b = [0u8; 2];
-            b.copy_from_slice(&bytes[cur..cur + 2]);
-            cur += 2;
+            b.copy_from_slice(&bytes[cur..end]);
+            cur = end;
             private_key.push(i16::from_le_bytes(b));
         }
         let pub_len = take_u32(&mut cur)? as usize;
-        if bytes.len() < cur + pub_len {
+        let pub_end = cur.checked_add(pub_len)?;
+        if bytes.len() < pub_end {
             return None;
         }
-        let public_key = bytes[cur..cur + pub_len].to_vec();
-        cur += pub_len;
+        let public_key = bytes[cur..pub_end].to_vec();
+        cur = pub_end;
         let mut arr = || -> Option<[i16; 512]> {
-            if bytes.len() < cur + 512 * 2 {
+            let arr_bytes = 512usize.checked_mul(2)?;
+            let arr_end = cur.checked_add(arr_bytes)?;
+            if bytes.len() < arr_end {
                 return None;
             }
             let mut a = [0i16; 512];
             for v in a.iter_mut() {
+                let end = cur.checked_add(2)?;
                 let mut b = [0u8; 2];
-                b.copy_from_slice(&bytes[cur..cur + 2]);
-                cur += 2;
+                b.copy_from_slice(&bytes[cur..end]);
+                cur = end;
                 *v = i16::from_le_bytes(b);
             }
             Some(a)
@@ -1806,14 +1814,17 @@ impl FalconKeypair {
         let g = arr()?;
         let capital_f = arr()?;
         let capital_g = arr()?;
-        if bytes.len() < cur + 512 * 2 {
+        let h_bytes = 512usize.checked_mul(2)?;
+        let h_end = cur.checked_add(h_bytes)?;
+        if bytes.len() < h_end {
             return None;
         }
         let mut h = [0u16; 512];
         for v in h.iter_mut() {
+            let end = cur.checked_add(2)?;
             let mut b = [0u8; 2];
-            b.copy_from_slice(&bytes[cur..cur + 2]);
-            cur += 2;
+            b.copy_from_slice(&bytes[cur..end]);
+            cur = end;
             *v = u16::from_le_bytes(b);
         }
         // AUDIT W6.1 (live-cluster key migration, fail-closed but MIGRATION
@@ -2218,6 +2229,46 @@ impl FalconPubkeyCache {
             .or_else(|| self.lru.get(key).map(|e| e.h_ntt))
     }
 
+    fn compact_order_deque<V>(
+        deque: &mut std::collections::VecDeque<[u8; 32]>,
+        map: &HashMap<[u8; 32], V>,
+        cap: usize,
+    ) {
+        if map.is_empty() {
+            deque.clear();
+            return;
+        }
+        let threshold = cap
+            .saturating_mul(2)
+            .min(map.len().saturating_mul(2).max(256));
+        if deque.len() <= threshold {
+            return;
+        }
+        let mut seen = std::collections::HashSet::with_capacity(map.len());
+        let mut keep = vec![false; deque.len()];
+        for (idx, k) in deque.iter().enumerate().rev() {
+            if map.contains_key(k) && seen.insert(*k) {
+                keep[idx] = true;
+            }
+        }
+        let mut iter = keep.into_iter();
+        deque.retain(|_| iter.next().unwrap_or(false));
+    }
+
+    fn compact_orders(&mut self) {
+        Self::compact_order_deque(&mut self.order, &self.lru, FALCON_PUBKEY_CACHE_CAP);
+        Self::compact_order_deque(
+            &mut self.pinned_order,
+            &self.pinned,
+            FALCON_PUBKEY_PINNED_CAP,
+        );
+        Self::compact_order_deque(
+            &mut self.explicit_pinned_order,
+            &self.explicit_pinned,
+            FALCON_PUBKEY_PINNED_CAP,
+        );
+    }
+
     /// Insert a freshly decoded key, evicting at most ONE oldest LRU entry.
     fn insert(&mut self, key: [u8; 32], h_ntt: [u16; 512]) {
         if self.explicit_pinned.contains_key(&key) || self.pinned.contains_key(&key) {
@@ -2244,6 +2295,7 @@ impl FalconPubkeyCache {
             },
         );
         self.order.push_back(key);
+        self.compact_orders();
     }
 
     /// Record a SUCCESSFUL verification and promote repeatedly-good keys to the
@@ -2262,6 +2314,7 @@ impl FalconPubkeyCache {
         let h_ntt = entry.h_ntt;
         self.lru.remove(key);
         self.pin(*key, h_ntt);
+        self.compact_orders();
     }
 
     /// Move a key into the auto-pinned tier. When the tier is full the OLDEST
@@ -2283,6 +2336,7 @@ impl FalconPubkeyCache {
             };
             self.pinned.remove(&oldest);
         }
+        self.compact_orders();
     }
 
     /// Explicitly pin a consensus validator key in the dedicated
@@ -2306,6 +2360,7 @@ impl FalconPubkeyCache {
             };
             self.pinned.remove(&oldest);
         }
+        self.compact_orders();
     }
 }
 
@@ -3902,5 +3957,56 @@ mod tests {
             assert_eq!(det.len(), FALCON512_SIG_LEN);
             assert!(verify_falcon512(kp.pubkey(), &msg, &det));
         }
+    }
+
+    #[test]
+    fn falcon_pubkey_cache_order_stays_bounded_after_promotion_cycles() {
+        let mut cache = FalconPubkeyCache::default();
+        // Keep one unpromoted key in `lru` so `lru` is non-empty throughout.
+        let anchor = [0xAAu8; 32];
+        cache.insert(anchor, [1u16; 512]);
+
+        for i in 0..2_500u64 {
+            let mut k = [0u8; 32];
+            k[0..8].copy_from_slice(&i.to_le_bytes());
+            k[8] = 0x5A;
+            cache.insert(k, [2u16; 512]);
+            for _ in 0..FALCON_PUBKEY_PIN_AFTER_SUCCESSES {
+                cache.note_verified(&k);
+            }
+            // Periodically re-pin explicitly and re-insert to churn all queues.
+            if i % 500 == 0 {
+                cache.pin_explicit(k, [3u16; 512]);
+            }
+        }
+
+        assert!(
+            cache.order.len() <= FALCON_PUBKEY_CACHE_CAP * 2,
+            "order deque grew unexpectedly: {}",
+            cache.order.len()
+        );
+        assert!(
+            cache.order.len() < 300,
+            "order deque should have compacted stale entries (len={})",
+            cache.order.len()
+        );
+        assert!(
+            cache.pinned_order.len() <= FALCON_PUBKEY_PINNED_CAP * 2,
+            "pinned_order deque grew unexpectedly: {}",
+            cache.pinned_order.len()
+        );
+        assert!(
+            cache.explicit_pinned_order.len() <= FALCON_PUBKEY_PINNED_CAP * 2,
+            "explicit_pinned_order deque grew unexpectedly: {}",
+            cache.explicit_pinned_order.len()
+        );
+    }
+
+    #[test]
+    fn falcon_keypair_from_bytes_rejects_overflowing_lengths() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 32]);
+        assert!(FalconKeypair::from_bytes(&buf).is_none());
     }
 }

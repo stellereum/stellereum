@@ -341,6 +341,25 @@ pub fn commit_parkable_during_apply(hc_height: u64, height: u64) -> bool {
     height == hc_height.saturating_add(1)
 }
 
+/// Gate-aware variant of [`commit_parkable_during_apply`]: at/above
+/// `EXECUTION_PIPELINE_V1` (`pipelined == true`), a commit at `hc_height`
+/// whose lag-2 committed post-state root is NOT yet available
+/// (`!can_validate_now`) is parkable for depth-2 replay, while a commit at
+/// `hc_height + 1` remains parkable across a height boundary. Below the gate
+/// (`pipelined == false`), byte-identical to [`commit_parkable_during_apply`].
+pub fn commit_parkable_during_apply_at(
+    hc_height: u64,
+    height: u64,
+    pipelined: bool,
+    can_validate_now: bool,
+) -> bool {
+    if pipelined {
+        (height == hc_height && !can_validate_now) || height == hc_height.saturating_add(1)
+    } else {
+        commit_parkable_during_apply(hc_height, height)
+    }
+}
+
 /// Whether a catch-up pass that returned `Some` must keep the reactive latch
 /// armed for the next tick.
 ///
@@ -891,31 +910,102 @@ pub(crate) fn parse_devnet_seed(raw: &str) -> anyhow::Result<Vec<u8>> {
     hex::decode(trimmed).map_err(|e| anyhow::anyhow!("invalid --seed hex value '{raw}': {e}"))
 }
 
+/// Resolve the base node data directory from `STELL_DATA_DIR`, defaulting to `./data`.
+#[allow(dead_code)] // GATE: shared across bin and policy-including integration tests.
+pub(crate) fn data_dir_from_env() -> std::path::PathBuf {
+    data_dir_from_opt(std::env::var("STELL_DATA_DIR").ok().as_deref())
+}
+
+pub(crate) fn data_dir_from_opt(raw: Option<&str>) -> std::path::PathBuf {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => std::path::PathBuf::from(p),
+        None => std::path::PathBuf::from("./data"),
+    }
+}
+
+/// Exclusive non-blocking advisory lock guard for a node data directory
+/// (`<data_dir>/.node.lock`). Released automatically on drop.
+#[derive(Debug)]
+#[allow(dead_code)] // GATE: held by node/bootstrap.rs::run_node and tested in integration suites.
+pub(crate) struct NodeDirLock {
+    file: std::fs::File,
+}
+
+impl Drop for NodeDirLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+/// Acquire an exclusive non-blocking `flock` (`LOCK_EX | LOCK_NB`) on
+/// `<data_dir>/.node.lock` BEFORE opening sled or the consensus safety store.
+///
+/// Fails loudly with a clear error message if another instance already holds
+/// the lock; releases on drop.
+#[allow(dead_code)] // GATE: called by node/bootstrap.rs::run_node and tested in integration suites.
+pub(crate) fn acquire_node_dir_lock(data_dir: &std::path::Path) -> anyhow::Result<NodeDirLock> {
+    std::fs::create_dir_all(data_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot create data directory {} for node lock: {e}",
+            data_dir.display()
+        )
+    })?;
+    let lock_path = data_dir.join(".node.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| anyhow::anyhow!("cannot open node lock file {}: {e}", lock_path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(NodeDirLock { file }),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            anyhow::bail!(
+                "another stellereum node instance already holds exclusive lock on {} \
+                 (refusing to open sled/safety store concurrently)",
+                lock_path.display()
+            );
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            anyhow::bail!(
+                "failed to acquire exclusive lock on {}: {e}",
+                lock_path.display()
+            );
+        }
+    }
+}
+
 /// On-disk mempool file for one shard.
 ///
-/// Single-shard nodes keep the historical `./data/mempool.bin` (so existing
-/// deployments and tests are byte-identical). A multi-shard process gives each
-/// shard its own file, or the pools of two shards would clobber each other on
-/// every save/restore.
+/// Single-shard nodes keep `<data_dir>/mempool.bin` (default `./data/mempool.bin`,
+/// so existing deployments and tests are byte-identical). A multi-shard process
+/// gives each shard its own file, or the pools of two shards would clobber each
+/// other on every save/restore.
+#[allow(dead_code)] // GATE: called by node/bootstrap.rs and tested in integration suites.
 pub(crate) fn mempool_path_for_shard(shard: u32, sharded: bool) -> std::path::PathBuf {
+    let base = data_dir_from_env();
     if sharded {
-        std::path::PathBuf::from(format!("./data/mempool-shard{shard}.bin"))
+        base.join(format!("mempool-shard{shard}.bin"))
     } else {
-        std::path::PathBuf::from("./data/mempool.bin")
+        base.join("mempool.bin")
     }
 }
 
 /// On-disk block/state store directory for one shard.
 ///
-/// Single-shard nodes (and the masterchain of a multi-shard process) keep the
-/// historical `./data/store`; every workchain gets its own `./data/store-shardN`.
-/// Sharing one directory would let the finalized height, consensus safety record
-/// and genesis fingerprint of one shard overwrite the other's.
+/// Single-shard nodes (and the masterchain of a multi-shard process) keep
+/// `<data_dir>/store` (default `./data/store`); every workchain gets its own
+/// `<data_dir>/store-shardN`. Sharing one directory would let the finalized
+/// height, consensus safety record and genesis fingerprint of one shard
+/// overwrite the other's.
+#[allow(dead_code)] // GATE: called by node/bootstrap.rs and tested in integration suites.
 pub(crate) fn store_path_for_shard(shard: u32, sharded: bool) -> std::path::PathBuf {
+    let base = data_dir_from_env();
     if sharded && shard != stellereum::sharding::MASTERCHAIN_SHARD {
-        std::path::PathBuf::from("./data").join(format!("store-shard{shard}"))
+        base.join(format!("store-shard{shard}"))
     } else {
-        std::path::PathBuf::from("./data").join("store")
+        base.join("store")
     }
 }
 
@@ -1113,10 +1203,19 @@ pub(crate) const TICK_MS: u64 = 50;
 /// Honest 2-node traffic is tens/tick; a flood of max-size batches would
 /// otherwise stretch verification past the round timeout and break the clock.
 pub(crate) const MAX_INBOUND_PER_TICK: u32 = 512;
+/// Max tx-gossip / MEV envelopes drained from `tx_rx` per consensus tick so
+/// bursts cannot starve consensus votes or view-change timers.
+pub(crate) const MAX_TX_RX_PER_TICK: usize = 256;
+/// Minimum interval between overlay mempool KV polls (`fetch_mempool_transactions`),
+/// avoiding an O(mempool) KV scan on every 50ms tick.
+pub(crate) const MEMPOOL_KV_POLL_INTERVAL_MS: u64 = 2_000;
 /// Cap on parked over-budget Batch envelopes (audit-network F1): deferral is
 /// scheduling, not parking — beyond this the oldest is handled inline (loudly
 /// counted) rather than growing memory without bound. Never dropped either way.
 pub(crate) const INBOUND_DEFERRED_CAP: usize = 1024;
+/// Slots reserved inside [`INBOUND_DEFERRED_CAP`] for H+1 consensus Proposals
+/// and Votes so over-budget bulk spam cannot crowd them out.
+pub(crate) const INBOUND_DEFERRED_H1_RESERVE: usize = 128;
 /// Rate-limit state for the tick-side flush ENQUEUE sub-timing WARN. The
 /// transport cost itself is now logged by the background sender as
 /// `flush_outbox`; this one proves the tick no longer waits for it.
@@ -1497,34 +1596,54 @@ pub(crate) fn spawn_tick_lane() -> TickLane {
     TickLane { tx }
 }
 
+/// RAII single-flight guard for an `Arc<AtomicBool>` latch.
+///
+/// Claimed via [`Self::try_acquire`] (`false -> true`) and unconditionally reset
+/// to `false` on [`Drop`] (normal return, early exit, panic unwind, or dropped
+/// async future), preventing a panicked worker from wedging the latch `true`.
+pub(crate) struct AtomicFlagResetGuard {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AtomicFlagResetGuard {
+    pub(crate) fn try_acquire(flag: Arc<std::sync::atomic::AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .ok()
+        .map(|_| Self { flag })
+    }
+}
+
+impl Drop for AtomicFlagResetGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Run `job` on the blocking pool, single-flight per `guard`.
 ///
-/// The guard is claimed BEFORE the job is spawned and released only after the
-/// job returns, so while one save (or prune) is in flight a second trigger is
-/// refused instead of overlapping it -- two threads writing the same file or
-/// scanning the same sled range was never possible while these ran inline on
-/// the tick, and must not become possible now that they are fire-and-forget.
+/// The guard is claimed BEFORE the job is spawned and released via an RAII
+/// [`AtomicFlagResetGuard`] when the job exits (including on panic), so while
+/// one save (or prune) is in flight a second trigger is refused instead of
+/// overlapping it -- two threads writing the same file or scanning the same
+/// sled range was never possible while these ran inline on the tick, and must
+/// not become possible now that they are fire-and-forget.
 /// Returns false when the job was refused; the caller drops that request (the
 /// in-flight one covers the same window).
 pub(crate) fn spawn_guarded_blocking<F>(guard: &Arc<std::sync::atomic::AtomicBool>, job: F) -> bool
 where
     F: FnOnce() + Send + 'static,
 {
-    if guard
-        .compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-        )
-        .is_err()
-    {
+    let Some(reset_guard) = AtomicFlagResetGuard::try_acquire(Arc::clone(guard)) else {
         return false;
-    }
-    let guard = Arc::clone(guard);
+    };
     tokio::task::spawn_blocking(move || {
+        let _reset_guard = reset_guard;
         job();
-        guard.store(false, std::sync::atomic::Ordering::SeqCst);
     });
     true
 }
@@ -1608,6 +1727,11 @@ pub(crate) fn xpc_activation_from_env() -> stellereum::xshard2pc::XpcActivation 
 /// restarted is still publishing its window), so the heal loop retries with
 /// backoff instead of exiting on the first miss.
 pub(crate) const HEAL_MAX_ATTEMPTS: u32 = 3;
+/// Hard outer wall-time bound on a single `heal_engine_to_head` attempt.
+pub(crate) const HEAL_ENGINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Maximum number of blocks retained in memory between the backward walk and
+/// forward replay in `heal_engine_to_head`.
+pub(crate) const HEAL_CACHE_CAP: usize = 2048;
 
 /// Fail-closed decision for the startup-heal loop (pure: unit-tested below).
 ///
@@ -1733,5 +1857,76 @@ mod faucet_policy_tests {
         assert_eq!(faucet_lifetime_cap_nano(), 50 * 1_000_000_000);
         std::env::set_var("STELL_FAUCET_LIFETIME_CAP_STELL", "120");
         assert_eq!(faucet_lifetime_cap_nano(), 120 * 1_000_000_000);
+    }
+}
+
+#[cfg(test)]
+mod raii_guard_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn atomic_flag_reset_guard_resets_on_drop_and_panic() {
+        let flag = Arc::new(AtomicBool::new(false));
+        {
+            let guard = AtomicFlagResetGuard::try_acquire(Arc::clone(&flag))
+                .expect("initial acquire must succeed");
+            assert!(flag.load(Ordering::Acquire));
+            assert!(
+                AtomicFlagResetGuard::try_acquire(Arc::clone(&flag)).is_none(),
+                "second concurrent acquire must be rejected"
+            );
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _held = guard;
+                panic!("simulated inner panic");
+            }));
+            assert!(panicked.is_err());
+        }
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "RAII guard must reset flag to false after panic unwind"
+        );
+        let reacquired = AtomicFlagResetGuard::try_acquire(Arc::clone(&flag));
+        assert!(
+            reacquired.is_some(),
+            "flag must be re-acquirable after panic"
+        );
+        drop(reacquired);
+        assert!(!flag.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn spawn_guarded_blocking_resets_guard_when_job_panics() {
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(spawn_guarded_blocking(&flag, || {
+            panic!("simulated blocking worker panic");
+        }));
+
+        // Wait up to 2s for the blocking pool thread to unwind and drop the guard.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while flag.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawn_guarded_blocking flag remained stuck true after inner panic"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_tx = Arc::clone(&completed);
+        assert!(
+            spawn_guarded_blocking(&flag, move || {
+                completed_tx.store(true, Ordering::Release);
+            }),
+            "guard must be re-acquirable after panicking blocking job"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !completed.load(Ordering::Acquire) || flag.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "follow-up guarded blocking job did not complete and release"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 }

@@ -1249,6 +1249,18 @@ impl InMemoryStateEngine {
                 if transition != XpcTransition::Created {
                     return false;
                 }
+                if crate::chain_spec::xshard_bounce_escrow_required_active_at(height) {
+                    let guard = self.cross_shard_xpc.read().await;
+                    if !crate::xshard2pc::target_prepare_slot_available(
+                        guard.values(),
+                        tx.source_shard,
+                        &tx.from,
+                        tx.nonce,
+                        &tx_hash,
+                    ) {
+                        return false;
+                    }
+                }
                 let rec = XpcRecord::prepared(tx.clone(), tx.source_shard, tx.target_shard, height);
                 self.write_xpc_record(&rec).await
             }

@@ -203,6 +203,10 @@ pub fn verify_transaction_envelope_at_height_with_activation(
 /// light clients -- inherits it without each remembering to check first.
 pub const MAX_COMMIT_CERT_SIGNERS: usize = 4_096;
 
+/// Maximum wire size (in bytes) accepted when decoding a PQ micro/epoch
+/// certificate envelope.
+pub const MAX_MICRO_CERT_WIRE_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Maximum entries a block may carry in its proposer-signature evidence list
 /// (C1-F5).
 ///
@@ -687,6 +691,9 @@ pub fn decode_pq_micro_envelope(payload: &[u8]) -> Option<PqMicroCertificate> {
     if payload.len() < 16 || &payload[..16] != QC_UQC_MAGIC {
         return None;
     }
+    if (payload.len() as u64) > MAX_MICRO_CERT_WIRE_BYTES {
+        return None;
+    }
 
     if payload.len() >= MIN_HEADER {
         let mut sortition_parent = [0u8; 32];
@@ -697,53 +704,64 @@ pub fn decode_pq_micro_envelope(payload: &[u8]) -> Option<PqMicroCertificate> {
             let committee_size = u32::from_le_bytes(payload[61..65].try_into().ok()?);
             let bitmask_len = u32::from_le_bytes(payload[65..69].try_into().ok()?) as usize;
 
-            let mut cursor = 69;
-            if payload.len() >= cursor + bitmask_len + 4 {
-                let signers_bitmask = payload[cursor..cursor + bitmask_len].to_vec();
-                cursor += bitmask_len;
-
+            let cursor = 69usize;
+            if let Some((sig_count_start, sig_count_end)) = cursor
+                .checked_add(bitmask_len)
+                .and_then(|s| s.checked_add(4).map(|e| (s, e)))
+                .filter(|&(_, e)| payload.len() >= e)
+            {
+                let signers_bitmask = payload[cursor..sig_count_start].to_vec();
                 let sig_count =
-                    u32::from_le_bytes(payload[cursor..cursor + 4].try_into().ok()?) as usize;
-                cursor += 4;
+                    u32::from_le_bytes(payload[sig_count_start..sig_count_end].try_into().ok()?)
+                        as usize;
+                if sig_count > MAX_COMMIT_CERT_SIGNERS {
+                    return None;
+                }
 
-                if sig_count <= MAX_COMMIT_CERT_SIGNERS {
-                    let mut signatures = Vec::with_capacity(sig_count);
-                    let mut valid = true;
+                let mut cursor = sig_count_end;
+                let max_possible_sigs = (payload.len() - cursor) / 4;
+                let mut signatures = Vec::with_capacity(sig_count.min(max_possible_sigs));
+                let mut valid = true;
 
-                    for _ in 0..sig_count {
-                        if cursor + 4 > payload.len() {
-                            valid = false;
-                            break;
-                        }
-                        let sig_len =
-                            u32::from_le_bytes(payload[cursor..cursor + 4].try_into().ok()?)
-                                as usize;
-                        cursor += 4;
-                        if cursor + sig_len > payload.len() {
-                            valid = false;
-                            break;
-                        }
-                        signatures.push(payload[cursor..cursor + sig_len].to_vec());
-                        cursor += sig_len;
+                for _ in 0..sig_count {
+                    let Some(len_end) = cursor.checked_add(4) else {
+                        valid = false;
+                        break;
+                    };
+                    if len_end > payload.len() {
+                        valid = false;
+                        break;
                     }
-
-                    if valid && cursor == payload.len() {
-                        return Some(PqMicroCertificate {
-                            scheme,
-                            height,
-                            round,
-                            committee_size,
-                            sortition_parent,
-                            signers_bitmask,
-                            signatures,
-                        });
+                    let sig_len =
+                        u32::from_le_bytes(payload[cursor..len_end].try_into().ok()?) as usize;
+                    let Some(sig_end) = len_end.checked_add(sig_len) else {
+                        valid = false;
+                        break;
+                    };
+                    if sig_end > payload.len() {
+                        valid = false;
+                        break;
                     }
+                    signatures.push(payload[len_end..sig_end].to_vec());
+                    cursor = sig_end;
+                }
+
+                if valid && cursor == payload.len() {
+                    return Some(PqMicroCertificate {
+                        scheme,
+                        height,
+                        round,
+                        committee_size,
+                        sortition_parent,
+                        signers_bitmask,
+                        signatures,
+                    });
                 }
             }
         }
     }
 
-    // Fallback: bincode deserialization after QC_UQC_MAGIC prefix.
+    // Fallback: bounded bincode deserialization after QC_UQC_MAGIC prefix.
     //
     // Audit-consensus F9 (assessed 2026-10-14, KEPT deliberately): accepting
     // non-canonical encodings here is safe because `verify_micro_cert`
@@ -753,7 +771,14 @@ pub fn decode_pq_micro_envelope(payload: &[u8]) -> Option<PqMicroCertificate> {
     // never VERIFY unless it names a real quorum of valid signatures, and
     // removing the fallback would only risk rejecting historic certificates
     // for zero safety gain. Pinned by test (`decode_rejects_malformed...`).
-    bincode::deserialize::<PqMicroCertificate>(&payload[16..]).ok()
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(MAX_MICRO_CERT_WIRE_BYTES)
+        .deserialize::<PqMicroCertificate>(&payload[16..])
+        .ok()
+        .filter(|cert| cert.signatures.len() <= MAX_COMMIT_CERT_SIGNERS)
 }
 
 /// Encode a full epoch post-quantum certificate (CEC).
@@ -796,6 +821,11 @@ pub struct ValidatorSet {
     #[serde(skip)]
     fingerprint: std::sync::OnceLock<[u8; 32]>,
 }
+
+/// Domain separator for unbiased rejection-sampling proposer selection
+/// (`W6-A7-7`, active at/above
+/// [`crate::chain_spec::SORTITION_UNBIASED_ACTIVATION_HEIGHT`]).
+pub const PROPOSER_UNBIASED_DOMAIN: &str = "STELL_PROPOSER_UNBIASED_V1";
 
 impl ValidatorSet {
     pub fn new() -> Self {
@@ -1038,7 +1068,7 @@ impl ValidatorSet {
     }
 
     /// Map a 32-byte digest into the normalized `total / gcd` cumulative power
-    /// slot over explicitly sorted validator IDs.
+    /// slot over explicitly sorted validator IDs (legacy modulo path).
     fn proposer_from_digest(&self, digest: &[u8; 32]) -> Option<ValidatorId> {
         let total = self.total_power();
         if total == 0 {
@@ -1082,6 +1112,53 @@ impl ValidatorSet {
         self.validators.keys().next().copied()
     }
 
+    /// Height-gated variant of [`Self::proposer_from_digest`] (`W6-A7-7`).
+    ///
+    /// Below [`crate::chain_spec::SORTITION_UNBIASED_ACTIVATION_HEIGHT`],
+    /// delegates directly to the legacy `digest[..8] % range` path.
+    /// At/above activation, draws `slot` over `[0, total / gcd)` via exact
+    /// 64-bit rejection sampling using
+    /// `BLAKE3("STELL_PROPOSER_UNBIASED_V1", digest, attempt)`.
+    pub fn proposer_from_digest_at(
+        &self,
+        digest: &[u8; 32],
+        height: Height,
+    ) -> Option<ValidatorId> {
+        if !crate::chain_spec::sortition_unbiased_active_at(height) {
+            return self.proposer_from_digest(digest);
+        }
+        let total = self.total_power();
+        if total == 0 {
+            return None;
+        }
+        fn gcd(mut a: u64, mut b: u64) -> u64 {
+            while b != 0 {
+                let t = b;
+                b = a % b;
+                a = t;
+            }
+            a
+        }
+        let g = self.validators.values().fold(0u64, |acc, &p| gcd(acc, p));
+        let g = if g == 0 { 1 } else { g };
+        let range = total / g;
+        if range == 0 {
+            return self.validators.keys().next().copied();
+        }
+        let slot =
+            super::sortition::rejection_sample_u64(PROPOSER_UNBIASED_DOMAIN, digest, None, range);
+        let mut ids: Vec<(&ValidatorId, &u64)> = self.validators.iter().collect();
+        ids.sort_unstable();
+        let mut acc = 0u64;
+        for (id, power) in ids {
+            acc = acc.saturating_add(*power / g);
+            if slot < acc {
+                return Some(*id);
+            }
+        }
+        self.validators.keys().next().copied()
+    }
+
     /// Deterministic proposer selection: weighted round-robin over sorted validators.
     /// `slot = height + round` maps into the cumulative power table, NORMALIZED
     /// by the GCD of all powers. Without normalization, large equal powers
@@ -1112,7 +1189,7 @@ impl ValidatorSet {
         hasher.update(&height.to_le_bytes());
         hasher.update(&round.to_le_bytes());
         let digest = hasher.finalize();
-        self.proposer_from_digest(digest.as_bytes())
+        self.proposer_from_digest_at(digest.as_bytes(), height)
     }
 
     /// Beacon-seeded proposer selection (CN-VRF v3):
@@ -1162,7 +1239,7 @@ impl ValidatorSet {
             return None;
         }
         let seed = cnvrf_v3_proposer_seed(&beacon.output, beacon.epoch, height, round);
-        self.proposer_from_digest(&seed)
+        self.proposer_from_digest_at(&seed, height)
     }
 
     #[cfg(test)]
@@ -1826,12 +1903,20 @@ impl VerifiedVoteCache {
     }
 
     fn insert(&mut self, key: VerifiedVoteCacheKey, verdict: bool) {
+        let bucket = self.bucket_of(&key);
+        if let Some((_, existing_verdict)) = self
+            .buckets
+            .get_mut(&bucket)
+            .and_then(|entries| entries.iter_mut().find(|(k, _)| *k == key))
+        {
+            *existing_verdict = verdict;
+            return;
+        }
         if self.len >= VERIFIED_VOTE_CACHE_CAP {
             // Fail-safe bound: drop everything and re-record (miss = full
             // verify). Verdicts are recomputed, never approximated.
             self.clear();
         }
-        let bucket = self.bucket_of(&key);
         self.buckets.entry(bucket).or_default().push((key, verdict));
         self.len += 1;
     }
@@ -3619,5 +3704,77 @@ mod audit_tests {
         assert!(forged_qc
             .verify_and_signers_with_schedule(&vs, schedule)
             .is_none());
+    }
+
+    #[test]
+    fn decode_pq_micro_envelope_rejects_oversized_sig_count_before_bincode() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(QC_UQC_MAGIC);
+        payload.extend_from_slice(&[0x11u8; 32]); // sortition_parent
+        payload.push(crate::post_quantum::PqScheme::Falcon512.id());
+        payload.extend_from_slice(&10u64.to_le_bytes()); // height
+        payload.extend_from_slice(&0u32.to_le_bytes()); // round
+        payload.extend_from_slice(&4u32.to_le_bytes()); // committee_size
+        payload.extend_from_slice(&0u32.to_le_bytes()); // bitmask_len = 0
+        payload.extend_from_slice(&((MAX_COMMIT_CERT_SIGNERS as u32) + 1).to_le_bytes()); // oversized sig_count
+
+        assert!(
+            decode_pq_micro_envelope(&payload).is_none(),
+            "oversized sig_count must be rejected immediately"
+        );
+
+        // Also ensure cursor arithmetic overflow on bitmask_len fails cleanly.
+        let mut overflow_payload = Vec::new();
+        overflow_payload.extend_from_slice(QC_UQC_MAGIC);
+        overflow_payload.extend_from_slice(&[0x22u8; 32]);
+        overflow_payload.push(crate::post_quantum::PqScheme::Falcon512.id());
+        overflow_payload.extend_from_slice(&10u64.to_le_bytes());
+        overflow_payload.extend_from_slice(&0u32.to_le_bytes());
+        overflow_payload.extend_from_slice(&4u32.to_le_bytes());
+        overflow_payload.extend_from_slice(&u32::MAX.to_le_bytes()); // overflowing bitmask_len
+        overflow_payload.extend_from_slice(&0u32.to_le_bytes());
+        assert!(decode_pq_micro_envelope(&overflow_payload).is_none());
+    }
+
+    #[test]
+    fn verified_vote_cache_insert_deduplicates_concurrent_inserts() {
+        let mut cache = VerifiedVoteCache::default();
+        let key = VerifiedVoteCacheKey {
+            voter: [0x55u8; 32],
+            height: 42,
+            round: 1,
+            kind: 1,
+            block_hash: Some([0x77u8; 32]),
+            shard_id: MASTERCHAIN_SHARD,
+            signature: vec![1, 2, 3, 4],
+            pq_key: Some((2, vec![5, 6, 7])),
+            pure_pq: true,
+            chain_id: 1,
+        };
+        let probe = VerifiedVoteCacheProbe {
+            voter: key.voter,
+            height: key.height,
+            round: key.round,
+            kind: key.kind,
+            block_hash: key.block_hash,
+            shard_id: key.shard_id,
+            signature: &key.signature,
+            pq_key: key.pq_key.as_ref().map(|(s, k)| (*s, k.as_slice())),
+            pure_pq: key.pure_pq,
+            chain_id: key.chain_id,
+        };
+
+        cache.insert(key.clone(), true);
+        cache.insert(key.clone(), true);
+        assert_eq!(cache.len(), 1, "duplicate insert must not increment len");
+        let bucket = cache.bucket_of(&key);
+        assert_eq!(cache.buckets.get(&bucket).map(Vec::len), Some(1));
+        assert_eq!(cache.get(&probe), Some(true));
+
+        // Re-inserting same key with updated verdict updates in place.
+        cache.insert(key.clone(), false);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.buckets.get(&bucket).map(Vec::len), Some(1));
+        assert_eq!(cache.get(&probe), Some(false));
     }
 }

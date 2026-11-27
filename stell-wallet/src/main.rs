@@ -38,9 +38,10 @@ struct Cli {
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
 
-    /// JSON-RPC endpoint of a Stellereum node (e.g. https://rpc.stellereum.org).
-    /// When set (or default), the wallet talks to the CHAIN (balances/proofs from the
-    /// node, receipts polled to finality). Defaults to STELL_RPC_URL or https://rpc.stellereum.org.
+    /// JSON-RPC endpoint of a Stellereum node (e.g. http://127.0.0.1:8545).
+    /// When set, the wallet talks to the CHAIN (balances/proofs from the
+    /// node, receipts polled to finality). Defaults to STELL_RPC_URL if set,
+    /// otherwise runs in Local simulation mode.
     #[arg(long, global = true)]
     rpc_url: Option<String>,
 
@@ -526,7 +527,7 @@ enum Commands {
     #[command(alias = "orderbook")]
     Book {
         /// Trading pair ID (1 = STELL/USDT, 2 = STELL/TON)
-        #[arg(short, long, default_value_t = 0)]
+        #[arg(short, long, default_value_t = 1)]
         pair: u32,
     },
     /// Quick limit/market buy on CLOB Orderbook
@@ -536,7 +537,7 @@ enum Commands {
         /// Price in USD (e.g. 0.25; exact decimal)
         price: String,
         /// Pair ID (1 = STELL/USDT, 2 = STELL/TON)
-        #[arg(short, long, default_value_t = 0)]
+        #[arg(short, long, default_value_t = 1)]
         pair: u32,
         /// Password (prompted securely if omitted)
         #[arg(short, long)]
@@ -549,7 +550,7 @@ enum Commands {
         /// Price in USD (e.g. 0.25; exact decimal)
         price: String,
         /// Pair ID (1 = STELL/USDT, 2 = STELL/TON)
-        #[arg(short, long, default_value_t = 0)]
+        #[arg(short, long, default_value_t = 1)]
         pair: u32,
         /// Password (prompted securely if omitted)
         #[arg(short, long)]
@@ -560,7 +561,7 @@ enum Commands {
         /// Order ID to cancel
         order_id: u64,
         /// Pair ID
-        #[arg(short, long, default_value_t = 0)]
+        #[arg(short, long, default_value_t = 1)]
         pair: u32,
     },
     /// Exchange external assets for STELL in Genesis Vault ($0.25 fixed rate)
@@ -792,7 +793,7 @@ enum AaCommands {
         #[arg(short, long)]
         password: Option<String>,
     },
-    /// Revoke a session key in 1 click
+    /// Account Object session revocation (currently unavailable)
     #[command(name = "revoke-session")]
     RevokeSession {
         /// Account Object address or ID
@@ -872,31 +873,23 @@ enum TradeCommands {
     },
 }
 
-/// Derive the PQ signing keypair and address for a PQ keystore (`falcon512` / `hybrid`).
-/// Refuses `mldsa44` (unsupported by the node) and classical `ed25519` (rejected on Pure-PQ).
+/// Derive the consensus signing identity without reinterpreting a legacy keystore.
 fn pq_keypair_for_keystore(
     keystore: &HardenedKeystore,
     secret: &[u8; 32],
     op: &str,
 ) -> anyhow::Result<(pq::PqKeyPair, [u8; 32])> {
-    if keystore.scheme == "mldsa44" {
+    if keystore.scheme != "falcon512" {
         anyhow::bail!(
-            "PQ wallet (scheme 'mldsa44'): '{}' is not supported (ML-DSA-44 is refused by the node). Use a falcon512 or hybrid wallet.",
-            op
+            "Unsupported wallet scheme '{}' for '{}': FULL-PQ consensus signing requires falcon512; the keystore was not converted",
+            keystore.scheme, op
         );
     }
-    if keystore.scheme == "ed25519" {
-        anyhow::bail!(
-            "Classical ed25519 wallet: '{}' requires a post-quantum wallet (Pure-PQ network refuses Ed25519). Generate or migrate to a falcon512 wallet.",
-            op
-        );
-    }
-    let pq_scheme = match keystore.scheme.as_str() {
-        "hybrid" => pq::PqScheme::Hybrid,
-        _ => pq::PqScheme::Falcon512,
-    };
-    let kp = pq::PqKeyPair::from_seed(pq_scheme, secret);
+    let kp = pq::PqKeyPair::from_seed(pq::PqScheme::Falcon512, secret);
     let addr = kp.derive_address(&pq::DEFAULT_SALT);
+    if parse_hex32(&keystore.address_hex, "wallet address")? != addr {
+        anyhow::bail!("wallet address does not match its Falcon-512 signing key");
+    }
     Ok((kp, addr))
 }
 
@@ -941,40 +934,45 @@ fn check_password_strength(pass: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn read_secret() -> anyhow::Result<String> {
+fn read_secret() -> anyhow::Result<zeroize::Zeroizing<String>> {
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
-        Ok(rpassword::read_password()?)
+        Ok(zeroize::Zeroizing::new(rpassword::read_password()?))
     } else {
-        let mut line = String::new();
+        let mut line = zeroize::Zeroizing::new(String::new());
         std::io::stdin().read_line(&mut line)?;
-        Ok(line.trim_end_matches(&['\r', '\n'][..]).to_string())
+        let trimmed_len = line.trim_end_matches(&['\r', '\n'][..]).len();
+        line.truncate(trimmed_len);
+        Ok(line)
     }
 }
 
-fn prompt_password_safely(given: Option<String>, prompt: &str) -> anyhow::Result<String> {
+fn prompt_password_safely(
+    given: Option<String>,
+    prompt: &str,
+) -> anyhow::Result<zeroize::Zeroizing<String>> {
     if let Some(p) = given {
         eprintln!(
             "{}",
             "warning: secret passed on the command line leaks via shell history and `ps`; prefer the interactive prompt".yellow()
         );
-        return Ok(p);
+        return Ok(zeroize::Zeroizing::new(p));
     }
     eprint!("{}: ", prompt);
     io::stderr().flush()?;
-    let pass = read_secret()?;
-    Ok(pass)
+    read_secret()
 }
 
 fn prompt_password_with_confirmation(
     given: Option<String>,
     prompt: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<zeroize::Zeroizing<String>> {
     if let Some(p) = given {
         eprintln!(
             "{}",
             "warning: secret passed on the command line leaks via shell history and `ps`; prefer the interactive prompt".yellow()
         );
+        let p = zeroize::Zeroizing::new(p);
         check_password_strength(&p)?;
         return Ok(p);
     }
@@ -989,7 +987,7 @@ fn prompt_password_with_confirmation(
         eprint!("Confirm password: ");
         io::stderr().flush()?;
         let p2 = read_secret()?;
-        if p1 != p2 {
+        if *p1 != *p2 {
             eprintln!("{}", "❌ Passwords do not match! Please try again.\n".red());
             continue;
         }
@@ -1079,19 +1077,13 @@ pub fn parse_hex16(hex_str: &str, what: &str) -> anyhow::Result<[u8; 16]> {
 /// Resolve the chain id for WALLET SIGNATURE STANDARD signing/verification.
 ///
 /// An explicit `--chain-id N` (non-zero) always wins. `0` (the default) asks
-/// the connected node (`stell_chainId`) and falls back to this deployment's
-/// default when offline — the same rule the `session` command uses, so the
-/// wallet and the node never disagree about which chain a signature is for
-/// when they can talk, and signing still works offline.
-fn resolve_sign_chain_id(flag: u64, client: &LightClient) -> u64 {
+/// the connected node (`stell_chainId`) or the local-mode default.
+/// RPC lookup failures must never silently change the signing chain.
+fn resolve_sign_chain_id(flag: u64, client: &LightClient) -> anyhow::Result<u64> {
     if flag != 0 {
-        return flag;
+        return Ok(flag);
     }
-    let live = client.chain_id();
-    if live != 0 {
-        return live;
-    }
-    stellereum::zkml::DEFAULT_CHAIN_ID
+    client.try_chain_id()
 }
 
 pub fn parse_hex32(hex_str: &str, what: &str) -> anyhow::Result<[u8; 32]> {
@@ -1182,6 +1174,9 @@ async fn execute_command(
             password,
             scheme,
         } => {
+            if scheme != pq::WalletScheme::Falcon512 {
+                anyhow::bail!("wallet creation requires Falcon-512; legacy schemes are read-only");
+            }
             println!(
                 "{}",
                 "╔═══════════════════════════════════════════════════════════════╗".cyan()
@@ -1204,8 +1199,15 @@ async fn execute_command(
             )?;
             check_password_strength(&pass)?;
 
-            let (phrase, seed) = Mnemonic::generate();
-            let sec_secret = SecureSecret::new(seed);
+            let (phrase, seed) = {
+                let (phrase_raw, seed_raw) = Mnemonic::generate();
+                (
+                    zeroize::Zeroizing::new(phrase_raw),
+                    zeroize::Zeroizing::new(seed_raw),
+                )
+            };
+            let sec_secret = SecureSecret::new(*seed);
+            drop(seed);
 
             let (address_hex, pubkey_hex_opt) = match scheme {
                 pq::WalletScheme::Falcon512 => {
@@ -1325,6 +1327,13 @@ async fn execute_command(
             password,
             scheme,
         } => {
+            if scheme != pq::WalletScheme::Falcon512 {
+                anyhow::bail!(
+                    "wallet restoration requires Falcon-512; legacy schemes are read-only"
+                );
+            }
+            let phrase = phrase.map(zeroize::Zeroizing::new);
+            let key = key.map(zeroize::Zeroizing::new);
             // argv-leak warning covers --phrase/--key too (audit follow-up:
             // more sensitive than --password, warned nowhere).
             if phrase.is_some() || key.is_some() {
@@ -1337,25 +1346,28 @@ async fn execute_command(
             let pass = prompt_password_safely(password, "Enter password for restored vault")?;
             check_password_strength(&pass)?;
 
-            let seed = if let Some(p) = phrase {
+            let seed = zeroize::Zeroizing::new(if let Some(p) = phrase {
                 Mnemonic::from_phrase(&p).map_err(|e| anyhow::anyhow!("{e}"))?
             } else if let Some(k) = key {
-                let bytes = hex::decode(&k).map_err(|e| anyhow::anyhow!("Invalid hex: {e}"))?;
+                let bytes = zeroize::Zeroizing::new(
+                    hex::decode(&*k).map_err(|e| anyhow::anyhow!("Invalid hex: {e}"))?,
+                );
                 if bytes.len() != 32 {
                     anyhow::bail!("Private key must be 32 bytes (64 hex characters)");
                 }
-                let mut arr = [0u8; 32];
+                let mut arr = zeroize::Zeroizing::new([0u8; 32]);
                 arr.copy_from_slice(&bytes);
-                arr
+                *arr
             } else {
                 eprint!("Enter 24-word recovery phrase: ");
                 io::stdout().flush()?;
-                let mut line = String::new();
+                let mut line = zeroize::Zeroizing::new(String::new());
                 io::stdin().read_line(&mut line)?;
                 Mnemonic::from_phrase(&line).map_err(|e| anyhow::anyhow!("{e}"))?
-            };
+            });
 
-            let sec_secret = SecureSecret::new(seed);
+            let sec_secret = SecureSecret::new(*seed);
+            drop(seed);
             let (address_hex, pubkey_hex_opt) = match scheme {
                 pq::WalletScheme::Falcon512 => {
                     let keypair =
@@ -1691,6 +1703,8 @@ async fn execute_command(
             let sec_secret = keystore
                 .decrypt(&pass)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (keypair, from_addr) =
+                pq_keypair_for_keystore(&keystore, &sec_secret.bytes, "stake")?;
             let nano = parse_stell_to_nano(&amount).map_err(|e| anyhow::anyhow!("{e}"))?;
             // Post-quantum keystores must submit a PQ1 envelope: classical
             // signatures are rejected on Pure-PQ networks. Classical keystores
@@ -1700,7 +1714,7 @@ async fn execute_command(
                 || keystore.scheme == "mldsa44";
             // A14: bound by default; the legacy flag recovers the old
             // replayable bytes with a loud warning (see `unbound_legacy_*`).
-            let chain_id = client.chain_id();
+            let chain_id = client.try_chain_id()?;
             if unbound_legacy {
                 eprintln!(
                     "{}",
@@ -1708,15 +1722,6 @@ async fn execute_command(
                 );
             }
             let res = if is_pq_store {
-                if keystore.scheme == "mldsa44" {
-                    anyhow::bail!("PQ wallet (scheme 'mldsa44'): 'stake' is not supported for ML-DSA-44 wallets yet (address derivation differs). Use a falcon512 or hybrid wallet.");
-                }
-                let pq_scheme = match keystore.scheme.as_str() {
-                    "hybrid" => pq::PqScheme::Hybrid,
-                    _ => pq::PqScheme::Falcon512,
-                };
-                let keypair = pq::PqKeyPair::from_seed(pq_scheme, &sec_secret.bytes);
-                let from_addr = keypair.derive_address(&pq::DEFAULT_SALT);
                 let val = match validator {
                     Some(v) => parse_hex32(&v, "validator key")?,
                     None => from_addr,
@@ -1745,6 +1750,7 @@ async fn execute_command(
                         is_activation,
                         payload,
                     )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
                 } else {
                     client::LightClient::build_pq_payload_tx_bound(
                         &keypair,
@@ -1758,6 +1764,7 @@ async fn execute_command(
                         payload,
                         chain_id,
                     )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
                 };
                 let val_hex = hex::encode(val);
                 let res = client
@@ -1855,8 +1862,9 @@ async fn execute_command(
                     validator: val,
                     amount: nano,
                 }],
-                client.chain_id(),
-            );
+                client.try_chain_id()?,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             let (tx_hash, finality) = client
                 .broadcast_tx(&tx)
                 .await
@@ -1897,7 +1905,9 @@ async fn execute_command(
                 .nonce_of(&from_addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let tx = LightClient::build_pq_delegate_tx(&kp, val, nano, nonce, client.chain_id());
+            let tx =
+                LightClient::build_pq_delegate_tx(&kp, val, nano, nonce, client.try_chain_id()?)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
             let (tx_hash, finality) = client
                 .broadcast_tx(&tx)
                 .await
@@ -1938,8 +1948,14 @@ async fn execute_command(
                 .nonce_of(&from_addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let tx =
-                LightClient::build_pq_begin_unbond_tx(&kp, val, nano, nonce, client.chain_id());
+            let tx = LightClient::build_pq_begin_unbond_tx(
+                &kp,
+                val,
+                nano,
+                nonce,
+                client.try_chain_id()?,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             let (tx_hash, finality) = client
                 .broadcast_tx(&tx)
                 .await
@@ -1978,7 +1994,9 @@ async fn execute_command(
                 .nonce_of(&from_addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let tx = LightClient::build_pq_withdraw_unbond_tx(&kp, val, nonce, client.chain_id());
+            let tx =
+                LightClient::build_pq_withdraw_unbond_tx(&kp, val, nonce, client.try_chain_id()?)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
             let (tx_hash, finality) = client
                 .broadcast_tx(&tx)
                 .await
@@ -2020,8 +2038,9 @@ async fn execute_command(
                 val,
                 is_delegator,
                 nonce,
-                client.chain_id(),
-            );
+                client.try_chain_id()?,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             let (tx_hash, finality) = client
                 .broadcast_tx(&tx)
                 .await
@@ -2074,8 +2093,9 @@ async fn execute_command(
                     old_validator: from_addr,
                     new_validator: new_val,
                 }],
-                client.chain_id(),
-            );
+                client.try_chain_id()?,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             let (tx_hash, finality) = client
                 .broadcast_tx(&tx)
                 .await
@@ -2117,13 +2137,12 @@ async fn execute_command(
                 .decrypt(&pass)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            let to_bytes = hex::decode(&to)
-                .map_err(|e| anyhow::anyhow!("Invalid recipient address hex: {e}"))?;
-            if to_bytes.len() != 32 {
-                anyhow::bail!("Recipient address must be 32 bytes (64 hex characters)");
+            if scheme != pq::WalletScheme::Falcon512 {
+                anyhow::bail!("pay requires the Falcon-512 scheme; no fallback is allowed");
             }
-            let mut to_arr = [0u8; 32];
-            to_arr.copy_from_slice(&to_bytes);
+            let (keypair, from_addr) =
+                pq_keypair_for_keystore(&keystore, &sec_secret.bytes, "pay")?;
+            let to_arr = parse_hex32(&to, "Recipient address")?;
 
             let nano_amount = parse_stell_to_nano(&amount).map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -2140,21 +2159,11 @@ async fn execute_command(
             };
 
             if use_pq {
-                let effective_pq_scheme = match scheme {
-                    pq::WalletScheme::Falcon512 => pq::PqScheme::Falcon512,
-                    pq::WalletScheme::Hybrid => pq::PqScheme::Hybrid,
-                    pq::WalletScheme::Ed25519 => {
-                        if keystore.scheme == "hybrid" {
-                            pq::PqScheme::Hybrid
-                        } else {
-                            pq::PqScheme::Falcon512
-                        }
-                    }
-                };
-
-                let keypair = pq::PqKeyPair::from_seed(effective_pq_scheme, &sec_secret.bytes);
-                let from_addr = keypair.derive_address(&pq::DEFAULT_SALT);
-                let nonce = client.nonce_of(&from_addr).await.unwrap_or(0);
+                let effective_pq_scheme = pq::PqScheme::Falcon512;
+                let nonce = client
+                    .nonce_of(&from_addr)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 // Wallet policy: ALWAYS explicit carrier. Implicit envelopes
                 // omit the pubkey and only verify against pinned on-chain keys,
                 // which also breaks the wallet's local pre-broadcast self-check.
@@ -2178,7 +2187,7 @@ async fn execute_command(
                         "warning: --unbound-legacy builds a REPLAYABLE transaction (no chain id); the node meters unbound admission and will refuse it in a later phase".yellow()
                     );
                 }
-                let bound_chain_id = client.chain_id();
+                let bound_chain_id = client.try_chain_id()?;
                 let tx = if unbound_legacy {
                     LightClient::build_pq_transfer_tx_with_gas(
                         &keypair,
@@ -2190,6 +2199,7 @@ async fn execute_command(
                         dst_shard,
                         is_activation,
                     )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
                 } else {
                     LightClient::build_pq_transfer_tx_bound(
                         &keypair,
@@ -2202,6 +2212,7 @@ async fn execute_command(
                         is_activation,
                         bound_chain_id,
                     )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
                 };
                 let tx_hash = tx.compute_tx_hash();
 
@@ -2243,7 +2254,7 @@ async fn execute_command(
                     );
                     println!(
                         "• To:              {}",
-                        pq::format_address_with_visual_checksum(&to)
+                        pq::format_address_with_visual_checksum(&hex::encode(to_arr))
                     );
                     println!(
                         "• Amount:          {} STELL ({} nano)",
@@ -2311,7 +2322,7 @@ async fn execute_command(
                 );
                 println!(
                     "• To:           {}",
-                    format_address_with_visual_checksum(&to)
+                    format_address_with_visual_checksum(&hex::encode(to_arr))
                 );
                 println!(
                     "• Amount:       {} STELL ({} nano)",
@@ -2337,7 +2348,7 @@ async fn execute_command(
                 );
                 println!(
                     "• Micro-Gas:    {}",
-                    "280_000 nano-STELL (~$0.00007 USD)".cyan()
+                    format!("{} nano-STELL", tx.gas_limit).cyan()
                 );
                 println!(
                     "• Finality:     {}",
@@ -2383,7 +2394,7 @@ async fn execute_command(
                         nonce,
                         src_shard,
                         dst_shard,
-                        client.chain_id(),
+                        client.try_chain_id()?,
                     )
                 };
 
@@ -2402,7 +2413,7 @@ async fn execute_command(
                     );
                     println!(
                         "• To:              {}",
-                        format_address_with_visual_checksum(&to)
+                        format_address_with_visual_checksum(&hex::encode(to_arr))
                     );
                     println!(
                         "• Amount:          {} STELL ({} nano)",
@@ -2432,7 +2443,7 @@ async fn execute_command(
                 );
                 println!(
                     "• To:           {}",
-                    format_address_with_visual_checksum(&to)
+                    format_address_with_visual_checksum(&hex::encode(to_arr))
                 );
                 println!(
                     "• Amount:       {} STELL ({} nano)",
@@ -2445,7 +2456,7 @@ async fn execute_command(
                 );
                 println!(
                     "• Micro-Gas:    {}",
-                    "280_000 nano-STELL (~$0.00007 USD)".cyan()
+                    format!("{} nano-STELL", tx.gas_limit).cyan()
                 );
                 println!(
                     "• Finality:     {}",
@@ -2631,8 +2642,9 @@ async fn execute_command(
                 amount,
                 nonce,
                 shard,
-                client.chain_id(),
-            );
+                client.try_chain_id()?,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             let (tx_hash, finality) = client
                 .broadcast_tx(&tx)
                 .await
@@ -2655,7 +2667,7 @@ async fn execute_command(
             );
             println!(
                 "• Gas limit:  {} nano (chain charges gas_used, less than the limit)",
-                stellereum::svm::GAS_BASIC_TRANSFER
+                tx.gas_limit
             );
             println!("• Finality: {}", display_finality(client, &finality).bold());
             if !client.is_rpc() {
@@ -2693,8 +2705,9 @@ async fn execute_command(
                 amount,
                 nonce,
                 shard,
-                client.chain_id(),
-            );
+                client.try_chain_id()?,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             let (tx_hash, finality) = client
                 .broadcast_tx(&tx)
                 .await
@@ -2720,7 +2733,7 @@ async fn execute_command(
             );
             println!(
                 "• Gas limit:  {} nano (chain charges gas_used, less than the limit)",
-                stellereum::svm::GAS_BASIC_TRANSFER
+                tx.gas_limit
             );
             println!("• Finality: {}", display_finality(client, &finality).bold());
             if !client.is_rpc() {
@@ -2765,8 +2778,9 @@ async fn execute_command(
                 cap,
                 nonce,
                 shard,
-                client.chain_id(),
-            );
+                client.try_chain_id()?,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             let (tx_hash, finality) = client
                 .broadcast_tx(&tx)
                 .await
@@ -2784,7 +2798,7 @@ async fn execute_command(
             );
             println!(
                 "• Gas limit:  {} nano (chain charges gas_used, less than the limit)",
-                stellereum::svm::GAS_BASIC_TRANSFER
+                tx.gas_limit
             );
             println!("• Finality: {}", display_finality(client, &finality).bold());
             if client.is_rpc() {
@@ -2859,7 +2873,10 @@ async fn execute_command(
             }
             // Honor the global --timeout/--poll-interval (audit 2026-10-06:
             // the old hardcoded 5s/1s lied Unknown on a slow chain).
-            let cfg = client.rpc.as_ref().expect("RPC mode checked above");
+            let cfg = client
+                .rpc
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("RPC mode required"))?;
             let finality = rpc::poll_receipt(
                 cfg,
                 &tx_hash,
@@ -2938,7 +2955,7 @@ async fn execute_command(
             // explicit pin and silently overridden). Explicit pins are honored.
             let chain_id = if chain_id == 0 {
                 if client.is_rpc() {
-                    client.chain_id()
+                    client.try_chain_id()?
                 } else {
                     stellereum::zkml::DEFAULT_CHAIN_ID
                 }
@@ -2962,45 +2979,9 @@ async fn execute_command(
                         )
                         .map_err(|e| anyhow::anyhow!("{e}"))?
                 }
-                pq::PqScheme::Hybrid => {
-                    if session_bytes.len() != stellereum::post_quantum::FALCON512_PUBKEY_LEN {
-                        anyhow::bail!(
-                            "invalid Falcon-512 session public key: expected {} bytes, got {}",
-                            stellereum::post_quantum::FALCON512_PUBKEY_LEN,
-                            session_bytes.len()
-                        );
-                    }
-                    let mut ed_hasher =
-                        blake3::Hasher::new_derive_key("STELL_PQ_HYBRID_ED25519_V4");
-                    ed_hasher.update(&sec_secret.bytes);
-                    let ed_seed = zeroize::Zeroizing::new(*ed_hasher.finalize().as_bytes());
-                    let ed_sk = ed25519_dalek::SigningKey::from_bytes(&ed_seed);
-                    let mut f_hasher =
-                        blake3::Hasher::new_derive_key("STELL_PQ_HYBRID_FALCON512_V4");
-                    f_hasher.update(&sec_secret.bytes);
-                    let f_seed = zeroize::Zeroizing::new(*f_hasher.finalize().as_bytes());
-                    let falcon_kp =
-                        stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&f_seed);
-                    let valid_until = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                        + duration;
-                    stellereum::zkml::SessionKeyAuthorization::sign_delegation_hybrid(
-                        &ed_sk,
-                        &falcon_kp,
-                        stellereum::post_quantum::PqScheme::Falcon512,
-                        &session_bytes,
-                        valid_until,
-                        max_gas,
-                        scope,
-                        max_value,
-                        chain_id,
-                    )
-                }
                 other => {
                     anyhow::bail!(
-                        "session delegation requires a Falcon-512 or Hybrid wallet, got {:?}",
+                        "session delegation requires a Falcon-512 wallet, got {:?}",
                         other
                     );
                 }
@@ -3050,7 +3031,8 @@ async fn execute_command(
                     true,
                     vec![OpCode::SysCallPublishSessionGrant(Box::new(auth.clone()))],
                     chain_id,
-                );
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
                 let (tx_hash, finality) = client
                     .broadcast_tx(&ptx)
                     .await
@@ -3161,10 +3143,8 @@ async fn execute_command(
             println!("╔═══════════════════════════════════════════════════════════════╗");
             println!("║                     🔐 EXPORTED CREDENTIALS                   ║");
             println!("╚═══════════════════════════════════════════════════════════════╝");
-            println!(
-                "• Master Seed (Hex): {}",
-                hex::encode(sec_secret.bytes).red().bold()
-            );
+            let hex_seed = zeroize::Zeroizing::new(hex::encode(sec_secret.bytes));
+            println!("• Master Seed (Hex): {}", hex_seed.as_str().red().bold());
             println!(
                 "{}",
                 "⚠️  NEVER SHARE THIS KEY! Anyone with it controls all your funds."
@@ -3188,7 +3168,10 @@ async fn execute_command(
             // Chain height + sync state in RPC mode (audit follow-up: status
             // was P2P-only, users couldn't see height or sync state).
             if client.is_rpc() {
-                let cfg = client.rpc.as_ref().expect("RPC mode checked above");
+                let cfg = client
+                    .rpc
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("RPC mode required"))?;
                 match rpc::chain_height(cfg) {
                     Ok(h) => println!("• Chain height: {}", h),
                     Err(e) => println!("• Chain height: unknown ({e})"),
@@ -3246,6 +3229,9 @@ async fn execute_command(
                     (bytes, false)
                 }
                 None => {
+                    if scheme != pq::PqScheme::Falcon512 {
+                        anyhow::bail!("sample key generation requires Falcon-512");
+                    }
                     let keypair = pq::generate_sample_keypair(scheme);
                     (keypair.public_key, true)
                 }
@@ -3303,8 +3289,8 @@ async fn execute_command(
             let scheme = pq::PqScheme::from(scheme);
             // Audit HIGH-2: ML-DSA-44 is fail-closed DISABLED (node never
             // verifies it) — refuse generation so no unusable keys are minted.
-            if scheme == pq::PqScheme::MlDsa44 {
-                anyhow::bail!("ML-DSA-44 is disabled (fail-closed): use falcon512 or hybrid");
+            if scheme != pq::PqScheme::Falcon512 {
+                anyhow::bail!("key generation requires Falcon-512; legacy and disabled schemes are not supported");
             }
             let salt_bytes = match salt {
                 Some(s) => parse_hex16(&s, "salt")?,
@@ -3383,28 +3369,31 @@ async fn execute_command(
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
             let pq_scheme: pq::PqScheme = scheme.into();
-            let keypair = pq::PqKeyPair::from_seed(pq_scheme, &sec_secret.bytes);
-
-            let to_bytes = hex::decode(&to)
-                .map_err(|e| anyhow::anyhow!("Invalid recipient address hex: {e}"))?;
-            if to_bytes.len() != 32 {
-                anyhow::bail!("Recipient address must be 32 bytes (64 hex characters)");
+            if pq_scheme != pq::PqScheme::Falcon512 {
+                anyhow::bail!("pq-transfer requires Falcon-512; no fallback is allowed");
             }
-            let mut to_arr = [0u8; 32];
-            to_arr.copy_from_slice(&to_bytes);
+            let (keypair, from_addr) =
+                pq_keypair_for_keystore(&keystore, &sec_secret.bytes, "pq-transfer")?;
+
+            let to_arr = parse_hex32(&to, "Recipient address")?;
 
             let nano_amount = parse_stell_to_nano(&amount).map_err(|e| anyhow::anyhow!("{e}"))?;
-            let from_addr = keypair.derive_address(&pq::DEFAULT_SALT);
-            let nonce = client.nonce_of(&from_addr).await.unwrap_or(0);
-            // Wallet policy (same as pay/stake): ALWAYS explicit carrier with
-            // the activation surcharge. Implicit envelopes fail the wallet's
-            // local pre-broadcast self-check (no pinned key locally), and a
-            // bare 280k gas_limit is rejected by the mempool floor (325k).
-            let _ = activation;
-            let is_activation = true;
-            let gas_limit = stellereum::svm::GAS_BASIC_TRANSFER
-                .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
-            let tx = LightClient::build_pq_transfer_tx_with_gas(
+            let nonce = client
+                .nonce_of(&from_addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            // Honor `--activation` when `nonce > 0`; at `nonce == 0` the account
+            // has not published its PQ key on-chain yet, so explicit carrier
+            // is required automatically.
+            let is_activation = activation || nonce == 0;
+            let gas_limit = if is_activation {
+                stellereum::svm::GAS_BASIC_TRANSFER
+                    .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS)
+            } else {
+                stellereum::svm::GAS_BASIC_TRANSFER
+            };
+            let bound_chain_id = client.try_chain_id()?;
+            let tx = LightClient::build_pq_transfer_tx_bound(
                 &keypair,
                 to_arr,
                 nano_amount,
@@ -3413,7 +3402,9 @@ async fn execute_command(
                 shard,
                 shard,
                 is_activation,
-            );
+                bound_chain_id,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             let tx_hash = tx.compute_tx_hash();
 
             if dry_run {
@@ -3454,7 +3445,7 @@ async fn execute_command(
                 );
                 println!(
                     "• To:              {}",
-                    pq::format_address_with_visual_checksum(&to)
+                    pq::format_address_with_visual_checksum(&hex::encode(to_arr))
                 );
                 println!(
                     "• Amount:          {} STELL ({} nano)",
@@ -3546,7 +3537,7 @@ async fn execute_command(
             );
             println!(
                 "• To:              {}",
-                pq::format_address_with_visual_checksum(&to)
+                pq::format_address_with_visual_checksum(&hex::encode(to_arr))
             );
             println!(
                 "• Amount:          {} STELL ({} nano)",
@@ -3585,7 +3576,10 @@ async fn execute_command(
 
             println!("• Mode:                 {}", client.mode_line().yellow());
             if client.is_rpc() {
-                let cfg = client.rpc.as_ref().unwrap();
+                let cfg = client
+                    .rpc
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("RPC mode required"))?;
                 println!("• RPC Endpoint:         {}", cfg.url.cyan());
                 match rpc::chain_id(cfg) {
                     Ok(cid) => println!("• Chain ID:             {}", cid),
@@ -3641,7 +3635,9 @@ async fn execute_command(
             println!("     • Security:       NIST Level 1 (~128-bit quantum security)");
             println!("     • PubKey Size:    897 bytes");
             println!("     • Signature Size: 666 bytes");
-            println!("     • Status:         Pure Post-Quantum Primary Scheme");
+            println!(
+                "     • Status:         Pure Post-Quantum Primary Scheme (Active; Falcon-512 only)"
+            );
 
             println!(
                 "  2. {} [Scheme ID: 3]",
@@ -3651,7 +3647,7 @@ async fn execute_command(
             println!("     • Security:       NIST Level 2 / FIPS 204 (~128-bit quantum security)");
             println!("     • PubKey Size:    1312 bytes");
             println!("     • Signature Size: 2420 bytes");
-            println!("     • Status:         Supported for Keygen & Address Derivation");
+            println!("     • Status:         DISABLED / REFUSED (fail-closed; Falcon-512 only)");
 
             println!(
                 "  3. {} [Scheme ID: 4]",
@@ -3661,7 +3657,7 @@ async fn execute_command(
             println!("     • Security:       Dual classical + post-quantum hedge");
             println!("     • PubKey Size:    929 bytes (32 + 897)");
             println!("     • Signature Size: 730 bytes (64 + 666)");
-            println!("     • Status:         Supported for Transfers");
+            println!("     • Status:         DISABLED / REFUSED (legacy hybrid refused; Falcon-512 only)");
 
             println!(
                 "  4. {} [Scheme ID: 1]",
@@ -3671,7 +3667,7 @@ async fn execute_command(
             println!("     • Security:       Classical 128-bit (Vulnerable to Shor's Algorithm)");
             println!("     • PubKey Size:    32 bytes");
             println!("     • Signature Size: 64 bytes");
-            println!("     • Status:         Backward Compatible (Non-Default)");
+            println!("     • Status:         DISABLED / REFUSED (legacy classical refused; Falcon-512 only)");
 
             println!("\n{}", "👛 LOCAL WALLET STATUS:".yellow().bold());
             if wallet_path.exists() {
@@ -3745,7 +3741,7 @@ async fn execute_command(
                 message_hex.as_deref(),
             )
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let cid = resolve_sign_chain_id(chain_id, client);
+            let cid = resolve_sign_chain_id(chain_id, client)?;
             let sig = key
                 .sign_message(cid, &msg)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -3795,7 +3791,7 @@ async fn execute_command(
             .map_err(|e| anyhow::anyhow!("{e}"))?;
             let sig = stellereum::wallet_signing::WalletSignature::from_hex(&signature)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let cid = resolve_sign_chain_id(chain_id, client);
+            let cid = resolve_sign_chain_id(chain_id, client)?;
             if stellereum::wallet_signing::verify_message(&addr, cid, &msg, &sig) {
                 println!(
                     "{}: {} signed the message on chain {cid}",
@@ -3835,7 +3831,7 @@ async fn execute_command(
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let key = pq::wallet_standard_signing_key(&sec_secret.bytes, scheme)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let cid = resolve_sign_chain_id(chain_id, client);
+            let cid = resolve_sign_chain_id(chain_id, client)?;
             let contract_bytes = parse_hex32(&contract, "contract")?;
             let args_value = match args.as_deref() {
                 None => serde_json::Value::Null,
@@ -3890,7 +3886,7 @@ async fn execute_command(
             signature,
         } => {
             let addr = parse_hex32(&address, "address")?;
-            let cid = resolve_sign_chain_id(chain_id, client);
+            let cid = resolve_sign_chain_id(chain_id, client)?;
             let contract_bytes = parse_hex32(&contract, "contract")?;
             let args_value = match args.as_deref() {
                 None => serde_json::Value::Null,
@@ -3935,26 +3931,15 @@ async fn execute_command(
 
 async fn execute_aa(
     sub: AaCommands,
-    wallet_path: &Path,
+    _wallet_path: &Path,
     _client: &LightClient,
 ) -> anyhow::Result<()> {
     match sub {
         AaCommands::List => {
-            println!("╔═══════════════════════════════════════════════════════════════╗");
-            println!("║              🛡️ NATIVE ACCOUNT OBJECTS (AA PASSPORTS)         ║");
-            println!("╚═══════════════════════════════════════════════════════════════╝");
-            let keystore = HardenedKeystore::load(wallet_path)
-                .map_err(|e| anyhow::anyhow!("Wallet not found: {e}"))?;
-            println!(
-                "• Owner Wallet:    {}",
-                format_address_with_visual_checksum(&keystore.address_hex)
-            );
-            println!("• State:           First-Class L1 Passport Vault");
-            println!("{}", "─".repeat(65).dimmed());
-            println!("  No external account objects minted yet in this wallet.");
-            println!(
-                "  Mint a new 2 STELL passport with: {}",
-                "stell aa new --name <name>".cyan().bold()
+            anyhow::bail!(
+                "Account Object listing (`stell aa list`) is unavailable: `stell aa` requires \
+                 --contract <ACCOUNT_OBJECT_ADDR> with real RPC / SysCallCallContractArgs \
+                 integration; no on-chain query was executed"
             );
         }
         AaCommands::New {
@@ -3962,31 +3947,11 @@ async fn execute_aa(
             guardian,
             password,
         } => {
-            let keystore = HardenedKeystore::load(wallet_path)
-                .map_err(|e| anyhow::anyhow!("Wallet not found: {e}"))?;
-            let pass = prompt_password_safely(
-                password,
-                "Enter password to mint Account Object (costs 2 STELL)",
-            )?;
-            let _sec_secret = keystore
-                .decrypt(&pass)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let label = name.unwrap_or_else(|| "My Passport".to_string());
-            let guardian_str = guardian.unwrap_or_else(|| "None".to_string());
-
-            println!("╔═══════════════════════════════════════════════════════════════╗");
-            println!("║              🛡️ MINT ACCOUNT OBJECT (AA PASSPORT)             ║");
-            println!("╚═══════════════════════════════════════════════════════════════╝");
-            println!("• Passport Label:  {}", label.cyan().bold());
-            println!(
-                "• Owner Address:   {}",
-                format_address_with_visual_checksum(&keystore.address_hex)
-            );
-            println!("• Guardian:        {}", guardian_str.yellow());
-            println!("• Creation Fee:    2 STELL (anti-spam state deposit)");
-            println!(
-                "• Status:          {} (L1 Object Verified)",
-                "ACTIVE".green().bold()
+            let _ = (name, guardian, password);
+            anyhow::bail!(
+                "Account Object minting (`stell aa new`) is unavailable: requires \
+                 --contract <ACCOUNT_OBJECT_ADDR> + real SysCallCallContractArgs submission; \
+                 no transaction was sent and no Account Object was minted"
             );
         }
         AaCommands::Session {
@@ -3995,26 +3960,13 @@ async fn execute_aa(
             budget,
             password,
         } => {
-            let keystore = HardenedKeystore::load(wallet_path)
-                .map_err(|e| anyhow::anyhow!("Wallet not found: {e}"))?;
-            let pass = prompt_password_safely(password, "Enter password to authorize session key")?;
-            let _sec_secret = keystore
-                .decrypt(&pass)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let budget_nano = parse_stell_to_nano(&budget).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            println!("╔═══════════════════════════════════════════════════════════════╗");
-            println!("║              🔑 ACCOUNT OBJECT SESSION DELEGATION             ║");
-            println!("╚═══════════════════════════════════════════════════════════════╝");
-            println!("• Target Object:   {}", object.cyan());
-            println!("• Service:         {}", service.yellow().bold());
-            println!(
-                "• Spend Ceiling:   {} STELL ({} nano-STELL)",
-                budget, budget_nano
+            let _ = (object, service, budget, password);
+            anyhow::bail!(
+                "Account Object session delegation (`stell aa session`) is unavailable: requires \
+                 --contract <ACCOUNT_OBJECT_ADDR> + real SysCallCallContractArgs submission; \
+                 no transaction was sent and no session was activated (use `stell session` for \
+                 protocol session grants)"
             );
-            println!("• Action Whitelist: SCOPE_SVM_CALL | SCOPE_DEX_SWAP");
-            println!("• Master Protection: Master wallet balance is isolated & secure.");
-            println!("• Status:          {}", "SESSION ACTIVE".green().bold());
         }
         AaCommands::AdjustBudget {
             object,
@@ -4022,26 +3974,11 @@ async fn execute_aa(
             budget,
             password,
         } => {
-            let keystore = HardenedKeystore::load(wallet_path)
-                .map_err(|e| anyhow::anyhow!("Wallet not found: {e}"))?;
-            let pass = prompt_password_safely(password, "Enter password to adjust session budget")?;
-            let _sec_secret = keystore
-                .decrypt(&pass)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let budget_nano = parse_stell_to_nano(&budget).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            println!("╔═══════════════════════════════════════════════════════════════╗");
-            println!("║              ⚙️ DYNAMIC SESSION BUDGET ADJUSTMENT             ║");
-            println!("╚═══════════════════════════════════════════════════════════════╝");
-            println!("• Target Object:   {}", object.cyan());
-            println!("• Session ID:      #{}", session);
-            println!(
-                "• New Budget:      {} STELL ({} nano-STELL)",
-                budget, budget_nano
-            );
-            println!(
-                "• Status:          {}",
-                "BUDGET UPDATED ON-CHAIN".green().bold()
+            let _ = (object, session, budget, password);
+            anyhow::bail!(
+                "Account Object budget adjustment (`stell aa adjust-budget`) is unavailable: \
+                 requires --contract <ACCOUNT_OBJECT_ADDR> + real SysCallCallContractArgs \
+                 submission; no transaction was sent and no budget was updated on-chain"
             );
         }
         AaCommands::RevokeSession {
@@ -4049,22 +3986,11 @@ async fn execute_aa(
             session,
             password,
         } => {
-            let keystore = HardenedKeystore::load(wallet_path)
-                .map_err(|e| anyhow::anyhow!("Wallet not found: {e}"))?;
-            let pass = prompt_password_safely(password, "Enter password to revoke session key")?;
-            let _sec_secret = keystore
-                .decrypt(&pass)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            println!("╔═══════════════════════════════════════════════════════════════╗");
-            println!("║              🚫 TERMINAL SESSION REVOCATION                  ║");
-            println!("╚═══════════════════════════════════════════════════════════════╝");
-            println!("• Target Object:   {}", object.cyan());
-            println!("• Session ID:      #{}", session);
-            println!("• Tombstone:       {}", "COMMITTED TERMINAL".red().bold());
-            println!(
-                "• Status:          {}",
-                "SESSION PERMANENTLY REVOKED".yellow().bold()
+            let _ = (object, session, password);
+            anyhow::bail!(
+                "Account Object session revocation is unavailable: no verified owner-authorized \
+                 path for this object and session ID; no transaction was sent and the session \
+                 was not revoked"
             );
         }
         AaCommands::Rent {
@@ -4073,46 +3999,22 @@ async fn execute_aa(
             hours,
             password,
         } => {
-            let keystore = HardenedKeystore::load(wallet_path)
-                .map_err(|e| anyhow::anyhow!("Wallet not found: {e}"))?;
-            let pass = prompt_password_safely(password, "Enter password to delegate rental")?;
-            let _sec_secret = keystore
-                .decrypt(&pass)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            println!("╔═══════════════════════════════════════════════════════════════╗");
-            println!("║              🤝 NON-CUSTODIAL OBJECT RENTAL (ERC-4907)        ║");
-            println!("╚═══════════════════════════════════════════════════════════════╝");
-            println!("• Target Object:   {}", object.cyan());
-            println!("• Tenant Address:  {}", tenant.yellow());
-            println!("• Duration:        {} hours ({} days)", hours, hours / 24);
-            println!(
-                "• Auto-Reclaim:    {} (Zero gas cost upon expiration)",
-                "AUTOMATIC".green().bold()
+            let _ = (object, tenant, hours, password);
+            anyhow::bail!(
+                "Account Object rental (`stell aa rent`) is unavailable: requires \
+                 --contract <ACCOUNT_OBJECT_ADDR> + real SysCallCallContractArgs submission; \
+                 no transaction was sent and no rental was delegated"
             );
-            println!("• Ownership:       Retained by Owner. Tenant cannot transfer or drain.");
-            println!("• Status:          {}", "RENTAL DELEGATED".green().bold());
         }
         AaCommands::RevokeRent { object, password } => {
-            let keystore = HardenedKeystore::load(wallet_path)
-                .map_err(|e| anyhow::anyhow!("Wallet not found: {e}"))?;
-            let pass = prompt_password_safely(password, "Enter password to revoke rental")?;
-            let _sec_secret = keystore
-                .decrypt(&pass)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            println!("╔═══════════════════════════════════════════════════════════════╗");
-            println!("║              ⛔ EARLY RENTAL REVOCATION                       ║");
-            println!("╚═══════════════════════════════════════════════════════════════╝");
-            println!("• Target Object:   {}", object.cyan());
-            println!("• Tenant Access:   {}", "REVOKED IMMEDIATELY".red().bold());
-            println!(
-                "• Status:          {}",
-                "OBJECT RETURNED TO OWNER".green().bold()
+            let _ = (object, password);
+            anyhow::bail!(
+                "Account Object rental revocation (`stell aa revoke-rent`) is unavailable: \
+                 requires --contract <ACCOUNT_OBJECT_ADDR> + real SysCallCallContractArgs \
+                 submission; no transaction was sent and rental was not revoked"
             );
         }
     }
-    Ok(())
 }
 
 async fn execute_trade(
@@ -4436,7 +4338,7 @@ async fn run_repl_console(
                 wallet_path = wallets::resolve_active_wallet_path(None, None);
             }
             "balance" | "bal" => {
-                run_cmd!(Commands::Balance { shard: 1 }, &wallet_path, &client);
+                run_cmd!(Commands::Balance { shard: 0 }, &wallet_path, &client);
             }
             "receive" | "addr" | "address" => {
                 run_cmd!(Commands::Receive { password: None }, &wallet_path, &client);
@@ -4478,7 +4380,7 @@ async fn run_repl_console(
                         to,
                         amount,
                         password: None,
-                        shard: 1,
+                        shard: 0,
                         source_shard: None,
                         target_shard: None,
                         scheme: pq::WalletScheme::Falcon512,
@@ -4508,7 +4410,7 @@ async fn run_repl_console(
                         amount: None,
                         fee: 280_000,
                         password: None,
-                        shard: 1,
+                        shard: 0,
                     },
                     &wallet_path,
                     &client
@@ -4548,7 +4450,7 @@ async fn run_repl_console(
                         amount,
                         blinding: None,
                         password: None,
-                        shard: 1
+                        shard: 0
                     },
                     &wallet_path,
                     &client
@@ -4567,7 +4469,7 @@ async fn run_repl_console(
                         amounts: None,
                         blindings: None,
                         password: None,
-                        shard: 1,
+                        shard: 0,
                     },
                     &wallet_path,
                     &client
@@ -4593,7 +4495,7 @@ async fn run_repl_console(
                         amount,
                         fee: 1500,
                         password: None,
-                        shard: 1
+                        shard: 0
                     },
                     &wallet_path,
                     &client
@@ -4631,7 +4533,7 @@ async fn run_repl_console(
                         to,
                         amount,
                         password: None,
-                        shard: 1
+                        shard: 0
                     },
                     &wallet_path,
                     &client
@@ -4658,7 +4560,7 @@ async fn run_repl_console(
                         spender,
                         amount,
                         password: None,
-                        shard: 1
+                        shard: 0
                     },
                     &wallet_path,
                     &client
@@ -4869,7 +4771,7 @@ async fn run_repl_console(
                         activation,
                         dry_run,
                         password: None,
-                        shard: 1,
+                        shard: 0,
                     },
                     &wallet_path,
                     &client
@@ -4890,6 +4792,44 @@ async fn run_repl_console(
 #[cfg(test)]
 mod amount_parser_tests {
     use super::*;
+
+    #[test]
+    fn consensus_keystore_scheme_is_never_reinterpreted() {
+        let seed = [42u8; 32];
+        let key = pq::PqKeyPair::from_seed(pq::PqScheme::Falcon512, &seed);
+        let address = key.derive_address(&pq::DEFAULT_SALT);
+        let mut store: HardenedKeystore = serde_json::from_value(serde_json::json!({
+            "version": 2, "kdf": "legacy", "cipher": "legacy",
+            "address_hex": hex::encode(address), "salt_hex": "",
+            "nonce_hex": "", "ciphertext_hex": "", "auth_tag_hex": "",
+            "scheme": "falcon512", "future_metadata": {"keep": true}
+        }))
+        .unwrap();
+        for scheme in ["ed25519", "hybrid", "mldsa44", "unknown"] {
+            store.scheme = scheme.into();
+            let error = pq_keypair_for_keystore(&store, &seed, "test").unwrap_err();
+            assert!(
+                error.to_string().contains("Unsupported wallet scheme"),
+                "{error}"
+            );
+        }
+        store.scheme = "falcon512".into();
+        let (key, actual) = pq_keypair_for_keystore(&store, &seed, "test").unwrap();
+        assert_eq!(actual, address);
+        let signature = key.sign(b"consensus test");
+        assert!(stellereum::post_quantum::verify_pq_signature(
+            stellereum::post_quantum::PqScheme::Falcon512,
+            key.public_key(),
+            b"consensus test",
+            &signature,
+        ));
+        store.address_hex = hex::encode([0u8; 32]);
+        assert!(pq_keypair_for_keystore(&store, &seed, "test").is_err());
+        assert_eq!(
+            serde_json::to_value(&store).unwrap()["future_metadata"]["keep"],
+            true
+        );
+    }
 
     #[test]
     fn test_parse_stl57_and_hex_address() {

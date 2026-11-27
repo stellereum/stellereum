@@ -5,6 +5,10 @@ Snapshot: после пентеста-2 и кросс-кат свипа. Раб�
 этот реестр сохраняет результаты и тесты-пины, по которым они закрыты.
 Статус: Ruleset v7; `UP-5` (`stellereum-upgrader`) закрыт в дереве.
 Обновлено на HEAD `c58375443` (+ HEIGHT-SPLIT wave; закрыты `--owner-key` и `store_mail`).
+Дополнено 2026-11-26 по Волнам 9–15; снимок рабочего дерева — HEAD `ab0adbf08`
+плюс незакоммиченные изменения (см. `docs/audits/AUDIT_HANDOFF_2026-11-26.md`).
+Этот раздел ниже — единственное место, где статусы Волн 9–15 подтверждены
+чтением кода; прогоны `cargo`/`node --test`/скриптов не выполнялись.
 Дополнено 2026-11-21 по контрактам `docs/specs/05_LOCK_SAFETY_P0.md`,
 `06_BRIDGE_RELEASE_AUTHORIZATION_DRAFT.md`, `07_PQ_VALIDATOR_LIFECYCLE_DRAFT.md`,
 `LIGHT_CLIENT_AND_EVM_INDEX_CONTRACT.md`, `SECURITY_HARDENING_FIXES_CONTRACT.md`,
@@ -119,6 +123,12 @@ one hiccup = 20+ minutes below 4/4). При `STELL_MIN_BLOCK_MS=400` бюдже�
 тяжёлых сборок при наборе < 4/4» остаётся в силе; сборки идут `taskset -c 8-11
 nice -n 19`.
 
+→ ЧАСТИЧНО ЗАКРЫТО (Волна 10, 2026-11-26): механизм `JAIL_BUDGET_V2` /
+`DOWNTIME_MISS_THRESHOLD_V2 = 200` (80 s при 400 ms) реализован и покрыт
+тестами, но гейт `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` остаётся `INERT
+(u64::MAX)`; оперативная митигация `auto-unjail` по-прежнему обязательна.
+См. «Волна 9–15».
+
 P0-PEER-SNAPSHOT-ANCHOR (FIXED в дереве, ожидает выката `cf054343`, 2026-11-25).
 Исправлено в Волне 2 (`e7246c5c2`) и Волне 7 (`ae493a270`):
 1. `verify_snapshot_anchor_with_sets_and_schedule` + строгий `validator_set_for_height_strict`
@@ -188,7 +198,7 @@ P0-SAFETY-BOOT-ONE-BLOCK (FIXED в дереве, ожидает выката `cf
 | SNAP-PQKEYS | `"pq_keys"` не публикуется в `SNAPSHOT_PUBLISH_DOMAIN_KINDS`; после snapshot-sync исторические PQ-ключи теряются. | **FIXED (локально, не задеплоено)**: `"pq_keys"` и `"evm_bindings"` включены в `SNAPSHOT_PUBLISH_DOMAIN_KINDS` (`network.rs`) и `SYNC_DOMAIN_KINDS` (`sync.rs`) и публикуются в `consensus_driver.rs` (`r2_storage_snapv4_sync_tests`, `observer_and_recovery_tests`). | `docs/specs/W1_INCREMENTAL_SNAPSHOTS_CONTRACT.md` §1.4 G6, §2.1; `stellereum/tests/r2_storage_snapv4_sync_tests.rs`, `stellereum/tests/observer_and_recovery_tests.rs` |
 | SNAP-DHT-NAME | DHT-имя `{epoch}_snap_{shard}_{height}` не содержит `state_root`, хеш манифеста или подпись; отравленный манифест с `FOREVER` TTL блокирует честный снапшот на той же высоте. | **FIXED (локально, не задеплоено)**: контент-адресованное именование `snapv4_manifest_name(epoch, shard, height, state_root)` и `snapv4_unit_name` с проверкой `blake3(bytes) == expected_hash` в `network.rs` (`r2_storage_snapv4_sync_tests`). | `docs/specs/W1_INCREMENTAL_SNAPSHOTS_CONTRACT.md` §1.4 G4, §2.2; `stellereum/tests/r2_storage_snapv4_sync_tests.rs` |
 | SNAP-TIP-SKIP | `verify_restored_root` при `snapshot_height == tip` пропускает проверку корня. | **FIXED (локально, не задеплоено)**: `put_finalized_post_root` / `finalized_post_root_at` в `storage.rs` + запись из `consensus_driver.rs`, проверка корня против сохранённого `finalized_post_root_at(tip)` даже при отсутствии `tip + 1` (`r2_storage_snapv4_sync_tests`). | `docs/specs/W1_INCREMENTAL_SNAPSHOTS_CONTRACT.md` §1.4 G6; `stellereum/src/storage.rs`, `stellereum/tests/r2_storage_snapv4_sync_tests.rs` |
-| FEE-PRIORITY-APPLY | `priority_fee_per_gas` проходит admission и proposal-check, но не списывается в `apply()` / `parallel`: priority bid фактически возвращается отправителю как неиспользованный газ. | **FIXED (локально, не активировано; `FEE_MARKET_V2_ACTIVATION_HEIGHT = u64::MAX`)**: `fee_for_gas_at_v2`/`failure_fee_for_v2` списывают `priority_fee_per_gas` внутри core (cap `gas_limit`, floor + surcharge); при выключенном гейте формула побайтово прежняя; `fee_market_v2` считается один раз на блок (sequential/parallel/`fail_with_floor!` parity). `w4_priority_fee_tests`. Активация — **R5**. | `docs/specs/W4_ECONOMICS_PRODUCT_CONTRACT.md` §1.1, §2.2; §3.2 п.1; `docs/specs/RULESET_V7_ACTIVATION_BLUEPRINT.md` |
+| FEE-PRIORITY-APPLY | `priority_fee_per_gas` проходит admission и proposal-check, но не списывается в `apply()` / `parallel`: priority bid фактически возвращается отправителю как неиспользованный газ. | **FIXED (локально, не активировано; `FEE_MARKET_V2_ACTIVATION_HEIGHT = u64::MAX`)**: `fee_for_gas_at_v2`/`failure_fee_for_v2` списывают `priority_fee_per_gas` внутри core (cap `gas_limit`, floor + surcharge); при выключенном гейте формула побайтово прежняя; `fee_market_v2` считается один раз на блок (sequential/parallel/`fail_with_floor!` parity). `w4_priority_fee_tests`. Активация — **R5**. → FIXED (R5, 2026-11-26: константа уже `0` в `stellereum/src/tokenomics.rs:296`, `docs/RULESET_V7.md` §7 это подтверждает; строка реестра была устаревшей). | `docs/specs/W4_ECONOMICS_PRODUCT_CONTRACT.md` §1.1, §2.2; §3.2 п.1; `docs/specs/RULESET_V7_ACTIVATION_BLUEPRINT.md` |
 
 ## P2 — средний риск
 
@@ -214,7 +224,7 @@ P0-SAFETY-BOOT-ONE-BLOCK (FIXED в дереве, ожидает выката `cf
 | CNVRF-EPOCH-OVERFLOW | `epoch_start_height` делает unchecked `epoch_n * EPOCH_LEN` (panic в debug / wrap в release) и проникает в `freeze_height_of_epoch`. | **FIXED (локально, не задеплоено)**: `CNVRF-OVERFLOW` — `epoch_n.saturating_mul(EPOCH_LEN)` в `cn_vrf.rs` (прошло `W0-CONSOLIDATE-GATE`; живой кластер ещё не обновлён). | `docs/specs/WASM_XSHARD_PMM_HARDENING_CONTRACT.md` §2 VRF-1, §3.4.2; §5.1 п.5; `stellereum/tests/pq_opt_equivalence_tests.rs` (`cn_vrf_epoch_and_freeze_height_boundaries_never_panic_or_wrap`) |
 | FAUCET-PAGINATION | `skip(offset).take(limit)` поверх `HashMap::keys()` в `stell_listTokens` / `api_contracts` даёт случайный порядок, пропуски и дубли; `last_public_drip` не чистился от истёкших записей (часть D4). | **FIXED (локально, не задеплоено)**: `TOKEN-LIST-PAGINATION` + `CONTRACT-LIST-PAGINATION` — `TokenRegistry::tokens` (`token.rs`) и `ContractRegistry::contracts` (`contract.rs`) переведены на `BTreeMap` с обратной совместимостью legacy `HashMap`-снапшотов, детерминированная курсорная пагинация в `stell_listTokens` (`rpc/reads.rs`) и `GET /api/contracts` (`explorer.rs`), очистка cooldown в `rpc/faucet.rs` (прошло `W0-CONSOLIDATE-GATE`; живой кластер ещё не обновлён). | `docs/specs/FAUCET_AND_EXPLORER_HARDENING_CONTRACT.md` §1 D4, §2.4; §4 п.6; `stellereum/tests/token_pagination_and_fee_opt_tests.rs` (`token_registry_and_list_tokens_are_deterministic_across_insertion_orders`, `list_tokens_cursor_pagination_survives_mid_scan_insertions_without_skips_or_dups`, `token_registry_bincode_roundtrip_and_legacy_hashmap_snapshot_compat`), `stellereum/tests/explorer_gateway_hardening_tests.rs` (`api_contracts_pagination_is_deterministic_and_supports_after_cursor`, `api_faucet_public_distinguishes_lifetime_cap_from_cooldown_and_rolls_back`), `stellereum/tests/wasm_cache_equivalence_tests.rs` (`contract_registry_btreemap_order_and_bincode_roundtrip_legacy_compat`) |
 | FEE-BURN-SPLIT | 100% собранных fees уходят `block.proposer`; нет burn/staking split и governance-параметров. | **FIXED (локально, не активировано)**: сплит в u128 на весь блок — `burn = fees*burn_bps/10_000`, `staking = fees*staking_bps/10_000`, `proposer = fees - burn - staking` (0 nano потерь); burn никуда не зачисляется, staking — `StakingLedger::distribute_fee_reward` (без `rewards_minted`/emission cap) + 1:1 `REWARDS_POOL`; jailed/неизвестный прпозер → доля прпозеру. `w4_priority_fee_tests`. | `docs/specs/W4_ECONOMICS_PRODUCT_CONTRACT.md` §1.1, §2.2; §3.2 п.1; `docs/specs/RULESET_V7_ACTIVATION_BLUEPRINT.md` |
-| FEE-SUBNANO-EXACT | Тихое усечение sub-nano wei в EVM carrier, сброс `remainder` в `ValidatorRewardState::accrue`, двойное усечение `GenesisVault::calculate_mint`, потеря Q0.64 в `pow_half_fixed`, `f64` в `eth_feeHistory`. | **FIXED (локально, не активировано; `SUB_NANO_STRICT_ACTIVATION_HEIGHT = u64::MAX`)**: `wei_to_nano_exact` на EVM carrier-границе (RPC/admission strict, консенсус по гейту), целочисленный `eth_feeHistory` без `f64`, одношаговый 256-битный `GenesisVault::calculate_mint`, `ValidatorRewardState::accrue_with_rescale` при смене `delegated` (проводка в `distribute_reward_at_height`/`distribute_fee_reward_at_height` в `apply.rs` Step 2/3), `pow_half_fixed_exact_q64`/`emit_with_q64_carry` + committed `StakingLedger::emission_carry_q64` (`STAKING_EMISSION_CARRY_V1` conditional + `StakingLedgerV7`/`DomainSnapshotV10`). Тесты: `w4_sub_nano_tests` **4/4** (`397+`/полный гейт). | `docs/specs/W4_ECONOMICS_PRODUCT_CONTRACT.md` §1.2, §2.3; §3.2 п.2; `docs/specs/RULESET_V7_ACTIVATION_BLUEPRINT.md` |
+| FEE-SUBNANO-EXACT | Тихое усечение sub-nano wei в EVM carrier, сброс `remainder` в `ValidatorRewardState::accrue`, двойное усечение `GenesisVault::calculate_mint`, потеря Q0.64 в `pow_half_fixed`, `f64` в `eth_feeHistory`. | **FIXED (локально, не активировано; `SUB_NANO_STRICT_ACTIVATION_HEIGHT = u64::MAX`) → ИСПРАВЛЕНО (R5, 2026-11-26: константа уже `0` в `stellereum/src/tokenomics.rs:251`, `docs/RULESET_V7.md` §8 это подтверждает; строка реестра была устаревшей)**: `wei_to_nano_exact` на EVM carrier-границе (RPC/admission strict, консенсус по гейту), целочисленный `eth_feeHistory` без `f64`, одношаговый 256-битный `GenesisVault::calculate_mint`, `ValidatorRewardState::accrue_with_rescale` при смене `delegated` (проводка в `distribute_reward_at_height`/`distribute_fee_reward_at_height` в `apply.rs` Step 2/3), `pow_half_fixed_exact_q64`/`emit_with_q64_carry` + committed `StakingLedger::emission_carry_q64` (`STAKING_EMISSION_CARRY_V1` conditional + `StakingLedgerV7`/`DomainSnapshotV10`). Тесты: `w4_sub_nano_tests` **4/4** (`397+`/полный гейт). | `docs/specs/W4_ECONOMICS_PRODUCT_CONTRACT.md` §1.2, §2.3; §3.2 п.2; `docs/specs/RULESET_V7_ACTIVATION_BLUEPRINT.md` |
 | FEE-DENSITY-ORDER | `Mempool::order` / `sealed_candidates` сортируют по сырому `(priority_fee_per_gas, gas_limit)`, а не по плотности `priority / max(gas, wire, proof)`; тяжёлая tx вытесняет пачку обычных. | **FIXED (локально)**: `Mempool::fee_density` = `priority / max(gas, wire, proof_units*10k)` (целочисленно, детерминированный total order) применяется в `select_for_block`, `select_for_block_multi` и `sealed_candidates`. `propose_select_differential_tests` 3/3. | `docs/specs/W4_ECONOMICS_PRODUCT_CONTRACT.md` §1.1, §2.2.1; §3.2 п.1; `docs/specs/RULESET_V7_ACTIVATION_BLUEPRINT.md` |
 | STREAM-SHARD-ID | `RpcState::record_block` жёстко передаёт `MASTERCHAIN_SHARD` в `publish_new_head`; на workchain-ноде `newHeads` сообщает `shard_id = 0`. | **FIXED (локально, не задеплоено)**: `RpcState::record_block` публикует `self.engine.shard_id()` и quorum-certified header (`prev_hash`/`state_root`/`proposer`; `null` при отсутствии сертификата). `w4_geyser_stream_tests`. | `docs/specs/W4_ECONOMICS_PRODUCT_CONTRACT.md` §1.4, §2.5; §3.2 п.4; `docs/specs/RULESET_V7_ACTIVATION_BLUEPRINT.md` |
 | STREAM-GEYSER-LITE | Нет `seq` / replay-окна / explicit `Lagged`, нет топиков `AccountUpdates` / `TokenTransfers`, payload не содержит `prev_hash` / `state_root` / `proposer` / `tx_index`. | **FIXED (локально, не задеплоено)**: `seq` + `GEYSER_REPLAY_WINDOW = 512` + `after_seq` (+ `-32005`), явные `Lagged`-фреймы в SSE/WS, топики `AccountUpdates`/`TokenTransfers` (`MAX_SUBSCRIPTION_ACCOUNTS = 32`), публикация дельт вне блокировок `record_block`. Индексерная часть — **FIXED** ранее. Тесты: `w4_geyser_stream_tests` 4/4 (`stellereum-indexer/tests/w4_indexer_tests.rs` 4/4). | `docs/specs/W4_ECONOMICS_PRODUCT_CONTRACT.md` §1.4, §2.5; §3.2 п.4; `docs/specs/RULESET_V7_ACTIVATION_BLUEPRINT.md`; `stellereum-indexer/tests/w4_indexer_tests.rs` |
@@ -233,7 +243,7 @@ P0-SAFETY-BOOT-ONE-BLOCK (FIXED в дереве, ожидает выката `cf
 | unicast Body | нет `send_to_peer`, ответы broadcast (bounded) | **FIXED** (`send_to_peer`, 10→10 unicast) | — |
 | `--owner-key` | seed в argv | **FIXED** (HEAD `9832e97a9`: `--owner-key-file` 0600/stdin, `$INFNODE_OWNER_KEY`; argv deprecated with a loud warning; `cli_seal_tests`) | — |
 | store_mail | fail-open на неоткрываемом ключе | **FIXED** (HEAD `9832e97a9`: `StoreMailError`, key boxed before any chunk/manifest; `store_mail_with_unboxable_owner_key_fails_closed`) | — |
-| sub-nano | усечение при переводе в nano | **FIXED (локально, не активировано)** — см. `FEE-SUBNANO-EXACT`: закрыты все 5 пунктов (§2.3 п.1–п.5: `wei_to_nano_exact`, 256-bit `GenesisVault`, `accrue_with_rescale`, `emission_carry_q64`, integer `eth_feeHistory`). `w4_sub_nano_tests` **4/4**. | `docs/specs/W4_ECONOMICS_PRODUCT_CONTRACT.md` §1.2, §2.3, §3.2 п.2; `docs/specs/RULESET_V7_ACTIVATION_BLUEPRINT.md`; см. `FEE-SUBNANO-EXACT` |
+| sub-nano | усечение при переводе в nano | **FIXED (локально, не активировано)** — см. `FEE-SUBNANO-EXACT`: закрыты все 5 пунктов (§2.3 п.1–п.5: `wei_to_nano_exact`, 256-bit `GenesisVault`, `accrue_with_rescale`, `emission_carry_q64`, integer `eth_feeHistory`). `w4_sub_nano_tests` **4/4**. → FIXED (R5, 2026-11-26: `SUB_NANO_STRICT_ACTIVATION_HEIGHT = 0`). | `docs/specs/W4_ECONOMICS_PRODUCT_CONTRACT.md` §1.2, §2.3, §3.2 п.2; `docs/specs/RULESET_V7_ACTIVATION_BLUEPRINT.md`; см. `FEE-SUBNANO-EXACT` |
 | pre-auth sealed | старые sealed-блобы отклоняются | ACCEPTED (требуют переопубликации) | — |
 | zkML | re-execution, не ZK | **SEPARATE SYSTEM** | см. «Отложено осознанно» |
 | EVM | только переводы, без контрактов | **SEPARATE SYSTEM** | см. «Отложено осознанно» |
@@ -345,8 +355,8 @@ P0-SAFETY-BOOT-ONE-BLOCK (FIXED в дереве, ожидает выката `cf
 | ID | Находка | Статус |
 |---|---|---|
 | BRIDGE-REFUND-WINDOW | **HIGH.** Refund заявки, запаркованной в ПРОШЛОМ часовом окне, безусловно вычитал сумму из `hourly_withdrawn` текущего окна → серией таких refund'ов можно было обнулить текущий лимит и вывести >2× `HOURLY_RATE_LIMIT_NANO`. | **FIXED (локально, не задеплоено)**: вычитание только если `requested_at >= last_rate_limit_reset`; инвариант восстановлен. Тесты `tests/x6_bridge_accounting_tests.rs` (fail-before). Меняет committed-счётчик для pre-window refund → нужен согласованный апгрейд. |
-| XSHARD-BOUNCE-MINT | **CRITICAL (multi-shard only).** Timeout-bounce возвращал `tx.amount` по outbound-записи, которая доказывает только связность, а не списание на источнике: (a) валидно подписанная tx с `nonce=u64::MAX` падает на apply (дебета нет), запись создаётся, через 64 высоты bounce минтит value; (b) 2PC-escrow + legacy-запись + bounce → target кредитует COMMIT, source возвращает refund (двойная трата). | **ACTIVATION-REQUIRED**: фикс в `runtime/**` (produced только при `status[i]==true`, inclusion/escrow proof для outbound, escrow-leaf перед bounce, отказ при наличии 2PC-записи; зеркала движка синхронно). В `{0}` недостижимо; обязателен до включения `{0,1}`. |
-| XPC-PREPARED-UNBOUNDED | **HIGH (multi-shard).** `Prepare` принимает affordability-proof и пишет `PREPARED`; `is_retired` не ретирит `PREPARED`, а один funded-ключ создаёт неограниченно разных tx-hash на одном nonce → target забивается ~16 записями/блок навсегда. | **ACTIVATION-REQUIRED**: escrow-backed PREPARE или bounded per-source admission. |
+| XSHARD-BOUNCE-MINT | **CRITICAL (multi-shard only).** Timeout-bounce возвращал `tx.amount` по outbound-записи, которая доказывает только связность, а не списание на источнике: (a) валидно подписанная tx с `nonce=u64::MAX` падает на apply (дебета нет), запись создаётся, через 64 высоты bounce минтит value; (b) 2PC-escrow + legacy-запись + bounce → target кредитует COMMIT, source возвращает refund (двойная трата). | **ACTIVATION-REQUIRED**: фикс в `runtime/**` (produced только при `status[i]==true`, inclusion/escrow proof для outbound, escrow-leaf перед bounce, отказ при наличии 2PC-записи; зеркала движка синхронно). В `{0}` недостижимо; обязателен до включения `{0,1}`. → Гейт `XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT` и тесты добавлены (Волна 9, 2026-11-26), но гейт остаётся `INERT (u64::MAX)`; поведение на живой `{0}` не менялось. |
+| XPC-PREPARED-UNBOUNDED | **HIGH (multi-shard).** `Prepare` принимает affordability-proof и пишет `PREPARED`; `is_retired` не ретирит `PREPARED`, а один funded-ключ создаёт неограниченно разных tx-hash на одном nonce → target забивается ~16 записями/блок навсегда. | **ACTIVATION-REQUIRED, РЕАЛИЗОВАНО за инертным гейтом (Волна 9, 2026-11-26)**: bounded per-source admission — `target_prepare_slot_available` (один активный `Prepared` на `(source_shard, from, nonce)` и `MAX_ACTIVE_PREPARED_PER_SENDER = 4`) + `XPC_PREPARE_TTL_HEIGHTS = 4_096` в `is_retired_at`; всё за `XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT = u64::MAX`, на живой `{0}` не включено. Тесты: `xshard2pc` unit + `w9_core_polish_tests::xpc_prepared_unbounded_guard_blocks_same_nonce_spam_when_gated_and_preserves_pre_activation`. |
 | BRIDGE-TARGET-ADDRESS-UNBOUNDED | **HIGH.** `TeleportWithdrawalRequest.target_address: String` не ограничен по длине и коммитится в `pending_withdrawals`; лимит только по сумме, количество бесплатно → state под контролем атакующего. | **FIXED (локально, за гейтом `BRIDGE_TARGET_ADDRESS_CAP_HEIGHT = u64::MAX`)**: `MAX_BRIDGE_TARGET_ADDRESS_BYTES = 128`; проверка в `BridgeIntent::validate_at_height` (а `validate()` = высота 0, поэтому гейт-с-генезиса тоже ловится) и в `BridgeState::plan_at_height` — единственном пути, который паркует заявку, ДО rate-window/очереди. Ниже гейта вердикт байт-в-байт прежний (1 MiB проходит), на/выше — отказ с именем лимита. Тесты: `tests/h9_bridge_target_address_cap.rs` (5: ниже гейта 1 MiB, ниже гейта при назначенной активации, на/выше отказ, height-indexed validate + граница 128/129, обычный адрес). Включение — отдельное активационное решение. | `stellereum/src/bridge.rs`, `stellereum/src/chain_spec.rs` |
 | XSHARD-REEMIT-ROTATION | **LOW.** `height % plan.len()` при периоде 64 и `plan.len() % 64 == 0` даёт постоянный offset — часть набора ждёт дольше. Самоисправляется, value не теряется. | Documented (proposer-policy). |
 | XPC-DECIDED-ZERO | **LATENT.** `decided_height == 0` трактуется как «не решено»: COMMIT/ABORT-ACK применяется, но decision-leaf не пишется, а ошибка записи игнорируется. Недостижимо (target не может быть PREPARED до высоты 0). | Report-only (смена state-format sentinel). |
@@ -396,9 +406,9 @@ P0-SAFETY-BOOT-ONE-BLOCK (FIXED в дереве, ожидает выката `cf
   * `W6-A4-1/2`: `ACTOR_MAILBOX_HARDENING_HEIGHT` (запрет несанкционированных `Transfer`/дебитов в чужом `inbox` и биллинг `host.send_message` `gas_budget`).
   * `W6-A7-1` / `W6-A1-4`: персистентность `cnvrf_freeze_inputs` и догонка `epoch_vdf` при `CNVRF_V3_ACTIVATION_HEIGHT`.
   * `W6-A7-2/3/4`: паркованный `mev_epoch.rs` (`OrderCommitment`/`ShareRelease`/`EpochKeyAnnouncement`).
-  * `W6-A7-7`: modulo-bias в `sortition`.
-* **Вне кодового скоупа (зафиксировано, не правлено):**
-  * `W6-A6-1,2,5,7,8,10,11` в `stell-wallet/` (отложенные пользовательские правки — SPV leaf-decode, `pq-transfer` chain-binding, stealth plaintext fallback, `faucet_token` HTTP check, zeroization, fake `aa` commands, local sim overflow/permissions).
+  * `W6-A7-7`: modulo-bias в `sortition`. → РЕАЛИЗОВАНО (Волна 10, 2026-11-26) за `SORTITION_UNBIASED_ACTIVATION_HEIGHT` (INERT `u64::MAX`); см. «Волна 9–15».
+* **Вне кодового скоупа на момент Волны 7 (зафиксировано, тогда не правлено; `W6-A6-*` закрыто в Волне 9 — см. ниже):**
+  * `W6-A6-1,2,5,7,8,10,11` в `stell-wallet/` (отложенные пользовательские правки — SPV leaf-decode, `pq-transfer` chain-binding, stealth plaintext fallback, `faucet_token` HTTP check, zeroization, fake `aa` commands, local sim overflow/permissions). → FIXED (Волна 9, 2026-11-26): см. раздел «Волна 9–15» (шесть из семи подтверждены новыми тестами; `W6-A6-8` — код без отдельного fail-before теста).
 
 ## Волна 8 — Дозакрытие остаточных уязвимостей и блокера разджейливания (2026-11-25)
 
@@ -407,4 +417,203 @@ P0-SAFETY-BOOT-ONE-BLOCK (FIXED в дереве, ожидает выката `cf
   * **CN-VRF v3 и паркованный `mev_epoch` (`W6-A7-1..4`, `W6-A1-4`, `retention.rs`):** персистентность `cnvrf_freeze_inputs` в отдельном дереве sled и запрет тихого пропуска seed после `H_freeze`; извлечение/проверка `epoch_vdf` в `adopt_committed` и `walk_chain_once_with_lanes` до `committee_schedule_at`; PQ-подписи, членство комитета, анти-эквивокация и DLEQ/Feldman-проверка в `mev_epoch.rs` / `runtime/mev_sync.rs`; `saturating_add(1)` в `storage/retention.rs` → `tests/w8_cnvrf_and_mev_hardening_tests.rs` (15/15).
   * **Safety, Sync, WS, ABI:** сохранение `last_non_nil_prevote` при апгрейде `LegacyConsensusSafetyStateV1` (`remote_signer.rs`); проверка `shard_id` в `cheap`-ветке `adopt.rs`; учёт `latest_snap_committed()` при проверке свежести набора (`consensus_driver/mod.rs`); разбор объектного и строкового `stell_unsubscribe` в WS (`rpc/streams.rs`); фикс bare length-prefixed fallback в `ContractAbi::decode_return` → `tests/w8_polish_hardening_tests.rs` (3/3).
   * **CLI, `unjail` под D2-штрафом, `stellereum-upgrader`, systemd:** `--gas-limit` + автоэскалация газа (`2x..16x`, cap `5_000_000`) при `"below the base fee"` в `validator unjail` / `wallet unjail` (проверено вживую: разджейлены `C` и `D` и возвращён кворум `4/4`); `W6-A8-12` — `--falcon-seed-file` + `STELL_FALCON_SEED` с `Zeroizing` и перевод `scripts/soak_two_shard.sh` на `0600` key-file; запрет 3xx-редиректов/proxy-env в `UpgradePlan::read_rpc`, передача `rpc_plan` в `run_supervise`, проверка прав/симлинков в `Progress::record`; харденинг `scripts/systemd/stellereum-indexer.service`; синхронизация `ACTIVATION_BATCH_1.md` A7 → `tests/w8_cli_unjail_and_upgrader_tests.rs` (30/30), `stellereum-upgrader` (27/27).
+
+## Волна 9–16 — закрытие шероховатостей, инертных гейтов и пост-аудитных находок (2026-11-26)
+
+Снимок: рабочее дерево поверх HEAD `ab0adbf08` после прохождения Волн 9–16 и
+пост-аудитного ревью/фиксов (см. `docs/audits/AUDIT_HANDOFF_2026-11-26.md`).
+
+**Статус проверок:** подтверждено локальными прогонами в рабочем дереве:
+`cargo fmt --all -- --check` (PASS), `cargo clippy --workspace --locked --offline --all-targets -- -D warnings`
+(0 предупреждений / 0 ошибок), `stellereum --lib` (`1530/1530`), `stellereum --bins`
+(`113/113`), все сьюты `w8..w16` и 27 оставшихся интеграционных наборов из `ci_local.sh`
+(включая `consensus_liveness_harness` `13/13`), `stellereum-indexer` (включая `w14_multishard_backfill_tests` `6/6`
+и `indexer_api_tests` `12/12`), `stell-wallet` (все таргеты green), `stellereum-wasm` (`unit` + `wasm32-unknown-unknown` build),
+`stellereum-contracts` (`--workspace` + пересборка 4 `wasm32` контрактов), `sdk-js` (`typecheck` + `45/45`),
+`explorer-site/backend` (`7/7`). Живой кластер не перезапускался (`DEPLOYED` для этих правок не ставится).
+
+### CLI и кошелёк
+
+| Область | Что сделано | Статус | Тест / файл |
+|---|---|---|---|
+| `stellereum wallet generate` / `address` | Ключ и адрес теперь **Falcon-512** (897 B pk, 666 B sig, `STL_ADDR_V4`), а не Ed25519. `generate` печатает 32-байтный seed в `Zeroizing`, `address` выводит spendable PQ-адрес. | FIXED (в дереве, не задеплоено) | `w9_cli_wallet_and_config_tests.rs::wallet_generate_and_address_derive_spendable_falcon_pq_address`; `stellereum/src/cli/handlers.rs:422-476` |
+| `wallet balance` | Идёт через RPC (`stell_getBalance` + shard/address), а не по локальному файлу; при недоступном RPC — явная ошибка, не выдуманный ноль. | FIXED (в дереве; сетевой путь не прогонялся) | `stellereum/src/cli/handlers.rs:440-460`; отдельного сетевого теста нет |
+| `--falcon-seed-file` | Seed читается из файла `0600`/stdin/`STELL_FALCON_SEED` с `Zeroizing`, argv-seed остаётся deprecated. | FIXED (в дереве) | `cli_parses_wallet_consistency_and_falcon_seed_file_flags` (тот же файл) |
+| `remote-signer serve` | Добавлена подкоманда `remote-signer serve` (v2 `/v2/public_key`, `/v2/sign`, `/v2/set_lock`), `--genesis-hash`/`--shard`, ограничение 32 одновременных соединений, общий дедлайн `DeadlineReader`, корректный выход по Ctrl-C/SIGTERM и unit `scripts/systemd/stell-remote-signer.service`; без URL/токена и вне loopback путь fail-closed, локального фоллбека нет. | FIXED (в дереве; сервис не установлен) | `w9_cli_wallet_and_config_tests.rs` (23/23); `scripts/systemd/stell-remote-signer.service` |
+| `contract deploy` / `contract call` | CLI строит и подписывает Falcon-512 `SysCallDeployContract` / `SysCallCallContract` (JSON-аргументы, `--calldata`, `contract_address` по `tx.nonce`), а не только WAT-пример. | FIXED (в дереве) | `w9_cli_wallet_and_config_tests.rs` (23/23); `stellereum/src/cli/args.rs` |
+
+Итого по файлу `w9_cli_wallet_and_config_tests.rs` — **23** теста (включая `node_config_round_timeout_warning_and_toml_example_valid`, `acquire_node_dir_lock_rejects_concurrent_lock_and_releases_on_drop`, `--calldata`, `remote-signer serve`, `--node-toml` и `verify_signature_for_chain` self-checks).
+
+### `stell-wallet/` — семь дефектов W6-A6
+
+| ID | Было | Исправлено | Тест | Статус |
+|---|---|---|---|---|
+| `W6-A6-1` | SPV-баланс не проверял, что `leaf_data` действительно кодирует `balance || nonce`; подделанный лист проходил. | Декодирование листа (включая 49-байтный PQ-лист) и сверка с заявленными `balance/nonce`; подделка отвергается. | `w9_wallet_hardening_tests.rs::w6_a6_1_spv_rejects_forged_balance_with_real_16_byte_leaf_data`, `::w6_a6_1_spv_supports_49_byte_pq_leaf_and_rejects_forged_balance` | FIXED (в дереве) |
+| `W6-A6-2` | `pq-transfer`/`pq-payload` подписывали unbound конверт, который после chain-binding активации не проходил бы. | `build_pq_transfer_tx_bound` / `build_pq_payload_tx_bound` + `resolve_sign_chain_id`; legacy-строители оставлены как явный unbound escape hatch. | `wallet_chain_binding_tests.rs` (4: `bound_pq_transfer_verifies_only_on_its_chain`, `bound_pq_payload_carries_stake_and_binds`, `legacy_pq_builders_stay_unbound_but_verifying`, `transaction_chain_parity_between_paths`) | FIXED (в дереве) |
+| `W6-A6-5` | Stealth-выходы читались из незааутентифицированного plaintext JSON (вектор подмены). | `load_stealth_outputs_with_password` требует пароль и отказывает plaintext-fallback. | `w6_a6_5_plaintext_stealth_outputs_rejected_with_password`; `stell-wallet/src/notes.rs:1164` | FIXED (в дереве) |
+| `W6-A6-7` | `faucet_drip` мог отправить `STELL_FAUCET_TOKEN` по cleartext/не-loopback URL. | Проверка политики URL/токена **до** сети; не-loopback `http://` отвергается. | `w6_a6_7_faucet_drip_refuses_non_loopback_http` | FIXED (в дереве) |
+| `W6-A6-8` | Passphrase/seed/hex жили в обычных `String`/`Vec`. | `Zeroizing` для seed, passphrase, hex-seed (`pq.rs`/`security.rs`/`client.rs`); `SecureSecret`/`HardenedKeystore` не логируют секрет; notes-ключ зануляется. | `wallet_pq_tests::test_secure_memory_scrubbing_and_no_leak` (проверка Debug-редакции); код проверен, `stell-wallet` tests green | FIXED (в дереве) |
+| `W6-A6-10` | `stell aa` печатал «успех» без on-chain вызова. | Все `AaCommands` fail-closed с явным сообщением «no transaction was sent»; `revoke_session` не притворяется успешным. | `ux_pay_accepts_stl57_address_and_aa_fails_closed`, `wallet_aa_revoke_tests::revoke_session_fails_closed_even_with_a_valid_wallet`, `wallet_privacy_integration_tests::test_cli_excised_privacy_commands_fail_closed` | FIXED (в дереве) |
+| `W6-A6-11` | Локальная симуляция переполнялась, приватные файлы писались с широкими правами. | Overflow-checked атомарный локальный broadcast (без частичных списаний, включая rollback `to`), приватные файлы `0600`. | `w6_a6_11_local_broadcast_rejects_overflow_atomically`, `w6_a6_11_private_files_written_with_0600_mode` | FIXED (в дереве) |
+
+`stell-wallet` исключён из корневого workspace (`Cargo.toml` → `exclude`),
+поэтому проверяется отдельным прогоном (`cargo test --manifest-path stell-wallet/Cargo.toml`: все таргеты прошли, 0 падений).
+
+### SDK / ABI
+
+| Область | Что сделано | Статус | Тест |
+|---|---|---|---|
+| `stellereum-sdk` | Добавлены `Op::DeployContract`, `Op::DeployContractWithAbi` и `TxIntent::ContractDeploy`; wire-дискриминант **65**, gas-оценка и `Transaction::deploy_contract*` совпадают с узлом. | FIXED (в дереве) | `stellereum-sdk/src/{opcode,tx,signer}.rs`; `w10_deploy_contract_abi_tests::opcode_discriminant_is_65_and_wire_and_gas_match_sdk_layout` |
+| `CONTRACT_ABI_ONCHAIN_ACTIVATION_HEIGHT` | `SysCallDeployContractWithAbi` валидирует ABI (≤ `MAX_CONTRACT_ABI_BYTES`), деплоит и сохраняет `ContractAbi` в `ContractRegistry`/`state_root`; ниже гейта — fail-closed revert. | **INERT (`u64::MAX`)** — реализовано, не включено | `w10_deploy_contract_abi_tests` (4/4: inert+registered, discriminant 65, on-chain persist, rejected/oversized ABI) |
+| `sdk-js` | Добавлен `contractCallRaw`/`contract_call_raw`, `contractDeploy` берёт `baseFee()`, валидация `evm_carrier` non-zero, зануление `sk`, bounds checks; `npm run typecheck && npm test` **45/45** зелёные. | FIXED (в дереве) | `sdk-js/test/*.test.ts` (45/45); `sdk-js/package.json` |
+| `stellereum-wasm` + `WasmFalconSigner` | Отдельный `wasm32-unknown-unknown` cdylib с C ABI (`alloc`, `falcon_keygen`, `falcon_sign_with_entropy`, `falcon_verify`, `falcon_derive_address`), фикс длины `"STL_ADDR_V4"` (11 B) и `__getrandom_v03_custom` zero-output guard; `sdk-js/src/wasm_signer.ts` грузит его и зануляет линейную память. | FIXED (в дереве) | `stellereum-wasm/src/lib.rs` (4/4 + `wasm32` release build); `sdk-js/test/wasm_signer.test.ts` |
+
+### Контракты
+
+| Область | Что сделано | Статус | Тест |
+|---|---|---|---|
+| `*_pq` entrypoints + `SLOT_PQ_MODE` | В `sts20-token`, `account-object`, `liquidity-pool`, `stl-dns` работают PQ-точки входа (`init_pq`, `transfer_pq`, `transfer_from_pq`, `approve_pq`, `mint_pq`, `burn_pq`, `create_session_pq`, `deposit_pq`, `withdraw_pq`, `resolve_pq`, …) под 32-байтный `host.caller`; добавлен `SLOT_PQ_MODE` для блокировки неаутентифицированных legacy entrypoints после `init_pq`, фиксы `checked_add`/zero-reserve/`i64::try_from`, пересобраны 4 `wasm32` контракта. | FIXED (в дереве; контракты вне root workspace) | `stellereum-contracts` `--workspace` (green, включая `w9_pq_contract_auth_tests.rs`) |
+| Старые packed-`i64` entrypoints | `init`, `transfer`, `approve`, `deposit`, … при отсутствии `init_pq` остаются **DEMO-GRADE** shim'ами с integer id (`caller_is`), без внешнего аудита. | BY DESIGN / DEMO-GRADE | `stellereum-contracts/README.md`; заголовки `contracts/*/src/lib.rs` |
+
+### Консенсус-гейты (все — `INERT u64::MAX`)
+
+| Гейт | Значение | Что реализовано | Тест |
+|---|---|---|---|
+| `SORTITION_UNBIASED_ACTIVATION_HEIGHT` | `u64::MAX` (INERT) | `rejection_sample_u64` + `select_committee_from_seed_at` / `proposer_from_digest_at`; ниже гейта — побайтово прежний modulo-путь. | `w10_sortition_and_jail_gates_tests.rs` (6/6) |
+| `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` | `u64::MAX` (INERT) | `DOWNTIME_MISS_THRESHOLD_V2 = 200` (80 s при 400 ms) и `downtime_miss_threshold_at(height)`; ниже гейта — 42. | тот же файл (`jail_budget_v2_*`) |
+| `EXECUTION_PIPELINE_V1_ACTIVATION_HEIGHT` | `u64::MAX` (INERT) | `committed_state_height_at` (lag 2), `anchor_height_for_post_state_at` (S+2), `VecDeque` `apply_in_flight`, `ApplyLane` penalty snapshot, `PendingExecView`, proposer/adopt/catchup lag-2 gating, `post_state_roots` seed при старте/снапшоте. | `w12_pipeline_gate_tests.rs` (7/7), `w12_pipeline_runtime_state_tests.rs` (11/11) |
+| `XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT` | `u64::MAX` (INERT) | Bounded per-source PREPARE (`MAX_ACTIVE_PREPARED_PER_SENDER = 4`) + TTL `4_096`, всё за гейтом; см. `XPC-PREPARED-UNBOUNDED`. | `x8_bounce_escrow_gate.rs`, `activation_gate_xshard_bounce_escrow_tests.rs`, `w9_core_polish_tests::xpc_prepared_*` (10/10) |
+| `CNVRF_V3_ACTIVATION_HEIGHT` (schedule-only) | `u64::MAX` (INERT) | Готовность CN-VRF v3: многоэпоховый переход Producer/Adopter, churn набора в середине эпохи, отказ `Beacon(None)` и подделанного `epoch_vdf`; активация по-прежнему выключена. | `w11_cnvrf_epoch_churn_tests.rs` (3/3) |
+
+**Важно:** четыре гейта — `SORTITION_UNBIASED`, `JAIL_BUDGET_V2`,
+`CONTRACT_ABI_ONCHAIN` (см. раздел SDK/ABI) и `EXECUTION_PIPELINE_V1` —
+**не входят в `FORK_ID_RULES`** (`docs/audits/AUDIT_HANDOFF_2026-11-26.md`
+§1.2). Их включение координируется общей высотой активации и одним бинарём,
+а не сменой `FORK_ID`; «тот же `FORK_ID`» не доказывает одинаковое поведение
+разных бинарей на этих гейтах. `XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT` тоже
+не входит в `FORK_ID_RULES`; `CNVRF_V3_ACTIVATION_HEIGHT` — schedule-only.
+
+### Storage и инструменты
+
+| Инструмент | Что сделано | Статус | Тест |
+|---|---|---|---|
+| `stelops compact` | Offline-перестройка store: отказ без `--force`, отказ при живом lock, копия `.pre-compact.*`, повторное открытие каждого дерева и сверка счётчиков/хешей перед атомарным переносом. | FIXED (в дереве) | `scripts/tools/stelops/src/main.rs` (`compact_refuses_without_force_and_missing_store` и др.) |
+| `stellereum-ledger-tool verify-store` | Проверяет связность блоков и высоты в store, отвергает битый/не-store вход; остаётся автономным офлайн-инструментом. | FIXED (в дереве) | `stellereum-ledger-tool/tests/cli.rs::verify_store_checks_linked_blocks_and_rejects_broken_or_non_store` |
+
+### Ops
+
+| Область | Что сделано | Статус | Где |
+|---|---|---|---|
+| `join-testnet.sh` | `STELL_MIN_BLOCK_MS=400`, bootstrap через `stellereum store bootstrap` (snapshot + safety-init), `--skip-snapshot`/`--refresh-store`, честные проверки store. | FIXED (в дереве; не прогонялся) | `scripts/join-testnet.sh` |
+| `run-observer.sh` | Тот же `store bootstrap --observer` + `safety-reset` для чужого `safety_record_v1`; observer больше не стартует с пустым store. | FIXED (в дереве) | `scripts/run-observer.sh` |
+| prune | `PRUNE_GRACE`/`PRUNE_MAX_KV_AGE = 7200` (2 h) и `flock` на весь проход — cron-тик не может идти параллельно с ручным. | FIXED (в дереве) | `scripts/node-prune-cron.sh` |
+| graceful stop | `TimeoutStopSec=300` в `stell-nodeA/B.service` (C/D в этом дереве его не несут — проверять деплой). | FIXED (в дереве; только A/B) | `stellereum/scripts/systemd/stell-node{A,B}.service` |
+| `status_server.py` | Явные порты кластера (`127.0.0.1:8095`, targets 9080/8546/18081/9081/18552/9082), поле `jailed` per-node, `unknown` вместо выдуманных значений. | FIXED (в дереве; сервис не перезапускался) | `ops/status/status_server.py` |
+| `node_exporter` | Идемпотентный `setup-validator-monitoring.sh`: remote `:9100` только на loopback + SSH-туннели A/C/D. | FIXED (в дереве; на хостах не применялся) | `scripts/setup-validator-monitoring.sh` |
+| cosign | `verify-cosign-artifact.sh` (`--require`/`--if-present`, OIDC identity, `.sha256`), подключён в `rolling-deploy.sh` и `auto-bootstrap-store.sh` (`--require-cosign`). | FIXED (в дереве; артефакты не проверялись) | `scripts/verify-cosign-artifact.sh`, `scripts/rolling-deploy.sh`, `scripts/auto-bootstrap-store.sh` |
+
+### Индексатор
+
+| Область | Что сделано | Статус | Тест |
+|---|---|---|---|
+| Мультишард-бэкфилл и роутинг | `syncer.rs` читает `stell_getShards`, бэкфиллит все активные шарды, отклоняет trailing bytes в `raw_tx`, корректно пересчитывает `accounts.tx_count` при реорге, а `get_shards`/фильтры используют longest-prefix маршрутизацию и shard-0 `mc_seqno`/`lag`. | FIXED (в дереве; индексер не перезапускался) | `stellereum-indexer/tests/w14_multishard_backfill_tests.rs` (6/6) |
+| Честные метрики | `/api/overview` и `db::get_stats` больше не зажимают значения в `[0.48, 0.50]` / `.max(1.0)`: `tps`, `avg_block_time`, `yesterday` считаются из реальных данных; chain id конфигурируется. | FIXED (в дереве) | `w9_indexer_honest_stats_tests.rs` (2/2), `indexer_api_tests.rs` (12/12) |
+| Deploy-ABI без RPC | ABI из `SysCallDeployContractWithAbi` берётся из метаданных tx, а не дозапрашивается по RPC; revert не персистит ABI и не ставит `has_abi`. | FIXED (в дереве) | `w10_indexer_abi_deploy_tests.rs` (2/2) |
+
+### RPC
+
+| Область | Что сделано | Статус | Тест |
+|---|---|---|---|
+| `ShardRpcRouter` | Общий `Arc<RwLock<BTreeMap<u32, Arc<RpcState>>>>`; bootstrap регистрирует каждый hosted shard, поэтому HTTP/WS шарда 1 наконец доступны с любой ноды, а не только с локального движка. | FIXED (в дереве; живой кластер не обновлялся) | `stellereum/tests/w14_shard_rpc_router_tests.rs` (5/5); `stellereum/src/rpc/state.rs`, `node/bootstrap.rs` |
+
+### MEV
+
+| Область | Что сделано | Статус | Тест |
+|---|---|---|---|
+| `MevKemRegistry` + peer gossip + DLEQ | `bootstrap` выводит 64-байтный ML-KEM seed (`derive_mev_kem_seed`), `MevFrame::KemKey` (`chain_id`-привязанный `KemKeyAnnouncement` с проверкой `activation_height <= now_height` и `merge_non_conflicting`) распространяет ключи пиров по P2P, а `MevFrame::PqRelease` проходит обязательную Chaum-Pedersen DLEQ-проверку (`ingest_release_authenticated_with_ephemeral`). | FIXED (в дереве; не выкачено на живой кластер) | `w11_mev_kem_registry_wiring_tests.rs` (8/8) |
+
+### Документация
+
+| Документ | Что обновлено | Статус |
+|---|---|---|
+| `docs/site/00-index.md`, `01-quickstart.md`, `03-contracts.md`, `04-validators.md`, `05-operators.md` | Актуальные CLI (`wallet generate/address/balance`, `--falcon-seed-file`, `contract deploy/call`), 14 host-импортов, `*_pq`-контракты, `STELL_SHARDS=0`, faucet-лимиты, join/observer/prune. | FIXED (в дереве) |
+| `stellereum/docs/RPC.md` | Таблица auth-политики (`stell_deployContract`/`stell_callContract` — TOKEN-ALWAYS), `stell_getShards`, shard-aware методы, deploy/call. | FIXED (в дереве) |
+| `stellereum/docs/WALLET_SIGNING.md` | Falcon-512 как единственная живая схема, удаление Ed25519/Hybrid, точные размеры конверта, `sign`/`verify`/typed-data, anti-oracle. | FIXED (в дереве) |
+| `docs/TESTNET_UX_COMPARISON.md` | Живой testnet `rpc.stellereum.org`, faucet 2 STELL / 45 min / 50 STELL cap, границы доверия. | FIXED (в дереве) |
+| `docs/audits/AUDIT_HANDOFF_2026-11-26.md` | Пакет для внешнего аудитора: заморозка `FORK_ID`, 14 гейтов, 18 незмеренных ячеек, честные ограничения. | FIXED (в дереве; актуализирован) |
+
+### Независимый верификатор (`stellereum-verifier`)
+
+Что **есть** (включён в корневой `Cargo.toml` workspace, проверено прогоном):
+
+* 7 модулей (`wire`, `falcon512`, `block_hash`, `consensus`, `tx`, `commitment`, `lib`);
+  чистый Rust без зависимости от `stellereum` в `[dependencies]` (`stellereum` только
+  в `dev-dependencies` для differential-тестов).
+* CLI `src/main.rs`: `verify-tx`, `verify-block`, `verify-chain`, `verify-proof`,
+  `verify-snapshot`, `--chain-id`, `--validators`, `--require-qc`, `--require-chain-id`,
+  `--verify-txs`, `--absent`, строгая валидация конфликтующих флагов; exit codes 0/1/2.
+* `VerifierCommitmentSnapshot` хеширует все 17 доменов (включая `zkml`, `cnvrf`,
+  `total_minted_nano`, `evm_bindings`, `pq_registry`); `verify_block` проверяет `last_qc`
+  криптографически; `verify_tx` проверяет `SF1`/`SP1` политики и канонический
+  `split_sponsor_envelope`.
+* Differential-тесты `diff_block_qc`, `diff_commitment_root`, `diff_quorum_sortition`,
+  `diff_tx_envelopes`, `fuzz_corpus_parity` + unit/CLI-тесты.
+
+### Закрыто в Волнах 9–16 + пост-аудитных фиксах и оставшиеся пробелы (2026-11-26)
+
+1. **MEV peer KEM gossip + DLEQ — FIXED (в дереве).** Реализованы `MevFrame::KemKey`,
+   `chain_id`-привязка и проверка `activation_height <= now_height` в `KemKeyAnnouncement`,
+   устойчивый `merge_non_conflicting` и DLEQ-проверка на `MevFrame::PqRelease`
+   (`w11_mev_kem_registry_wiring_tests.rs` 8/8).
+2. **`stellereum-verifier` — FIXED (в дереве).** Добавлены подкоманды
+   `verify-proof`/`verify-snapshot`, 17-доменный `VerifierCommitmentSnapshot`,
+   крипто-проверка `last_qc` и `SF1`/`SP1` политик, включён в корневой `Cargo.toml`.
+3. **Волна 12, фаза 2b (`EXECUTION_PIPELINE_V1`) — FIXED (в дереве, гейт `INERT u64::MAX`).**
+   Реализованы `VecDeque` `apply_in_flight`, `ApplyLane` с захватом штрафов, `PendingExecView`
+   с фильтрацией `is_in_flight` в `propose()`, сидинг `post_state_roots` при старте и снапшоте,
+   `write_ahead_finalized_block` до `safety.advance_height` и lag-2 драйвер
+   (`w12_pipeline_runtime_state_tests.rs` 11/11). Гейт остаётся `u64::MAX` до координированной
+   активации.
+4. **Волна 13 (`PARALLEL_EXEC_V2` + STM) — FIXED (в дереве, opt-in `parallel_exec`).**
+   Исправлены кросс-доменные волны `Contract <-> Market/Staking` и `sync_aux_trie()` при отказе
+   `commit_native` в ветке `Token` (`w13_parallel_native_and_stm_parity_tests.rs` 9/9,
+   `w13_scheduler_access_tests.rs` 9/9, `w13_contract_stm_trace_tests.rs` 4/4,
+   `w13_domain_overlays_tests.rs` 5/5). `stellereum.toml.example` сохраняет `parallel_exec = false`;
+   живой замер на кластере остаётся `NOT MEASURED`.
+5. **Волна 14b (динамический sharding split/merge) — FIXED (в дереве).**
+   Реализована fail-closed миграция `sharding_migration.rs` (проверка непустых неподдерживаемых
+   доменов, перенос `pq_registry`/`pq_keys_fallback`/`consensus_penalty`, split/merge
+   `chain_mint_limit_nano` и `total_minted_nano`, проверка `tx_load`, SPV-листьев и токенов) —
+   `w14_dynamic_sharding_tests.rs` 8/8, подключено в `scripts/ci_local.sh` и `.github/workflows/ci.yml`.
+6. **`docs/feature_gates.yaml` — FIXED.** Перегенерирован командой `stellereum gates --yaml`
+   (14 гейтов); `feature_gates::tests::committed_manifest_matches_the_table` зелёный.
+7. **Остаётся `NOT MEASURED` / заблокировано на живом кластере:**
+   * **`perf-matrix`:** все 18 ячеек `NOT MEASURED` (требуется живой `4/4` кластер и отдельный замер
+     после восстановления `nodeB`/`nodeC`).
+   * **Живой деплой / rolling-deploy / индексер / мониторинг:** заблокированы до восстановления `4/4`
+     (после перезагрузки хоста `nodeA`/`nodeD` на `#727828`, `nodeB` застрял на `#658159` с отказом
+     `snapshot-sync` на `#720000`, `nodeC` под высокой нагрузкой не отвечает по RPC).
+
+## Волны 17–24 — многораундовый self-improving аудит и закрытие находок (2026-11-27)
+
+Три цикла сквозного аудита (`C1–C3`, по 3–4 read-only агента) и 8 последовательно
+проверенных волн фиксов (**Waves 17–24**) без изменения замороженного ядра
+(`FORK_ID = 0x3ae00ebc`, Ruleset v7, Chain ID `5757`, все консенсусные гейты `INERT u64::MAX`):
+
+* **Ядро `stellereum/src/` (Волны 17, 21, 23, 24):**
+  * Детерминизм и инварианты: учёт `SysCallDeployContractWithAbi` в `pre_deploy_addrs` (`parallel.rs`), сортировка `pair_id` в `SysCallCancelOrder` (`svm.rs`), детерминированный порядок `qc.signatures` (`consensus/engine.rs`), fail-closed при падении apply-воркера в `adopt_committed` (`consensus_step.rs`).
+  * Lock safety и async I/O: снятие локов до `.await` в `stell_getProgramAccounts` (`rpc/reads.rs`) и `admit_tx_from_ingress` (`propose.rs`, порядок `accounts` -> `mempool`), перенос фонового sled/`fsync` писателя на выделенный OS-поток `"stell-persist"` (`storage/persistence.rs`), батчевая гидрация `hydrate_rpc_from_store` и sled/WAT I/O в `spawn_blocking` (`rpc/{eth,contracts,state}.rs`, `storage/archive.rs`, `mempool::load_into`).
+  * Защита от DoS / OOM и оптимизации: клонирование только целевого контракта в `preview_contract_call`, `OrderbookManager::clone_pair`, снятие двойной валидации деплоя до `falcon_host_fuel_v2` и `PqRegistry` RO-проверка (`svm.rs`), `BinaryHeap`-фронтир `select_multi` + кэш `TxMeta` + `O(|confirmed|)` `prune_confirmed` + `by_account` + удаление `mempool.all()` из `adopt.rs`, отказ от 0-байтных снапшотов + `PersistJob::DomainsBundle` + `prune_receipts_below` по `receipts_by_height`, ограничение `ValidatorRuntime::{blocks,finalized}` / `EvmAdapter` / `FalconPubkeyCache` / `VerifiedVoteCache` / `SharedSequencer` / `L2Sequencer`, фиксы `mev_epoch` (`roll_partials_to` + `valid_signature_count`) и `mev_kem_registry`, `evm_adapter` (`eth_feeHistory` `u64::MAX`, ASCII `get_balance`, `y_parity <= 1`, строгий `blockHash`), `light_client*` (таймаут/капы/lag-2), `remote_signer` `@`-userinfo bypass, `store_bootstrap` `tar -tvf` до `tar -xf`.
+  * Liveness/P2P: `BodyPull::full_request` юникаст (`W6-A3-7`), `Body` index cap, `heal_engine_to_head` прогресс/таймаут/кэш, RAII `AtomicFlagResetGuard`, `PREFIX_SHARD_MEMPOOL` 512 cap, атомарный `publish_head`, 10с таймаут `publish_overlay`, 15с таймаут в `network/retention.rs`, pre-download QC verify и fail-closed drain timeout в `sync.rs`, параллельный shutdown в `bootstrap.rs`.
+* **Индексатор, верификатор, fuzz, инструменты, SDK и контракты (Волны 18, 19, 22, 24):**
+  * `stellereum-indexer`: `into_make_service_with_connect_info`, фикс `get_validators` post-sort `falcon_pubkey`, `PRAGMA busy_timeout`, композитный PK `contracts(shard_id, address)` с миграцией, журнал `token_balance_history` для отката при реорге, `spawn_blocking` хэндлеры, `fetch_abi` без кэширования временных ошибок.
+  * `stellereum-verifier` и `stellereum-ledger-tool`: глубина JSON `64`, `0x`/`0X`, exit codes `1`/`2`, `--block` в `verify-snapshot`, `shard_id` continuity, `README.md`; не-мутирующий `verify-store` во временной копии с проверкой `.node.lock`, симлинков и обрезанного префикса заголовков; `stellereum-upgrader` `O_NOFOLLOW` + `(dev, ino)` + HTTPS/64KiB; `stelops` без `.expect()`-паник.
+  * `stellereum/fuzz` и CI: 24 сида во всех 5 ранее пустых корпусах, `TEST_THREADS=1` для `--lib`, включение `stellereum-verifier`, `stellereum-wasm` (`working-directory: stellereum-wasm`) и `sdk-js` в `ci_local.sh` и `.github/workflows/ci.yml`.
+  * `stellereum-contracts`, `stellereum-sdk`, `sdk-js`, `stellereum-wasm`, `stell-wallet`, `explorer-site/backend`, `ops`/`scripts`: полные `SLOT_PQ_MODE` и `*_pq` parity + `calldata_exact` + 256-bit `mul_div_u128` (`wasm32` пересобраны), `SP1` `SponsorAuthorization` + `SF1` `SessionGrant` + пустой `payload` в Rust/JS SDK, чистый браузерный SHA-256 и тесты на реальном `stellereum_wasm.wasm` (`56/56`), канонический солёный `PQ1` и `Zeroizing` + тест `W6-A6-8` в `stell-wallet`, BLAKE3 `Stl57` + единый bucket + IPv6 `/64` в `explorer-site/backend` (`17/17`), `status_server.py` (`14/14`), PromQL алерты (`NodeOutOfSync`/`PeersLost`/`FalconSignRate`), унификация `systemd` A/B/C/D и `scripts/*.sh`.
+
+**Подтверждённый итоговый прогон (2026-11-27):**
+* `./scripts/ci_local.sh --sdk`: **`CI_LOCAL_RESULT=PASS`** (`passed=6 failed=0`: `fmt`, `clippy --workspace --all-targets -- -D warnings`, `test-lib` `1602/1602`, 7 PR-сьютов `stellereum`, `sibling-suites` (`stellereum-verifier`, `stellereum-indexer`, `stellereum-ledger-tool`, `stellereum-upgrader`, `infnode`, `infmail`, `stellereum-sdk --features node-parity`), `stellereum-wasm` unit + `wasm32`, `sdk-js` `56/56` + `check:rpc-types` + `build`).
+* Отдельно подтверждены после правок: `vuln_bundle_tests` + `pentest_state_wave`, `light_client_tests` (`22/22`), `stellereum-contracts` (`--workspace` + 4 `wasm32` билда), `stell-wallet` (все таргеты, `clippy 0/0`), `explorer-site/backend` (`17/17`), `stelops` (`5/5`), `ops/status` (`14/14`).
+* Прим. по полному `--full` (`452/459`): 5 старых до-v7/до-W8 тестов (`activation_gates_inert`, `w4_engine_hardening_tests::wasm_table_elements_cap_gate_row_is_inert`, `downtime_restore_tests`, `network_audit_close_tests::tempo_c_slot_and_alignment_stay_put`, `hunt_consensus_round3::hunt23_adopt_committed_accepts_a_non_proposer_block`) содержат устаревшие ожидания, не затронутые Волнами 17–24.
+
 

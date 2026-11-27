@@ -877,13 +877,15 @@ impl PqKeyLookup
 
 /// Legacy pre-V2 key lookup: [`crate::consensus::pq_key_at_height`].
 ///
-/// Used ONLY by the pre-activation replay wrappers
+/// Used by the pre-activation replay wrappers
 /// ([`verify_quorum_signatures`], [`distinct_falcon_signers`],
-/// [`MultisigRelayer::count_signers`]) at `attestation_height = 0`, and only
-/// while `height < BRIDGE_V2_ACTIVATION_HEIGHT` semantics apply. Post-V2
-/// settlement passes the committed `(&staking, &pq_registry)` lookup instead,
-/// so the process-local `PQ_VALIDATOR_KEYS` head map is never consulted for
-/// live verification (`get_validator_pq_key` is not referenced by this module).
+/// [`MultisigRelayer::count_signers`]) at `attestation_height = 0`, and by
+/// [`BridgeState::plan_at_height`] below `bridge_v2_active_at`, where the
+/// legacy (non-committed-registry) key source remains authoritative for that
+/// replayed height. Post-V2 settlement passes the committed
+/// `(&staking, &pq_registry)` lookup instead, so the process-local
+/// `PQ_VALIDATOR_KEYS` head map is never consulted for live verification
+/// (`get_validator_pq_key` is not referenced by this module).
 pub struct PreV2ConsensusLookup;
 
 impl PqKeyLookup for PreV2ConsensusLookup {
@@ -1197,15 +1199,24 @@ impl TeleportBridgeEngine {
         msg
     }
 
-    /// Process incoming Teleport deposit from external network.
+    /// Process incoming Teleport deposit from external network AT
+    /// `attestation_height`, resolving quorum keys through the height-indexed
+    /// committed `pq_keys` lookup.
     ///
-    /// SECURITY: the quorum counts DISTINCT validators — a single validator
-    /// submitting the same (or different) signatures N times cannot fake a 2/3
-    /// quorum. Replays by source tx hash are rejected.
-    ///
-    /// The signature count runs through [`verify_quorum_signatures`] - the
-    /// same helper the adapter's quorum-attested evidence uses.
-    pub fn process_deposit(&mut self, event: &TeleportDepositEvent) -> Result<u64, String> {
+    /// Performs EXACTLY the checks of [`Self::process_deposit`] (duplicate
+    /// source tx, optional zk gate, replay insert); the only difference is the
+    /// quorum helper: [`verify_quorum_signatures_at_height`] resolves each
+    /// validator's key AT the supplied height instead of the pre-V2
+    /// `attestation_height = 0` wrapper. At/after the bridge V2 activation
+    /// height this makes committed key ROTATIONS authoritative - a compromised
+    /// rotated-out key can no longer forge a deposit, and a legitimate
+    /// new-key attestation verifies.
+    pub fn process_deposit_at_height(
+        &mut self,
+        event: &TeleportDepositEvent,
+        attestation_height: u64,
+        pq_keys: &dyn PqKeyLookup,
+    ) -> Result<u64, String> {
         if self
             .processed_source_txs
             .contains_key(&event.source_tx_hash)
@@ -1214,8 +1225,14 @@ impl TeleportBridgeEngine {
         }
 
         let msg = Self::deposit_signing_message(event);
-        verify_quorum_signatures(&msg, &event.validator_signatures, &self.validators)
-            .map_err(|e| format!("Teleport deposit quorum not reached: {e}"))?;
+        verify_quorum_signatures_at_height(
+            &msg,
+            &event.validator_signatures,
+            &self.validators,
+            attestation_height,
+            pq_keys,
+        )
+        .map_err(|e| format!("Teleport deposit quorum not reached: {e}"))?;
 
         // Check optional zk-proof verification.
         //
@@ -1257,6 +1274,23 @@ impl TeleportBridgeEngine {
 
         self.processed_source_txs.insert(event.source_tx_hash, true);
         Ok(event.amount)
+    }
+
+    /// Process incoming Teleport deposit from external network.
+    ///
+    /// SECURITY: the quorum counts DISTINCT validators — a single validator
+    /// submitting the same (or different) signatures N times cannot fake a 2/3
+    /// quorum. Replays by source tx hash are rejected.
+    ///
+    /// The signature count runs through [`verify_quorum_signatures`] - the
+    /// same helper the adapter's quorum-attested evidence uses.
+    ///
+    /// PRE-V2 COMPATIBILITY WRAPPER: delegates to
+    /// [`Self::process_deposit_at_height`] at `attestation_height = 0` with
+    /// [`PreV2ConsensusLookup`], preserving the historical behavior
+    /// byte-for-byte for legacy callers and pre-v7 replay.
+    pub fn process_deposit(&mut self, event: &TeleportDepositEvent) -> Result<u64, String> {
+        self.process_deposit_at_height(event, 0, &PreV2ConsensusLookup)
     }
 
     /// Request withdrawal with rate-limits and time-locks.
@@ -1741,23 +1775,6 @@ impl BridgeState {
         }
     }
 
-    /// Write the engine's post-plan fields back. `escrow_balance` is NOT an
-    /// engine field: the caller refreshes it from the account map.
-    fn absorb(&mut self, engine: &TeleportBridgeEngine) {
-        self.processed_source_txs = engine.processed_source_txs.keys().copied().collect();
-        self.pending_withdrawals = engine
-            .pending_withdrawals
-            .iter()
-            .map(|(id, req)| (*id, req.clone()))
-            .collect();
-        self.next_withdrawal_id = engine.next_withdrawal_id;
-        self.hourly_withdrawn = engine.hourly_withdrawn;
-        self.last_rate_limit_reset = engine.last_rate_limit_reset;
-        self.hourly_deposited = engine.hourly_deposited;
-        self.last_deposit_reset = engine.last_deposit_reset;
-        self.total_minted = engine.total_minted;
-    }
-
     /// Plan one transaction's bridge intents against the COMMITTED state.
     ///
     /// This is the §8 policy gate, and it is the SAME rule the offline engine
@@ -1959,7 +1976,14 @@ impl BridgeState {
                     let event = intent
                         .deposit_event(signatures)
                         .expect("deposit_event on a Deposit always yields an event");
-                    match engine.process_deposit(&event) {
+                    // HEIGHT-INDEXED KEY RESOLUTION: below `bridge_v2_active_at`,
+                    // `evidence_lookup` is still `PreV2ConsensusLookup`, so a
+                    // pre-v7 replay keeps the legacy key source and stays
+                    // byte-identical. At/above it the committed height-indexed
+                    // registry is authoritative, so PQ key ROTATIONS are
+                    // respected: a rotated-out key can no longer forge a
+                    // deposit, and a legitimate new-key attestation verifies.
+                    match engine.process_deposit_at_height(&event, block_height, evidence_lookup) {
                         Ok(_) => {
                             // The live quorum path: unchanged behavior. When
                             // it passes, evidence (if any) is irrelevant.
@@ -2564,17 +2588,26 @@ impl BridgeState {
             }
         }
 
-        let mut state = self.clone();
-        state.absorb(&engine);
-        // Dispute layer (worked above against clones so intents in one
-        // payload see each other; committed here atomically with the rest).
-        state.deposit_records = records_map;
-        state.disputes = disputes_map;
-        state.next_dispute_id = next_dispute_id;
-        // BRIDGE-FIX-FULL containers (empty and unchanged pre-activation).
-        state.release_receipts = release_receipts;
-        state.processed_payout_txs = processed_payout_txs;
-        state.refunded_withdrawals = refunded_withdrawals;
+        let state = BridgeState {
+            processed_source_txs: engine.processed_source_txs.into_keys().collect(),
+            pending_withdrawals: engine.pending_withdrawals.into_iter().collect(),
+            next_withdrawal_id: engine.next_withdrawal_id,
+            hourly_withdrawn: engine.hourly_withdrawn,
+            last_rate_limit_reset: engine.last_rate_limit_reset,
+            escrow_balance: self.escrow_balance,
+            hourly_deposited: engine.hourly_deposited,
+            last_deposit_reset: engine.last_deposit_reset,
+            total_minted: engine.total_minted,
+            // Dispute layer (worked above against clones so intents in one
+            // payload see each other; committed here atomically with the rest).
+            deposit_records: records_map,
+            disputes: disputes_map,
+            next_dispute_id,
+            // BRIDGE-FIX-FULL containers (empty and unchanged pre-activation).
+            release_receipts,
+            processed_payout_txs,
+            refunded_withdrawals,
+        };
         Ok(BridgePlan { state, effects })
     }
 }

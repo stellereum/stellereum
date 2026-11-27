@@ -446,6 +446,15 @@ pub fn source_on_abort_ack(existing: Option<&XpcRecord>) -> XpcTransition {
     }
 }
 
+/// Hard cap on concurrent active `Prepared` 2PC records per sender on a target
+/// shard once [`crate::chain_spec::xshard_bounce_escrow_required_active_at`] is active.
+pub const MAX_ACTIVE_PREPARED_PER_SENDER: usize = 4;
+
+/// Deterministic TTL (in heights) after which an unresolved `Prepared` 2PC
+/// record retires in [`is_retired`] once
+/// [`crate::chain_spec::xshard_bounce_escrow_required_active_at`] is active.
+pub const XPC_PREPARE_TTL_HEIGHTS: u64 = 4_096;
+
 /// The TARGET-side transition: the source's PREPARE arrived and validated.
 ///
 /// The target records PREPARED and votes YES. It never moves out of PREPARED
@@ -462,6 +471,41 @@ pub fn target_prepare(existing: Option<&XpcRecord>) -> XpcTransition {
             }
         }
     }
+}
+
+/// Gate-protected `XPC-PREPARED-UNBOUNDED` admission check for target `Prepared`
+/// records:
+/// 1. At most ONE active `Prepared` record per `(source_shard, from, source_nonce)`,
+///    blocking multi-`tx_hash` same-nonce spam against a single affordability proof;
+/// 2. At most [`MAX_ACTIVE_PREPARED_PER_SENDER`] concurrent active `Prepared`
+///    records from the same `(source_shard, from)` sender.
+pub fn target_prepare_slot_available<'a, I>(
+    active_records: I,
+    source_shard: ShardId,
+    from: &[u8; 32],
+    source_nonce: u64,
+    tx_hash: &[u8; 32],
+) -> bool
+where
+    I: IntoIterator<Item = &'a XpcRecord>,
+{
+    let mut sender_active_count = 0usize;
+    for rec in active_records {
+        if rec.phase != XpcPhase::Prepared || rec.source_shard != source_shard {
+            continue;
+        }
+        if rec.tx.from != *from || rec.tx_hash == *tx_hash {
+            continue;
+        }
+        if rec.tx.nonce == source_nonce {
+            return false;
+        }
+        sender_active_count += 1;
+        if sender_active_count >= MAX_ACTIVE_PREPARED_PER_SENDER {
+            return false;
+        }
+    }
+    true
 }
 
 /// The TARGET-side transition: the source's COMMIT arrived, so the target
@@ -764,17 +808,32 @@ pub fn opening_prepare_budget(plan_len: usize) -> usize {
     remaining.saturating_sub(XPC_INBOUND_CONTROL_RESERVE.min(remaining))
 }
 
-/// True when this record is terminal AND old enough to be retired at
-/// `height`.
+/// True when this record is eligible for retirement at `height`.
 ///
-/// PURE function of the committed record and the applied height, so every
-/// node retires exactly the same records at exactly the same height (and the
-/// resulting state root and replay snapshot agree). PREPARED records are
-/// never retired here: their escrow is still open and the protocol must keep
-/// the state needed to reach a decision.
+/// PURE function of the committed record, the applied height, and the active
+/// chain-spec gate, so every node retires exactly the same records at exactly
+/// the same height (and the resulting state root and replay snapshot agree).
+/// Pre-activation (`xshard_bounce_escrow_required_active_at(height) == false`),
+/// `Prepared` records are never retired here; once active, unresolved
+/// `Prepared` records expire at `prepared_height + XPC_PREPARE_TTL_HEIGHTS`.
 pub fn is_retired(record: &XpcRecord, height: u64) -> bool {
+    is_retired_at(
+        record,
+        height,
+        crate::chain_spec::xshard_bounce_escrow_required_active_at(height),
+    )
+}
+
+/// Pure form of [`is_retired`] with an explicit `enforce_prepared_ttl` gate.
+pub fn is_retired_at(record: &XpcRecord, height: u64, enforce_prepared_ttl: bool) -> bool {
     match record.phase {
-        XpcPhase::Prepared => false,
+        XpcPhase::Prepared => {
+            enforce_prepared_ttl
+                && height
+                    >= record
+                        .prepared_height
+                        .saturating_add(XPC_PREPARE_TTL_HEIGHTS)
+        }
         XpcPhase::Committed | XpcPhase::Aborted => {
             height
                 >= record
@@ -1767,6 +1826,17 @@ mod retention_tests {
             XpcRecord::prepared(tx, 0, 1, 10)
         };
         assert!(!is_retired(&prepared, u64::MAX));
+        assert!(!is_retired_at(
+            &prepared,
+            10 + XPC_PREPARE_TTL_HEIGHTS,
+            false
+        ));
+        assert!(!is_retired_at(
+            &prepared,
+            10 + XPC_PREPARE_TTL_HEIGHTS - 1,
+            true
+        ));
+        assert!(is_retired_at(&prepared, 10 + XPC_PREPARE_TTL_HEIGHTS, true));
         let committed = committed_at(20);
         assert!(!is_retired(
             &committed,
@@ -1774,6 +1844,67 @@ mod retention_tests {
         ));
         assert!(is_retired(&committed, 20 + XPC_TERMINAL_RETENTION_HEIGHTS));
         assert!(is_retired(&committed, u64::MAX));
+    }
+
+    #[test]
+    fn target_prepare_slot_available_enforces_nonce_uniqueness_and_sender_cap() {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let from = signer.verifying_key().to_bytes();
+        let tx_n0_a = crate::sharding::Transaction::sign(&signer, [1u8; 32], 10, 280_000, 0, 0, 1);
+        let tx_n0_b = crate::sharding::Transaction::sign(&signer, [2u8; 32], 10, 280_000, 0, 0, 1);
+        let rec_n0_a = XpcRecord::prepared(tx_n0_a.clone(), 0, 1, 10);
+
+        // Same (source_shard, from, nonce) with a distinct tx_hash is refused.
+        assert!(!target_prepare_slot_available(
+            [&rec_n0_a],
+            0,
+            &from,
+            0,
+            &tx_n0_b.compute_tx_hash()
+        ));
+        // Same tx_hash is allowed (idempotency check is handled by target_prepare).
+        assert!(target_prepare_slot_available(
+            [&rec_n0_a],
+            0,
+            &from,
+            0,
+            &rec_n0_a.tx_hash
+        ));
+
+        // Distinct nonces are allowed up to MAX_ACTIVE_PREPARED_PER_SENDER, then blocked.
+        let mut active = Vec::new();
+        for nonce in 0..MAX_ACTIVE_PREPARED_PER_SENDER as u64 {
+            let tx =
+                crate::sharding::Transaction::sign(&signer, [3u8; 32], 10, 280_000, nonce, 0, 1);
+            active.push(XpcRecord::prepared(tx, 0, 1, 10));
+        }
+        let tx_extra = crate::sharding::Transaction::sign(
+            &signer,
+            [3u8; 32],
+            10,
+            280_000,
+            MAX_ACTIVE_PREPARED_PER_SENDER as u64,
+            0,
+            1,
+        );
+        assert!(!target_prepare_slot_available(
+            active.iter(),
+            0,
+            &from,
+            MAX_ACTIVE_PREPARED_PER_SENDER as u64,
+            &tx_extra.compute_tx_hash()
+        ));
+
+        // Decided records do not consume active Prepared capacity.
+        active[0].phase = XpcPhase::Committed;
+        active[0].decided_height = 12;
+        assert!(target_prepare_slot_available(
+            active.iter(),
+            0,
+            &from,
+            MAX_ACTIVE_PREPARED_PER_SENDER as u64,
+            &tx_extra.compute_tx_hash()
+        ));
     }
 
     #[test]

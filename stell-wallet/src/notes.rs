@@ -9,7 +9,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::security::enforce_strict_permissions;
 
@@ -50,18 +50,19 @@ impl HardenedNotesStore {
             .map_err(|e| format!("Argon2 params error: {e:?}"))?;
         let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
-        let mut derived_key = [0u8; 32];
+        let mut derived_key = Zeroizing::new([0u8; 32]);
         argon2
-            .hash_password_into(password.as_bytes(), &salt, &mut derived_key)
+            .hash_password_into(password.as_bytes(), &salt, &mut *derived_key)
             .map_err(|e| format!("Argon2 KDF failed: {e:?}"))?;
 
-        let cipher = XChaCha20Poly1305::new((&derived_key).into());
+        let cipher = XChaCha20Poly1305::new((&*derived_key).into());
         let mut nonce = [0u8; 24];
         OsRng.fill_bytes(&mut nonce);
         let xnonce = XNonce::from_slice(&nonce);
 
-        let plaintext =
-            serde_json::to_vec(notes).map_err(|e| format!("Failed to serialize notes: {e}"))?;
+        let plaintext = Zeroizing::new(
+            serde_json::to_vec(notes).map_err(|e| format!("Failed to serialize notes: {e}"))?,
+        );
 
         let payload = Payload {
             msg: &plaintext,
@@ -74,7 +75,6 @@ impl HardenedNotesStore {
 
         let tag_split = ciphertext.len().saturating_sub(16);
         let (ct_body, auth_tag) = ciphertext.split_at(tag_split);
-        derived_key.zeroize();
 
         Ok(Self {
             version: NOTES_STORE_VERSION,
@@ -107,9 +107,9 @@ impl HardenedNotesStore {
             .map_err(|e| format!("Argon2 params error: {e:?}"))?;
         let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
-        let mut derived_key = [0u8; 32];
+        let mut derived_key = Zeroizing::new([0u8; 32]);
         argon2
-            .hash_password_into(password.as_bytes(), &salt, &mut derived_key)
+            .hash_password_into(password.as_bytes(), &salt, &mut *derived_key)
             .map_err(|e| format!("Argon2 derivation error: {e:?}"))?;
 
         if nonce.len() != 24 {
@@ -118,7 +118,7 @@ impl HardenedNotesStore {
                 nonce.len()
             ));
         }
-        let cipher = XChaCha20Poly1305::new((&derived_key).into());
+        let cipher = XChaCha20Poly1305::new((&*derived_key).into());
         let xnonce = XNonce::from_slice(&nonce);
 
         let mut full_ct = Vec::with_capacity(ct_body.len() + auth_tag.len());
@@ -130,11 +130,10 @@ impl HardenedNotesStore {
             aad: NOTES_AAD,
         };
 
-        let decrypted = cipher.decrypt(xnonce, payload).map_err(|_| {
+        let decrypted = Zeroizing::new(cipher.decrypt(xnonce, payload).map_err(|_| {
             "Decryption failed: incorrect password or tampered notes container!".to_string()
-        })?;
+        })?);
 
-        derived_key.zeroize();
         serde_json::from_slice(&decrypted)
             .map_err(|e| format!("Failed to parse decrypted notes JSON: {e}"))
     }
@@ -144,18 +143,20 @@ impl HardenedNotesStore {
         let mut salt = [0u8; 16];
         OsRng.fill_bytes(&mut salt);
 
-        let mut material = [0u8; 48];
+        let mut material = Zeroizing::new([0u8; 48]);
         material[..32].copy_from_slice(secret);
         material[32..].copy_from_slice(&salt);
-        let derived_key = blake3::derive_key("STELL_NOTES_SECRET_KDF_V1", &material);
+        let derived_key =
+            Zeroizing::new(blake3::derive_key("STELL_NOTES_SECRET_KDF_V1", &*material));
 
-        let cipher = XChaCha20Poly1305::new((&derived_key).into());
+        let cipher = XChaCha20Poly1305::new((&*derived_key).into());
         let mut nonce = [0u8; 24];
         OsRng.fill_bytes(&mut nonce);
         let xnonce = XNonce::from_slice(&nonce);
 
-        let plaintext =
-            serde_json::to_vec(notes).map_err(|e| format!("Failed to serialize notes: {e}"))?;
+        let plaintext = Zeroizing::new(
+            serde_json::to_vec(notes).map_err(|e| format!("Failed to serialize notes: {e}"))?,
+        );
 
         let payload = Payload {
             msg: &plaintext,
@@ -202,10 +203,11 @@ impl HardenedNotesStore {
                 salt.len()
             ));
         }
-        let mut material = [0u8; 48];
+        let mut material = Zeroizing::new([0u8; 48]);
         material[..32].copy_from_slice(secret);
         material[32..].copy_from_slice(&salt);
-        let derived_key = blake3::derive_key("STELL_NOTES_SECRET_KDF_V1", &material);
+        let derived_key =
+            Zeroizing::new(blake3::derive_key("STELL_NOTES_SECRET_KDF_V1", &*material));
 
         if nonce.len() != 24 {
             return Err(format!(
@@ -213,7 +215,7 @@ impl HardenedNotesStore {
                 nonce.len()
             ));
         }
-        let cipher = XChaCha20Poly1305::new((&derived_key).into());
+        let cipher = XChaCha20Poly1305::new((&*derived_key).into());
         let xnonce = XNonce::from_slice(&nonce);
 
         let mut full_ct = Vec::with_capacity(ct_body.len() + auth_tag.len());
@@ -225,9 +227,9 @@ impl HardenedNotesStore {
             aad: NOTES_AAD,
         };
 
-        let decrypted = cipher.decrypt(xnonce, payload).map_err(|_| {
+        let decrypted = Zeroizing::new(cipher.decrypt(xnonce, payload).map_err(|_| {
             "Decryption failed: incorrect secret or tampered notes container!".to_string()
-        })?;
+        })?);
 
         serde_json::from_slice(&decrypted)
             .map_err(|e| format!("Failed to parse decrypted notes JSON: {e}"))
@@ -255,7 +257,7 @@ impl HardenedNotesStore {
 pub fn derive_blinding_factor(seed: &[u8; 32], note_counter: u64) -> [u8; 32] {
     let mut attempt = 0u64;
     loop {
-        let mut material = Vec::with_capacity(48);
+        let mut material = Zeroizing::new(Vec::with_capacity(48));
         material.extend_from_slice(seed);
         material.extend_from_slice(&note_counter.to_le_bytes());
         if attempt > 0 {
@@ -572,8 +574,8 @@ fn decrypt_legacy_notes_file(path: &Path) -> Result<Vec<ShieldedNote>, String> {
                 nonce.len()
             ));
         }
-        let key = derive_storage_key(path, &salt_arr)?;
-        let cipher = XChaCha20Poly1305::new((&key).into());
+        let key = Zeroizing::new(derive_storage_key(path, &salt_arr)?);
+        let cipher = XChaCha20Poly1305::new((&*key).into());
         let xnonce = XNonce::from_slice(&nonce);
 
         let mut full_ct = Vec::with_capacity(ct_body.len() + auth_tag.len());
@@ -585,9 +587,9 @@ fn decrypt_legacy_notes_file(path: &Path) -> Result<Vec<ShieldedNote>, String> {
             aad: NOTES_AAD,
         };
 
-        let decrypted = cipher.decrypt(xnonce, payload).map_err(|_| {
+        let decrypted = Zeroizing::new(cipher.decrypt(xnonce, payload).map_err(|_| {
             "Decryption failed: corrupted notes store or tampering detected!".to_string()
-        })?;
+        })?);
 
         serde_json::from_slice(&decrypted)
             .map_err(|e| format!("Failed to parse decrypted notes JSON: {e}"))
@@ -886,18 +888,20 @@ impl HardenedStealthStore {
             .map_err(|e| format!("Argon2 params error: {e:?}"))?;
         let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
-        let mut derived_key = [0u8; 32];
+        let mut derived_key = Zeroizing::new([0u8; 32]);
         argon2
-            .hash_password_into(password.as_bytes(), &salt, &mut derived_key)
+            .hash_password_into(password.as_bytes(), &salt, &mut *derived_key)
             .map_err(|e| format!("Argon2 KDF failed: {e:?}"))?;
 
-        let cipher = XChaCha20Poly1305::new((&derived_key).into());
+        let cipher = XChaCha20Poly1305::new((&*derived_key).into());
         let mut nonce = [0u8; 24];
         OsRng.fill_bytes(&mut nonce);
         let xnonce = XNonce::from_slice(&nonce);
 
-        let plaintext = serde_json::to_vec(outputs)
-            .map_err(|e| format!("Failed to serialize stealth outputs: {e}"))?;
+        let plaintext = Zeroizing::new(
+            serde_json::to_vec(outputs)
+                .map_err(|e| format!("Failed to serialize stealth outputs: {e}"))?,
+        );
         let payload = Payload {
             msg: &plaintext,
             aad: STEALTH_AAD,
@@ -907,7 +911,6 @@ impl HardenedStealthStore {
             .map_err(|e| format!("Encryption error: {e:?}"))?;
         let tag_split = ciphertext.len().saturating_sub(16);
         let (ct_body, auth_tag) = ciphertext.split_at(tag_split);
-        derived_key.zeroize();
 
         Ok(Self {
             version: STEALTH_STORE_VERSION,
@@ -942,9 +945,9 @@ impl HardenedStealthStore {
             .map_err(|e| format!("Argon2 params error: {e:?}"))?;
         let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
-        let mut derived_key = [0u8; 32];
+        let mut derived_key = zeroize::Zeroizing::new([0u8; 32]);
         argon2
-            .hash_password_into(password.as_bytes(), &salt, &mut derived_key)
+            .hash_password_into(password.as_bytes(), &salt, &mut *derived_key)
             .map_err(|e| format!("Argon2 derivation error: {e:?}"))?;
 
         if nonce.len() != 24 {
@@ -953,7 +956,7 @@ impl HardenedStealthStore {
                 nonce.len()
             ));
         }
-        let cipher = XChaCha20Poly1305::new((&derived_key).into());
+        let cipher = XChaCha20Poly1305::new((&*derived_key).into());
         let xnonce = XNonce::from_slice(&nonce);
         let mut full_ct = Vec::with_capacity(ct_body.len() + auth_tag.len());
         full_ct.extend_from_slice(&ct_body);
@@ -962,10 +965,10 @@ impl HardenedStealthStore {
             msg: &full_ct,
             aad: STEALTH_AAD,
         };
-        let decrypted = cipher.decrypt(xnonce, payload).map_err(|_| {
+        let decrypted = zeroize::Zeroizing::new(cipher.decrypt(xnonce, payload).map_err(|_| {
             "Decryption failed: incorrect password or tampered stealth container!".to_string()
-        })?;
-        derived_key.zeroize();
+        })?);
+        drop(derived_key);
         serde_json::from_slice(&decrypted)
             .map_err(|e| format!("Failed to parse decrypted stealth JSON: {e}"))
     }
@@ -978,18 +981,23 @@ impl HardenedStealthStore {
         let mut salt = [0u8; 16];
         OsRng.fill_bytes(&mut salt);
 
-        let mut material = [0u8; 48];
+        let mut material = zeroize::Zeroizing::new([0u8; 48]);
         material[..32].copy_from_slice(secret);
         material[32..].copy_from_slice(&salt);
-        let derived_key = blake3::derive_key("STELL_STEALTH_SECRET_KDF_V1", &material);
+        let derived_key = zeroize::Zeroizing::new(blake3::derive_key(
+            "STELL_STEALTH_SECRET_KDF_V1",
+            &*material,
+        ));
 
-        let cipher = XChaCha20Poly1305::new((&derived_key).into());
+        let cipher = XChaCha20Poly1305::new((&*derived_key).into());
         let mut nonce = [0u8; 24];
         OsRng.fill_bytes(&mut nonce);
         let xnonce = XNonce::from_slice(&nonce);
 
-        let plaintext = serde_json::to_vec(outputs)
-            .map_err(|e| format!("Failed to serialize stealth outputs: {e}"))?;
+        let plaintext = zeroize::Zeroizing::new(
+            serde_json::to_vec(outputs)
+                .map_err(|e| format!("Failed to serialize stealth outputs: {e}"))?,
+        );
         let payload = Payload {
             msg: &plaintext,
             aad: STEALTH_AAD,
@@ -1035,10 +1043,13 @@ impl HardenedStealthStore {
                 salt.len()
             ));
         }
-        let mut material = [0u8; 48];
+        let mut material = zeroize::Zeroizing::new([0u8; 48]);
         material[..32].copy_from_slice(secret);
         material[32..].copy_from_slice(&salt);
-        let derived_key = blake3::derive_key("STELL_STEALTH_SECRET_KDF_V1", &material);
+        let derived_key = zeroize::Zeroizing::new(blake3::derive_key(
+            "STELL_STEALTH_SECRET_KDF_V1",
+            &*material,
+        ));
 
         if nonce.len() != 24 {
             return Err(format!(
@@ -1046,7 +1057,7 @@ impl HardenedStealthStore {
                 nonce.len()
             ));
         }
-        let cipher = XChaCha20Poly1305::new((&derived_key).into());
+        let cipher = XChaCha20Poly1305::new((&*derived_key).into());
         let xnonce = XNonce::from_slice(&nonce);
         let mut full_ct = Vec::with_capacity(ct_body.len() + auth_tag.len());
         full_ct.extend_from_slice(&ct_body);
@@ -1055,9 +1066,9 @@ impl HardenedStealthStore {
             msg: &full_ct,
             aad: STEALTH_AAD,
         };
-        let decrypted = cipher.decrypt(xnonce, payload).map_err(|_| {
+        let decrypted = zeroize::Zeroizing::new(cipher.decrypt(xnonce, payload).map_err(|_| {
             "Decryption failed: incorrect secret or tampered stealth container!".to_string()
-        })?;
+        })?);
         serde_json::from_slice(&decrypted)
             .map_err(|e| format!("Failed to parse decrypted stealth JSON: {e}"))
     }
@@ -1142,8 +1153,8 @@ fn decrypt_stealth_store_with_storage_key(
             nonce.len()
         ));
     }
-    let key = derive_stealth_storage_key(path, &salt_arr)?;
-    let cipher = XChaCha20Poly1305::new((&key).into());
+    let key = Zeroizing::new(derive_stealth_storage_key(path, &salt_arr)?);
+    let cipher = XChaCha20Poly1305::new((&*key).into());
     let xnonce = XNonce::from_slice(&nonce);
     let mut full_ct = Vec::with_capacity(ct_body.len() + auth_tag.len());
     full_ct.extend_from_slice(&ct_body);
@@ -1152,18 +1163,16 @@ fn decrypt_stealth_store_with_storage_key(
         msg: &full_ct,
         aad: STEALTH_AAD,
     };
-    let decrypted = cipher.decrypt(xnonce, payload).map_err(|_| {
+    let decrypted = Zeroizing::new(cipher.decrypt(xnonce, payload).map_err(|_| {
         "Decryption failed: corrupted stealth store or tampering detected!".to_string()
-    })?;
+    })?);
     serde_json::from_slice(&decrypted)
         .map_err(|e| format!("Failed to parse decrypted stealth JSON: {e}"))
 }
 
-/// Loads stealth outputs, decrypting the XChaCha20-Poly1305 [`HardenedStealthStore`]
-/// container. Audit B-WALLET-4: no plaintext fallback (forgery vector).
-/// Saves stealth outputs encrypted with XChaCha20-Poly1305 (legacy wallet-bound key)
-/// using atomic persistence (.tmp -> 0600 -> sync_all -> rename).
-/// Loads stealth outputs decrypting with a password (or legacy plaintext migration).
+/// Loads stealth outputs decrypting with a password.
+///
+/// Audit B-WALLET-4 / W6-A6-5: no plaintext fallback (forgery vector).
 pub fn load_stealth_outputs_with_password(
     path: &Path,
     password: &str,
@@ -1180,8 +1189,10 @@ pub fn load_stealth_outputs_with_password(
     if let Ok(store) = serde_json::from_str::<HardenedStealthStore>(trimmed) {
         store.decrypt(password)
     } else {
-        serde_json::from_str(trimmed)
-            .map_err(|e| format!("Failed to parse legacy stealth outputs JSON: {e}"))
+        Err(format!(
+            "refusing unauthenticated plaintext stealth outputs at {path:?}: \
+             re-import ancient files via a password- or secret-bound store"
+        ))
     }
 }
 

@@ -1,12 +1,16 @@
 use bincode::Options;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+use stellereum::consensus::{consensus_chain_id, VoteKind};
 use stellereum::sharding::Block;
+use stellereum::storage::{BlockHash, Storage};
 
 const MAX_BLOCK_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CHAIN_BLOCKS: usize = 1024;
-const USAGE: &str = "usage: stellereum-ledger-tool inspect-block <bincode-file> <chain-id>\n       stellereum-ledger-tool verify-block <bincode-file> <chain-id> <expected-hash-hex>\n       stellereum-ledger-tool verify-chain current-v1 <chain-id> <block-file> <block-file> [block-file...]\n       stellereum-ledger-tool repair|export [arguments...]\ncurrent-v1 means the full current node Block encoded by bincode fixed-int; legacy formats are not supported\ninput must be a stable, independent current-format block file, not a live store or a file being written; no snapshot or concurrency protection is provided\ninput limit: 32 MiB per block, 1024 blocks per chain; decoded heap and hash computation are not bounded by this limit; use OS resource limits for untrusted input";
+const USAGE: &str = "usage: stellereum-ledger-tool inspect-block <bincode-file> <chain-id>\n       stellereum-ledger-tool verify-block <bincode-file> <chain-id> <expected-hash-hex>\n       stellereum-ledger-tool verify-chain current-v1 <chain-id> <block-file> <block-file> [block-file...]\n       stellereum-ledger-tool verify-store [--in-place] <store-dir> <chain-id>\n       stellereum-ledger-tool repair|export [arguments...]\ncurrent-v1 means the full current node Block encoded by bincode fixed-int; legacy formats are not supported\ninput must be a stable, independent current-format block file, not a live store or a file being written; no snapshot or concurrency protection is provided\ninput limit: 32 MiB per block, 1024 blocks per chain; decoded heap and hash computation are not bounded by this limit; use OS resource limits for untrusted input";
 
 fn decode_block(bytes: &[u8]) -> Result<Block, String> {
     if bytes.len() as u64 > MAX_BLOCK_BYTES {
@@ -31,10 +35,12 @@ fn decode_block(bytes: &[u8]) -> Result<Block, String> {
 }
 
 fn read_block(path: &Path) -> Result<Block, String> {
-    if !std::fs::metadata(path)
-        .map_err(|e| format!("cannot stat input: {e}"))?
-        .is_file()
-    {
+    let link_meta =
+        std::fs::symlink_metadata(path).map_err(|e| format!("cannot stat input: {e}"))?;
+    if link_meta.file_type().is_symlink() {
+        return Err(format!("refusing symlinked input: {}", path.display()));
+    }
+    if !link_meta.is_file() {
         return Err("input must be a regular file, not a store directory".into());
     }
     let file = File::open(path).map_err(|e| format!("cannot open input: {e}"))?;
@@ -104,6 +110,26 @@ fn run(args: &[String]) -> Result<(), String> {
             examine(&args[1], &args[2], Some(expected))
         }
         Some("verify-chain") if args.len() >= 5 => verify_chain(&args[1], &args[2], &args[3..]),
+        Some("verify-store") => {
+            let mut in_place = false;
+            let mut positional: Vec<&str> = Vec::new();
+            for arg in &args[1..] {
+                if arg == "--in-place" {
+                    if in_place {
+                        return Err(USAGE.into());
+                    }
+                    in_place = true;
+                } else if arg.starts_with('-') {
+                    return Err(USAGE.into());
+                } else {
+                    positional.push(arg.as_str());
+                }
+            }
+            if positional.len() != 2 {
+                return Err(USAGE.into());
+            }
+            verify_store(Path::new(positional[0]), positional[1], in_place)
+        }
         _ => Err(USAGE.into()),
     }
 }
@@ -183,6 +209,582 @@ fn examine(path: &str, chain_id: &str, expected: Option<[u8; 32]>) -> Result<(),
     println!(
         "input limit: 32 MiB; decoded heap and hash computation are not bounded by this limit"
     );
+    Ok(())
+}
+
+static TEMP_STORE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+struct TempStoreGuard {
+    path: PathBuf,
+}
+
+impl Drop for TempStoreGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn create_temp_store_dir() -> Result<TempStoreGuard, String> {
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    for _ in 0..16 {
+        let seq = TEMP_STORE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = base.join(format!("stellereum-verify-store-{pid}-{nanos}-{seq}"));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&candidate) {
+            Ok(()) => return Ok(TempStoreGuard { path: candidate }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(format!(
+                    "cannot create temporary verify directory {}: {e}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Err("cannot allocate unique temporary verify directory".into())
+}
+
+fn validate_store_paths(store_dir: &Path) -> Result<(), String> {
+    let dir_meta = std::fs::symlink_metadata(store_dir)
+        .map_err(|e| format!("cannot stat store dir {}: {e}", store_dir.display()))?;
+    if dir_meta.file_type().is_symlink() {
+        return Err(format!(
+            "refusing symlinked store directory: {}",
+            store_dir.display()
+        ));
+    }
+    if !dir_meta.is_dir() {
+        return Err(format!(
+            "store path is not a directory: {}",
+            store_dir.display()
+        ));
+    }
+    let db_path = store_dir.join("db");
+    let db_meta = std::fs::symlink_metadata(&db_path).map_err(|_| {
+        format!(
+            "not a stellereum store (no `db` file in {}): refusing to open",
+            store_dir.display()
+        )
+    })?;
+    if db_meta.file_type().is_symlink() {
+        return Err(format!(
+            "refusing symlinked store `db` file: {}",
+            db_path.display()
+        ));
+    }
+    if !db_meta.is_file() {
+        return Err(format!(
+            "not a stellereum store (`db` is not a regular file in {})",
+            store_dir.display()
+        ));
+    }
+    let blobs_path = store_dir.join("blobs");
+    match std::fs::symlink_metadata(&blobs_path) {
+        Ok(blobs_meta) => {
+            if blobs_meta.file_type().is_symlink() {
+                return Err(format!(
+                    "refusing symlinked store `blobs` entry: {}",
+                    blobs_path.display()
+                ));
+            }
+            if !blobs_meta.is_dir() {
+                return Err(format!(
+                    "not a stellereum store (`blobs` is not a directory in {})",
+                    store_dir.display()
+                ));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "cannot stat store `blobs` in {}: {e}",
+                store_dir.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_node_locks(store_dir: &Path) -> Result<Vec<File>, String> {
+    let mut candidates = vec![store_dir.join(".node.lock")];
+    if let Some(parent) = store_dir.parent() {
+        if parent.as_os_str().is_empty() {
+            candidates.push(Path::new(".").join(".node.lock"));
+        } else {
+            candidates.push(parent.join(".node.lock"));
+        }
+    } else if store_dir == Path::new(".") {
+        candidates.push(Path::new("..").join(".node.lock"));
+    }
+
+    let mut guards = Vec::new();
+    for lock_path in candidates {
+        match std::fs::symlink_metadata(&lock_path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(format!(
+                        "refusing symlinked node lock: {}",
+                        lock_path.display()
+                    ));
+                }
+                if !meta.is_file() {
+                    return Err(format!(
+                        "node lock is not a regular file: {}",
+                        lock_path.display()
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(format!(
+                    "cannot stat node lock {}: {e}",
+                    lock_path.display()
+                ));
+            }
+        }
+        let file = File::open(&lock_path)
+            .map_err(|e| format!("cannot open node lock {}: {e}", lock_path.display()))?;
+        match file.try_lock() {
+            Ok(()) => guards.push(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(format!(
+                    "refusing to verify store: node lock {} is actively held by another process",
+                    lock_path.display()
+                ));
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!(
+                    "cannot check node lock {}: {e}",
+                    lock_path.display()
+                ));
+            }
+        }
+    }
+    Ok(guards)
+}
+
+fn copy_store_for_readonly_verify(src: &Path, dst: &Path) -> Result<(), String> {
+    let entries = std::fs::read_dir(src)
+        .map_err(|e| format!("cannot read store directory {}: {e}", src.display()))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| format!("cannot read store directory entry {}: {e}", src.display()))?;
+        let name = entry.file_name();
+        if name == ".node.lock" {
+            continue;
+        }
+        let src_path = entry.path();
+        let meta = std::fs::symlink_metadata(&src_path)
+            .map_err(|e| format!("cannot stat store entry {}: {e}", src_path.display()))?;
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "refusing symlinked store entry: {}",
+                src_path.display()
+            ));
+        }
+        let dst_path = dst.join(&name);
+        if meta.is_file() {
+            std::fs::copy(&src_path, &dst_path).map_err(|e| {
+                format!(
+                    "cannot copy store file {} to temporary store: {e}",
+                    src_path.display()
+                )
+            })?;
+        } else if meta.is_dir() && name == "blobs" {
+            std::fs::create_dir(&dst_path).map_err(|e| {
+                format!(
+                    "cannot create temporary blobs directory {}: {e}",
+                    dst_path.display()
+                )
+            })?;
+            let blob_entries = std::fs::read_dir(&src_path)
+                .map_err(|e| format!("cannot read blobs directory {}: {e}", src_path.display()))?;
+            for blob_entry in blob_entries {
+                let blob_entry = blob_entry.map_err(|e| {
+                    format!(
+                        "cannot read blobs directory entry {}: {e}",
+                        src_path.display()
+                    )
+                })?;
+                let blob_src = blob_entry.path();
+                let blob_meta = std::fs::symlink_metadata(&blob_src)
+                    .map_err(|e| format!("cannot stat blob entry {}: {e}", blob_src.display()))?;
+                if blob_meta.file_type().is_symlink() {
+                    return Err(format!(
+                        "refusing symlinked blob entry: {}",
+                        blob_src.display()
+                    ));
+                }
+                if !blob_meta.is_file() {
+                    return Err(format!(
+                        "unexpected non-regular entry in blobs directory: {}",
+                        blob_src.display()
+                    ));
+                }
+                let blob_dst = dst_path.join(blob_entry.file_name());
+                std::fs::copy(&blob_src, &blob_dst).map_err(|e| {
+                    format!(
+                        "cannot copy blob file {} to temporary store: {e}",
+                        blob_src.display()
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_retained_header_prefix(
+    storage: &Storage,
+    start_height: u64,
+    mut expected_hash: BlockHash,
+    expected_shard: Option<u32>,
+    min_verified_header_height: &mut Option<u64>,
+    verified_header_count: &mut u64,
+) -> Result<(), String> {
+    let mut h = start_height;
+    loop {
+        let indexed = storage
+            .hashes_at_height(h)
+            .map_err(|e| format!("height {h}: cannot read height index: {e}"))?;
+        if !indexed.is_empty() {
+            if !indexed.contains(&expected_hash) {
+                return Err(format!(
+                    "height {h}: broken prev_hash link; child expects {} while height index holds {}",
+                    hex::encode(expected_hash),
+                    hex::encode(indexed[0])
+                ));
+            }
+            if storage
+                .get_block(&expected_hash)
+                .map_err(|e| {
+                    format!(
+                        "height {h}: cannot read block {}: {e}",
+                        hex::encode(expected_hash)
+                    )
+                })?
+                .is_none()
+            {
+                return Err(format!(
+                    "height {h}: broken prev_hash link; child expects {} which is absent while height index holds {}",
+                    hex::encode(expected_hash),
+                    hex::encode(indexed[0])
+                ));
+            }
+            return Err(format!(
+                "height {h}: non-contiguous block body retention gap above height {h}"
+            ));
+        }
+
+        let hdr_opt = storage
+            .header_at(h)
+            .map_err(|e| format!("height {h}: cannot read header: {e}"))?;
+        let hdr2_opt = storage
+            .header_v2_at(h)
+            .map_err(|e| format!("height {h}: cannot read header_v2: {e}"))?;
+
+        if let Some(hdr) = &hdr_opt {
+            if hdr.height != h {
+                return Err(format!(
+                    "height {h}: stored header reports height {}",
+                    hdr.height
+                ));
+            }
+            if hdr.block_hash != expected_hash {
+                return Err(format!(
+                    "height {h}: broken prev_hash link; child expects {}, header records {}",
+                    hex::encode(expected_hash),
+                    hex::encode(hdr.block_hash)
+                ));
+            }
+        }
+
+        if let Some(hdr2) = &hdr2_opt {
+            if hdr2.header.height != h {
+                return Err(format!(
+                    "height {h}: stored header_v2 reports height {}",
+                    hdr2.header.height
+                ));
+            }
+            if hdr2.block_hash != expected_hash {
+                return Err(format!(
+                    "height {h}: broken prev_hash link; child expects {}, header_v2 records {}",
+                    hex::encode(expected_hash),
+                    hex::encode(hdr2.block_hash)
+                ));
+            }
+            if let Some(shard) = expected_shard {
+                if hdr2.header.shard_id != shard {
+                    return Err(format!(
+                        "height {h}: header_v2 shard mismatch (expected {shard}, got {})",
+                        hdr2.header.shard_id
+                    ));
+                }
+            }
+        }
+
+        if let (Some(hdr), Some(hdr2)) = (&hdr_opt, &hdr2_opt) {
+            if hdr.height != hdr2.header.height
+                || hdr.prev_hash != hdr2.header.prev_hash
+                || hdr.state_root != hdr2.header.state_root
+                || hdr.proposer != hdr2.header.proposer
+                || hdr.timestamp != hdr2.header.timestamp
+                || hdr.tx_count != hdr2.tx_count
+                || hdr.gas_used != hdr2.gas_used
+                || hdr.block_hash != hdr2.block_hash
+            {
+                return Err(format!(
+                    "height {h}: header and header_v2 records are inconsistent"
+                ));
+            }
+        }
+
+        let next_prev_hash = match (&hdr2_opt, &hdr_opt) {
+            (Some(hdr2), _) => hdr2.header.prev_hash,
+            (None, Some(hdr)) => hdr.prev_hash,
+            (None, None) => break,
+        };
+
+        *min_verified_header_height = Some(h);
+        *verified_header_count += 1;
+        if h == 0 {
+            break;
+        }
+        expected_hash = next_prev_hash;
+        h -= 1;
+    }
+    Ok(())
+}
+
+struct StoreVerifySummary {
+    verified_count: u64,
+    min_verified_height: u64,
+    finalized_height: u64,
+    finalized_hash: BlockHash,
+    tip_shard: u32,
+    verified_header_count: u64,
+    min_verified_header_height: Option<u64>,
+}
+
+fn verify_opened_storage(storage: &Storage, chain_id: u64) -> Result<StoreVerifySummary, String> {
+    let (finalized_height, finalized_hash) = storage
+        .finalized()
+        .map_err(|e| format!("cannot read finalized pointer: {e}"))?
+        .ok_or_else(|| "store has no finalized pointer".to_string())?;
+
+    let mut expected_hash: BlockHash = finalized_hash;
+    let mut expected_shard: Option<u32> = None;
+    let mut min_verified_height = finalized_height;
+    let mut verified_count = 0u64;
+    let mut min_verified_header_height: Option<u64> = None;
+    let mut verified_header_count = 0u64;
+    let mut h = finalized_height;
+
+    loop {
+        let block_opt = storage.get_block(&expected_hash).map_err(|e| {
+            format!(
+                "height {h}: cannot read block {}: {e}",
+                hex::encode(expected_hash)
+            )
+        })?;
+        let Some(block) = block_opt else {
+            if h == finalized_height {
+                return Err(format!(
+                    "finalized tip block {} at height {h} is missing from store",
+                    hex::encode(expected_hash)
+                ));
+            }
+            verify_retained_header_prefix(
+                storage,
+                h,
+                expected_hash,
+                expected_shard,
+                &mut min_verified_header_height,
+                &mut verified_header_count,
+            )?;
+            break;
+        };
+
+        if block.height != h {
+            return Err(format!(
+                "height {h}: stored block reports height {}",
+                block.height
+            ));
+        }
+        match expected_shard {
+            None => expected_shard = Some(block.shard_id),
+            Some(shard) if block.shard_id != shard => {
+                return Err(format!(
+                    "height {h}: shard mismatch (expected {shard}, got {})",
+                    block.shard_id
+                ));
+            }
+            Some(_) => {}
+        }
+
+        let computed = block.compute_hash();
+        if computed != expected_hash {
+            return Err(format!(
+                "height {h}: block hash mismatch for chain id {chain_id} (expected {}, computed {})",
+                hex::encode(expected_hash),
+                hex::encode(computed)
+            ));
+        }
+
+        let indexed = storage
+            .hashes_at_height(h)
+            .map_err(|e| format!("height {h}: cannot read height index: {e}"))?;
+        if !indexed.is_empty() && !indexed.contains(&expected_hash) {
+            return Err(format!(
+                "height {h}: block {} is missing from by_height index",
+                hex::encode(expected_hash)
+            ));
+        }
+
+        let tx_count = u32::try_from(block.transactions.len())
+            .map_err(|_| format!("height {h}: transaction count exceeds u32::MAX"))?;
+
+        if let Some(hdr) = storage
+            .header_at(h)
+            .map_err(|e| format!("height {h}: cannot read header: {e}"))?
+        {
+            if hdr.height != block.height
+                || hdr.prev_hash != block.prev_hash
+                || hdr.state_root != block.state_root
+                || hdr.proposer != block.proposer
+                || hdr.timestamp != block.timestamp
+                || hdr.tx_count != tx_count
+                || hdr.block_hash != computed
+            {
+                return Err(format!(
+                    "height {h}: header record is inconsistent with block body"
+                ));
+            }
+        }
+
+        if let Some(hdr2) = storage
+            .header_v2_at(h)
+            .map_err(|e| format!("height {h}: cannot verify header_v2: {e}"))?
+        {
+            if hdr2.header != block.header()
+                || hdr2.block_hash != computed
+                || hdr2.tx_count != tx_count
+            {
+                return Err(format!(
+                    "height {h}: header_v2 record is inconsistent with block body"
+                ));
+            }
+        }
+
+        if let Some(qc) = &block.precommit_qc {
+            if qc.kind != VoteKind::Precommit
+                || qc.height != block.height
+                || qc.shard_id != block.shard_id
+                || qc.block_hash != Some(computed)
+            {
+                return Err(format!(
+                    "height {h}: precommit_qc is inconsistent with block"
+                ));
+            }
+        }
+        if let Some(last_qc) = &block.last_qc {
+            let parent_h = block
+                .height
+                .checked_sub(1)
+                .ok_or_else(|| format!("height {h}: genesis block must not carry last_qc"))?;
+            if last_qc.kind != VoteKind::Precommit
+                || last_qc.height != parent_h
+                || last_qc.shard_id != block.shard_id
+                || last_qc.block_hash != Some(block.prev_hash)
+            {
+                return Err(format!(
+                    "height {h}: last_qc is inconsistent with parent block"
+                ));
+            }
+        }
+
+        min_verified_height = h;
+        verified_count += 1;
+        if h == 0 {
+            break;
+        }
+        expected_hash = block.prev_hash;
+        h -= 1;
+    }
+
+    let tip_shard = expected_shard.ok_or_else(|| "no blocks verified".to_string())?;
+    Ok(StoreVerifySummary {
+        verified_count,
+        min_verified_height,
+        finalized_height,
+        finalized_hash,
+        tip_shard,
+        verified_header_count,
+        min_verified_header_height,
+    })
+}
+
+fn verify_store(store_dir: &Path, chain_id: &str, in_place: bool) -> Result<(), String> {
+    let chain_id = parse_chain_id(chain_id)?;
+    validate_store_paths(store_dir)?;
+    let _lock_guards = check_node_locks(store_dir)?;
+
+    // The CLI process is single-threaded and computes no consensus hash
+    // before setting the node's one-time chain-id source.
+    std::env::set_var("STELL_CHAIN_ID", chain_id.to_string());
+    let effective_chain_id = consensus_chain_id();
+    if effective_chain_id != chain_id {
+        return Err(format!(
+            "chain-id mismatch: requested {chain_id}, process frozen at {effective_chain_id}"
+        ));
+    }
+
+    let _temp_guard = if in_place {
+        None
+    } else {
+        let guard = create_temp_store_dir()?;
+        copy_store_for_readonly_verify(store_dir, &guard.path)?;
+        Some(guard)
+    };
+    let open_dir = _temp_guard
+        .as_ref()
+        .map_or(store_dir, |guard| guard.path.as_path());
+
+    let summary = {
+        let storage = Storage::open(open_dir)
+            .map_err(|e| format!("cannot open store {}: {e}", store_dir.display()))?;
+        verify_opened_storage(&storage, chain_id)?
+    };
+
+    println!(
+        "verified store: {} block(s), heights {}..={}, shard {}, chain id {}",
+        summary.verified_count,
+        summary.min_verified_height,
+        summary.finalized_height,
+        summary.tip_shard,
+        chain_id
+    );
+    if let Some(min_hdr_h) = summary.min_verified_header_height {
+        println!(
+            "verified retained prefix headers: {} header(s), heights {}..={}",
+            summary.verified_header_count,
+            min_hdr_h,
+            summary.min_verified_height.saturating_sub(1)
+        );
+    }
+    println!("finalized height: {}", summary.finalized_height);
+    println!("finalized hash: {}", hex::encode(summary.finalized_hash));
+    println!("checked: finalized pointer, contiguous retained block hashes, retained prefix header linkage, prev_hash linkage, chain-id binding, and header/QC consistency where present");
     Ok(())
 }
 
@@ -317,6 +919,9 @@ mod tests {
             ],
             vec!["inspect-block".to_string(), ".".into(), "1".into()],
             vec!["inspect-block".to_string(), "unused".into(), "0".into()],
+            vec!["verify-store".to_string()],
+            vec!["verify-store".to_string(), ".".into(), "1".into()],
+            vec!["verify-store".to_string(), "unused".into(), "0".into()],
         ] {
             assert!(run(&args).is_err());
         }

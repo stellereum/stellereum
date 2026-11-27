@@ -177,12 +177,15 @@ impl From<WalletScheme> for PqScheme {
     }
 }
 
-impl From<WalletScheme> for stellereum::post_quantum::PqScheme {
-    fn from(s: WalletScheme) -> Self {
+impl TryFrom<WalletScheme> for stellereum::post_quantum::PqScheme {
+    type Error = String;
+
+    fn try_from(s: WalletScheme) -> Result<Self, Self::Error> {
         match s {
-            WalletScheme::Falcon512 => stellereum::post_quantum::PqScheme::Falcon512,
-            WalletScheme::Hybrid => stellereum::post_quantum::PqScheme::Hybrid,
-            WalletScheme::Ed25519 => stellereum::post_quantum::PqScheme::Ed25519,
+            WalletScheme::Falcon512 => Ok(stellereum::post_quantum::PqScheme::Falcon512),
+            WalletScheme::Hybrid | WalletScheme::Ed25519 => Err(format!(
+                "legacy wallet scheme {s} is not supported for consensus signing"
+            )),
         }
     }
 }
@@ -190,10 +193,13 @@ impl From<WalletScheme> for stellereum::post_quantum::PqScheme {
 impl From<PqScheme> for stellereum::post_quantum::PqScheme {
     fn from(s: PqScheme) -> Self {
         match s {
-            PqScheme::Ed25519 => stellereum::post_quantum::PqScheme::Ed25519,
             PqScheme::Falcon512 => stellereum::post_quantum::PqScheme::Falcon512,
-            PqScheme::MlDsa44 => stellereum::post_quantum::PqScheme::MlDsa44,
-            PqScheme::Hybrid => stellereum::post_quantum::PqScheme::Hybrid,
+            // Fail-closed fallback: disabled/legacy schemes map to the disabled
+            // consensus variant instead of panicking; consensus builders and
+            // verifiers refuse everything except Falcon-512.
+            PqScheme::MlDsa44 | PqScheme::Ed25519 | PqScheme::Hybrid => {
+                stellereum::post_quantum::PqScheme::MlDsa44
+            }
         }
     }
 }
@@ -201,10 +207,8 @@ impl From<PqScheme> for stellereum::post_quantum::PqScheme {
 impl From<stellereum::post_quantum::PqScheme> for PqScheme {
     fn from(s: stellereum::post_quantum::PqScheme) -> Self {
         match s {
-            stellereum::post_quantum::PqScheme::Ed25519 => PqScheme::Ed25519,
             stellereum::post_quantum::PqScheme::Falcon512 => PqScheme::Falcon512,
             stellereum::post_quantum::PqScheme::MlDsa44 => PqScheme::MlDsa44,
-            stellereum::post_quantum::PqScheme::Hybrid => PqScheme::Hybrid,
         }
     }
 }
@@ -266,6 +270,17 @@ impl PqScheme {
         match self {
             Self::Ed25519 => false,
             Self::Falcon512 | Self::MlDsa44 | Self::Hybrid => true,
+        }
+    }
+
+    /// Fallible conversion to a consensus-enabled `stellereum::post_quantum::PqScheme`.
+    #[allow(dead_code)] // GATE: explicit fallible conversion helper alongside From<PqScheme>
+    pub fn try_consensus_scheme(self) -> Result<stellereum::post_quantum::PqScheme, String> {
+        match self {
+            Self::Falcon512 => Ok(stellereum::post_quantum::PqScheme::Falcon512),
+            Self::MlDsa44 | Self::Ed25519 | Self::Hybrid => Err(format!(
+                "scheme {self} is not supported for consensus signing (Falcon-512 only)"
+            )),
         }
     }
 }
@@ -419,7 +434,7 @@ impl PqKeyPair {
             PqScheme::Falcon512 => {
                 let mut hasher = blake3::Hasher::new_derive_key("STELL_PQ_FALCON512_SEED_V4");
                 hasher.update(seed);
-                let falcon_sec = *hasher.finalize().as_bytes();
+                let falcon_sec = zeroize::Zeroizing::new(*hasher.finalize().as_bytes());
 
                 let falcon_kp =
                     stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&falcon_sec);
@@ -435,10 +450,10 @@ impl PqKeyPair {
             PqScheme::MlDsa44 => {
                 let mut hasher = blake3::Hasher::new_derive_key("STELL_PQ_MLDSA44_SEED_V4");
                 hasher.update(seed);
-                let mldsa_sec = *hasher.finalize().as_bytes();
+                let mldsa_sec = zeroize::Zeroizing::new(*hasher.finalize().as_bytes());
 
                 let mut pk_hasher = blake3::Hasher::new_derive_key("STELL_PQ_MLDSA44_PUBKEY_V4");
-                pk_hasher.update(&mldsa_sec);
+                pk_hasher.update(mldsa_sec.as_ref());
                 let mut pubkey = vec![0u8; MLDSA44_PUBKEY_LEN];
                 let mut reader = pk_hasher.finalize_xof();
                 reader.fill(&mut pubkey);
@@ -455,13 +470,14 @@ impl PqKeyPair {
             PqScheme::Hybrid => {
                 let mut ed_hasher = blake3::Hasher::new_derive_key("STELL_PQ_HYBRID_ED25519_V4");
                 ed_hasher.update(seed);
-                let ed_seed = *ed_hasher.finalize().as_bytes();
+                let ed_seed = zeroize::Zeroizing::new(*ed_hasher.finalize().as_bytes());
                 let ed_signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_seed);
                 let ed_pubkey = ed_signing_key.verifying_key().to_bytes();
+                let ed_sk_bytes = zeroize::Zeroizing::new(ed_signing_key.to_bytes());
 
                 let mut f_hasher = blake3::Hasher::new_derive_key("STELL_PQ_HYBRID_FALCON512_V4");
                 f_hasher.update(seed);
-                let falcon_sec = *f_hasher.finalize().as_bytes();
+                let falcon_sec = zeroize::Zeroizing::new(*f_hasher.finalize().as_bytes());
 
                 let falcon_kp =
                     stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&falcon_sec);
@@ -471,8 +487,8 @@ impl PqKeyPair {
                 pubkey.extend_from_slice(&falcon_kp.public_key);
 
                 let mut secret_bytes = Vec::with_capacity(64);
-                secret_bytes.extend_from_slice(&ed_signing_key.to_bytes());
-                secret_bytes.extend_from_slice(&falcon_sec);
+                secret_bytes.extend_from_slice(&*ed_sk_bytes);
+                secret_bytes.extend_from_slice(&*falcon_sec);
 
                 PqKeyPair {
                     scheme,
@@ -485,29 +501,48 @@ impl PqKeyPair {
         }
     }
 
-    /// Sign message with secret key according to scheme
-    pub fn sign(&self, message: &[u8]) -> Vec<u8> {
+    /// Sign message with secret key according to scheme, returning an error on
+    /// disabled schemes or malformed key material instead of panicking.
+    pub fn try_sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
         match self.scheme {
             PqScheme::Falcon512 => {
-                sign_falcon512(&self._secret_key.bytes, &self.public_key, message)
+                if self._secret_key.bytes.len() < 32 {
+                    return Err(format!(
+                        "Falcon-512 secret key must be at least 32 bytes, got {}",
+                        self._secret_key.bytes.len()
+                    ));
+                }
+                let sig = sign_falcon512(&self._secret_key.bytes, &self.public_key, message);
+                if sig.is_empty() {
+                    return Err("Falcon-512 signing produced empty signature".to_string());
+                }
+                Ok(sig)
             }
             PqScheme::Hybrid => sign_hybrid(&self._secret_key.bytes, &self.public_key, message),
             PqScheme::Ed25519 => {
                 use ed25519_dalek::Signer;
-                let sk = ed25519_dalek::SigningKey::from_bytes(
-                    self._secret_key
-                        .bytes
-                        .as_slice()
-                        .try_into()
-                        .expect("32 bytes"),
-                );
-                sk.sign(message).to_bytes().to_vec()
+                let sk_bytes: [u8; 32] =
+                    self._secret_key.bytes.as_slice().try_into().map_err(|_| {
+                        format!(
+                            "Ed25519 secret key must be exactly 32 bytes, got {}",
+                            self._secret_key.bytes.len()
+                        )
+                    })?;
+                let sk = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
+                Ok(sk.sign(message).to_bytes().to_vec())
             }
             // Audit HIGH-2: ML-DSA-44 is disabled node-side (verify always
             // false) — the wallet must not mint signatures that can never
-            // verify (funds-lock footgun). Fail closed with an empty sig.
-            PqScheme::MlDsa44 => Vec::new(),
+            // verify (funds-lock footgun).
+            PqScheme::MlDsa44 => {
+                Err("ML-DSA-44 is disabled (fail-closed): signing refused".to_string())
+            }
         }
+    }
+
+    /// Sign message with secret key according to scheme (fails closed with empty `Vec` on error).
+    pub fn sign(&self, message: &[u8]) -> Vec<u8> {
+        self.try_sign(message).unwrap_or_default()
     }
 }
 
@@ -527,6 +562,10 @@ impl crate::client::PqSigner for PqKeyPair {
     fn sign(&self, message: &[u8]) -> Vec<u8> {
         self.sign(message)
     }
+
+    fn try_sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
+        self.try_sign(message)
+    }
 }
 
 /// Signs a message with Falcon-512 conforming to Stellereum PQ-BFT v4 verification rules.
@@ -538,60 +577,64 @@ pub fn sign_falcon512(secret_key: &[u8], _pubkey: &[u8], message: &[u8]) -> Vec<
     let mut seed = zeroize::Zeroizing::new([0u8; 32]);
     seed.copy_from_slice(&secret_key[..32]);
     let falcon_kp = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed);
-    falcon_kp.sign_with_seed(message, &seed)
+    falcon_kp.sign(message)
 }
 
 /// Signs a message with Hybrid scheme (Ed25519 + Falcon-512).
-pub fn sign_hybrid(secret_bytes: &[u8], pubkey: &[u8], message: &[u8]) -> Vec<u8> {
+pub fn sign_hybrid(secret_bytes: &[u8], pubkey: &[u8], message: &[u8]) -> Result<Vec<u8>, String> {
     use ed25519_dalek::Signer;
-    let ed_secret: [u8; 32] = secret_bytes[..32]
+    if secret_bytes.len() < 64 {
+        return Err(format!(
+            "Hybrid secret must be at least 64 bytes (32B Ed25519 + 32B Falcon-512), got {}",
+            secret_bytes.len()
+        ));
+    }
+    if pubkey.len() < ED25519_PUBKEY_LEN {
+        return Err(format!(
+            "Hybrid public key must be at least {} bytes, got {}",
+            ED25519_PUBKEY_LEN,
+            pubkey.len()
+        ));
+    }
+    let ed_slice: [u8; 32] = secret_bytes[..32]
         .try_into()
-        .expect("Hybrid secret must start with 32-byte Ed25519 seed");
+        .map_err(|_| "Hybrid secret must start with 32-byte Ed25519 seed".to_string())?;
+    let ed_secret = zeroize::Zeroizing::new(ed_slice);
     let falcon_secret = &secret_bytes[32..];
     let falcon_pk = &pubkey[ED25519_PUBKEY_LEN..];
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&ed_secret);
     let ed_sig = sk.sign(message).to_bytes();
     let falcon_sig = sign_falcon512(falcon_secret, falcon_pk, message);
+    if falcon_sig.is_empty() {
+        return Err("Falcon-512 signing failed inside hybrid signer".to_string());
+    }
 
     let mut hybrid_sig = Vec::with_capacity(HYBRID_SIG_LEN);
     hybrid_sig.extend_from_slice(&ed_sig);
     hybrid_sig.extend_from_slice(&falcon_sig);
-    hybrid_sig
+    Ok(hybrid_sig)
 }
 
 /// Build a WALLET SIGNATURE STANDARD signing key (`stellereum::wallet_signing`,
 /// docs/WALLET_SIGNING.md in the node repo) from this wallet's 32-byte seed.
 ///
-/// The derivation mirrors [`PqKeyPair::from_seed`] EXACTLY (same BLAKE3
-/// domain KDFs), so the standard signature comes from the wallet's OWN
-/// identity: `key.address()` equals the wallet's address for every scheme
-/// (`ed25519` direct, `falcon512`/`hybrid` via the zero-salt PQ derivation).
-///
-/// `mldsa44` is refused fail-closed (forgeable verifier — same rule as the
-/// node side; a `WalletScheme` never names it, this arm is for the raw
-/// [`PqScheme`] only).
+/// Falcon derivation mirrors [`PqKeyPair::from_seed`]. Legacy wallet
+/// schemes remain parseable but cannot produce a standard signing key.
 pub fn wallet_standard_signing_key(
     seed: &[u8; 32],
     scheme: WalletScheme,
 ) -> Result<stellereum::wallet_signing::WalletSigningKey, String> {
     use stellereum::wallet_signing::WalletSigningKey;
     match scheme {
-        WalletScheme::Ed25519 => Ok(WalletSigningKey::ed25519(*seed)),
+        WalletScheme::Ed25519 | WalletScheme::Hybrid => Err(format!(
+            "legacy wallet scheme {scheme} is not supported for wallet signing"
+        )),
         WalletScheme::Falcon512 => {
             let mut hasher = blake3::Hasher::new_derive_key("STELL_PQ_FALCON512_SEED_V4");
             hasher.update(seed);
-            let falcon_sec = *hasher.finalize().as_bytes();
+            let falcon_sec = zeroize::Zeroizing::new(*hasher.finalize().as_bytes());
             Ok(WalletSigningKey::falcon_from_seed(&falcon_sec))
-        }
-        WalletScheme::Hybrid => {
-            let mut ed_hasher = blake3::Hasher::new_derive_key("STELL_PQ_HYBRID_ED25519_V4");
-            ed_hasher.update(seed);
-            let ed_seed = *ed_hasher.finalize().as_bytes();
-            let mut f_hasher = blake3::Hasher::new_derive_key("STELL_PQ_HYBRID_FALCON512_V4");
-            f_hasher.update(seed);
-            let falcon_sec = *f_hasher.finalize().as_bytes();
-            Ok(WalletSigningKey::hybrid(ed_seed, &falcon_sec))
         }
     }
 }
@@ -602,22 +645,22 @@ pub fn generate_sample_keypair(scheme: PqScheme) -> PqKeyPair {
     let mut rng = OsRng;
     match scheme {
         PqScheme::Ed25519 => {
-            let mut seed = [0u8; 32];
-            rng.fill_bytes(&mut seed);
+            let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+            rng.fill_bytes(&mut *seed);
             let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
             let pubkey = signing_key.verifying_key().to_bytes().to_vec();
-            seed.zeroize();
+            let sk_bytes = zeroize::Zeroizing::new(signing_key.to_bytes());
             PqKeyPair {
                 scheme,
                 public_key: pubkey,
                 _secret_key: PqSecretKey {
-                    bytes: signing_key.to_bytes().to_vec(),
+                    bytes: sk_bytes.to_vec(),
                 },
             }
         }
         PqScheme::Falcon512 => {
-            let mut seed = [0u8; 32];
-            rng.fill_bytes(&mut seed);
+            let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+            rng.fill_bytes(&mut *seed);
             let falcon_kp =
                 stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed);
             PqKeyPair {
@@ -629,11 +672,11 @@ pub fn generate_sample_keypair(scheme: PqScheme) -> PqKeyPair {
             }
         }
         PqScheme::MlDsa44 => {
-            let mut seed = [0u8; 32];
-            rng.fill_bytes(&mut seed);
+            let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+            rng.fill_bytes(&mut *seed);
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"STELL_PQ_MLDSA44_SAMPLE_PUBKEY");
-            hasher.update(&seed);
+            hasher.update(&*seed);
             let mut pubkey = vec![0u8; MLDSA44_PUBKEY_LEN];
             let mut reader = hasher.finalize_xof();
             reader.fill(&mut pubkey);
@@ -646,14 +689,14 @@ pub fn generate_sample_keypair(scheme: PqScheme) -> PqKeyPair {
             }
         }
         PqScheme::Hybrid => {
-            let mut ed_seed = [0u8; 32];
-            rng.fill_bytes(&mut ed_seed);
+            let mut ed_seed = zeroize::Zeroizing::new([0u8; 32]);
+            rng.fill_bytes(&mut *ed_seed);
             let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_seed);
             let ed_pubkey = signing_key.verifying_key().to_bytes();
-            ed_seed.zeroize();
+            let ed_sk_bytes = zeroize::Zeroizing::new(signing_key.to_bytes());
 
-            let mut pq_seed = [0u8; 32];
-            rng.fill_bytes(&mut pq_seed);
+            let mut pq_seed = zeroize::Zeroizing::new([0u8; 32]);
+            rng.fill_bytes(&mut *pq_seed);
             let falcon_kp =
                 stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&pq_seed);
 
@@ -662,8 +705,8 @@ pub fn generate_sample_keypair(scheme: PqScheme) -> PqKeyPair {
             pubkey.extend_from_slice(&falcon_kp.public_key);
 
             let mut combined_secret = Vec::with_capacity(64);
-            combined_secret.extend_from_slice(&signing_key.to_bytes());
-            combined_secret.extend_from_slice(&pq_seed);
+            combined_secret.extend_from_slice(&*ed_sk_bytes);
+            combined_secret.extend_from_slice(&*pq_seed);
 
             PqKeyPair {
                 scheme,
@@ -691,46 +734,37 @@ mod wallet_standard_tests {
     #[test]
     fn standard_signing_key_matches_wallet_address_for_all_schemes() {
         let seed = [0x5Au8; 32];
-        for scheme in [
-            WalletScheme::Ed25519,
-            WalletScheme::Falcon512,
-            WalletScheme::Hybrid,
-        ] {
-            // The wallet's own identity (what `new`/`restore` store).
-            let (wallet_addr, expected_pubkey) = match scheme {
-                WalletScheme::Ed25519 => {
-                    let account = stellereum::wallet::WalletAccount::from_seed(&seed);
-                    (account.address, account.address.to_vec())
-                }
-                WalletScheme::Falcon512 => {
-                    let kp = PqKeyPair::from_seed(PqScheme::Falcon512, &seed);
-                    (kp.derive_address(&DEFAULT_SALT), kp.public_key().to_vec())
-                }
-                WalletScheme::Hybrid => {
-                    let kp = PqKeyPair::from_seed(PqScheme::Hybrid, &seed);
-                    (kp.derive_address(&DEFAULT_SALT), kp.public_key().to_vec())
-                }
+        for legacy in [WalletScheme::Ed25519, WalletScheme::Hybrid] {
+            let err = match wallet_standard_signing_key(&seed, legacy) {
+                Ok(_) => panic!("legacy scheme {legacy} must be refused for wallet signing"),
+                Err(e) => e,
             };
-            // The standard key the `sign` command builds from the same seed.
-            let key = wallet_standard_signing_key(&seed, scheme)
-                .expect("standard key builds for every wallet scheme");
-            assert_eq!(key.address(), wallet_addr, "scheme {scheme}");
-            assert_eq!(key.pubkey_bytes(), expected_pubkey, "scheme {scheme}");
-            // ... and it round-trips through the standard envelope.
-            let sig = key.sign_message(5757, b"stell conformance").expect("signs");
-            assert!(stellereum::wallet_signing::verify_message(
-                &wallet_addr,
-                5757,
-                b"stell conformance",
-                &sig
-            ));
-            assert!(!stellereum::wallet_signing::verify_message(
-                &wallet_addr,
-                5758,
-                b"stell conformance",
-                &sig
-            ));
+            assert!(
+                err.contains("not supported for wallet signing"),
+                "unexpected error for {legacy}: {err}"
+            );
         }
+
+        let kp = PqKeyPair::from_seed(PqScheme::Falcon512, &seed);
+        let (wallet_addr, expected_pubkey) =
+            (kp.derive_address(&DEFAULT_SALT), kp.public_key().to_vec());
+        let key = wallet_standard_signing_key(&seed, WalletScheme::Falcon512)
+            .expect("standard key builds for Falcon512");
+        assert_eq!(key.address(), wallet_addr);
+        assert_eq!(key.pubkey_bytes(), expected_pubkey);
+        let sig = key.sign_message(5757, b"stell conformance").expect("signs");
+        assert!(stellereum::wallet_signing::verify_message(
+            &wallet_addr,
+            5757,
+            b"stell conformance",
+            &sig
+        ));
+        assert!(!stellereum::wallet_signing::verify_message(
+            &wallet_addr,
+            5758,
+            b"stell conformance",
+            &sig
+        ));
     }
 
     #[test]

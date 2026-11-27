@@ -160,6 +160,18 @@ use std::fmt;
 /// few tens of kilobytes no matter how long the client runs.
 pub const DEFAULT_MAX_HEADERS: usize = 2_048;
 
+/// Maximum number of epoch beacons retained by a [`LightClient`].
+pub const MAX_RETAINED_EPOCH_BEACONS: usize = 1_024;
+
+/// Maximum number of MMR mountain peaks accepted in an [`EpochRootAnswer`].
+const MAX_EPOCH_ROOT_PEAKS: usize = 64;
+
+/// Maximum number of hex nodes accepted in a single proof JSON array.
+const MAX_PROOF_NODES: usize = 256;
+
+/// Maximum number of storage proofs accepted in a single [`ProofAnswer`].
+const MAX_STORAGE_PROOFS: usize = 64;
+
 /// Upper bound on the number of branch points in a Merkle proof path.
 ///
 /// The trie walks one bit of the 32-byte key per branch and refuses to
@@ -250,7 +262,9 @@ pub struct Checkpoint {
     /// The state root committed by that block.
     ///
     /// ⚠️ CHAIN CONVENTION: a block commits to the state BEFORE its own
-    /// block, so this is the root of the state as of `height - 1`.
+    /// block, so this is the root of the state as of `height - 1` on the legacy
+    /// lag-1 chain and as of `height - 2` once `EXECUTION_PIPELINE_V1` is
+    /// active (see [`crate::chain_spec::committed_state_height_at`]).
     pub state_root: CellHash,
     /// Precommit quorum certificate for `block_hash` at `height`.
     pub cert: QuorumCertificate,
@@ -387,13 +401,18 @@ impl Checkpoint {
 
     /// Build the checkpoint a `stell_getHistoricalRoot` answer authenticates.
     ///
-    /// The answer names the post-`height` state root and the anchoring
-    /// finalized block (`height + 1`) with its precommit QC. The caller
+    /// The answer names the post-`height` state root and the finalized block
+    /// that commits it ([`crate::chain_spec::anchor_height_for_post_state_at`]:
+    /// `height + 1` below `EXECUTION_PIPELINE_V1`, `height + 2` at/above it)
+    /// with its precommit QC. The caller
     /// verifies the result with `Checkpoint::verify` against its OWN
     /// validator set and, on success, adopts the root (e.g. via
     /// `LightClient::advance_to_checkpoint`, then `verify_archive_proof`).
     /// A `finalized: false` answer is refused: only a finalized anchor is
     /// evidence.
+    ///
+    /// Identity below the gate: the expected anchor is `height + 1`, exactly as
+    /// before, so every pre-activation answer parses unchanged.
     pub fn from_historical_root_json(v: &serde_json::Value) -> Result<Self, String> {
         if !v
             .get("finalized")
@@ -416,13 +435,15 @@ impl Checkpoint {
             .get("anchor_height")
             .and_then(|x| x.as_u64())
             .ok_or_else(|| "historical root has no anchor height".to_string())?;
-        if anchor_height
-            != height
-                .checked_add(1)
-                .ok_or_else(|| "height overflows".to_string())?
-        {
+        let expected_anchor = crate::chain_spec::anchor_height_for_post_state_at(height);
+        // A saturated anchor cannot be a successor; keep the legacy overflow
+        // refusal at `u64::MAX` (the helper itself never wraps).
+        if expected_anchor <= height {
+            return Err("height overflows".to_string());
+        }
+        if anchor_height != expected_anchor {
             return Err(format!(
-                "historical root anchor {anchor_height} is not the successor of height {height}: refusing"
+                "historical root anchor {anchor_height} is not the post-state anchor of height {height} (expected {expected_anchor}): refusing"
             ));
         }
         let anchor_hash = parse_hex32(
@@ -491,17 +512,42 @@ impl Checkpoint {
             .get("height")
             .and_then(|x| x.as_u64())
             .ok_or_else(|| "historical root certificate has no height".to_string())?;
-        let cert_round = cert_value
+        let cert_round_u64 = cert_value
             .get("round")
             .and_then(|x| x.as_u64())
-            .ok_or_else(|| "historical root certificate has no round".to_string())?
-            as u32;
+            .ok_or_else(|| "historical root certificate has no round".to_string())?;
+        let cert_round = u32::try_from(cert_round_u64).map_err(|_| {
+            format!("historical root certificate round {cert_round_u64} is not a valid u32")
+        })?;
+        let cert_shard_id = match cert_value.get("shard_id") {
+            None | Some(serde_json::Value::Null) => crate::sharding::MASTERCHAIN_SHARD,
+            Some(serde_json::Value::Number(n)) => n
+                .as_u64()
+                .and_then(|x| crate::sharding::ShardId::try_from(x).ok())
+                .ok_or_else(|| {
+                    "historical root certificate shard_id is not a valid u32".to_string()
+                })?,
+            Some(_) => {
+                return Err(
+                    "historical root certificate shard_id must be an unsigned 32-bit integer"
+                        .to_string(),
+                )
+            }
+        };
         let cert_block = match cert_value.get("block_hash") {
             Some(serde_json::Value::String(s)) => Some(parse_hex32(s)?),
             _ => None,
         };
         let mut signatures = Vec::new();
         if let Some(arr) = cert_value.get("signatures").and_then(|x| x.as_array()) {
+            if arr.len() > crate::consensus::MAX_COMMIT_CERT_SIGNERS {
+                return Err(format!(
+                    "historical root certificate carries {} signatures, exceeding maximum {}",
+                    arr.len(),
+                    crate::consensus::MAX_COMMIT_CERT_SIGNERS
+                ));
+            }
+            signatures.reserve(arr.len());
             for sig in arr {
                 let validator =
                     parse_hex32(sig.get("validator").and_then(|x| x.as_str()).ok_or_else(
@@ -528,11 +574,7 @@ impl Checkpoint {
                 signatures,
                 // Shard binding of the signatures (V3 vote preimage). A
                 // server that predates the field serves masterchain only.
-                shard_id: cert_value
-                    .get("shard_id")
-                    .and_then(|x| x.as_u64())
-                    .map(|v| v as crate::sharding::ShardId)
-                    .unwrap_or(crate::sharding::MASTERCHAIN_SHARD),
+                shard_id: cert_shard_id,
             },
             shard_id,
             round,
@@ -1138,12 +1180,18 @@ impl EpochRootAnswer {
                 .and_then(|x| x.as_str())
                 .ok_or_else(|| "epoch root answer has no mmr_root".to_string())?,
         )?;
-        let mut peaks = Vec::new();
-        for p in v
+        let peaks_arr = v
             .get("peaks")
             .and_then(|x| x.as_array())
-            .ok_or_else(|| "epoch root answer has no peaks".to_string())?
-        {
+            .ok_or_else(|| "epoch root answer has no peaks".to_string())?;
+        if peaks_arr.len() > MAX_EPOCH_ROOT_PEAKS {
+            return Err(format!(
+                "epoch root answer carries {} peaks, exceeding maximum {MAX_EPOCH_ROOT_PEAKS}",
+                peaks_arr.len()
+            ));
+        }
+        let mut peaks = Vec::with_capacity(peaks_arr.len());
+        for p in peaks_arr {
             peaks.push(parse_hex32(p.as_str().ok_or_else(|| {
                 "epoch root peak is not a hex string".to_string()
             })?)?);
@@ -1216,6 +1264,13 @@ pub fn verify_epoch_root_answer(answer: &EpochRootAnswer) -> Result<(), String> 
             "epoch root answer is for an incomplete epoch: the root is not the epoch root yet"
                 .to_string(),
         );
+    }
+    if answer.leaves == 0 || answer.leaves > crate::mmr::MMR_EPOCH_BLOCKS {
+        return Err(format!(
+            "epoch root answer has invalid leaf count {} (expected 1..={}): refusing",
+            answer.leaves,
+            crate::mmr::MMR_EPOCH_BLOCKS
+        ));
     }
     if answer.mmr_root == [0u8; 32] {
         return Err(
@@ -1422,6 +1477,12 @@ fn parse_u64_field(v: Option<&serde_json::Value>) -> Result<u64, String> {
 fn parse_proof_nodes(v: Option<&serde_json::Value>) -> Result<Vec<String>, String> {
     match v {
         Some(serde_json::Value::Array(arr)) => {
+            if arr.len() > MAX_PROOF_NODES {
+                return Err(format!(
+                    "proof has {} nodes, exceeding maximum {MAX_PROOF_NODES}",
+                    arr.len()
+                ));
+            }
             let mut out = Vec::with_capacity(arr.len());
             for n in arr {
                 match n.as_str() {
@@ -1458,6 +1519,13 @@ impl ProofAnswer {
         let account_proof = parse_proof_nodes(v.get("account_proof"))?;
         let mut storage_proofs = Vec::new();
         if let Some(arr) = v.get("storage_proofs").and_then(|x| x.as_array()) {
+            if arr.len() > MAX_STORAGE_PROOFS {
+                return Err(format!(
+                    "proof answer has {} storage proofs, exceeding maximum {MAX_STORAGE_PROOFS}",
+                    arr.len()
+                ));
+            }
+            storage_proofs.reserve(arr.len());
             for sp in arr {
                 let key = parse_hex32(
                     sp.get("key")
@@ -1466,6 +1534,10 @@ impl ProofAnswer {
                 )?;
                 let value = match sp.get("value") {
                     Some(serde_json::Value::String(s)) => {
+                        let s = s
+                            .strip_prefix("0x")
+                            .or_else(|| s.strip_prefix("0X"))
+                            .unwrap_or(s);
                         Some(hex::decode(s).map_err(|e| format!("bad storage value hex: {e}"))?)
                     }
                     _ => None,
@@ -1862,6 +1934,9 @@ impl LightClient {
     /// Record a finalized epoch beacon this client may verify against.
     pub fn record_epoch_beacon(&mut self, epoch: u64, output: [u8; 48]) {
         self.epoch_beacons.insert(epoch, output);
+        while self.epoch_beacons.len() > MAX_RETAINED_EPOCH_BEACONS {
+            self.epoch_beacons.pop_first();
+        }
     }
 
     /// The epoch beacon of `height` as this client knows it.
@@ -2446,6 +2521,12 @@ impl LightClient {
                     if sp.value.is_some() {
                         return Err(LightError::InvalidProof(format!(
                             "storage key {} is proven absent but the answer carries a value for it",
+                            hex::encode(sp.key)
+                        )));
+                    }
+                    if sp.exists {
+                        return Err(LightError::InvalidProof(format!(
+                            "storage key {} is proven absent but the answer says it exists",
                             hex::encode(sp.key)
                         )));
                     }
@@ -3708,5 +3789,230 @@ mod tests {
             sampled_qc_verify(&inside, &beacon, 3, 8, 8_000, 1_000).is_err(),
             "a fault inside the challenge must be caught"
         );
+    }
+
+    #[test]
+    fn test_proof_answer_from_json_accepts_0x_prefixed_storage_values() {
+        let mut trie = crate::cpat2::CompressedTrie::new();
+        let address = [0xABu8; 32];
+        let slot_lower = [0xC1u8; 32];
+        let slot_upper = [0xC2u8; 32];
+        trie.insert(&address, &account_leaf(42, 3));
+        trie.insert(&slot_lower, b"hello");
+        trie.insert(&slot_upper, b"world");
+        let root = trie.root_hash();
+        let lc = client_for(root);
+
+        let answer = answer_for(
+            &trie,
+            &address,
+            &[
+                (slot_lower, Some(b"hello".to_vec())),
+                (slot_upper, Some(b"world".to_vec())),
+            ],
+        );
+        let json = serde_json::json!({
+            "address": hex::encode(address),
+            "balance": 42u64,
+            "nonce": 3u64,
+            "account_proof": answer.account_proof,
+            "storage_proofs": [
+                {
+                    "key": hex::encode(slot_lower),
+                    "value": format!("0x{}", hex::encode(b"hello")),
+                    "exists": true,
+                    "proof": answer.storage_proofs[0].proof,
+                },
+                {
+                    "key": hex::encode(slot_upper),
+                    "value": format!("0X{}", hex::encode(b"world")),
+                    "exists": true,
+                    "proof": answer.storage_proofs[1].proof,
+                },
+            ],
+            "state_root": hex::encode(root),
+            "height": 1u64,
+        });
+        let parsed = ProofAnswer::from_json(&json).expect("0x/0X storage values must parse");
+        assert_eq!(
+            parsed.storage_proofs[0].value.as_deref(),
+            Some(&b"hello"[..])
+        );
+        assert_eq!(
+            parsed.storage_proofs[1].value.as_deref(),
+            Some(&b"world"[..])
+        );
+        let proven = lc
+            .verify_proof_answer(&parsed)
+            .expect("parsed 0x/0X storage proof must verify");
+        assert_eq!(proven.storage.len(), 2);
+        assert_eq!(proven.storage[0].value.as_deref(), Some(&b"hello"[..]));
+        assert_eq!(proven.storage[1].value.as_deref(), Some(&b"world"[..]));
+    }
+
+    #[test]
+    fn test_proof_answer_from_json_caps_proof_nodes_and_storage_proofs() {
+        let addr = hex::encode([0x11u8; 32]);
+        let root = hex::encode([0x22u8; 32]);
+        let over_nodes = vec!["00"; MAX_PROOF_NODES + 1];
+        let json_over_acct = serde_json::json!({
+            "address": addr,
+            "balance": 0u64,
+            "nonce": 0u64,
+            "account_proof": over_nodes,
+            "storage_proofs": [],
+            "state_root": root,
+        });
+        assert!(
+            ProofAnswer::from_json(&json_over_acct).is_err(),
+            "account_proof exceeding MAX_PROOF_NODES must be rejected"
+        );
+
+        let key_hex = hex::encode([0x33u8; 32]);
+        let over_storage: Vec<serde_json::Value> = (0..=MAX_STORAGE_PROOFS)
+            .map(|_| {
+                serde_json::json!({
+                    "key": key_hex,
+                    "value": serde_json::Value::Null,
+                    "exists": false,
+                    "proof": [],
+                })
+            })
+            .collect();
+        let json_over_storage = serde_json::json!({
+            "address": addr,
+            "balance": 0u64,
+            "nonce": 0u64,
+            "account_proof": [],
+            "storage_proofs": over_storage,
+            "state_root": root,
+        });
+        assert!(
+            ProofAnswer::from_json(&json_over_storage).is_err(),
+            "storage_proofs exceeding MAX_STORAGE_PROOFS must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_verify_proof_answer_rejects_exclusion_with_exists_true() {
+        let mut trie = crate::cpat2::CompressedTrie::new();
+        let address = [0xABu8; 32];
+        let present = [0xCDu8; 32];
+        let absent = [0xEEu8; 32];
+        trie.insert(&address, &account_leaf(10, 1));
+        trie.insert(&present, b"present");
+        let lc = client_for(trie.root_hash());
+
+        let mut answer = answer_for(&trie, &address, &[(absent, None)]);
+        assert!(
+            lc.verify_proof_answer(&answer).is_ok(),
+            "sanity: valid exclusion storage proof must verify"
+        );
+        answer.storage_proofs[0].exists = true;
+        assert!(
+            matches!(
+                lc.verify_proof_answer(&answer),
+                Err(LightError::InvalidProof(_))
+            ),
+            "exclusion storage proof with exists=true must be rejected fail-closed"
+        );
+    }
+
+    #[test]
+    fn test_historical_root_json_rejects_u32_overflow_and_oversized_signatures() {
+        let (validators, sk, fk) = pq_singleton(0x88);
+        let keys = vec![(sk, fk)];
+        let (answer, _, _) =
+            historical_root_fixture(5, [0x11u8; 32], [0x22u8; 32], &validators, &keys);
+        assert!(
+            Checkpoint::from_historical_root_json(&answer).is_ok(),
+            "sanity: valid fixture without cert.shard_id must parse"
+        );
+
+        let mut over_round = answer.clone();
+        over_round["cert"]["round"] = serde_json::json!(u64::from(u32::MAX) + 1);
+        assert!(
+            Checkpoint::from_historical_root_json(&over_round).is_err(),
+            "cert.round > u32::MAX must be rejected"
+        );
+
+        let mut missing_round = answer.clone();
+        missing_round["cert"]
+            .as_object_mut()
+            .expect("cert object")
+            .remove("round");
+        assert!(
+            Checkpoint::from_historical_root_json(&missing_round).is_err(),
+            "missing cert.round must be rejected"
+        );
+
+        let mut over_shard = answer.clone();
+        over_shard["cert"]["shard_id"] = serde_json::json!(u64::from(u32::MAX) + 1);
+        assert!(
+            Checkpoint::from_historical_root_json(&over_shard).is_err(),
+            "cert.shard_id > u32::MAX must be rejected"
+        );
+
+        let mut over_sigs = answer;
+        let sigs: Vec<serde_json::Value> = (0..=crate::consensus::MAX_COMMIT_CERT_SIGNERS)
+            .map(|_| {
+                serde_json::json!({
+                    "validator": hex::encode([0x11u8; 32]),
+                    "signature": "00",
+                })
+            })
+            .collect();
+        over_sigs["cert"]["signatures"] = serde_json::Value::Array(sigs);
+        assert!(
+            Checkpoint::from_historical_root_json(&over_sigs).is_err(),
+            "cert.signatures > MAX_COMMIT_CERT_SIGNERS must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_epoch_root_answer_caps_peaks_and_validates_leaves() {
+        let (answer, _, _) = epoch_answer_fixture();
+        let mut over_peaks = answer.to_json();
+        let peaks: Vec<String> = (0..=MAX_EPOCH_ROOT_PEAKS)
+            .map(|_| hex::encode([0xAAu8; 32]))
+            .collect();
+        over_peaks["peaks"] = serde_json::json!(peaks);
+        assert!(
+            EpochRootAnswer::from_json(&over_peaks).is_err(),
+            "peaks > 64 must be rejected"
+        );
+
+        let mut zero_leaves = answer.clone();
+        zero_leaves.leaves = 0;
+        assert!(
+            verify_epoch_root_answer(&zero_leaves).is_err(),
+            "complete epoch with 0 leaves must be rejected"
+        );
+
+        let mut over_leaves = answer;
+        over_leaves.leaves = crate::mmr::MMR_EPOCH_BLOCKS + 1;
+        assert!(
+            verify_epoch_root_answer(&over_leaves).is_err(),
+            "epoch with leaves > MMR_EPOCH_BLOCKS must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_epoch_beacons_capped_at_max_retained() {
+        let mut lc = client_for([0x11u8; 32]);
+        let extra = 5u64;
+        let total = MAX_RETAINED_EPOCH_BEACONS as u64 + extra;
+        for epoch in 0..total {
+            lc.record_epoch_beacon(epoch, [(epoch % 251) as u8; 48]);
+        }
+        assert_eq!(lc.epoch_beacons.len(), MAX_RETAINED_EPOCH_BEACONS);
+        for evicted in 0..extra {
+            assert!(
+                !lc.epoch_beacons.contains_key(&evicted),
+                "oldest epoch {evicted} should have been evicted"
+            );
+        }
+        assert!(lc.epoch_beacons.contains_key(&extra));
+        assert!(lc.epoch_beacons.contains_key(&(total - 1)));
     }
 }

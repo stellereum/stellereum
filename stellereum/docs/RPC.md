@@ -1,8 +1,8 @@
 # Stellereum JSON-RPC reference
 
 Complete reference for the node's JSON-RPC 2.0 surface. Every `stell_*` method
-that exists in `src/rpc.rs` is documented here; nothing is documented that is not
-in the dispatch match arm.
+that exists in `src/rpc/` is documented here; nothing is documented that is not
+in the dispatch match arms.
 
 For running a node, see [`../testnet/README.md`](../testnet/README.md). For
 operating one, see [`OPERATIONS.md`](OPERATIONS.md).
@@ -19,7 +19,7 @@ operating one, see [`OPERATIONS.md`](OPERATIONS.md).
 | Content type | any; the body is read as a string and parsed with `serde_json` |
 | Max body | 1 MiB (`MAX_RPC_BODY`). Larger → `-32600 "request too large"` |
 | Rate limit | standalone RPC: **300 req/s per IP** (`STELL_STANDALONE_RATE_LIMIT`, default `STANDALONE_RATE_LIMIT_DEFAULT = 300`; the legacy `STELL_RPC_RATE_LIMIT_PER_SEC` is honoured when the new name is unset). The gateway nests the same router under its own **30 req/s per IP** limiter (`STELL_RATE_LIMIT_PER_SEC`). Both are in-process fixed windows — a speed bump, not access control. |
-| Auth | none on reads and none on submission: `stell_sendRawTransaction` / `eth_sendRawTransaction` are **open submission by design** (a caller can only submit a validly signed, funded, nonce-sane tx; the tx authenticates itself). `stell_mempoolDump` and the two wallet SIGN arms `stell_signMessage`, `stell_signTypedData` are **fail-closed without a token** (refuse with `-32001`, even on loopback). Gated by `STELL_RPC_AUTH_TOKEN` when set: `stell_submitPriceFeed`, `stell_submitPqPriceFeed`, `stell_pmmBuy`, `stell_pmmSell` (open when unset, require the token when set). TOKEN-ALWAYS (N-02/N-03, no loopback escape): the three governance writes `stell_submitProposal`, `stell_vote`, `stell_executeProposal` and the two contract previews `stell_deployContract`, `stell_callContract` require a valid token on EVERY bind, loopback included — with no token configured they refuse with `-32001` instead of serving (a loopback bind is not proof of a local caller behind a proxy; `src/rpc.rs:49-67`). The VERIFY arms are public. `stell_faucet` requires the separate `STELL_FAUCET_TOKEN` and is **fail-closed**: an enabled faucet with no token refuses to dispense. |
+| Auth | none on reads and none on submission: `stell_sendRawTransaction` / `eth_sendRawTransaction` (and the self-authenticating `stell_evmBindingSubmit` / `stell_evmCarrierSubmit` / `stell_registerContractSource`) are **open submission by design** (a caller can only submit a validly signed, funded, nonce-sane tx; the tx authenticates itself). `stell_mempoolDump` and the two wallet SIGN arms `stell_signMessage`, `stell_signTypedData` are **fail-closed without a token** (refuse with `-32001`, even on loopback; SIGN arms also require `STELL_DEV_UNSAFE_TESTKEY=1` and a direct loopback peer). Gated by `STELL_RPC_AUTH_TOKEN` when set: `stell_submitPriceFeed`, `stell_submitPqPriceFeed`, `stell_pmmBuy`, `stell_pmmSell` (open when unset, require the token when set). TOKEN-ALWAYS (N-02/N-03, no loopback escape): the three governance writes `stell_submitProposal`, `stell_vote`, `stell_executeProposal` and the two contract previews `stell_deployContract`, `stell_callContract` require a valid token on EVERY bind, loopback included — with no token configured they refuse with `-32001` instead of serving (a loopback bind is not proof of a local caller behind a proxy; `src/rpc/mod.rs` & `src/rpc/auth.rs`). The VERIFY arms are public. `stell_faucet` requires the separate `STELL_FAUCET_TOKEN` and is **fail-closed**: an enabled faucet with no token refuses to dispense. |
 
 There is exactly one route in the router — `("/", post(rpc_handler))` — so
 `GET /`, or a POST to any other path, returns 404. `/health`, `/healthz`,
@@ -714,11 +714,83 @@ Parameters: none.
 ```
 
 Every token id in the registry, as hex. Paginated: `limit` (default 100, max
-1000) + `offset`. Use `stell_tokenResolve` (`creator`+`name`+`symbol`) to find
+200 `MAX_PAGE_LIMIT`) + `cursor` or `offset`. Use `stell_tokenResolve` (`creator`+`name`+`symbol`) to find
 the id of a token you created. There is no metadata method: name,
-symbol, decimals, minter and supply cap are not exposed over RPC. To read
+symbol, decimals, minter and supply cap are not exposed over `stell_listTokens`. To read
 `decimals` you have to out-of-band agree on it — the CLI and the PMM treat
-USDT as 6 decimals and everything else as 9.
+USDT as 6 decimals and everything else as 9 — or use `stell_tokenMetadata` /
+`stell_getTokenAccountsByOwner` / `stell_getProgramAccounts`.
+
+### `stell_getAddressHistory`
+
+**READ.** No token (expensive-read concurrency budget applies).
+
+Parameters: `{"address": "<hex | Stl57 | 0x20-byte-EVM>", [from_height], [to_height], [role], [cursor], [limit]}` (also `[object]`).
+
+```json
+{"method":"stell_getAddressHistory",
+ "params":{"address":"<64 hex>","role":"all","limit":50}}
+→ {"result":{
+     "address":"<64 hex>",
+     "address_stl57":"Stl57…",
+     "items":[
+       {"tx_hash":"<64 hex>","height":77,"tx_index":0,
+        "from":"<64 hex>|null","to":"<64 hex>|null",
+        "amount":"1000|null","shard_id":0,"timestamp":1758800000}
+     ],
+     "next_cursor":"<24 hex>|null",
+     "has_more":false,
+     "scanned":1,
+     "scan_truncated":false
+   }}
+```
+
+- Merges durable `tx_by_addr` (tip-first) with the in-memory receipt window, deduped by `tx_hash`.
+- `role`: `"all"` (default), `"sender"`, or `"recipient"`.
+- `from_height` / `to_height` (aliases `fromHeight` / `toHeight`): inclusive `u64` or hex string bounds.
+- `cursor`: 12-byte (24-hex) `HistoryCursor` from `next_cursor`; `limit`: default `50` (`DEFAULT_PAGE_LIMIT`), max `200` (`STORAGE_HISTORY_MAX_LIMIT`). Scan capped at `10,000` entries (`STORAGE_SCAN_HARD_CAP`).
+- Errors: `-32602` on missing/invalid `address`, height bounds, `role`, or `cursor`; `-32000` on archive read failure.
+
+### `stell_getProgramAccounts`
+
+**READ.** No token (expensive-read concurrency budget applies).
+
+Parameters: `{"program": "token"|"contract"|"system", ...}` (also `[object]`). Deterministic cursor-paginated account/slot lookup; unfiltered `system` dumps are refused (`-32602`).
+
+- **`program: "token"`** — requires `token` or `owner` (address); optional `min_balance`/`minBalance` (`u64`), `include_zero` (bool), `with_proof` (bool), `cursor` (32-byte hex), `limit` (default `50`, max `100` `MAX_PROGRAM_ACCOUNTS_LIMIT`, or `16` `MAX_PROGRAM_ACCOUNTS_PROOFS` when `with_proof: true`).
+- **`program: "contract"`** — requires `contract` or `creator` (address):
+  - with `contract`: paginates storage slots (`slot_from`/`slotFrom`, `slot_to`/`slotTo`, integer `cursor`); when `with_proof: true`, sets `proof: null` and `proof_note` (storage slots are committed via the contract digest).
+  - with `creator`: paginates contracts deployed by `creator` (32-byte hex `cursor`, optional `include_code` bool).
+- **`program: "system"`** — requires at least one of `owner`, `min_balance`/`minBalance > 0`, or explicit `cursor` (32-byte hex); returns `{program, address, address_stl57, balance, nonce, scheme, code_hash, [proof]}`.
+
+Caps: scan capped at `10,000` entries (`MAX_PROGRAM_ACCOUNTS_SCAN`, sets `scan_truncated: true`), serialized response capped at `2 MiB` (`MAX_PROGRAM_ACCOUNTS_RESPONSE_BYTES`). Result: `{program, items, next_cursor, has_more, scanned, scan_truncated}`. Errors: `-32602` on missing/invalid params or oversized response; `-32004` on unknown `token` or `contract`.
+
+### `stell_getTokenAccountsByOwner`
+
+**READ.** No token (expensive-read concurrency budget applies).
+
+Parameters: `{"owner": "<hex | Stl57 | 0x20-byte-EVM>", [token], [include_zero], [cursor], [limit]}` (also `[object]`).
+
+```json
+{"method":"stell_getTokenAccountsByOwner","params":{"owner":"<64 hex>"}}
+→ {"result":{
+     "owner":"<64 hex>",
+     "owner_stl57":"Stl57…",
+     "items":[
+       {"token":"<64 hex>","token_stl57":"Stl57…",
+        "owner":"<64 hex>","owner_stl57":"Stl57…",
+        "balance":"1000","decimals":9,"symbol":"TOK","name":"Token"}
+     ],
+     "next_cursor":"<64 hex>|null",
+     "has_more":false,
+     "scanned":1,
+     "scan_truncated":false
+   }}
+```
+
+- `token` (optional): restrict to a single token id. `include_zero` (bool, default `false`).
+- `cursor`: 32-byte hex token id; `limit`: default `50`, max `200` (`MAX_PAGE_LIMIT`). Scan capped at `10,000` (`MAX_PROGRAM_ACCOUNTS_SCAN`).
+- Errors: `-32602` on missing/invalid `owner`, `token`, or `cursor`.
 
 ---
 
@@ -796,6 +868,38 @@ Statuses are captured at the single point where a block is actually applied and
 are never recomputed — re-deriving a verdict from post-state would report every
 successful transaction as failed, because the nonce has already moved
 (PROTOCOL.md I8).
+
+### `stell_getTransactionByHash`
+
+**READ.** No token.
+
+Parameters: `{"hash": "<hex>"}`, bare `"<hex>"`, or `["<hex>"]`. Accepts both native 32-byte Stellereum tx hashes and EVM intent hashes (resolved via the settlement map).
+
+```json
+{"method":"stell_getTransactionByHash","params":"<64 hex>"}
+→ {"result":{
+     "tx_hash":"<64 hex>",
+     "status":"success",
+     "height":77,
+     "block_hash":"<64 hex>",
+     "index":0,
+     "confirmations":3,
+     "gas_limit":"1000",
+     "fee_charged":"1000",
+     "body_available":true,
+     "from":"<64 hex>",
+     "to":"<64 hex>",
+     "amount":"25000000000",
+     "nonce":1,
+     "source_shard":0,
+     "target_shard":0,
+     "payload_ops":0
+   }}
+```
+
+- Serves from the finalized receipt index (reconstructing the tx body from `raw_tx` or the archive store's committed block body), then the local mempool (`status: "pending"`, `height: null`, `confirmations: 0`), else `{"status":"unknown"}`.
+- Never fabricates: if a receipt exists on a pruned node without the body, `body_available` is `false` and `from`, `to`, `amount`, `nonce` are `null`.
+- Errors: `-32602 "missing tx hash"`.
 
 ### `stell_getTransactionStatus`
 
@@ -1013,11 +1117,10 @@ same node would reject for under-declared gas.
 The node serves a read-only EVM-compatible view plus the standard `net_*` /
 `web3_*` network labels so wallets, explorers and EVM tooling can connect
 without a Stellereum adapter. All of these are **live in the `POST /`
-dispatch** (`src/rpc.rs` → `src/evm_adapter.rs`); they never mutate state.
-`eth_sendRawTransaction` is the one write: it converts the signed EVM bytes
-to a Stellereum transaction and admits it through the same mempool gate as
-`stell_sendRawTransaction` (open submission by design — the signature, nonce
-and solvency authenticate the caller).
+dispatch** (`src/rpc/eth.rs` → `src/evm_adapter/`); they never mutate state.
+`eth_sendRawTransaction` (and the `stell_evmBindingSubmit` / `stell_evmCarrierSubmit`
+companion methods) settle EVM value transfers using a PQ1 Falcon-512 binding and
+carrier (`src/rpc/eth.rs`).
 
 | method | params | result |
 | --- | --- | --- |
@@ -1056,13 +1159,51 @@ and solvency authenticate the caller).
 | `eth_uninstallFilter` | `[id]` | bool |
 | `eth_getLogs` | filter object | matching contract events (bounded) |
 | `eth_getStorageAt` | `[address, slot, block]` | storage word as `0x`-hex |
-| `eth_sendRawTransaction` | `[signed bytes]` | EVM keccak hash on admission (L1 leg admitted first, then the EVM intent) |
+| `eth_sendRawTransaction` | `[signed bytes]` | EVM keccak hash on admission (requires bound PQ carrier signatures; refuses unbound/contract/calldata) |
+| `stell_getEvmBinding` / `eth_getEvmBinding` | `"<0x+40-hex \| 0x+64-hex>"` or `["<addr>"]` | `{evmAddress, pqAddress, bound, source}` (read-only) |
+| `stell_evmBindingSubmit` | `{pqPublicKey, evmAddress, bindingSignature, evmSignature, txSignature, [nonce], [gasLimit]}` | `<64-hex Stell tx hash>` (self-authenticating, no token) |
+| `stell_evmCarrierSubmit` | `{rawTransaction, pqPublicKey, intentSignature, txSignature, [gasLimit]}` | `<0x EVM tx hash>` (self-authenticating, no token) |
 
 Unknown EVM selectors return `"0x"`; unknown block/tx hashes return `null`
 (JSON-RPC success with a null result), never an invented block. Filter ids
 are 64-bit random `0x`-hex and expire after `FILTER_TTL_SECS` (300 s); at
 most `MAX_ACTIVE_FILTERS` (10 000) live filters with at most
 `MAX_PENDING_PER_FILTER` (1 000) pending entries each.
+
+#### `stell_getEvmBinding` / `eth_getEvmBinding`
+
+**READ.** No token.
+
+Parameters: `"<0x+40-hex EVM address | 0x+64-hex PQ address>"` or `["<address>"]`.
+
+Returns `{ "evmAddress": "0x…"|null, "pqAddress": "0x…"|null, "bound": bool, "source": "…" }` from the node's committed EVM binding index (applied `SysCallBindEvmAddress` / carrier transactions only; mempool-only claims are never reported as bound). Errors: `-32602` on missing or invalid address.
+
+#### `stell_evmBindingSubmit`
+
+**WRITE (self-authenticating, no API token).**
+
+Parameters (`object` or `[object]`):
+- `pqPublicKey` (alias `pq_public_key`): `0x`-hex Falcon-512 public key (897 bytes).
+- `evmAddress` (aliases `evm_address`, `evm`): `0x`-hex 20-byte EVM address.
+- `bindingSignature` (aliases `binding_signature`, `claimSignature`): `0x`-hex Falcon-512 signature (666 bytes) over `keccak256("STELL_EVM_BIND_V1" || chain_id || evm || pq)`.
+- `evmSignature` (aliases `evm_signature`, `evmProof`): `0x`-hex 65-byte secp256k1 proof-of-possession signature from the EVM key.
+- `txSignature` (aliases `tx_signature`, `signature`): `0x`-hex Falcon-512 signature (666 bytes) over the binding transaction's signing message.
+- `nonce` (optional `u64`, defaults to account's on-chain nonce), `gasLimit` (alias `gas_limit`, optional `u64`).
+
+Returns `<64-hex Stell tx hash>` on mempool admission (`stell_getEvmBinding` updates only once a block applies it). Errors: `-32602` on missing/bad params; `-32000` on conflict (`reason: "evm-binding-conflict"`, first claim wins) or bad signature (`reason: "evm-binding-signature-rejected"`, returning `claimSignThis` and `txSignThis` in `error.data`).
+
+#### `stell_evmCarrierSubmit`
+
+**WRITE (self-authenticating, no API token).**
+
+Parameters (`object` or `[object]`):
+- `rawTransaction` (aliases `rawTx`, `tx`, `data`): `0x`-hex canonical EIP-155/1559 raw transaction bytes (plain transfer only; contract creation and calldata are refused).
+- `pqPublicKey` (alias `pq_public_key`): `0x`-hex Falcon-512 public key (897 bytes) deriving the sender's bound PQ address.
+- `intentSignature` (alias `intent_signature`): `0x`-hex Falcon-512 signature over `keccak256(EVM raw tx)`.
+- `txSignature` (aliases `tx_signature`, `signature`): `0x`-hex Falcon-512 signature over `signThis` (the carrier transaction's signing message).
+- `gasLimit` (alias `gas_limit`, optional `u64`).
+
+Returns `<0x-prefixed EVM tx hash>` on mempool admission. Errors: `-32602` on missing/bad params; `-32000` on unbound sender (`full-pq-admission`), unbound recipient (`recipient-evm-address-unbound`), contract/calldata (`evm-contract-execution-unsupported`), mismatched PQ key, or bad signature (`evm-carrier-signature-rejected`, returning `signThis` in `error.data`).
 
 ### `stell_faucet`
 
@@ -1152,7 +1293,7 @@ is supposed to prevent.
 The returned `tx_hash` is a *pending* transaction. It can sit in the mempool
 without ever being included. The faucet's `next_nonce` and per-address
 `dispensed` totals are **persisted** under the meta key `faucet_state_v1` on
-every mutation and loaded at startup (`Faucet::with_persist`, `src/rpc.rs`),
+every mutation and loaded at startup (`Faucet::with_persist`, `src/rpc/faucet.rs`),
 then clamped down (never up) to the on-chain nonce. They are still **not part of
 consensus state**, so an unsynced or forked node can still diverge from the
 chain; but they no longer reset to 0 on a clean restart as they once did. A
@@ -1251,6 +1392,65 @@ a freshly started network reports exactly the ids in your `validators:` YAML
 list. The set is capped at **250 active validators**
 (`MAX_ACTIVE_VALIDATORS`, TON-style Elector cap).
 
+### `stell_getValidatorStatus`
+
+**READ.** No token.
+
+Parameters: `{"validator": "<hex | Stl57>"}`.
+
+```json
+{"method":"stell_getValidatorStatus","params":{"validator":"<64 hex>"}}
+→ {"result":{
+     "validator":"<64 hex>",
+     "known":true,
+     "jailed":false,
+     "jailed_at_height":null,
+     "release_height":null,
+     "in_set":true,
+     "self_bond":"1000000000000",
+     "commission_bps":1000,
+     "withdrawal_address":"<64 hex>|null",
+     "rotation_seq":0,
+     "pending_commission":null,
+     "last_commission_change_height":null
+   }}
+```
+
+Read-only projection of a validator's staking record, jail status (`jailed_at_height`, `release_height`), active-set membership (`in_set`), cold `withdrawal_address`, `rotation_seq`, and pending/last commission change heights. Errors: `-32602 "missing validator"`.
+
+### `stell_getPqKey`
+
+**READ.** No token.
+
+Parameters: `{"validator": "<hex | Stl57>", "height": <u64, optional>}` (`height` defaults to the node's current tip).
+
+```json
+{"method":"stell_getPqKey","params":{"validator":"<64 hex>"}}
+→ {"result":{
+     "validator":"<64 hex>",
+     "scheme":"Falcon512",
+     "scheme_id":2,
+     "pubkey_hex":"<1794 hex>",
+     "activated_at":0,
+     "pending":null
+   }}
+```
+
+Returns the validator's active post-quantum voting key at `height` (membership-gated via `pq_active_key`), plus any pending key rotation (`scheme`, `scheme_id`, `pubkey_hex`, `announced_height`, `effective_height`). Errors: `-32602` on missing validator or invalid `height`; `-32004` if `height > tip` or unknown validator / no PQ key at that height.
+
+### `stell_getPqRegistryStatus`
+
+**READ.** No token.
+
+Parameters: none.
+
+```json
+{"method":"stell_getPqRegistryStatus","params":{}}
+→ {"result":{"count":4,"delay_heights":30000,"history_limit":8}}
+```
+
+Returns the number of registered validators in the committed PQ key registry (`count`) and the registry constants (`PQ_ROTATION_DELAY_HEIGHTS`, `PQ_KEY_HISTORY_LIMIT`).
+
 ---
 
 ## 6. Governance
@@ -1277,7 +1477,7 @@ governance state; these methods are a valid way to compare it.
 
 The three writes require a valid token on EVERY bind, loopback included
 (N-02: a loopback bind is not proof of a local caller once a proxy is in
-front, so `require_gov_write_auth` in `src/rpc.rs` consults neither bind nor
+front, so `require_gov_write_auth` in `src/rpc/auth.rs` consults neither bind nor
 peer). Caller presents it as `params.token`, `params.apiKey` or an HTTP
 header. With no token configured the arms refuse with `-32001` instead of
 serving (dev flows must configure a token); a missing or wrong token is
@@ -1903,7 +2103,7 @@ can skip a value without knowing its type.
 
 **PREVIEW-ONLY (N-03): it predicts the deploy, NEVER admits it. Requires the
 auth token ALWAYS** (same fail-closed gate as the governance writes —
-`require_gov_write_auth` in `src/rpc.rs:4545`; no token configured refuses on
+`require_gov_write_auth` in `src/rpc/auth.rs`; no token configured refuses on
 every bind, loopback included). `private_key` / `from` are refused with
 `-32602` — sign the deploy transaction locally and submit the sealed
 transaction via the `tx` form. There is **no SDK deploy builder today**:
@@ -1988,7 +2188,7 @@ bad hex, undecodable `tx`, `private_key`/`from` present, invalid `abi`),
 **PREVIEW-ONLY (N-03): it runs the call on a registry CLONE and DROPS the tx —
 never admitted, never gossipped, never executed against live state. Requires
 the auth token ALWAYS** (same fail-closed gate as the governance writes —
-`require_gov_write_auth` in `src/rpc.rs:4545`; no token configured refuses on
+`require_gov_write_auth` in `src/rpc/auth.rs`; no token configured refuses on
 every bind, loopback included). `private_key` / `from` are refused with
 `-32602` — sign locally (SDK `TxBuilder::contract_call` + `sign`) and submit
 the sealed transaction via the `tx` form. The direct form requires an explicit
@@ -2235,9 +2435,9 @@ with enough gas to hold the answer:
 
 | bound | value | where |
 | --- | --- | --- |
-| per-IP rate limit | **5 req/s** (`ESTIMATE_FEE_RATE_LIMIT_DEFAULT`), override with `STELL_ESTIMATE_FEE_RATE_LIMIT` | `rpc.rs` |
-| simulation gas ceiling | **5,000,000** (`ESTIMATE_FEE_GAS_CEILING`) — FIXED: the simulation's gas limit is never above it, so a pathological payload can never burn the full 50,000,000 contract ceiling on an unauthenticated read. A caller may LOWER it with `max_gas` (≥ `ESTIMATE_FEE_MIN_GAS` = 280,000) | `rpc.rs` |
-| request body | 1 MiB (`MAX_RPC_BODY`) | `rpc.rs` |
+| per-IP rate limit | **5 req/s** (`ESTIMATE_FEE_RATE_LIMIT_DEFAULT`), override with `STELL_ESTIMATE_FEE_RATE_LIMIT` | `src/rpc/` |
+| simulation gas ceiling | **5,000,000** (`ESTIMATE_FEE_GAS_CEILING`) — FIXED: the simulation's gas limit is never above it, so a pathological payload can never burn the full 50,000,000 contract ceiling on an unauthenticated read. A caller may LOWER it with `max_gas` (≥ `ESTIMATE_FEE_MIN_GAS` = 280,000) | `src/rpc/` |
+| request body | 1 MiB (`MAX_RPC_BODY`) | `src/rpc/` |
 
 The estimate clones the **whole** engine state and runs a full SVM execution on
 the clone, so it is orders of magnitude more expensive than any other read. It
@@ -2696,9 +2896,7 @@ latched circuit breaker: a peg/deviation violation latches it, and only a
 #### Shielded path — REMOVED (Ristretto excision)
 
 The three shielded arms (`stell_shieldedTransfer`, `stell_shieldedBalance`,
-`stell_unshield`) are GONE from dispatch: the RPC audit gate counts 140
-public methods — 143 minus those 3 (`src/rpc.rs:18824-18828`) — and
-`src/crypto_privacy.rs` (Pedersen/Ristretto/range proofs) is deleted. Any
+`stell_unshield`) are GONE from dispatch (`src/rpc/`): any
 client calling them gets `-32601 "method not found"`. Privacy work now lives
 only in the UNWIRED, default-OFF prototypes (HashPool / SilentPay /
 Dandelion) documented in [`PRIVACY.md`](PRIVACY.md): stealth + CoinJoin
@@ -2778,9 +2976,16 @@ for a mistyped token id would show an empty balance instead of a failure.
 | `stell_tokenSupply` | read | — | `{token}` | decimal string |
 | `stell_tokenBalanceSpv` | read | — | `{token, account}` | `balance`, `stateRoot`, `key`, `proof` |
 | `stell_tokenResolve` | read | — | `{creator, name, symbol}` | `{token}` or `-32004` |
-| `stell_listTokens` | read | — | `{limit, offset}` | `{tokens, total, offset}` (limit default 100, max 1000) |
+| `stell_listTokens` | read | — | `{limit, [cursor\|offset]}` | `{tokens, total, [offset], next_cursor, has_more, truncated}` |
+| `stell_getAddressHistory` | read | — | `{address, [from_height], [to_height], [role], [cursor], [limit]}` | `{address, address_stl57, items, next_cursor, has_more, scanned, scan_truncated}` |
+| `stell_getProgramAccounts` | read | — | `{program, ...}` | `{program, items, next_cursor, has_more, scanned, scan_truncated}` |
+| `stell_getTokenAccountsByOwner` | read | — | `{owner, [token], [include_zero], [cursor], [limit]}` | `{owner, owner_stl57, items, next_cursor, has_more, scanned, scan_truncated}` |
 | `stell_getTransactionReceipt` | read | — | hash (bare or object) | receipt, or `{status}` |
-| `stell_getTransactionStatus` | read | — | hash (bare or object) | `{status, height}` |
+| `stell_getTransactionByHash` | read | — | hash (bare, object, or `[hash]`) | full tx + receipt view, `{status:"pending",...}`, or `{status:"unknown"}` |
+| `stell_getTransactionStatus` | read | — | hash (bare or object) | `{status, height, confirmations}` |
+| `stell_getEvmBinding` / `eth_getEvmBinding` | read | — | `"<0x+40-hex \| 0x+64-hex>"` or `["<addr>"]` | `{evmAddress, pqAddress, bound, source}` |
+| `stell_evmBindingSubmit` | write (signed) | — | `{pqPublicKey, evmAddress, bindingSignature, evmSignature, txSignature, [nonce], [gasLimit]}` | `<64-hex Stell tx hash>` |
+| `stell_evmCarrierSubmit` | write (signed) | — | `{rawTransaction, pqPublicKey, intentSignature, txSignature, [gasLimit]}` | `<0x EVM tx hash>` |
 | `stell_sendRawTransaction` | write (open) | — | `{tx}` | tx hash hex |
 | `stell_faucet` | write | faucet token | `{address, [amount]}` | `{credited_nano, recipient, tx_hash}` |
 | `stell_submitPriceFeed` / `stell_submitPqPriceFeed` | write | gated when set | `{tx}` | tx hash hex |
@@ -2803,7 +3008,10 @@ for a mistyped token id would show an empty balance instead of a failure.
 | `stell_getEpochRoot` | read | — | `{epoch}` (or `{height}`, or a bare epoch number) | `{epoch, start_height, end_height, mmr_root, peaks, complete, leaves, committed_root, committed_in_height}` (the V5 Tier-2 epoch MMR root) |
 | `stell_estimateFee` | read | — (own 5/s budget) | `{from, to, amount, …, [max_gas]}` | `{gas_limit, estimated_fee, base_fee, source_shard, target_shard, is_cross_shard, gas_budget, gas_ceiling}` |
 | `stell_stakeOf` | read | — | `{validator}` | `{total, self_bond, delegated}` |
+| `stell_getValidatorStatus` | read | — | `{validator}` | `{validator, known, jailed, jailed_at_height, release_height, in_set, self_bond, commission_bps, withdrawal_address, rotation_seq, pending_commission, last_commission_change_height}` |
 | `stell_getValidators` | read | — | — | `{validators, total_power, quorum, fragile, fragile_reason}` |
+| `stell_getPqKey` | read | — | `{validator, [height]}` | `{validator, scheme, scheme_id, pubkey_hex, activated_at, pending}` |
+| `stell_getPqRegistryStatus` | read | — | — | `{count, delay_heights, history_limit}` |
 | `stell_listProposals` | read | — | — | array of proposals |
 | `stell_proposal` | read | — | `{id}` | proposal, or `-32004` |
 | `stell_governanceParams` | read | — | — | `{quorum_bps, next_id, applied}` |
@@ -3028,11 +3236,11 @@ section is the RPC binding. The standard covers how a wallet signs a MESSAGE
 or a contract call — never transactions (different preimage, different
 domain) and never addresses (unchanged).
 
-### `stell_signMessage` (node key, testing/devnet ONLY)
+### `stell_signMessage` (ephemeral dev key, testing/devnet ONLY)
 
-**WRITE. Fail-closed without a token; requires the auth token plus a loopback
-peer and an explicitly configured dev signing key otherwise** (the VERIFY arms
-stay public).
+**WRITE. Fail-closed without a token; requires `STELL_RPC_AUTH_TOKEN`, a
+direct loopback peer, and `STELL_DEV_UNSAFE_TESTKEY=1` at startup** (the
+VERIFY arms stay public).
 
 Parameters: `{"message": "<utf8>"}` XOR `{"message_hex": "<hex>"}`, plus
 optional `{"chain_id": <u64>}` (default: this node's chain id) and
@@ -3041,17 +3249,19 @@ optional `{"chain_id": <u64>}` (default: this node's chain id) and
 ```json
 {"method":"stell_signMessage","params":{"message":"hello stellereum","token":"<api token>"}}
 → {"result":{
-     "address":"2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
-     "scheme":"Ed25519","scheme_id":1,
-     "signature":"01010020… (standard envelope hex)",
+     "address":"<64 hex>",
+     "scheme":"Falcon512","scheme_id":2,
+     "signature":"01020381… (standard envelope hex)",
      "preimage":"5374656c… (what was signed, hex)",
      "chain_id":5757}}
 ```
 
-It signs with the NODE's Ed25519 key (wired to the validator/identity key at
-startup). A node with no signing key configured refuses fail-closed with
-`-32000`. Production wallets MUST sign locally (`stellereum wallet sign` or
-the library) and never ship keys to a node.
+It signs with an **ephemeral random Falcon-512 key** minted in-memory at
+startup only when `STELL_DEV_UNSAFE_TESTKEY=1` is set (`src/rpc/faucet.rs` —
+never the validator/identity key, and never persisted). A node without
+`STELL_DEV_UNSAFE_TESTKEY=1` refuses fail-closed with `-32000`. Production
+wallets MUST sign locally (`stellereum wallet sign --scheme falcon` or the
+library) and never ship keys to a node.
 
 ### `stell_verifyMessage` (public, no auth)
 
@@ -3059,12 +3269,13 @@ Parameters: `{"address": "<hex>", "message"|"message_hex": …, "signature":
 "<hex envelope>", ["chain_id"]}`.
 
 ```json
-→ {"result":{"valid":true,"address":"<hex>","scheme":"Ed25519","scheme_id":1,"chain_id":5757}}
+→ {"result":{"valid":true,"address":"<hex>","scheme":"Falcon512","scheme_id":2,"chain_id":5757}}
 ```
 
-Accepts all three live schemes (Ed25519, Falcon-512, Hybrid). `valid: false`
-for a wrong chain, a tampered message, a wrong address — a MALFORMED envelope
-is instead `-32602 "bad signature envelope: …"`.
+Accepts live Falcon-512 (`0x02`) envelopes; removed Ed25519/Hybrid (`0x01`/`0x04`)
+and disabled ML-DSA-44 (`0x03`) envelopes are refused with `-32602 "bad
+signature envelope: …"`. `valid: false` for a wrong chain, a tampered message,
+or a wrong address.
 
 ### `stell_signTypedData` / `stell_verifyTypedData`
 
@@ -3078,7 +3289,7 @@ sees exactly what they authorize (EIP-712-style readable signing).
            "args":{"to":"alice","amount":100},
            "value":"1000","nonce":"7","token":"<api token>"}}
 → {"result":{
-     "address":"<hex>","scheme":"Ed25519","scheme_id":1,
+     "address":"<hex>","scheme":"Falcon512","scheme_id":2,
      "signature":"<hex envelope>",
      "canonical":"{\"args\":{\"amount\":100,\"to\":\"alice\"},\"chain_id\":\"5757\",…}",
      "chain_id":5757}}
@@ -3090,6 +3301,7 @@ in `args` does not matter — it is re-encoded canonically (sorted,
 whitespace-free) before signing and before verifying. Display `canonical` to
 the user; it is the exact bytes the signature commits to.
 
-Errors mirror the message arms: the SIGN arm is fail-closed without a
-configured token (and needs a loopback peer plus a configured node key); the VERIFY arm is public and answers
-`{"valid":…}` with the locally re-encoded `canonical` beside it.
+Errors mirror the message arms: the SIGN arm is fail-closed without
+`STELL_RPC_AUTH_TOKEN`, a direct loopback peer, and `STELL_DEV_UNSAFE_TESTKEY=1`;
+the VERIFY arm is public and answers `{"valid":…}` with the locally re-encoded
+`canonical` beside it.

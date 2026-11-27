@@ -1,5 +1,5 @@
 [Unit]
-Description=Stellereum node C (shard 1, RPC 127.0.0.1:8545, P2P UDP 9410)
+Description=Stellereum node C (shard 0, RPC 127.0.0.1:8545, P2P UDP 9410)
 Documentation=file:/root/stellereum/scripts/backup/BACKUP.md
 Wants=network-online.target
 After=network-online.target
@@ -12,9 +12,10 @@ User=root
 Group=root
 WorkingDirectory=/root/nodeC
 EnvironmentFile=/root/nodeC/env.C
-ExecStart=/root/nodeC/stellereum run --config node.yaml --shard 1
+ExecStart=/root/nodeC/stellereum run --config node.yaml --shard 0
 Restart=always
 RestartSec=5
+TimeoutStopSec=300
 MemoryMax=2G
 CPUQuota=80%
 StandardOutput=journal

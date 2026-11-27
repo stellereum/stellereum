@@ -1171,7 +1171,11 @@ impl P2pNetworkAdapter {
             return Vec::new();
         };
 
-        let hashes: Vec<String> = serde_json::from_str(&index_str).unwrap_or_default();
+        let mut hashes: Vec<String> = serde_json::from_str(&index_str).unwrap_or_default();
+        if hashes.len() > super::MAX_KV_MEMPOOL_INDEX {
+            let excess = hashes.len() - super::MAX_KV_MEMPOOL_INDEX;
+            hashes.drain(..excess);
+        }
         let mut entries = Vec::with_capacity(hashes.len());
 
         for hash_hex in hashes {

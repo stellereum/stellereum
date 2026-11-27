@@ -34,24 +34,9 @@ DOCTOR_DIR="${STELL_DOCTOR_DIR:-}"
 DOCTOR_SERVICE="${STELL_DOCTOR_SERVICE:-}"
 DOCTOR_SCOPE="${STELL_DOCTOR_SCOPE:-system}"
 DOCTOR_RPC="${STELL_DOCTOR_RPC:-}"
-DOCTOR_SHARD_ID="${STELL_DOCTOR_SHARD_ID:-1}"
+DOCTOR_SHARD_ID="${STELL_DOCTOR_SHARD_ID:-0}"
 DOCTOR_JSON=0
 DOCTOR_QUIET=0
-
-EXPECT_STELL_SHARDS="${EXPECT_STELL_SHARDS:-0,1}"
-EXPECT_STELL_ROUND_TIMEOUT_MS="${EXPECT_STELL_ROUND_TIMEOUT_MS:-3500}"
-EXPECT_STELL_DOWN_PROPOSER_TIMEOUT_MS="${EXPECT_STELL_DOWN_PROPOSER_TIMEOUT_MS:-800}"
-EXPECT_STELL_MIN_BLOCK_MS="${EXPECT_STELL_MIN_BLOCK_MS:-50}"
-EXPECT_STELL_KEEP_BLOCKS="${EXPECT_STELL_KEEP_BLOCKS:-8000}"
-EXPECT_STELL_ARCHIVE="${EXPECT_STELL_ARCHIVE:-0}"
-EXPECT_STELL_CHAIN_ID="${EXPECT_STELL_CHAIN_ID:-5757}"
-EXPECT_BASE_FEE="${EXPECT_BASE_FEE:-280000}"
-INODE_WARN_PCT="${INODE_WARN_PCT:-70}"
-INODE_HARD_PCT="${INODE_HARD_PCT:-85}"
-ORPHAN_WARN_COUNT="${ORPHAN_WARN_COUNT:-20000}"
-
-STELOPS_BIN="${STELOPS_BIN:-/home/imm/stellereum-project/scripts/tools/stelops/target/release/stelops}"
-STELOPS_REMOTE="${STELOPS_REMOTE:-/root/stelops}"
 
 # The cluster conf (optional): it carries the expected values AND the topology.
 STELL_CONF="${STELL_CONF:-/home/imm/stellereum-project/scripts/cluster-nodes.conf}"
@@ -68,7 +53,7 @@ OPTIONS
   --service NAME    the systemd unit that runs the node
   --scope system|user  which systemd manager owns the unit (default: system)
   --rpc URL         the node's RPC URL (default: derived from the env file)
-  --shard-id N      the shard the node validates (default: 1)
+  --shard-id N      the shard the node validates (default: 0)
   --json            machine-readable output
   --quiet           only the problems, no report
   --help            this text
@@ -81,11 +66,11 @@ EOF
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --dir) DOCTOR_DIR="$2"; shift 2 ;;
-        --service) DOCTOR_SERVICE="$2"; shift 2 ;;
-        --scope) DOCTOR_SCOPE="$2"; shift 2 ;;
-        --rpc) DOCTOR_RPC="$2"; shift 2 ;;
-        --shard-id) DOCTOR_SHARD_ID="$2"; shift 2 ;;
+        --dir) [ $# -ge 2 ] || { echo "doctor.sh: --dir requires an argument" >&2; exit 2; }; DOCTOR_DIR="$2"; shift 2 ;;
+        --service) [ $# -ge 2 ] || { echo "doctor.sh: --service requires an argument" >&2; exit 2; }; DOCTOR_SERVICE="$2"; shift 2 ;;
+        --scope) [ $# -ge 2 ] || { echo "doctor.sh: --scope requires an argument" >&2; exit 2; }; DOCTOR_SCOPE="$2"; shift 2 ;;
+        --rpc) [ $# -ge 2 ] || { echo "doctor.sh: --rpc requires an argument" >&2; exit 2; }; DOCTOR_RPC="$2"; shift 2 ;;
+        --shard-id) [ $# -ge 2 ] || { echo "doctor.sh: --shard-id requires an argument" >&2; exit 2; }; DOCTOR_SHARD_ID="$2"; shift 2 ;;
         --json) DOCTOR_JSON=1; shift ;;
         --quiet) DOCTOR_QUIET=1; shift ;;
         --help|-h) usage; exit 0 ;;
@@ -96,9 +81,49 @@ done
 if [ -r "$STELL_CONF" ]; then
     # shellcheck disable=SC1090
     . "$STELL_CONF"
-    # the conf may override the expectations; re-apply the flag-free defaults
-    # only if the conf did not set them (it always sets them).
 fi
+
+EXPECT_STELL_SHARDS="${EXPECT_STELL_SHARDS:-0}"
+EXPECT_STELL_ROUND_TIMEOUT_MS="${EXPECT_STELL_ROUND_TIMEOUT_MS:-5000}"
+EXPECT_STELL_DOWN_PROPOSER_TIMEOUT_MS="${EXPECT_STELL_DOWN_PROPOSER_TIMEOUT_MS:-800}"
+EXPECT_STELL_MIN_BLOCK_MS="${EXPECT_STELL_MIN_BLOCK_MS:-400}"
+EXPECT_STELL_KEEP_BLOCKS="${EXPECT_STELL_KEEP_BLOCKS:-8000}"
+EXPECT_STELL_ARCHIVE="${EXPECT_STELL_ARCHIVE:-0}"
+EXPECT_STELL_CHAIN_ID="${EXPECT_STELL_CHAIN_ID:-5757}"
+EXPECT_BASE_FEE="${EXPECT_BASE_FEE:-280000}"
+INODE_WARN_PCT="${INODE_WARN_PCT:-70}"
+INODE_HARD_PCT="${INODE_HARD_PCT:-85}"
+ORPHAN_WARN_COUNT="${ORPHAN_WARN_COUNT:-20000}"
+
+STELOPS_BIN="${STELOPS_BIN:-/home/imm/stellereum-project/scripts/tools/stelops/target/release/stelops}"
+STELOPS_REMOTE="${STELOPS_REMOTE:-/root/stelops}"
+
+DOCTOR_TMPDIR=""
+cleanup_tmp() {
+    [ -n "${DOCTOR_TMPDIR:-}" ] && rm -rf "$DOCTOR_TMPDIR"
+}
+trap cleanup_tmp EXIT INT TERM
+
+json_escape() {
+    case "$1" in
+        *\\*|*\"*|*[![:print:]]*)
+            printf '%s' "$1" | awk '
+                BEGIN { ORS = "" }
+                {
+                    if (NR > 1) printf "\\n"
+                    gsub(/\\/, "\\\\")
+                    gsub(/"/, "\\\"")
+                    gsub(/\r/, "\\r")
+                    gsub(/\t/, "\\t")
+                    gsub(/\b/, "\\b")
+                    gsub(/\f/, "\\f")
+                    printf "%s", $0
+                }
+            '
+            ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
 
 SYSCTL="systemctl"
 JOURNAL="journalctl"
@@ -111,6 +136,18 @@ fi
 if [ -z "$DOCTOR_DIR" ] && [ -n "$DOCTOR_SERVICE" ]; then
     DOCTOR_DIR=$($SYSCTL show "$DOCTOR_SERVICE" -p WorkingDirectory 2>/dev/null \
         | sed -n 's/^WorkingDirectory=//p' | head -1)
+    if [ -z "$DOCTOR_DIR" ] && [ -n "${STELL_NODES:-}" ]; then
+        for _n in $STELL_NODES; do
+            case "$_n" in
+                *[!A-Za-z0-9_]*|'') continue ;;
+            esac
+            eval "_nsvc=\${NODE_${_n}_SERVICE:-}; _ndir=\${NODE_${_n}_DIR:-}"
+            if [ "$_nsvc" = "$DOCTOR_SERVICE" ] && [ -n "$_ndir" ]; then
+                DOCTOR_DIR="$_ndir"
+                break
+            fi
+        done
+    fi
 fi
 [ -z "$DOCTOR_DIR" ] && DOCTOR_DIR="$(pwd)"
 
@@ -121,13 +158,42 @@ STORE_DIR="$DATA_DIR/store"
 # --- the env file -----------------------------------------------------------
 ENV_FILE=""
 if [ -n "$DOCTOR_SERVICE" ]; then
+    # `systemctl show -p EnvironmentFiles` outputs:
+    #   EnvironmentFiles=/path/to/env (ignore_errors=no)
     ENV_FILE=$($SYSCTL show "$DOCTOR_SERVICE" -p EnvironmentFiles 2>/dev/null \
-        | sed -n 's/.*(ignore_errors=[a-z]*)\{0,1\} *\([^ ]*\) (.*/\1/p' | head -1)
+        | sed -n 's/^EnvironmentFiles=-\{0,1\}\([^ ]*\)\( (ignore_errors=.*\)\{0,1\}$/\1/p' | head -1)
     [ -z "$ENV_FILE" ] && ENV_FILE=$($SYSCTL cat "$DOCTOR_SERVICE" 2>/dev/null \
-        | sed -n 's/^EnvironmentFile=//p' | head -1 | tr -d '"')
+        | sed -n 's/^EnvironmentFile=-\{0,1\}//p' | head -1 | tr -d '"')
 fi
-[ -z "$ENV_FILE" ] && { [ -f "$DOCTOR_DIR/env.$(basename "$DOCTOR_DIR" | tr 'a-z' 'A-Z')" ] \
-    && ENV_FILE="$DOCTOR_DIR/env.$(basename "$DOCTOR_DIR" | tr 'a-z' 'A-Z')"; }
+if [ -z "$ENV_FILE" ] && [ -n "${STELL_NODES:-}" ]; then
+    for _n in $STELL_NODES; do
+        case "$_n" in
+            *[!A-Za-z0-9_]*|'') continue ;;
+        esac
+        eval "_ndir=\${NODE_${_n}_DIR:-}; _nsvc=\${NODE_${_n}_SERVICE:-}; _nenv=\${NODE_${_n}_ENV:-}"
+        if { [ -n "$DOCTOR_DIR" ] && [ "$_ndir" = "$DOCTOR_DIR" ]; } \
+           || { [ -n "$DOCTOR_SERVICE" ] && [ "$_nsvc" = "$DOCTOR_SERVICE" ]; }; then
+            if [ -n "$_nenv" ] && [ -f "$_nenv" ]; then
+                ENV_FILE="$_nenv"
+                break
+            fi
+        fi
+    done
+fi
+if [ -z "$ENV_FILE" ]; then
+    _base=$(basename "$DOCTOR_DIR")
+    _suffix=""
+    case "$_base" in
+        node?*) _suffix=$(printf '%s' "${_base#node}" | tr 'a-z' 'A-Z') ;;
+    esac
+    if [ -n "$_suffix" ]; then
+        if [ -f "$DOCTOR_DIR/env.$_suffix" ]; then
+            ENV_FILE="$DOCTOR_DIR/env.$_suffix"
+        elif [ -f "$(dirname "$DOCTOR_DIR")/env.$_suffix" ]; then
+            ENV_FILE="$(dirname "$DOCTOR_DIR")/env.$_suffix"
+        fi
+    fi
+fi
 
 env_get() {
     [ -n "$ENV_FILE" ] && [ -r "$ENV_FILE" ] || { echo "<unset>"; return; }
@@ -176,24 +242,27 @@ fi
 # removes a chunk that a manifest (even a dying one) still points at.
 chunk_files=0; chunk_orphans=0; chunk_ref=0
 if [ -d "$DATA_DIR/chunks" ]; then
-    raw=$(mktemp 2>/dev/null || echo /tmp/.doctor-raw.$$)
-    have=$(mktemp 2>/dev/null || echo /tmp/.doctor-have.$$)
-    find "$DATA_DIR/chunks" -type f ! -name '.*' -printf '%f\n' 2>/dev/null > "$raw"
-    chunk_files=$(wc -l < "$raw" | tr -d ' ')
-    sort -u "$raw" > "$have" 2>/dev/null || cp "$raw" "$have"
-    if [ -r "$DATA_DIR/kv.json" ]; then
-        ref=$(mktemp 2>/dev/null || echo /tmp/.doctor-ref.$$)
-        # The manifest is a JSON STRING inside kv.json, so its quotes are
-        # escaped in the file: \"id\":\"<64 hex>\". Strip the backslashes first,
-        # then pull the chunk ids out.
-        tr -d '\\' < "$DATA_DIR/kv.json" 2>/dev/null \
-            | grep -o '"id"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]\{64\}"' \
-            | sed 's/^"id"[[:space:]]*:[[:space:]]*"//; s/"$//' | sort -u > "$ref" 2>/dev/null || : > "$ref"
-        chunk_ref=$(wc -l < "$ref" | tr -d ' ')
-        chunk_orphans=$(comm -23 "$have" "$ref" 2>/dev/null | wc -l | tr -d ' ')
-        rm -f "$ref"
+    if DOCTOR_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/stell-doctor.XXXXXX" 2>/dev/null); then
+        chmod 700 "$DOCTOR_TMPDIR"
+        raw="$DOCTOR_TMPDIR/raw"
+        have="$DOCTOR_TMPDIR/have"
+        find "$DATA_DIR/chunks" -type f ! -name '.*' -printf '%f\n' 2>/dev/null > "$raw"
+        chunk_files=$(wc -l < "$raw" | tr -d ' ')
+        sort -u "$raw" > "$have" 2>/dev/null || cp "$raw" "$have"
+        if [ -r "$DATA_DIR/kv.json" ]; then
+            ref="$DOCTOR_TMPDIR/ref"
+            # The manifest is a JSON STRING inside kv.json, so its quotes are
+            # escaped in the file: \"id\":\"<64 hex>\". Strip the backslashes first,
+            # then pull the chunk ids out.
+            tr -d '\\' < "$DATA_DIR/kv.json" 2>/dev/null \
+                | grep -o '"id"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]\{64\}"' \
+                | sed 's/^"id"[[:space:]]*:[[:space:]]*"//; s/"$//' | sort -u > "$ref" 2>/dev/null || : > "$ref"
+            chunk_ref=$(wc -l < "$ref" | tr -d ' ')
+            chunk_orphans=$(comm -23 "$have" "$ref" 2>/dev/null | wc -l | tr -d ' ')
+        fi
+        rm -rf "$DOCTOR_TMPDIR"
+        DOCTOR_TMPDIR=""
     fi
-    rm -f "$raw" "$have"
 fi
 
 # --- the consensus checkpoint / genesis root (the store) --------------------
@@ -415,14 +484,47 @@ fi
 
 # --- the report -------------------------------------------------------------
 if [ "$DOCTOR_JSON" = "1" ]; then
+    drift_line=$(printf '%s' "$drift" | tr '\n' '|')
     printf '{"node_dir":"%s","service":"%s","service_state":"%s","service_enabled":"%s","service_restarts":"%s","service_exit_code":"%s","service_since":"%s","env_file":"%s","inode_total":"%s","inode_used":"%s","inode_free":"%s","inode_pct":"%s","disk_pct":"%s","data_kb":"%s","chunk_files":"%s","chunk_orphans":"%s","chunk_referenced":"%s","checkpoint_height":"%s","checkpoint_round":"%s","lock_hash":"%s","lock_round":"%s","finalized_height":"%s","checkpoint_source":"%s","genesis_root":"%s","epoch":"%s","shards":"%s","is_sharded":"%s","expected_topic":"%s","subscribed_topic":"%s","subscribed_topics":"%s","topic_peers":"%s","binary_path":"%s","binary_sha256":"%s","binary_in_target_dir":"%s","key_format":"%s","chain_id":"%s","base_fee":"%s","tip":"%s","drift":"%s"}\n' \
-        "$DOCTOR_DIR" "$DOCTOR_SERVICE" "$svc_state" "$svc_enabled" "$svc_restarts" "$svc_exit" "$svc_since" \
-        "$ENV_FILE" "$inode_total" "$inode_used" "$inode_free" "$inode_pct" "$disk_pct" "$data_kb" \
-        "$chunk_files" "$chunk_orphans" "$chunk_ref" \
-        "$cp_height" "$cp_round" "$cp_lock_hash" "$cp_lock_round" "$cp_final" "$cp_source" \
-        "$genesis_root" "$epoch" "$shards" "$is_sharded" "$expected_topic" "$subscribed_topic" "$subscribed_topics" "$topic_peers" \
-        "$bin_path" "$bin_sha" "$bin_in_target" "$key_format" "$chain_id" "$base_fee" "$tip" \
-        "$(printf '%s' "$drift" | tr '\n' '|')"
+        "$(json_escape "$DOCTOR_DIR")" \
+        "$(json_escape "$DOCTOR_SERVICE")" \
+        "$(json_escape "$svc_state")" \
+        "$(json_escape "$svc_enabled")" \
+        "$(json_escape "$svc_restarts")" \
+        "$(json_escape "$svc_exit")" \
+        "$(json_escape "$svc_since")" \
+        "$(json_escape "$ENV_FILE")" \
+        "$(json_escape "$inode_total")" \
+        "$(json_escape "$inode_used")" \
+        "$(json_escape "$inode_free")" \
+        "$(json_escape "$inode_pct")" \
+        "$(json_escape "$disk_pct")" \
+        "$(json_escape "$data_kb")" \
+        "$(json_escape "$chunk_files")" \
+        "$(json_escape "$chunk_orphans")" \
+        "$(json_escape "$chunk_ref")" \
+        "$(json_escape "$cp_height")" \
+        "$(json_escape "$cp_round")" \
+        "$(json_escape "$cp_lock_hash")" \
+        "$(json_escape "$cp_lock_round")" \
+        "$(json_escape "$cp_final")" \
+        "$(json_escape "$cp_source")" \
+        "$(json_escape "$genesis_root")" \
+        "$(json_escape "$epoch")" \
+        "$(json_escape "$shards")" \
+        "$(json_escape "$is_sharded")" \
+        "$(json_escape "$expected_topic")" \
+        "$(json_escape "$subscribed_topic")" \
+        "$(json_escape "$subscribed_topics")" \
+        "$(json_escape "$topic_peers")" \
+        "$(json_escape "$bin_path")" \
+        "$(json_escape "$bin_sha")" \
+        "$(json_escape "$bin_in_target")" \
+        "$(json_escape "$key_format")" \
+        "$(json_escape "$chain_id")" \
+        "$(json_escape "$base_fee")" \
+        "$(json_escape "$tip")" \
+        "$(json_escape "$drift_line")"
     exit 0
 fi
 

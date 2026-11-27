@@ -712,6 +712,17 @@ fn jwt_sign_2fa(secret: &[u8; 32], sub: &str) -> String {
     format!("{data}.{sig}")
 }
 
+fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Верифицировать JWT и вернуть (sub, sid, v, typ).
 #[allow(clippy::type_complexity)] // GATE: JWT claims tuple is the standard claims shape
 fn jwt_verify_full(
@@ -726,7 +737,7 @@ fn jwt_verify_full(
     let mut mac = HmacSha256::new_from_slice(secret).ok()?;
     mac.update(data.as_bytes());
     let expect = b64url(&mac.finalize().into_bytes());
-    if expect != parts[2] {
+    if !ct_eq_bytes(expect.as_bytes(), parts[2].as_bytes()) {
         return None;
     }
     let claims: Value = serde_json::from_slice(
@@ -763,7 +774,7 @@ fn jwt_verify_pk(secret: &[u8; 32], token: &str) -> Option<(String, Option<Strin
     let mut mac = HmacSha256::new_from_slice(secret).ok()?;
     mac.update(data.as_bytes());
     let expect = b64url(&mac.finalize().into_bytes());
-    if expect != parts[2] {
+    if !ct_eq_bytes(expect.as_bytes(), parts[2].as_bytes()) {
         return None;
     }
     let claims: Value = serde_json::from_slice(
@@ -1118,22 +1129,79 @@ async fn newest_backup_with_accounts(path: &std::path::Path) -> Option<(PathBuf,
 /// Ключ шифрования секретов at-rest (smtp_pass): отдельный файл 0600 рядом с базой,
 /// чтобы пароль ящика не лежал в accounts.json открытым текстом.
 async fn secrets_key(path: &std::path::Path) -> Option<[u8; 32]> {
-    let dir = path.parent()?;
+    let dir = path.parent()?.to_path_buf();
     let kp = dir.join("secrets.key");
-    if let Ok(d) = tokio::fs::read(&kp).await {
-        if d.len() == 32 {
-            let mut k = [0u8; 32];
-            k.copy_from_slice(&d);
-            return Some(k);
+    tokio::task::spawn_blocking(move || -> Option<[u8; 32]> {
+        use std::io::Write;
+        if let Ok(d) = std::fs::read(&kp) {
+            if d.len() == 32 {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&d);
+                return Some(k);
+            }
         }
-    }
-    let mut k = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut k);
-    if tokio::fs::write(&kp, k).await.is_err() {
-        return None;
-    }
-    set_private_perms(&kp).await;
-    Some(k)
+        std::fs::create_dir_all(&dir).ok()?;
+        let mut k = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut k);
+
+        let create_temp_0600 = |tmp: &std::path::Path, key: &[u8; 32]| -> std::io::Result<()> {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(tmp)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            f.write_all(key)?;
+            f.sync_all()?;
+            Ok(())
+        };
+
+        let tmp = dir.join(format!(
+            "secrets.key.tmp.{}",
+            hex::encode(rand::random::<[u8; 8]>())
+        ));
+        create_temp_0600(&tmp, &k).ok()?;
+        match std::fs::hard_link(&tmp, &kp) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&tmp);
+                Some(k)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Ok(d) = std::fs::read(&kp) {
+                    if d.len() == 32 {
+                        let _ = std::fs::remove_file(&tmp);
+                        let mut existing = [0u8; 32];
+                        existing.copy_from_slice(&d);
+                        return Some(existing);
+                    }
+                }
+                // Corrupt/empty file existed — replace atomically via rename from 0600 temp file.
+                if std::fs::rename(&tmp, &kp).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                    return None;
+                }
+                Some(k)
+            }
+            Err(_) => {
+                // Filesystem without hard_link support — fallback to atomic rename from 0600 temp file.
+                if std::fs::rename(&tmp, &kp).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                    return None;
+                }
+                Some(k)
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn enc_secret(key: &[u8; 32], plain: &str) -> String {
@@ -1869,6 +1937,36 @@ fn verify_pow(solution: &Value) -> bool {
     hex.starts_with(&"0".repeat(difficulty as usize))
 }
 
+async fn hash_password_blocking(password: String) -> Option<String> {
+    tokio::task::spawn_blocking(move || {
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .ok()
+            .map(|h| h.to_string())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn verify_password_hash(pw_hash: String, password: String) -> bool {
+    if pw_hash.is_empty() {
+        return false;
+    }
+    tokio::task::spawn_blocking(move || {
+        PasswordHash::new(&pw_hash)
+            .map(|h| {
+                Argon2::default()
+                    .verify_password(password.as_bytes(), &h)
+                    .is_ok()
+            })
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false)
+}
+
 #[derive(Deserialize)]
 struct RegisterReq {
     email: String,
@@ -1922,16 +2020,18 @@ async fn register(
             }
         }
     }
-    let mut db = st.db.lock().await;
-    if db.accounts.contains_key(&email) {
-        return err_json(StatusCode::CONFLICT, "this address is already registered");
-    }
-    if let Some(owner) = resolve_db_email(&db, &email) {
-        if owner != email {
-            return err_json(
-                StatusCode::CONFLICT,
-                "this address is an alias of another account",
-            );
+    {
+        let db = st.db.lock().await;
+        if db.accounts.contains_key(&email) {
+            return err_json(StatusCode::CONFLICT, "this address is already registered");
+        }
+        if let Some(owner) = resolve_db_email(&db, &email) {
+            if owner != email {
+                return err_json(
+                    StatusCode::CONFLICT,
+                    "this address is an alias of another account",
+                );
+            }
         }
     }
     // защита от захвата: email уже занят в DHT-реестре (зарегистрирован через CLI/иную ноду)
@@ -1941,11 +2041,9 @@ async fn register(
             "this address is already registered on the network",
         );
     }
-    let salt = SaltString::generate(&mut OsRng);
-    let hash = Argon2::default()
-        .hash_password(req.password.as_bytes(), &salt)
-        .map(|h| h.to_string())
-        .unwrap_or_default();
+    let Some(hash) = hash_password_blocking(req.password.clone()).await else {
+        return err_json(StatusCode::INTERNAL_SERVER_ERROR, "password hashing failed");
+    };
     // SMTP-пароль для relay во внешнюю почту (генерится; ящик в MTA создаётся фоном)
     let smtp_pass = if std::env::var("INFNODE_SMTP_HOST").is_ok() {
         Some(gen_smtp_pass())
@@ -1980,10 +2078,23 @@ async fn register(
         session_epoch: 0,
         signature: None,
     };
-    db.accounts.insert(email.clone(), acc.clone());
+    {
+        let mut db = st.db.lock().await;
+        if db.accounts.contains_key(&email) {
+            return err_json(StatusCode::CONFLICT, "this address is already registered");
+        }
+        if let Some(owner) = resolve_db_email(&db, &email) {
+            if owner != email {
+                return err_json(
+                    StatusCode::CONFLICT,
+                    "this address is an alias of another account",
+                );
+            }
+        }
+        db.accounts.insert(email.clone(), acc.clone());
+        save_db(&st.db_path, &db).await;
+    }
     send_welcome_mail(&st, &email).await;
-    save_db(&st.db_path, &db).await;
-    drop(db);
     // профиль для DHT-репликации сразу (не ждём 5-минутный цикл — иначе свежий
     // аккаунт не восстановить, пока не отработает replicate_accounts_loop)
     {
@@ -2148,13 +2259,7 @@ async fn login(
     let pw_hash = acc.pw_hash.clone();
     let need_2fa_early = acc.totp_enabled;
     drop(db);
-    let ok = PasswordHash::new(&pw_hash)
-        .map(|h| {
-            Argon2::default()
-                .verify_password(req.password.as_bytes(), &h)
-                .is_ok()
-        })
-        .unwrap_or(false);
+    let ok = verify_password_hash(pw_hash, req.password.clone()).await;
     if !ok {
         if rate_limit(&st.login_guard, &ip, 10, 15 * 60 * 1000).await {
             return err_json(
@@ -2406,15 +2511,10 @@ async fn recovery_reset(State(st): State<WebState>, Json(req): Json<RecoveryReq>
         }
     };
     // путь 1: если знаешь текущий пароль — просто меняем
-    let old_ok = req
-        .old_pass
-        .as_ref()
-        .map(|op| {
-            PasswordHash::new(&snap.pw_hash)
-                .map(|h| Argon2::default().verify_password(op.as_bytes(), &h).is_ok())
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
+    let old_ok = match req.old_pass.as_ref() {
+        Some(op) => verify_password_hash(snap.pw_hash.clone(), op.clone()).await,
+        None => false,
+    };
     // путь 2: код восстановления из KV
     let code_key = format!("recovery:{email}");
     let code_valid = match req.code {
@@ -2467,11 +2567,9 @@ async fn recovery_reset(State(st): State<WebState>, Json(req): Json<RecoveryReq>
             burn_backup = Some(sha256_hex(tcode));
         }
     }
-    let salt = argon2::password_hash::SaltString::generate(&mut rand::rngs::OsRng);
-    let hash = Argon2::default()
-        .hash_password(new_pass.as_bytes(), &salt)
-        .map(|h| h.to_string())
-        .unwrap_or_else(|_| snap.pw_hash.clone());
+    let Some(hash) = hash_password_blocking(new_pass).await else {
+        return err_json(StatusCode::INTERNAL_SERVER_ERROR, "password hashing failed");
+    };
     let mut db = st.db.lock().await;
     let acc = match db.accounts.get_mut(&email) {
         Some(a) => a,
@@ -3167,12 +3265,12 @@ async fn mail_attachment_save(
             );
         }
     }
-    // квота файлов + дедуп имени
+    // квота файлов + дедуп имени (мутируем files_used только ПОСЛЕ успешной записи блоба)
     let ikey = file_index_key(&email);
     let mut list = files_index(&st.node, &email).await;
-    {
-        let mut db = st.db.lock().await;
-        let acc = match db.accounts.get_mut(&email) {
+    let fq = {
+        let db = st.db.lock().await;
+        let acc = match db.accounts.get(&email) {
             Some(a) => a,
             None => return err_json(StatusCode::UNAUTHORIZED, "account not found"),
         };
@@ -3183,16 +3281,15 @@ async fn mail_attachment_save(
                 "file storage is available by subscription",
             );
         }
-        let new_total = acc.files_used + data.len() as u64;
+        let new_total = acc.files_used.saturating_add(data.len() as u64);
         if new_total > fq {
             return err_json(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!("file storage limit: {} bytes", fq),
             );
         }
-        acc.files_used = new_total;
-        save_db(&st.db_path, &db).await;
-    }
+        fq
+    };
     // если имя занято — добавляем суффикс (n)
     let mut final_name = name.clone();
     let mut n = 1usize;
@@ -3234,6 +3331,29 @@ async fn mail_attachment_save(
                 "file seal failed (chunks={}, replicas={})",
                 report.chunks, report.replicas
             ),
+        );
+    }
+    // Только после успешного store_blob_boxed фиксируем списание квоты на диске.
+    let over_quota = {
+        let mut db = st.db.lock().await;
+        let acc = match db.accounts.get_mut(&email) {
+            Some(a) => a,
+            None => return err_json(StatusCode::UNAUTHORIZED, "account not found"),
+        };
+        let new_total = acc.files_used.saturating_add(data.len() as u64);
+        if new_total > fq {
+            true
+        } else {
+            acc.files_used = new_total;
+            save_db(&st.db_path, &db).await;
+            false
+        }
+    };
+    if over_quota {
+        st.node.delete_blob("files", &blob_name).await;
+        return err_json(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("file storage limit: {} bytes", fq),
         );
     }
     list.push(json!({ "name": final_name, "size": data.len(), "at": proto::now_ms() }));
@@ -4077,21 +4197,13 @@ async fn settings_change_password(
             None => return err_json(StatusCode::UNAUTHORIZED, "account not found"),
         }
     };
-    let ok = PasswordHash::new(&pw_hash)
-        .map(|h| {
-            Argon2::default()
-                .verify_password(req.current_pass.as_bytes(), &h)
-                .is_ok()
-        })
-        .unwrap_or(false);
+    let ok = verify_password_hash(pw_hash, req.current_pass.clone()).await;
     if !ok {
         return err_json(StatusCode::UNAUTHORIZED, "invalid current password");
     }
-    let salt = SaltString::generate(&mut OsRng);
-    let new_hash = Argon2::default()
-        .hash_password(req.new_pass.as_bytes(), &salt)
-        .map(|h| h.to_string())
-        .unwrap_or_default();
+    let Some(new_hash) = hash_password_blocking(req.new_pass.clone()).await else {
+        return err_json(StatusCode::INTERNAL_SERVER_ERROR, "password hashing failed");
+    };
     let mut db = st.db.lock().await;
     let acc = match db.accounts.get_mut(&email) {
         Some(a) => a,
@@ -4169,17 +4281,17 @@ async fn settings_account_delete(
     // Исключение: passwordless web3-аккаунты (pw_hash пуст — пароля нет по дизайну):
     // для них хватает самой сессии (получена по wallet-proof при входе), код 2FA —
     // по-прежнему обязателен, если 2FA включена.
-    let need_2fa = {
+    let (pw_hash, need_2fa) = {
         let db = st.db.lock().await;
         let acc = match db.accounts.get(&email) {
             Some(a) => a,
             None => return err_json(StatusCode::UNAUTHORIZED, "account not found"),
         };
-        if !acc.pw_hash.is_empty() && !verify_account_password(acc, &req.current_password) {
-            return err_json(StatusCode::UNAUTHORIZED, "invalid current password");
-        }
-        acc.totp_enabled
+        (acc.pw_hash.clone(), acc.totp_enabled)
     };
+    if !pw_hash.is_empty() && !verify_password_hash(pw_hash, req.current_password.clone()).await {
+        return err_json(StatusCode::UNAUTHORIZED, "invalid current password");
+    }
     if need_2fa {
         let db = st.db.lock().await;
         let acc = match db.accounts.get(&email) {
@@ -4333,49 +4445,66 @@ async fn delete_stalwart_mailbox(email: &str) -> String {
 
 // E2E на новой системе включён всегда (ключи генерируются в браузере при первом входе).
 // Отдаём enabled:true, чтобы фронтенд не блокировал E2EE-тумблер.
-fn verify_account_password(acc: &Account, pw: &str) -> bool {
-    PasswordHash::new(&acc.pw_hash)
-        .map(|h| Argon2::default().verify_password(pw.as_bytes(), &h).is_ok())
-        .unwrap_or(false)
-}
-
 fn sha256_hex(s: &str) -> String {
     let mut h = Sha256::new();
     h.update(s.as_bytes());
     hex::encode(h.finalize())
 }
 
+const BACKUP_CODES_KDF_CTX: &str = "infmail-backup-codes-v2";
+
 fn xor_codes(password: &str, codes: &[String]) -> Vec<String> {
-    let key = blake3::hash(password.as_bytes());
-    let k = key.as_bytes();
+    let master_key = blake3::derive_key(BACKUP_CODES_KDF_CTX, password.as_bytes());
     codes
         .iter()
-        .map(|c| {
-            let x: Vec<u8> = c
-                .bytes()
-                .enumerate()
-                .map(|(i, b)| b ^ k[i % k.len()])
-                .collect();
-            hex::encode(x)
+        .enumerate()
+        .map(|(idx, c)| {
+            let mut nonce = [0u8; 16];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+            let mut h = blake3::Hasher::new_keyed(&master_key);
+            h.update(&(idx as u64).to_le_bytes());
+            h.update(&nonce);
+            let mut ks = vec![0u8; c.len()];
+            h.finalize_xof().fill(&mut ks);
+            let ct: Vec<u8> = c.bytes().zip(ks.iter()).map(|(b, k)| b ^ k).collect();
+            format!("v2:{}:{}", hex::encode(nonce), hex::encode(ct))
         })
         .collect()
 }
 
 fn unxor_codes(password: &str, enc: &[String]) -> Vec<String> {
-    let key = blake3::hash(password.as_bytes());
-    let k = key.as_bytes();
+    let master_key = blake3::derive_key(BACKUP_CODES_KDF_CTX, password.as_bytes());
+    let legacy_key = blake3::hash(password.as_bytes());
+    let lk = legacy_key.as_bytes();
     enc.iter()
-        .filter_map(|h| {
-            let x = hex::decode(h).ok()?;
-            if x.is_empty() {
-                return None;
+        .enumerate()
+        .filter_map(|(idx, entry)| {
+            if let Some(rest) = entry.strip_prefix("v2:") {
+                let (nonce_hex, ct_hex) = rest.split_once(':')?;
+                let nonce = hex::decode(nonce_hex).ok()?;
+                let ct = hex::decode(ct_hex).ok()?;
+                if ct.is_empty() {
+                    return None;
+                }
+                let mut h = blake3::Hasher::new_keyed(&master_key);
+                h.update(&(idx as u64).to_le_bytes());
+                h.update(&nonce);
+                let mut ks = vec![0u8; ct.len()];
+                h.finalize_xof().fill(&mut ks);
+                let plain: Vec<u8> = ct.iter().zip(ks.iter()).map(|(b, k)| b ^ k).collect();
+                String::from_utf8(plain).ok()
+            } else {
+                let x = hex::decode(entry).ok()?;
+                if x.is_empty() {
+                    return None;
+                }
+                let plain: Vec<u8> = x
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| *b ^ lk[i % lk.len()])
+                    .collect();
+                String::from_utf8(plain).ok()
             }
-            let s: String = x
-                .iter()
-                .enumerate()
-                .map(|(i, b)| (*b ^ k[i % k.len()]) as char)
-                .collect();
-            Some(s)
         })
         .collect()
 }
@@ -4442,15 +4571,22 @@ async fn settings_2fa_enable(
     if rate_limit(&st.login_guard, &format!("2fae:{email}"), 10, 900000).await {
         return err_json(StatusCode::TOO_MANY_REQUESTS, "too many 2fa attempts, wait");
     }
+    let pw_hash = {
+        let db = st.db.lock().await;
+        match db.accounts.get(&email) {
+            Some(a) => a.pw_hash.clone(),
+            None => return err_json(StatusCode::UNAUTHORIZED, "account not found"),
+        }
+    };
+    if !verify_password_hash(pw_hash, req.current_password.clone()).await {
+        return err_json(StatusCode::BAD_REQUEST, "invalid password");
+    }
     let now = proto::now_ms() / 1000;
     let mut db = st.db.lock().await;
     let acc = match db.accounts.get_mut(&email) {
         Some(a) => a,
         None => return err_json(StatusCode::UNAUTHORIZED, "account not found"),
     };
-    if !verify_account_password(acc, &req.current_password) {
-        return err_json(StatusCode::BAD_REQUEST, "invalid password");
-    }
     let stored = acc.totp_secret.clone().unwrap_or_default();
     if stored.is_empty() || stored != req.secret {
         return err_json(
@@ -4505,14 +4641,21 @@ async fn settings_2fa_disable(
     if rate_limit(&st.login_guard, &format!("2fad:{email}"), 10, 900000).await {
         return err_json(StatusCode::TOO_MANY_REQUESTS, "too many 2fa attempts, wait");
     }
+    let pw_hash = {
+        let db = st.db.lock().await;
+        match db.accounts.get(&email) {
+            Some(a) => a.pw_hash.clone(),
+            None => return err_json(StatusCode::UNAUTHORIZED, "account not found"),
+        }
+    };
+    if !verify_password_hash(pw_hash, req.current_password.clone()).await {
+        return err_json(StatusCode::BAD_REQUEST, "invalid password");
+    }
     let mut db = st.db.lock().await;
     let acc = match db.accounts.get_mut(&email) {
         Some(a) => a,
         None => return err_json(StatusCode::UNAUTHORIZED, "account not found"),
     };
-    if !verify_account_password(acc, &req.current_password) {
-        return err_json(StatusCode::BAD_REQUEST, "invalid password");
-    }
     if acc.totp_enabled {
         let now = proto::now_ms();
         let totp_ok = acc
@@ -4557,15 +4700,17 @@ async fn settings_2fa_backup_codes(
     if rate_limit(&st.login_guard, &format!("2fab:{email}"), 10, 900000).await {
         return err_json(StatusCode::TOO_MANY_REQUESTS, "too many 2fa attempts, wait");
     }
-    let db = st.db.lock().await;
-    let acc = match db.accounts.get(&email) {
-        Some(a) => a,
-        None => return err_json(StatusCode::UNAUTHORIZED, "account not found"),
+    let (pw_hash, backup_codes_enc) = {
+        let db = st.db.lock().await;
+        match db.accounts.get(&email) {
+            Some(a) => (a.pw_hash.clone(), a.backup_codes_enc.clone()),
+            None => return err_json(StatusCode::UNAUTHORIZED, "account not found"),
+        }
     };
-    if !verify_account_password(acc, &req.current_password) {
+    if !verify_password_hash(pw_hash, req.current_password.clone()).await {
         return err_json(StatusCode::BAD_REQUEST, "invalid password");
     }
-    let plain = unxor_codes(&req.current_password, &acc.backup_codes_enc);
+    let plain = unxor_codes(&req.current_password, &backup_codes_enc);
     ok_json(json!({ "backup_codes": plain }))
 }
 
@@ -4583,17 +4728,26 @@ async fn settings_trusted_email(
     if te.is_empty() || !te.contains('@') {
         return err_json(StatusCode::BAD_REQUEST, "provide a valid backup email");
     }
+    let pw_hash = {
+        let db = st.db.lock().await;
+        match db.accounts.get(&email) {
+            Some(a) => a.pw_hash.clone(),
+            None => return err_json(StatusCode::UNAUTHORIZED, "account not found"),
+        }
+    };
+    // пароль обязателен, если у аккаунта он есть (раньше пустой пароль проходил —
+    // угнанная сессия привязывала чужой ящик без знания пароля). У web3-аккаунтов
+    // без пароля сама сессия доказывает владение кошельком.
+    if !pw_hash.is_empty()
+        && (password.is_empty() || !verify_password_hash(pw_hash, password.to_string()).await)
+    {
+        return err_json(StatusCode::BAD_REQUEST, "password required");
+    }
     let mut db = st.db.lock().await;
     let acc = match db.accounts.get_mut(&email) {
         Some(a) => a,
         None => return err_json(StatusCode::UNAUTHORIZED, "account not found"),
     };
-    // пароль обязателен, если у аккаунта он есть (раньше пустой пароль проходил —
-    // угнанная сессия привязывала чужой ящик без знания пароля). У web3-аккаунтов
-    // без пароля сама сессия доказывает владение кошельком.
-    if !acc.pw_hash.is_empty() && (password.is_empty() || !verify_account_password(acc, password)) {
-        return err_json(StatusCode::BAD_REQUEST, "password required");
-    }
     acc.trusted_email = Some(te.clone());
     acc.pending_email = None;
     save_db(&st.db_path, &db).await;
@@ -5456,29 +5610,28 @@ async fn files_upload(
         );
     }
     // квота файлов (раздельная от почты). При перезаписи файла возвращаем старый размер.
+    // Запрос files_index вне db-лока и списание files_used только ПОСЛЕ store_blob_boxed.
+    let list_pre = files_index(&st.node, &email).await;
+    let prev_size_pre = list_pre
+        .iter()
+        .find(|e| e["name"].as_str() == Some(req.name.as_str()))
+        .and_then(|e| e["size"].as_u64())
+        .unwrap_or(0);
     {
-        let mut db = st.db.lock().await;
-        let acc = match db.accounts.get_mut(&email) {
+        let db = st.db.lock().await;
+        let acc = match db.accounts.get(&email) {
             Some(a) => a,
             None => return err_json(StatusCode::UNAUTHORIZED, "account not found"),
         };
         let fq = effective_file_quota(acc);
-        let list = files_index(&st.node, &email).await;
-        let prev_size = list
-            .iter()
-            .find(|e| e["name"].as_str() == Some(req.name.as_str()))
-            .and_then(|e| e["size"].as_u64())
-            .unwrap_or(0);
-        let cur_used = acc.files_used.saturating_sub(prev_size);
-        let new_total = cur_used + data.len() as u64;
+        let cur_used = acc.files_used.saturating_sub(prev_size_pre);
+        let new_total = cur_used.saturating_add(data.len() as u64);
         if new_total > fq {
             return err_json(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!("file storage limit: {} bytes", fq),
             );
         }
-        acc.files_used = new_total;
-        save_db(&st.db_path, &db).await;
     }
     let blob_name = file_blob_key(&email, &req.name);
     // Owner-sealed upload (account-scoped owner key; see `files_owner_seed`).
@@ -5517,9 +5670,32 @@ async fn files_upload(
             "file stored locally but no durable replica accepted it",
         );
     }
-    // индекс файлов владельца
+    // индекс файлов владельца и фиксация квоты после успешного store_blob_boxed
     let ikey = file_index_key(&email);
     let mut list = files_index(&st.node, &email).await;
+    let prev_size = list
+        .iter()
+        .find(|e| e["name"].as_str() == Some(req.name.as_str()))
+        .and_then(|e| e["size"].as_u64())
+        .unwrap_or(0);
+    {
+        let mut db = st.db.lock().await;
+        let acc = match db.accounts.get_mut(&email) {
+            Some(a) => a,
+            None => return err_json(StatusCode::UNAUTHORIZED, "account not found"),
+        };
+        let fq = effective_file_quota(acc);
+        let cur_used = acc.files_used.saturating_sub(prev_size);
+        let new_total = cur_used.saturating_add(data.len() as u64);
+        if new_total > fq {
+            return err_json(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("file storage limit: {} bytes", fq),
+            );
+        }
+        acc.files_used = new_total;
+        save_db(&st.db_path, &db).await;
+    }
     list.retain(|e| e["name"].as_str() != Some(req.name.as_str()));
     list.push(json!({ "name": req.name, "size": data.len(), "at": proto::now_ms() }));
     kv_set(
@@ -6092,6 +6268,12 @@ struct Web3Domain {
     value: String,
 }
 
+fn web3_proof_ts_ms(timestamp_secs: u64) -> Option<i64> {
+    i64::try_from(timestamp_secs)
+        .ok()
+        .and_then(|t| t.checked_mul(1000))
+}
+
 async fn web3_login(
     State(st): State<WebState>,
     headers: HeaderMap,
@@ -6135,7 +6317,10 @@ async fn web3_login(
         if !domain_ok {
             return err_json(StatusCode::UNAUTHORIZED, "invalid proof domain");
         }
-        if proto::now_ms().abs_diff(pr.timestamp as i64 * 1000) > 10 * 60 * 1000 {
+        let Some(proof_ts_ms) = web3_proof_ts_ms(pr.timestamp) else {
+            return err_json(StatusCode::BAD_REQUEST, "invalid proof timestamp");
+        };
+        if proto::now_ms().abs_diff(proof_ts_ms) > 10 * 60 * 1000 {
             return err_json(StatusCode::UNAUTHORIZED, "proof expired");
         }
         // анти-replay: payload должен содержать выданный nonce (web3n_active)
@@ -6311,17 +6496,19 @@ async fn register_web3(
     if !valid_email(&email) {
         return err_json(StatusCode::BAD_REQUEST, "invalid email (only @infmail.org)");
     }
-    let db = st.db.lock().await;
-    if db.accounts.contains_key(&email) {
-        return err_json(StatusCode::CONFLICT, "this address is already registered");
-    }
-    // email не должен быть алиасом другого аккаунта (иначе перехват почты алиаса)
-    if let Some(owner) = resolve_db_email(&db, &email) {
-        if owner != email {
-            return err_json(
-                StatusCode::CONFLICT,
-                "this address is an alias of another account",
-            );
+    {
+        let db = st.db.lock().await;
+        if db.accounts.contains_key(&email) {
+            return err_json(StatusCode::CONFLICT, "this address is already registered");
+        }
+        // email не должен быть алиасом другого аккаунта (иначе перехват почты алиаса)
+        if let Some(owner) = resolve_db_email(&db, &email) {
+            if owner != email {
+                return err_json(
+                    StatusCode::CONFLICT,
+                    "this address is an alias of another account",
+                );
+            }
         }
     }
     // защита от захвата: email уже занят в DHT-реестре (зарегистрирован через CLI/иную ноду)
@@ -6334,22 +6521,38 @@ async fn register_web3(
     // ПРОВЕРКА ОПЛАТЫ/ВЛАДЕНИЯ: web3-аккаунт создаётся ТОЛЬКО если email зарегистрирован
     // в TON Registry И владелец (getOwnerByHash) == текущий кошелёк (MED-2 фикс: «стек непуст»
     // не доказывал владельца — теперь проверяем реальный адрес владельца on-chain).
-    {
-        if !crate::blockchain::check_registry_ownership(&email, &wallet) {
-            return err_json(
-                StatusCode::PAYMENT_REQUIRED,
-                "email is not owned by this wallet on the blockchain — register the email to your wallet first",
-            );
-        }
-        // та же проверка цены тира, что и в опросе (self-attested usernameLength)
-        if !crate::blockchain::verify_registry_payment(&email, "", &wallet) {
-            return err_json(
-                StatusCode::PAYMENT_REQUIRED,
-                "ownership found but no sufficient registration payment — pay the tier price first",
-            );
+    let email_c = email.clone();
+    let wallet_c = wallet.clone();
+    let owned = tokio::task::spawn_blocking(move || {
+        crate::blockchain::check_registry_ownership(&email_c, &wallet_c)
+    })
+    .await
+    .unwrap_or(false);
+    if !owned {
+        return err_json(
+            StatusCode::PAYMENT_REQUIRED,
+            "email is not owned by this wallet on the blockchain — register the email to your wallet first",
+        );
+    }
+    let email_c = email.clone();
+    let wallet_c = wallet.clone();
+    let paid = tokio::task::spawn_blocking(move || {
+        crate::blockchain::verify_registry_payment(&email_c, "", &wallet_c)
+    })
+    .await
+    .unwrap_or(false);
+    if !paid {
+        return err_json(
+            StatusCode::PAYMENT_REQUIRED,
+            "ownership found but no sufficient registration payment — pay the tier price first",
+        );
+    }
+    match create_web3_account(&st, &email, &wallet, &wallet_pub).await {
+        CreateWeb3Outcome::Created | CreateWeb3Outcome::AlreadyOwned => {}
+        CreateWeb3Outcome::Conflict => {
+            return err_json(StatusCode::CONFLICT, "this address is already registered");
         }
     }
-    create_web3_account(&st, &email, &wallet, &wallet_pub).await;
     let device = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -6683,17 +6886,19 @@ async fn web3_save_intent(
     if !valid_email(&email) {
         return err_json(StatusCode::BAD_REQUEST, "invalid email (only @infmail.org)");
     }
-    let db = st.db.lock().await;
-    if db.accounts.contains_key(&email) {
-        return err_json(StatusCode::CONFLICT, "this address is already registered");
-    }
-    // email не должен быть алиасом другого аккаунта (иначе перехват почты алиаса)
-    if let Some(owner) = resolve_db_email(&db, &email) {
-        if owner != email {
-            return err_json(
-                StatusCode::CONFLICT,
-                "this address is an alias of another account",
-            );
+    {
+        let db = st.db.lock().await;
+        if db.accounts.contains_key(&email) {
+            return err_json(StatusCode::CONFLICT, "this address is already registered");
+        }
+        // email не должен быть алиасом другого аккаунта (иначе перехват почты алиаса)
+        if let Some(owner) = resolve_db_email(&db, &email) {
+            if owner != email {
+                return err_json(
+                    StatusCode::CONFLICT,
+                    "this address is an alias of another account",
+                );
+            }
         }
     }
     if registry_get(&st.node, &email).await.is_some() {
@@ -6717,7 +6922,13 @@ async fn web3_save_intent(
     }
     // Уже оплачен этим кошельком ранее (страница была закрыта до финализации)?
     // Фронт тогда пропустит повторную отправку и сразу перейдёт к опросу.
-    let owned = crate::blockchain::check_registry_ownership(&email, &wallet);
+    let email_c = email.clone();
+    let wallet_c = wallet.clone();
+    let owned = tokio::task::spawn_blocking(move || {
+        crate::blockchain::check_registry_ownership(&email_c, &wallet_c)
+    })
+    .await
+    .unwrap_or(false);
     ok_json(json!({ "ok": true, "email": email, "owned": owned }))
 }
 
@@ -6736,14 +6947,22 @@ async fn web3_auth(st: &WebState, headers: &HeaderMap) -> Result<String, Respons
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CreateWeb3Outcome {
+    Created,
+    AlreadyOwned,
+    Conflict,
+}
+
 /// Создать web3-аккаунт: вставка в базу + приветственное письмо + сохранение.
-/// Вызывать ТОЛЬКО после проверки владения on-chain (getOwnerByHash == кошелёк).
+/// Вызывать ТОЛЬКО после проверки владения on-chain (getOwnerByHash == кошелёк)
+/// и без удержания `st.db` мьютекса.
 async fn create_web3_account(
     st: &WebState,
     email: &str,
     wallet: &str,
     wallet_pub: &Option<String>,
-) {
+) -> CreateWeb3Outcome {
     let acc = Account {
         pw_hash: String::new(),
         created_ms: proto::now_ms(),
@@ -6772,17 +6991,26 @@ async fn create_web3_account(
         session_epoch: 0,
         signature: None,
     };
-    let mut db = st.db.lock().await;
-    // LOW-6: атомарный check-then-insert — два параллельных опроса (даблклик
-    // "Verify again", два девайса) не плодят двойное создание + двойной welcome
-    if let Some(existing) = db.accounts.get(email) {
-        if existing.wallet.as_deref() == Some(wallet) {
-            return;
+    {
+        let mut db = st.db.lock().await;
+        // LOW-6: атомарный check-then-insert — два параллельных опроса (даблклик
+        // "Verify again", два девайса) не плодят двойное создание + двойной welcome
+        if let Some(existing) = db.accounts.get(email) {
+            if existing.wallet.as_deref() == Some(wallet) {
+                return CreateWeb3Outcome::AlreadyOwned;
+            }
+            return CreateWeb3Outcome::Conflict;
         }
+        if let Some(owner) = resolve_db_email(&db, email) {
+            if owner != email {
+                return CreateWeb3Outcome::Conflict;
+            }
+        }
+        db.accounts.insert(email.to_string(), acc);
+        save_db(&st.db_path, &db).await;
     }
-    db.accounts.insert(email.to_string(), acc);
     send_welcome_mail(st, email).await;
-    save_db(&st.db_path, &db).await;
+    CreateWeb3Outcome::Created
 }
 
 async fn web3_poll_activation(
@@ -6836,17 +7064,35 @@ async fn web3_poll_activation(
     // MED-2 гарантия сохранена: аккаунт создаётся ТОЛЬКО если on-chain владелец
     // email (getOwnerByHash) == текущий кошелёк. Но теперь проверка ПОСЛЕ оплаты,
     // а не до неё (раньше был тупик «зарегистрируй, чтобы зарегистрировать»).
-    if crate::blockchain::check_registry_ownership(&email, &wallet) {
+    let email_c = email.clone();
+    let wallet_c = wallet.clone();
+    let owned = tokio::task::spawn_blocking(move || {
+        crate::blockchain::check_registry_ownership(&email_c, &wallet_c)
+    })
+    .await
+    .unwrap_or(false);
+    if owned {
         // Цена тира по РЕАЛЬНОЙ длине имени: закрывает self-attested usernameLength
         // (короткое имя, оплаченное как длинное — контракт пропустит, мы — нет).
         // Ищем RegisterZK с нашим emailHash и суммой >= цены тира в последних 100
         // входящих контракту. Без найденной оплаты — не создаём (pending, не active).
-        if !crate::blockchain::verify_registry_payment(&email, "", &wallet) {
+        let email_c = email.clone();
+        let wallet_c = wallet.clone();
+        let paid = tokio::task::spawn_blocking(move || {
+            crate::blockchain::verify_registry_payment(&email_c, "", &wallet_c)
+        })
+        .await
+        .unwrap_or(false);
+        if !paid {
             eprintln!("[web3] ownership ok but no sufficient payment found for {email}");
             return ok_json(json!({ "status": "pending" }));
         }
-        create_web3_account(&st, &email, &wallet, &wallet_pub).await;
-        return ok_json(json!({ "status": "active" }));
+        return match create_web3_account(&st, &email, &wallet, &wallet_pub).await {
+            CreateWeb3Outcome::Created | CreateWeb3Outcome::AlreadyOwned => {
+                ok_json(json!({ "status": "active" }))
+            }
+            CreateWeb3Outcome::Conflict => ok_json(json!({ "status": "taken" })),
+        };
     }
     ok_json(json!({ "status": "pending" }))
 }
@@ -6948,23 +7194,59 @@ async fn nft_verify(State(st): State<WebState>, Path(token_id): Path<String>) ->
     ok_json(resp)
 }
 
+const MAX_PNG_DIM: u32 = 4096;
+const MAX_PNG_OUTPUT_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+
 /// Декодировать PNG в сырые RGBA-байты (для LSB-извлечения).
-/// Возвращает None если декодирование невозможно.
+/// Возвращает None если декодирование невозможно или превышены лимиты.
 fn decode_png_rgba(png_bytes: &[u8]) -> Option<Vec<u8>> {
+    use png::{BitDepth, ColorType};
     use std::io::Cursor;
-    let decoder = png::Decoder::new(Cursor::new(png_bytes));
+
+    let mut decoder = png::Decoder::new(Cursor::new(png_bytes));
+    decoder.set_limits(png::Limits {
+        bytes: MAX_PNG_OUTPUT_BYTES,
+    });
     let mut reader = decoder.read_info().ok()?;
-    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info_pre = reader.info();
+    if info_pre.width == 0
+        || info_pre.height == 0
+        || info_pre.width > MAX_PNG_DIM
+        || info_pre.height > MAX_PNG_DIM
+    {
+        return None;
+    }
+    let (out_ct, out_bd) = reader.output_color_type();
+    if out_bd != BitDepth::Eight || !matches!(out_ct, ColorType::Rgba | ColorType::Rgb) {
+        return None;
+    }
+    let out_len = reader.output_buffer_size();
+    if out_len == 0 || out_len > MAX_PNG_OUTPUT_BYTES {
+        return None;
+    }
+    let mut buf = vec![0u8; out_len];
     let info = reader.next_frame(&mut buf).ok()?;
-    let w = info.width as usize;
-    let h = info.height as usize;
-    use png::ColorType;
+    if info.width == 0
+        || info.height == 0
+        || info.width > MAX_PNG_DIM
+        || info.height > MAX_PNG_DIM
+        || info.bit_depth != BitDepth::Eight
+    {
+        return None;
+    }
+    let pixels = (info.width as usize).checked_mul(info.height as usize)?;
     match info.color_type {
-        ColorType::Rgba => Some(buf[..w * h * 4].to_vec()),
+        ColorType::Rgba => {
+            let need = pixels.checked_mul(4)?;
+            Some(buf.get(..need)?.to_vec())
+        }
         ColorType::Rgb => {
+            let need = pixels.checked_mul(3)?;
+            let rgba_len = pixels.checked_mul(4)?;
+            let slice = buf.get(..need)?;
             // LSB вшивается по всем 4 каналам RGBA — достраиваем alpha=255
-            let mut rgba = Vec::with_capacity(w * h * 4);
-            for px in buf[..w * h * 3].chunks_exact(3) {
+            let mut rgba = Vec::with_capacity(rgba_len);
+            for px in slice.chunks_exact(3) {
                 rgba.extend_from_slice(px);
                 rgba.push(255);
             }
@@ -7533,5 +7815,270 @@ mod acct_auth_tests {
         assert!(!restore_account_on_demand(&node, &db, &db_path, bob).await);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod wave21b_tests {
+    use super::*;
+    use infnode::config::NodeConfig;
+    use infnode::keyring::{NodeKeys, PqKeys};
+
+    fn test_cfg(name: &str) -> NodeConfig {
+        NodeConfig {
+            name: name.to_string(),
+            listen: "127.0.0.1:0".to_string(),
+            client_listen: None,
+            advertise: None,
+            peers: Vec::new(),
+            allow_unknown: false,
+            unknown_allow: Vec::new(),
+            metrics_listen: None,
+            log_level: Some(0),
+            roles: Default::default(),
+            outbox_ttl_secs: 3600,
+            storage_roles: Vec::new(),
+            validators: Vec::new(),
+            domain: None,
+            web_listen: None,
+            wallet: None,
+            web_static: None,
+        }
+    }
+
+    async fn test_web_state(dir: &std::path::Path) -> WebState {
+        let keys = NodeKeys::generate();
+        let pq = PqKeys::from_seed([0x33u8; 32]);
+        let node = Node::new(
+            test_cfg("web-test"),
+            keys,
+            pq,
+            dir.join("node"),
+            PathBuf::new(),
+        )
+        .await
+        .expect("node");
+        let jwt_secret = derive_jwt_secret(&node);
+        WebState {
+            node,
+            db: Arc::new(Mutex::new(AccountsDb::default())),
+            db_path: dir.join("accounts.json"),
+            jwt_secret,
+            login_guard: Arc::new(Mutex::new(HashMap::new())),
+            reg_guard: Arc::new(Mutex::new(HashMap::new())),
+            relay_guard: Arc::new(Mutex::new(HashMap::new())),
+            recovery_guard: Arc::new(Mutex::new(HashMap::new())),
+            nft_guard: Arc::new(Mutex::new(HashMap::new())),
+            index_lock: Arc::new(Mutex::new(())),
+            sync_inflight: Arc::new(Mutex::new(HashSet::new())),
+            sync_last: Arc::new(Mutex::new(HashMap::new())),
+            nft_status_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn web3_register_no_deadlock() {
+        let dir = std::env::temp_dir().join(format!("infmail-w21b-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = test_web_state(&dir).await;
+
+        let wallet = "11".repeat(32);
+        let pk = "22".repeat(32);
+        let email = "w3test@infmail.org";
+
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            create_web3_account(&st, email, &wallet, &Some(pk.clone())),
+        )
+        .await
+        .expect("create_web3_account must not deadlock");
+        assert_eq!(out, CreateWeb3Outcome::Created);
+
+        // Lock must not be held after create_web3_account returns.
+        assert!(st.db.try_lock().is_ok());
+
+        // Idempotent repeat for same wallet and conflict for another wallet.
+        let out_same = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            create_web3_account(&st, email, &wallet, &Some(pk.clone())),
+        )
+        .await
+        .expect("repeat create_web3_account must not deadlock");
+        assert_eq!(out_same, CreateWeb3Outcome::AlreadyOwned);
+
+        let other_wallet = "aa".repeat(32);
+        let out_other = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            create_web3_account(&st, email, &other_wallet, &Some(pk.clone())),
+        )
+        .await
+        .expect("conflict create_web3_account must not deadlock");
+        assert_eq!(out_other, CreateWeb3Outcome::Conflict);
+
+        // Calling register_web3 on existing account must return 409 without deadlocking.
+        let tok = jwt_sign_web3(&st.jwt_secret, &wallet, &pk, true, 600);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_str(&format!("Bearer {tok}")).unwrap(),
+        );
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            register_web3(
+                State(st.clone()),
+                headers,
+                Json(RegisterWeb3Req {
+                    email: email.to_string(),
+                    wallet_address: wallet,
+                }),
+            ),
+        )
+        .await
+        .expect("register_web3 must not deadlock");
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(st.db.try_lock().is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn secrets_key_created_with_0600_permissions() {
+        let dir = std::env::temp_dir().join(format!("infmail-w21b-seckey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("accounts.json");
+
+        let k1 = secrets_key(&db_path).await.expect("secrets_key created");
+        let kp = dir.join("secrets.key");
+        assert!(kp.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&kp).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "secrets.key must be 0o600, got 0o{mode:03o}");
+        }
+        let k2 = secrets_key(&db_path).await.expect("secrets_key reloaded");
+        assert_eq!(k1, k2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn web3_login_rejects_timestamp_overflow() {
+        assert!(web3_proof_ts_ms(u64::MAX).is_none());
+        assert!(web3_proof_ts_ms((i64::MAX as u64 / 1000) + 1).is_none());
+        assert_eq!(web3_proof_ts_ms(1_700_000_000), Some(1_700_000_000_000));
+
+        let dir = std::env::temp_dir().join(format!("infmail-w21b-ts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = test_web_state(&dir).await;
+
+        let resp = web3_login(
+            State(st),
+            HeaderMap::new(),
+            Json(Web3LoginReq {
+                address: format!("0:{}", "11".repeat(32)),
+                network: "-239".into(),
+                public_key: "22".repeat(32),
+                proof: Some(Web3Proof {
+                    timestamp: u64::MAX,
+                    domain: Web3Domain {
+                        length_bytes: 11,
+                        value: "infmail.org".into(),
+                    },
+                    signature: String::new(),
+                    payload: String::new(),
+                }),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn crc32_ieee(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in data {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    fn encode_test_png(w: u32, h: u32, ct: png::ColorType, px: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, w, h);
+            enc.set_color(ct);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut writer = enc.write_header().unwrap();
+            writer.write_image_data(px).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn decode_png_rgba_rejects_oversized_dimensions() {
+        let big_w = encode_test_png(4097, 1, png::ColorType::Rgba, &vec![0u8; 4097 * 4]);
+        assert!(decode_png_rgba(&big_w).is_none());
+
+        let big_h = encode_test_png(1, 4097, png::ColorType::Rgba, &vec![0u8; 4097 * 4]);
+        assert!(decode_png_rgba(&big_h).is_none());
+
+        // Synthetic 5000x5000 IHDR header without allocating 100 MB.
+        let mut synthetic = Vec::new();
+        synthetic.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]); // PNG sig
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(b"IHDR");
+        ihdr.extend_from_slice(&5000u32.to_be_bytes());
+        ihdr.extend_from_slice(&5000u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA
+        let crc = crc32_ieee(&ihdr);
+        synthetic.extend_from_slice(&13u32.to_be_bytes());
+        synthetic.extend_from_slice(&ihdr);
+        synthetic.extend_from_slice(&crc.to_be_bytes());
+        assert!(decode_png_rgba(&synthetic).is_none());
+
+        // Valid small RGBA and RGB PNGs succeed.
+        let rgba_png = encode_test_png(2, 2, png::ColorType::Rgba, &[1, 2, 3, 4].repeat(4));
+        assert_eq!(decode_png_rgba(&rgba_png), Some([1, 2, 3, 4].repeat(4)));
+
+        let rgb_png = encode_test_png(2, 2, png::ColorType::Rgb, &[10, 20, 30].repeat(4));
+        assert_eq!(decode_png_rgba(&rgb_png), Some([10, 20, 30, 255].repeat(4)));
+    }
+
+    #[test]
+    fn backup_codes_v2_roundtrip_and_ct_eq() {
+        let codes = vec!["AAAA-1111".to_string(), "AAAA-1111".to_string()];
+        let enc = xor_codes("pw-secret", &codes);
+        assert!(enc[0].starts_with("v2:"));
+        assert!(enc[1].starts_with("v2:"));
+        assert_ne!(enc[0], enc[1], "per-code nonce/index must differ");
+        assert_eq!(unxor_codes("pw-secret", &enc), codes);
+
+        // Legacy v1 compatibility
+        let key = blake3::hash(b"pw-secret");
+        let k = key.as_bytes();
+        let legacy: String = hex::encode(
+            "LEGACY-9"
+                .bytes()
+                .enumerate()
+                .map(|(i, b)| b ^ k[i % k.len()])
+                .collect::<Vec<u8>>(),
+        );
+        assert_eq!(
+            unxor_codes("pw-secret", &[legacy]),
+            vec!["LEGACY-9".to_string()]
+        );
+
+        assert!(ct_eq_bytes(b"abcdef", b"abcdef"));
+        assert!(!ct_eq_bytes(b"abcdef", b"abcdeg"));
+        assert!(!ct_eq_bytes(b"abcdef", b"abcde"));
     }
 }

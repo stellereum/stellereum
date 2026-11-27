@@ -7,7 +7,7 @@ use super::naming::{
 };
 use super::retention::{
     dht_blob_ttl_ms, dht_forever_ttl_ms, header_publish_slots, paced_store_blob,
-    paced_store_blob_in_lane, retention_keep_blocks, ReplStoreKind,
+    paced_store_blob_in_lane, paced_store_pointer_overwrite, retention_keep_blocks, ReplStoreKind,
 };
 use super::{
     decode_wire_limited, verify_bytes_blake3_hash, P2pNetworkAdapter, RecentHqPublishCache,
@@ -18,6 +18,31 @@ use crate::oracle::PriceFeedUpdate;
 use crate::sharding::{Block, Transaction};
 use infnode::node::Node;
 use std::sync::Arc;
+
+/// Bound on the `PREFIX_SHARD_MEMPOOL` JSON index list in local DHT KV.
+pub const MAX_KV_MEMPOOL_INDEX: usize = 512;
+
+/// Append `hash_hex` to a shard mempool index list, trimming the oldest entries
+/// so the index stays bounded at [`MAX_KV_MEMPOOL_INDEX`] and checking
+/// duplicates over the bounded `<= MAX_KV_MEMPOOL_INDEX` slice. Returns `true`
+/// when `hashes` was modified and should be re-persisted.
+fn append_bounded_mempool_index(hashes: &mut Vec<String>, hash_hex: String) -> bool {
+    let mut trimmed = false;
+    if hashes.len() > MAX_KV_MEMPOOL_INDEX {
+        let excess = hashes.len() - MAX_KV_MEMPOOL_INDEX;
+        hashes.drain(..excess);
+        trimmed = true;
+    }
+    if hashes.iter().any(|h| h == &hash_hex) {
+        return trimmed;
+    }
+    if hashes.len() >= MAX_KV_MEMPOOL_INDEX {
+        let excess = hashes.len() - MAX_KV_MEMPOOL_INDEX + 1;
+        hashes.drain(..excess);
+    }
+    hashes.push(hash_hex);
+    true
+}
 
 /// Whether publishing `height` as a shard head is safe, given `last_published`
 /// is the highest head this process has advertised before.
@@ -268,12 +293,17 @@ impl P2pNetworkAdapter {
     /// most a momentary miss, repaired by the next finalize/probe republish.
     /// A failed store leaves the same state as before this change (the
     /// overwrite itself already replaced the manifest).
-    async fn store_pointer_overwrite(&self, bucket: &str, name: &str, payload: &[u8], ttl_ms: i64) {
-        self.node.delete_blob_local(bucket, name).await;
-        // Same backpressure as every other publish (bounded, never infinite);
-        // charged as a Pointer (small floor) rather than Bulk so the per-finalize
-        // head republish cannot lag the tip behind the bulk lane.
-        paced_store_blob(
+    async fn store_pointer_overwrite(
+        &self,
+        bucket: &str,
+        name: &str,
+        payload: &[u8],
+        ttl_ms: i64,
+    ) -> usize {
+        // Delete old local blob only once the pacing/breaker gates admit the
+        // write, and return the store count so `publish_head` does not advance
+        // `last_published_head` on a 0-replica shed/drop.
+        paced_store_pointer_overwrite(
             &self.node,
             bucket,
             name,
@@ -281,7 +311,62 @@ impl P2pNetworkAdapter {
             ttl_ms,
             ReplStoreKind::Pointer,
         )
+        .await
+    }
+
+    /// Core `publish_head` logic parameterized by the pointer-overwrite store
+    /// function so unit tests can inject a 0-replica shed without mutating
+    /// process-wide backpressure state.
+    async fn publish_head_with<F, Fut>(
+        &self,
+        shard_id: u32,
+        height: u64,
+        hash: [u8; 32],
+        store: F,
+    ) -> bool
+    where
+        F: FnOnce(&'static str, String, Vec<u8>, i64) -> Fut,
+        Fut: std::future::Future<Output = usize>,
+    {
+        let last = self
+            .last_published_head
+            .lock()
+            .map(|m| m.get(&shard_id).copied().unwrap_or(0))
+            .unwrap_or(0);
+        if !head_publish_allowed(height, last) {
+            tracing::debug!(
+                "head publish refused: shard={shard_id} height={height} last_published={last} \
+                 (genesis-only or stale; refusing to rewind the shared head key)"
+            );
+            return false;
+        }
+        let payload = format!("{height}:{}", hex::encode(hash));
+        // The head pointer stays FOREVER: it is one entry per shard (overwritten
+        // every finalize and every ~30s probe), and a lagging node needs a live
+        // head to discover the tip at all. Overwrite via `store_pointer_overwrite`
+        // so the retired chunk set is deleted instead of orphaned (chunk ids are
+        // content-addressed: every rewrite would otherwise leak one file set).
+        let stored = store(
+            BUCKET_STELLEREUM_HEAD,
+            head_name(&self.epoch(), shard_id),
+            payload.into_bytes(),
+            dht_forever_ttl_ms(),
+        )
         .await;
+        if stored == 0 {
+            tracing::warn!(
+                "head publish shed/failed: shard={shard_id} height={height}; \
+                 not advancing last_published_head so subsequent probes can retry"
+            );
+            return false;
+        }
+        if let Ok(mut m) = self.last_published_head.lock() {
+            let entry = m.entry(shard_id).or_insert(0);
+            if height > *entry {
+                *entry = height;
+            }
+        }
+        true
     }
 
     /// Publish this node's finalized head so a peer can discover it.
@@ -304,35 +389,16 @@ impl P2pNetworkAdapter {
     /// advertised head for every reader, including ourselves: the local
     /// manifest shadows peers on read). Returns true when published.
     pub async fn publish_head(&self, shard_id: u32, height: u64, hash: [u8; 32]) -> bool {
-        let last = self
-            .last_published_head
-            .lock()
-            .map(|m| m.get(&shard_id).copied().unwrap_or(0))
-            .unwrap_or(0);
-        if !head_publish_allowed(height, last) {
-            tracing::debug!(
-                "head publish refused: shard={shard_id} height={height} last_published={last} \
-                 (genesis-only or stale; refusing to rewind the shared head key)"
-            );
-            return false;
-        }
-        if let Ok(mut m) = self.last_published_head.lock() {
-            m.insert(shard_id, height);
-        }
-        let payload = format!("{height}:{}", hex::encode(hash));
-        // The head pointer stays FOREVER: it is one entry per shard (overwritten
-        // every finalize and every ~30s probe), and a lagging node needs a live
-        // head to discover the tip at all. Overwrite via `store_pointer_overwrite`
-        // so the retired chunk set is deleted instead of orphaned (chunk ids are
-        // content-addressed: every rewrite would otherwise leak one file set).
-        self.store_pointer_overwrite(
-            BUCKET_STELLEREUM_HEAD,
-            &head_name(&self.epoch(), shard_id),
-            payload.as_bytes(),
-            dht_forever_ttl_ms(),
+        self.publish_head_with(
+            shard_id,
+            height,
+            hash,
+            |bucket, name, payload, ttl_ms| async move {
+                self.store_pointer_overwrite(bucket, &name, &payload, ttl_ms)
+                    .await
+            },
         )
-        .await;
-        true
+        .await
     }
 
     /// Publish a finalized block's HEADER so a cold node can chain from a snapshot.
@@ -664,12 +730,11 @@ impl P2pNetworkAdapter {
             .kv_store_local(&tx_key, &hex::encode(&tx_bytes))
             .await;
 
-        // Append to shard mempool index
+        // Append to shard mempool index (bounded at MAX_KV_MEMPOOL_INDEX)
         let shard_key = format!("{}{}", PREFIX_SHARD_MEMPOOL, tx.source_shard);
         let current_index = self.node.get_local_kv(&shard_key).await.unwrap_or_default();
         let mut hashes: Vec<String> = serde_json::from_str(&current_index).unwrap_or_default();
-        if !hashes.contains(&hash_hex) {
-            hashes.push(hash_hex);
+        if append_bounded_mempool_index(&mut hashes, hash_hex) {
             let serialized = serde_json::to_string(&hashes).unwrap_or_default();
             self.node.kv_store_local(&shard_key, &serialized).await;
         }
@@ -697,12 +762,11 @@ impl P2pNetworkAdapter {
             .kv_store_local(&tx_key, &hex::encode(&tx_bytes))
             .await;
 
-        // Append to shard mempool index
+        // Append to shard mempool index (bounded at MAX_KV_MEMPOOL_INDEX)
         let shard_key = format!("{}{}", PREFIX_SHARD_MEMPOOL, envelope.meta.source_shard);
         let current_index = self.node.get_local_kv(&shard_key).await.unwrap_or_default();
         let mut hashes: Vec<String> = serde_json::from_str(&current_index).unwrap_or_default();
-        if !hashes.contains(&hash_hex) {
-            hashes.push(hash_hex);
+        if append_bounded_mempool_index(&mut hashes, hash_hex) {
             let serialized = serde_json::to_string(&hashes).unwrap_or_default();
             self.node.kv_store_local(&shard_key, &serialized).await;
         }
@@ -718,7 +782,8 @@ impl P2pNetworkAdapter {
         };
 
         let mut hashes: Vec<String> = serde_json::from_str(&index_str).unwrap_or_default();
-        let confirmed_hexes: Vec<String> = confirmed_hashes.iter().map(hex::encode).collect();
+        let confirmed_hexes: std::collections::HashSet<String> =
+            confirmed_hashes.iter().map(hex::encode).collect();
 
         hashes.retain(|h| !confirmed_hexes.contains(h));
 
@@ -1054,4 +1119,159 @@ where
     // loops on `maybe_more` can never spin.
     report.maybe_more = max > 0 && taken == max;
     report
+}
+
+#[cfg(test)]
+mod wave23c_tests {
+    use super::*;
+
+    static TEST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    async fn test_adapter(tag: &str) -> (P2pNetworkAdapter, std::path::PathBuf) {
+        let n = TEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("stell-pub-w23c-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let cfg = infnode::config::NodeConfig {
+            name: "test".to_string(),
+            listen: "127.0.0.1:0".to_string(),
+            client_listen: None,
+            advertise: None,
+            peers: vec![],
+            allow_unknown: false,
+            unknown_allow: vec![],
+            metrics_listen: None,
+            log_level: Some(0),
+            roles: Default::default(),
+            outbox_ttl_secs: 3600,
+            storage_roles: vec![],
+            validators: vec![],
+            domain: None,
+            web_listen: None,
+            wallet: None,
+            web_static: None,
+        };
+        let node = infnode::node::Node::new(
+            cfg,
+            infnode::keyring::NodeKeys::generate(),
+            infnode::keyring::PqKeys::generate(),
+            dir.clone(),
+            std::path::PathBuf::new(),
+        )
+        .await
+        .expect("test node");
+        let adapter = P2pNetworkAdapter::new(node);
+        adapter.set_epoch(EpochTag::from_genesis(&[0x55u8; 32]));
+        (adapter, dir)
+    }
+
+    #[test]
+    fn shard_mempool_index_is_bounded_at_512_and_trims_oldest() {
+        let mut hashes = Vec::new();
+        for i in 0..(MAX_KV_MEMPOOL_INDEX + 88) {
+            let h = format!("{i:064x}");
+            assert!(append_bounded_mempool_index(&mut hashes, h));
+            assert!(hashes.len() <= MAX_KV_MEMPOOL_INDEX);
+        }
+        assert_eq!(hashes.len(), MAX_KV_MEMPOOL_INDEX);
+        assert_eq!(hashes[0], format!("{:064x}", 88));
+        assert_eq!(
+            hashes[MAX_KV_MEMPOOL_INDEX - 1],
+            format!("{:064x}", MAX_KV_MEMPOOL_INDEX + 87)
+        );
+        // Duplicate inside the bounded window is ignored without shifting entries.
+        let dup = hashes[10].clone();
+        assert!(!append_bounded_mempool_index(&mut hashes, dup));
+        assert_eq!(hashes.len(), MAX_KV_MEMPOOL_INDEX);
+    }
+
+    #[tokio::test]
+    async fn broadcast_and_fetch_mempool_entries_stay_bounded_at_512() {
+        let (adapter, dir) = test_adapter("mempool-cap").await;
+        let kp = crate::post_quantum::FalconKeypair::generate_from_seed_bytes(&[0x42u8; 32]);
+        let shard = 0u32;
+        let chain_id = crate::consensus::consensus_chain_id();
+        let total = MAX_KV_MEMPOOL_INDEX + 20;
+        let mut last_hashes = Vec::new();
+        for nonce in 0..(total as u64) {
+            let tx = crate::rpc::sign_pq_explicit_transfer_with_chain(
+                &kp, [9u8; 32], 10, 350_000, nonce, shard, shard, chain_id,
+            );
+            let h = adapter
+                .broadcast_transaction(&tx)
+                .await
+                .expect("broadcast tx");
+            last_hashes.push(h);
+        }
+
+        let shard_key = format!("{PREFIX_SHARD_MEMPOOL}{shard}");
+        let raw_idx = adapter
+            .node
+            .get_local_kv(&shard_key)
+            .await
+            .expect("shard mempool index");
+        let idx: Vec<String> = serde_json::from_str(&raw_idx).expect("json index");
+        assert_eq!(idx.len(), MAX_KV_MEMPOOL_INDEX);
+
+        let entries = adapter.fetch_mempool_entries(shard).await;
+        assert_eq!(entries.len(), MAX_KV_MEMPOOL_INDEX);
+
+        // Clearing with HashSet removes matching entries cleanly.
+        adapter
+            .clear_mempool_transactions(shard, &last_hashes[total - 5..])
+            .await;
+        let after_clear = adapter.fetch_mempool_entries(shard).await;
+        assert_eq!(after_clear.len(), MAX_KV_MEMPOOL_INDEX - 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn publish_head_does_not_mark_last_published_head_on_zero_replica_shed() {
+        let (adapter, dir) = test_adapter("head-shed").await;
+        let hash = [0xABu8; 32];
+
+        // 0-replica shed: returns false and must NOT record height 10.
+        let shed = adapter
+            .publish_head_with(0, 10, hash, |_, _, _, _| async { 0 })
+            .await;
+        assert!(!shed, "0-replica shed must return false");
+        assert_eq!(
+            adapter
+                .last_published_head
+                .lock()
+                .expect("lock")
+                .get(&0)
+                .copied(),
+            None,
+            "last_published_head must not advance on 0-replica shed"
+        );
+
+        // Subsequent retry at the exact same height 10 succeeds once store lands.
+        let retried = adapter
+            .publish_head_with(0, 10, hash, |_, _, _, _| async { 1 })
+            .await;
+        assert!(retried, "retry after shed at same height must succeed");
+        assert_eq!(
+            adapter
+                .last_published_head
+                .lock()
+                .expect("lock")
+                .get(&0)
+                .copied(),
+            Some(10)
+        );
+
+        // Once recorded, duplicate height 10 is still blocked by monotonic guard.
+        let dup = adapter
+            .publish_head_with(0, 10, hash, |_, _, _, _| async { 1 })
+            .await;
+        assert!(
+            !dup,
+            "monotonic guard blocks duplicate height after success"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

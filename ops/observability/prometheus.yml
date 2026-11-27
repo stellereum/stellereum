@@ -83,6 +83,35 @@ scrape_configs:
           node: build-host
           role: monitor-host
 
+  # Remote validator hosts (A, C, D) node_exporter via SSH local forwards.
+  # Uncomment ONLY after `scripts/setup-validator-monitoring.sh` has installed
+  # prometheus-node-exporter (bound strictly to 127.0.0.1:9100 on each remote
+  # validator), opened the local SSH forwards (9102->A:9100, 9103->C:9100,
+  # 9104->D:9100), and `scripts/setup-validator-monitoring.sh --check` passes —
+  # otherwise Prometheus will see down targets / fire NodeMetricsUnreachable
+  # before remote node_exporter and tunnels are active.
+  # (Validator B runs on this build host and is covered by job `node` above.)
+  # - job_name: validator-hosts
+  #   static_configs:
+  #     - targets:
+  #         - 127.0.0.1:9102
+  #       labels:
+  #         node: A
+  #         role: validator
+  #         transport: ssh-tunnel
+  #     - targets:
+  #         - 127.0.0.1:9103
+  #       labels:
+  #         node: C
+  #         role: validator
+  #         transport: ssh-tunnel
+  #     - targets:
+  #         - 127.0.0.1:9104
+  #       labels:
+  #         node: D
+  #         role: validator
+  #         transport: ssh-tunnel
+
   - job_name: prometheus
     static_configs:
       - targets:

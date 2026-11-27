@@ -415,9 +415,8 @@ impl HeaderStore {
     pub fn latest(&self, chain: SupportedChain) -> Option<&StoredHeader> {
         let tag = StoredHeader::chain_tag(chain);
         self.headers
-            .iter()
-            .rev()
-            .find(|((t, _), _)| *t == tag)
+            .range((tag, 0)..=(tag, u64::MAX))
+            .next_back()
             .map(|(_, h)| h)
     }
 }

@@ -18,12 +18,17 @@ mod contracts;
 pub mod memory_bounds;
 mod parallel;
 mod settlement;
+mod sharding_migration;
 mod types;
 mod verify_once;
 mod xshard;
 
 #[cfg(test)]
 mod tests;
+
+pub use sharding_migration::{
+    ShardMergeResult, ShardMigrationError, ShardMigrationOutcome, ShardSplitResult,
+};
 
 pub use types::{
     compute_contract_address, contract_abi_key, contract_key, contract_source_key,

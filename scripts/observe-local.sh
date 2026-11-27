@@ -11,7 +11,7 @@
 #   node A  root@212.113.103.105:22    local 127.0.0.1:9080
 #   node C  root@213.21.246.5:2222     local 127.0.0.1:9081
 #   node D  root@138.124.102.200:22    local 127.0.0.1:9082
-#   node B  this host (systemd --user) local 127.0.0.1:8080  (no tunnel)
+#   node B  this host (systemd --user) local 127.0.0.1:18081 (no tunnel)
 #
 # 9083 is reserved for a fifth endpoint. Hosts/ports come from
 # scripts/cluster-nodes.conf, never from values duplicated here.

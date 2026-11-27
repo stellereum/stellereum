@@ -22,10 +22,15 @@ From `scripts/cluster-nodes.conf` and `scripts/rolling-deploy.sh`:
 | `C` | `root@213.21.246.5` (`-p 2222`) | `/root/nodeC` | `stell-nodeC.service` (`system`) | `http://127.0.0.1:8545` | 1 vCPU (~68% baseline CPU); most sensitive to stalls |
 | `D` | `root@138.124.102.200` | `/root/nodeD` | `stell-nodeD.service` (`system`) | `http://127.0.0.1:8545` | 1 vCPU |
 
-- **Block tempo & jail budget**: At `STELL_MIN_BLOCK_MS=400` and
-  `DOWNTIME_MISS_THRESHOLD=42`, the unvoting budget before jailing is
-  `42 × 400 ms = 16.8 s` (`rolling-deploy.sh` warns above 90% = `15.1 s`).
-  At 400 ms/block, the chain advances ~150 blocks/min (~9 000 blocks/hour).
+- **Block tempo & jail budget**: At `STELL_MIN_BLOCK_MS=400` (configured in
+  `scripts/cluster-nodes.conf`) and `DOWNTIME_MISS_THRESHOLD=42`, the pre-`H`
+  unvoting budget before jailing is `42 × 400 ms = 16.8 s` (`rolling-deploy.sh`
+  warns above 90% = `15.1 s`). Once **A8** (`jail-budget-v2` /
+  `JAIL_BUDGET_V2_ACTIVATION_HEIGHT`) activates at `height >= H`,
+  `DOWNTIME_MISS_THRESHOLD_V2=200` raises outage tolerance to
+  `200 × 400 ms = 80.0 s` on single-vCPU / WAN nodes (all pre-`H` rolling
+  restarts during deployment still run under the `16.8 s` budget). At
+  400 ms/block, the chain advances ~150 blocks/min (~9 000 blocks/hour).
 - **Liveness guard**: `stell-node-guard.timer` restarts a stopped unit within
   60 s. `scripts/rolling-deploy.sh` automatically stops and restarts the guard
   around each unit restart so two processes never open the same sled store.
@@ -44,22 +49,28 @@ From `scripts/cluster-nodes.conf` and `scripts/rolling-deploy.sh`:
 Run sequentially on the build host (only when cluster is 4/4, `nice -n 10`,
 `CARGO_BUILD_JOBS=2`):
 
-1. **Manifest parity (`stellereum gates --yaml`)**:
-   - Confirm `docs/feature_gates.yaml` matches `stellereum gates --yaml` output
-     from the release candidate binary (`diff -u docs/feature_gates.yaml <($BIN gates --yaml)` is empty).
+1. **Manifest parity (`./target/release/stellereum gates --yaml`)**:
+   - Confirm `docs/feature_gates.yaml` matches `./target/release/stellereum gates --yaml`
+     output from the root release candidate binary
+     (`BIN=/home/imm/stellereum-project/target/release/stellereum`;
+     `diff -u docs/feature_gates.yaml <("$BIN" gates --yaml)` is empty).
    - Confirm `feature_gates::tests::committed_manifest_matches_the_table` passes.
    - Confirm every Batch 1 gate targeted for activation on this chain shows
      `status: SCHEDULED`, the **exact same** `activation_height: H`, and a
      non-`MISSING` proving `test:` entry:
-     - Public `{0}` chain: `WASM_TABLE_ELEMENTS_CAP_HEIGHT`,
-       `FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT`,
-       `CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT`,
-       `BRIDGE_TARGET_ADDRESS_CAP_HEIGHT` (plus `JAIL_BUDGET_V2_ACTIVATION_HEIGHT`
-       only if A6 Option 2/3 was chosen). `XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT`
+     - Public `{0}` chain: `WASM_TABLE_ELEMENTS_CAP_HEIGHT` (`wasm-table-elements-cap`),
+       `FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT` (`falcon-host-fuel-v2`),
+       `CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT` (`contract-block-hash`),
+       `BRIDGE_TARGET_ADDRESS_CAP_HEIGHT` (`bridge-target-address-cap`),
+       `ACTOR_MAILBOX_HARDENING_HEIGHT` (`actor-mailbox-hardening`),
+       `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` (`jail-budget-v2`, **A8**), and
+       `SORTITION_UNBIASED_ACTIVATION_HEIGHT` (`sortition-unbiased`, **A9**).
+       `XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT` (`xshard-bounce-escrow`)
        **must** remain `INERT` (`18446744073709551615` / `u64::MAX`) on `{0}`.
      - Coordinated `{0,1}` chain: additionally verify
-       `XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT` is `SCHEDULED` at `H` and
-       `XPC_ACTIVATION_HEIGHT` is `ACTIVE` (`0`).
+       `XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT` (`xshard-bounce-escrow`, which
+       also activates `XPC-PREPARED-UNBOUNDED` under `XPC_ACTIVATION`) is
+       `SCHEDULED` at `H` and `XPC_ACTIVATION_HEIGHT` is `ACTIVE` (`0`).
 2. **`current_activation_schedule()` parity**:
    - Confirm `chain_spec::tests::current_activation_schedule_matches_module_constants`
      passes and every Batch 1 gate is listed in `current_activation_schedule()`
@@ -83,7 +94,7 @@ Run sequentially on the build host (only when cluster is 4/4, `nice -n 10`,
      canary soak, 4-node sequential activation, and pre-`H` verification.
 2. **Verify 4/4 baseline**:
    ```sh
-   ./stellereum status --rpc http://127.0.0.1:8546 --expect 4
+   ./target/release/stellereum status --rpc http://127.0.0.1:8546 --expect 4
    ```
    Require `4/4` active validators, `fragile: false`, and `0` jailed members.
 3. **Verify `stell-auto-unjail` is active**:
@@ -163,13 +174,13 @@ Run canary on the first node in the chosen order (example uses `C -> A -> D -> B
 Before proceeding, confirm `4/4`:
 
 ```sh
-./stellereum status --rpc http://127.0.0.1:8546 --expect 4
+./target/release/stellereum status --rpc http://127.0.0.1:8546 --expect 4
 ```
 
 ### Step 3.2 — Activate remaining nodes one by one (`A`, then `D`, then `B`)
 
 Before **each** node, check:
-1. `./stellereum status --rpc http://127.0.0.1:8546 --expect 4` shows **4/4**
+1. `./target/release/stellereum status --rpc http://127.0.0.1:8546 --expect 4` shows **4/4**
    active, `fragile: false`, `0` jailed.
 2. Current tip height is still strictly `< H` with enough margin to finish
    the remaining nodes safely (if `H - tip` is too small to complete all
@@ -182,15 +193,15 @@ between every restart:
 ```sh
 # Node A (verify 4/4 before and after)
 ./scripts/rolling-deploy.sh activate --nodes "A"
-./stellereum status --rpc http://127.0.0.1:8546 --expect 4
+./target/release/stellereum status --rpc http://127.0.0.1:8546 --expect 4
 
 # Node D (verify 4/4 before and after)
 ./scripts/rolling-deploy.sh activate --nodes "D"
-./stellereum status --rpc http://127.0.0.1:8546 --expect 4
+./target/release/stellereum status --rpc http://127.0.0.1:8546 --expect 4
 
 # Node B (verify 4/4 before and after)
 ./scripts/rolling-deploy.sh activate --nodes "B"
-./stellereum status --rpc http://127.0.0.1:8546 --expect 4
+./target/release/stellereum status --rpc http://127.0.0.1:8546 --expect 4
 ```
 
 *(If using the `B -> D -> A -> C` order, run `--canary` on `B`, then activate
@@ -223,15 +234,27 @@ and running binaries are identical:
    ssh root@138.124.102.200 '/root/nodeD/stellereum gates --yaml' > /tmp/opencode/gates.D.yaml
    for n in A B C D; do diff -u docs/feature_gates.yaml /tmp/opencode/gates.$n.yaml; done
    ```
-   Every node must show zero diff, identical `activation_height: H` for all
-   Batch 1 gates, and `SCHEDULED` status (not `INERT`) for every armed gate.
+   Every node must show zero diff, identical `activation_height: H`, and
+   `SCHEDULED` status (not `INERT`) with a non-`MISSING` `test:` for every
+   armed Batch 1 gate—explicitly verifying:
+   - **A1–A4, A7**: `wasm-table-elements-cap`, `falcon-host-fuel-v2`,
+     `contract-block-hash`, `bridge-target-address-cap`,
+     `actor-mailbox-hardening`
+   - **A8 (`jail-budget-v2`)**: `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` at `H`
+     (pre-`H` threshold remains `42` / `16.8 s` at `STELL_MIN_BLOCK_MS=400`)
+   - **A9 (`sortition-unbiased`)**: `SORTITION_UNBIASED_ACTIVATION_HEIGHT` at `H`
+     (`W6-A7-7` unbiased rejection-sampling sortition armed at `H`)
+   - **A5 (`xshard-bounce-escrow`)**: `INERT` (`u64::MAX`) on `{0}`; `SCHEDULED`
+     at `H` on `{0,1}` (includes `XPC-PREPARED-UNBOUNDED`)
 
-3. **Logs match `current_activation_schedule()` and zero quarantine**:
-   Inspect startup logs on each node (`journalctl -u stell-node<X> -n 100` /
-   `journalctl --user -u stell-nodeB -n 100`) to confirm:
-   - Matching chain ID (`5757`), `FORK_ID`, and `current_activation_schedule()`
-     summary/activation heights logged at startup (if emitted) or verified via
-     the binary's `stellereum gates` table above.
+3. **Logs match `current_activation_schedule()`, `STELL_MIN_BLOCK_MS=400`, and zero quarantine**:
+   Inspect startup logs and unit config on each node (`journalctl -u stell-node<X> -n 100` /
+   `journalctl --user -u stell-nodeB -n 100`, plus `scripts/doctor.sh` /
+   `scripts/cluster-nodes.conf`) to confirm:
+   - Matching chain ID (`5757`), `FORK_ID`, `STELL_MIN_BLOCK_MS=400`, and
+     `current_activation_schedule()` summary/activation heights logged at
+     startup (if emitted) or verified via the binary's `stellereum gates` table
+     above.
    - Zero `QUARANTINED (fail-closed Observer)` errors.
    - Cluster `4/4`, `fragile: false`, `stell-auto-unjail` active, and
      `tip < H`.
@@ -252,7 +275,7 @@ and running binaries are identical:
    4 validators.
 2. **4/4 validator participation**:
    ```sh
-   ./stellereum status --rpc http://127.0.0.1:8546 --expect 4
+   ./target/release/stellereum status --rpc http://127.0.0.1:8546 --expect 4
    ```
    Confirm `4/4` active, `fragile: false`, `0` jailed, and `validator_efficiency`
    nominal.
@@ -266,10 +289,24 @@ and running binaries are identical:
    - `stell_weak_qc_refused_total`
    - `stell_nil_breaker_fires_total`
 5. **Per-gate sanity**:
-   Confirm `stellereum gates` reflects the expected `H` and post-`H` RPC /
-   execution checks (e.g., RPC and consensus WASM table cap active, Falcon v2
-   fuel active, `host.block_hash` returning `block.prev_hash`, bridge 128-byte
-   `Withdraw` cap active, and `{0,1}` bounce escrow active if on multi-shard).
+   Confirm `./target/release/stellereum gates` reflects the expected `H` and
+   post-`H` RPC / execution / consensus checks across all 4 nodes:
+   - **A1–A4, A7**: RPC and consensus WASM table cap active, Falcon v2 fuel
+     active, `host.block_hash` returning `block.prev_hash`, bridge 128-byte
+     `Withdraw` cap active, and actor mailbox hardening active.
+   - **A8 (`jail-budget-v2`)**: `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` active
+     (`DOWNTIME_MISS_THRESHOLD_V2 = 200`, providing `80.0 s` consecutive-miss
+     outage tolerance at `STELL_MIN_BLOCK_MS=400`), with zero unexpected jails
+     across single-vCPU / WAN validators (`A`, `C`, `D`).
+   - **A9 (`sortition-unbiased`)**: `SORTITION_UNBIASED_ACTIVATION_HEIGHT`
+     active (`W6-A7-7` rejection-sampling unbiased ticket selection in
+     `sortition.rs` / `consensus/types.rs`), with clean µQC verification and
+     zero committee-mismatch, `stell_fork_total`, or `stell_divergence_total`
+     increments.
+   - **A5 (`xshard-bounce-escrow`, `{0,1}` only)**: bounce escrow and
+     `XPC-PREPARED-UNBOUNDED` (`MAX_ACTIVE_PREPARED_PER_SENDER = 4`, same-nonce
+     `Prepared` dedup, `XPC_PREPARE_TTL_HEIGHTS = 4096`) active if on
+     multi-shard; remains `INERT` (`u64::MAX`) on `{0}`.
 
 ### 5.2 Why post-`H` rollback is impossible without snapshot restore
 
@@ -277,8 +314,10 @@ Once the chain finalizes block `H` under the Batch 1 ruleset:
 
 1. **Consensus-rule divergence**: Every block `>= H` is validated and executed
    under the new rules (WASM table cap, `150_000` Falcon fuel + single `(start)`
-   gas charge, nonzero `host.block_hash`, 128-byte bridge target cap, and
-   `{0,1}` bounce-escrow / A6 jailing rules).
+   gas charge, nonzero `host.block_hash`, 128-byte bridge target cap, actor
+   mailbox hardening, **A8** `200`-miss jail budget at `STELL_MIN_BLOCK_MS=400`,
+   **A9** `W6-A7-7` unbiased sortition ticket selection, and `{0,1}`
+   bounce-escrow + `XPC-PREPARED-UNBOUNDED` rules).
 2. **Irreversible BFT finality**: Stellereum has single-block BFT finality;
    committed blocks at `>= H` and their `state_root` / `body_commitment`
    digests cannot be un-finalized in place.

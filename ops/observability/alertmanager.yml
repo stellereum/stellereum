@@ -9,8 +9,12 @@
 # TELEGRAM:
 #   1. Create the bot, add it to the duty group, get the chat id.
 #   2. Put TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in ops/observability/.env.
+#      Note: Alertmanager does NOT support `--config.expand-env` (that is a
+#      Prometheus-only flag), so substitute those values into a rendered host
+#      copy of alertmanager.yml mounted into the container rather than relying
+#      on env-var expansion by Alertmanager.
 #   3. Uncomment the telegram-duty receiver AND the route that points at it.
-#   4. docker compose up -d alertmanager   (compose runs with --config.expand-env)
+#   4. docker compose up -d alertmanager
 #
 # TEST ALERT (exact procedure, also in README "Wave gate"):
 #   docker compose exec alertmanager \

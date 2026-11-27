@@ -33,9 +33,18 @@
 #                           (default: https://rpc.stellereum.org/snapshot/latest.tar.zst)
 #   --sha256-url URL        Snapshot SHA-256 checksum URL
 #                           (default: <snapshot-url>.sha256)
-#   --require-sha256        Fail if snapshot SHA-256 checksum is unavailable
+#   --require-sha256        Fail if snapshot SHA-256 checksum is unavailable (default)
+#   --allow-unverified-snapshot
+#                           Proceed even if snapshot SHA-256 checksum is unavailable
+#   --cosign                Verify downloaded snapshot with cosign via
+#                           scripts/verify-cosign-artifact.sh (defaults .sig/.pem
+#                           URLs to <snapshot-url>.sig/.pem)
+#   --require-cosign        Alias for --cosign (also STELL_REQUIRE_COSIGN=1)
+#   --cosign-sig-url URL    Override cosign .sig URL for snapshot archive
+#   --cosign-pem-url URL    Override cosign .pem URL for snapshot archive
 #   --refresh-store         Backup and replace an existing data/store from snapshot
-#   --skip-snapshot         Do not download the HTTP snapshot
+#   --skip-snapshot         Do not download the HTTP snapshot (requires existing store
+#                           or genesis/faucet key with STELL_NEW_CHAIN=1)
 #   --binary PATH           Path to stellereum binary (default: auto-detect)
 #   --chain-id ID           Target chain ID (default: 5757)
 #   --commission-bps N      Initial validator commission bps 0..10000 (default: 1000)
@@ -46,7 +55,8 @@
 # ==============================================================================
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 MODE=""
 HOME_DIR=""
@@ -60,7 +70,12 @@ PEERS_FILE=""
 SNAPSHOT_URL="https://rpc.stellereum.org/snapshot/latest.tar.zst"
 SHA256_URL=""
 SHA256_URL_SET=0
-REQUIRE_SHA256=0
+REQUIRE_SHA256="${REQUIRE_SHA256:-1}"
+REQUIRE_COSIGN="${STELL_REQUIRE_COSIGN:-0}"
+COSIGN_SIG_URL=""
+COSIGN_SIG_URL_SET=0
+COSIGN_PEM_URL=""
+COSIGN_PEM_URL_SET=0
 REFRESH_STORE=0
 SKIP_SNAPSHOT=0
 BINARY="${STELL_BIN:-}"
@@ -104,6 +119,12 @@ while [[ $# -gt 0 ]]; do
         --sha256-url) SHA256_URL="${2:?--sha256-url requires a URL}"; SHA256_URL_SET=1; shift 2 ;;
         --sha256-url=*) SHA256_URL="${1#--sha256-url=}"; SHA256_URL_SET=1; shift ;;
         --require-sha256) REQUIRE_SHA256=1; shift ;;
+        --allow-unverified-snapshot) REQUIRE_SHA256=0; shift ;;
+        --cosign|--require-cosign) REQUIRE_COSIGN=1; shift ;;
+        --cosign-sig-url) COSIGN_SIG_URL="${2:?--cosign-sig-url requires a URL}"; COSIGN_SIG_URL_SET=1; shift 2 ;;
+        --cosign-sig-url=*) COSIGN_SIG_URL="${1#--cosign-sig-url=}"; COSIGN_SIG_URL_SET=1; shift ;;
+        --cosign-pem-url) COSIGN_PEM_URL="${2:?--cosign-pem-url requires a URL}"; COSIGN_PEM_URL_SET=1; shift 2 ;;
+        --cosign-pem-url=*) COSIGN_PEM_URL="${1#--cosign-pem-url=}"; COSIGN_PEM_URL_SET=1; shift ;;
         --refresh-store) REFRESH_STORE=1; shift ;;
         --skip-snapshot) SKIP_SNAPSHOT=1; shift ;;
         --binary) BINARY="${2:?--binary requires a path}"; shift 2 ;;
@@ -160,6 +181,36 @@ fi
 if [[ -n "$PEERS_FILE" && ! -f "$PEERS_FILE" ]]; then
     die "--peers-file '$PEERS_FILE' not found"
 fi
+case "$REQUIRE_COSIGN" in
+    0|1) ;;
+    *) die "STELL_REQUIRE_COSIGN must be 0 or 1 (got '$REQUIRE_COSIGN')" ;;
+esac
+if [[ "$COSIGN_SIG_URL_SET" == "1" && -z "$COSIGN_SIG_URL" ]]; then
+    die "--cosign-sig-url cannot be empty"
+fi
+if [[ "$COSIGN_PEM_URL_SET" == "1" && -z "$COSIGN_PEM_URL" ]]; then
+    die "--cosign-pem-url cannot be empty"
+fi
+if [[ "$COSIGN_SIG_URL_SET" == "1" && "$COSIGN_PEM_URL_SET" == "0" ]]; then
+    if [[ "$REQUIRE_COSIGN" == "1" ]]; then
+        COSIGN_PEM_URL="${SNAPSHOT_URL}.pem"
+    else
+        die "--cosign-sig-url requires --cosign-pem-url"
+    fi
+fi
+if [[ "$COSIGN_PEM_URL_SET" == "1" && "$COSIGN_SIG_URL_SET" == "0" ]]; then
+    if [[ "$REQUIRE_COSIGN" == "1" ]]; then
+        COSIGN_SIG_URL="${SNAPSHOT_URL}.sig"
+    else
+        die "--cosign-pem-url requires --cosign-sig-url"
+    fi
+fi
+USE_COSIGN=0
+if [[ "$REQUIRE_COSIGN" == "1" || ( -n "$COSIGN_SIG_URL" && -n "$COSIGN_PEM_URL" ) ]]; then
+    USE_COSIGN=1
+    [[ -n "$COSIGN_SIG_URL" ]] || COSIGN_SIG_URL="${SNAPSHOT_URL}.sig"
+    [[ -n "$COSIGN_PEM_URL" ]] || COSIGN_PEM_URL="${SNAPSHOT_URL}.pem"
+fi
 
 if [[ -z "$HOME_DIR" ]]; then
     if [[ "$MODE" == "observer" ]]; then
@@ -211,8 +262,8 @@ fi
 if [[ -z "$BINARY" ]]; then
     for cand in \
         "$ROOT_DIR/target/release/stellereum" \
-        "$ROOT_DIR/target/debug/stellereum" \
         "$ROOT_DIR/stellereum/target/release/stellereum" \
+        "$ROOT_DIR/target/debug/stellereum" \
         "$ROOT_DIR/stellereum/target/debug/stellereum" \
         "$(command -v stellereum 2>/dev/null || true)"; do
         if [[ -n "$cand" && -x "$cand" ]]; then
@@ -221,7 +272,7 @@ if [[ -z "$BINARY" ]]; then
         fi
     done
 fi
-[[ -n "$BINARY" && -x "$BINARY" ]] || die "stellereum binary not found. Build it first ('cargo build --release' in stellereum/) or pass --binary PATH."
+[[ -n "$BINARY" && -x "$BINARY" ]] || die "stellereum binary not found. Build it first ('cargo build --release' from repo root) or pass --binary PATH."
 
 log "mode=$MODE home=$HOME_DIR name=$NAME binary=$BINARY"
 
@@ -261,16 +312,20 @@ if [[ "$MODE" == "validator" ]]; then
         --endpoint "$ADVERTISE" > "$STANZA_FILE" 2>/dev/null || true
     chmod 644 "$STANZA_FILE" 2>/dev/null || true
 
-    dry_out="$("$BINARY" validator register-validator \
+    if ! dry_out="$("$BINARY" validator register-validator \
         --withdrawal-key-file "$HOME_DIR/keys/withdrawal.key" \
         --voting-key-file "$HOME_DIR/keys/falcon.key" \
         --amount 1100000000000 \
         --commission-bps "$COMMISSION_BPS" \
         --chain-id "$CHAIN_ID" \
         --nonce 0 \
-        --dry-run 2>/dev/null || true)"
+        --dry-run)"; then
+        die "register-validator --dry-run failed"
+    fi
     VALIDATOR_ID="$(printf '%s\n' "$dry_out" | sed -n 's/^[[:space:]]*Validator ID:[[:space:]]*//p' | head -1)"
     WITHDRAWAL_ADDRESS="$(printf '%s\n' "$dry_out" | sed -n 's/^[[:space:]]*Withdrawal Address:[[:space:]]*//p' | head -1)"
+    [[ -n "$VALIDATOR_ID" && -n "$WITHDRAWAL_ADDRESS" ]] \
+        || die "register-validator --dry-run did not output Validator ID and Withdrawal Address"
 fi
 chmod 700 "$HOME_DIR/keys"
 chmod 600 "$HOME_DIR"/keys/* 2>/dev/null || true
@@ -340,11 +395,13 @@ else
 # only after registering on-chain and entering the active set.
 STELL_OBSERVER=1
 STELL_SHARDS=0
+STELL_NEW_CHAIN=${STELL_NEW_CHAIN:-0}
 STELL_CHAIN_ID=$CHAIN_ID
 STELL_RPC_LISTEN=$RPC
 STELL_EXPLORER_LISTEN=$EXPLORER
 STELL_ARCHIVE=0
 STELL_KEEP_BLOCKS=8000
+STELL_MIN_BLOCK_MS=${STELL_MIN_BLOCK_MS:-400}
 STELL_DNS_SEEDS=$SEEDS
 STELL_BROADCAST_JOIN_MS=300
 STELL_KEY_PASSPHRASE=$KEY_PASSPHRASE
@@ -356,21 +413,72 @@ fi
 # 4. Bootstrap snapshot into data/store
 if [[ "$SKIP_SNAPSHOT" == "1" ]]; then
     warn "skipping snapshot download (--skip-snapshot)"
+    if [[ ! -d "$HOME_DIR/data/store" ]]; then
+        if [[ "$MODE" == "validator" ]]; then
+            warn "no existing store at $HOME_DIR/data/store: --skip-snapshot validator boot requires an existing store (with safety-init) or a genesis/faucet key with STELL_NEW_CHAIN=1"
+        else
+            warn "no existing store at $HOME_DIR/data/store: --skip-snapshot observer boot requires an existing store or a genesis/faucet key with STELL_NEW_CHAIN=1"
+        fi
+        if [[ "$START_NOW" == "1" && "${STELL_NEW_CHAIN:-0}" != "1" && "${STELL_NEW_CHAIN:-0}" != "true" ]]; then
+            die "--start with --skip-snapshot requires an existing store at $HOME_DIR/data/store (or STELL_NEW_CHAIN=1 with a genesis/faucet key); re-run without --skip-snapshot to bootstrap from snapshot"
+        fi
+    else
+        log "using existing store at $HOME_DIR/data/store (--skip-snapshot)"
+    fi
 elif [[ -d "$HOME_DIR/data/store" && "$REFRESH_STORE" == "0" ]]; then
     log "existing store found at $HOME_DIR/data/store; skipping snapshot download (pass --refresh-store to replace)"
 else
-    BOOTSTRAP_SCRIPT="$ROOT_DIR/scripts/auto-bootstrap-store.sh"
-    [[ -f "$BOOTSTRAP_SCRIPT" ]] || die "missing helper script: $BOOTSTRAP_SCRIPT"
+    COSIGN_WORK_DIR=""
+    cleanup_cosign_work() {
+        if [[ -n "$COSIGN_WORK_DIR" && -d "$COSIGN_WORK_DIR" ]]; then
+            rm -rf "$COSIGN_WORK_DIR"
+        fi
+    }
+    trap cleanup_cosign_work EXIT
+
     bootstrap_args=(
-        --home "$HOME_DIR"
-        --snapshot-url "$SNAPSHOT_URL"
-        --binary "$BINARY"
+        store bootstrap
+        --data-dir "$HOME_DIR/data"
         --keys-dir "$HOME_DIR/keys"
         --shard 0
-        --env-file "$ENV_FILE"
+        --snapshot-url "$SNAPSHOT_URL"
     )
-    if [[ "$SHA256_URL_SET" == "1" ]]; then
+    if [[ "$USE_COSIGN" == "1" ]]; then
+        COSIGN_VERIFIER="$SCRIPT_DIR/verify-cosign-artifact.sh"
+        [[ -x "$COSIGN_VERIFIER" ]] || die "cosign verifier script missing or not executable: $COSIGN_VERIFIER"
+        command -v curl >/dev/null 2>&1 || die "required tool 'curl' not found in PATH for --cosign"
+        command -v cosign >/dev/null 2>&1 || die "required tool 'cosign' not found in PATH for --cosign"
+
+        COSIGN_WORK_DIR="$(mktemp -d)"
+        archive_file="$COSIGN_WORK_DIR/snapshot.tar.zst"
+        sig_file="$COSIGN_WORK_DIR/snapshot.tar.zst.sig"
+        pem_file="$COSIGN_WORK_DIR/snapshot.tar.zst.pem"
+
+        log "downloading snapshot from $SNAPSHOT_URL for cosign verification..."
+        curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -o "$archive_file" "$SNAPSHOT_URL" \
+            || die "failed to download snapshot from $SNAPSHOT_URL"
+        log "fetching cosign signature ($COSIGN_SIG_URL) and certificate ($COSIGN_PEM_URL)..."
+        curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -o "$sig_file" "$COSIGN_SIG_URL" \
+            || die "failed to download cosign signature from $COSIGN_SIG_URL"
+        curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -o "$pem_file" "$COSIGN_PEM_URL" \
+            || die "failed to download cosign certificate from $COSIGN_PEM_URL"
+        "$COSIGN_VERIFIER" --require --sig "$sig_file" --pem "$pem_file" "$archive_file" \
+            || die "cosign verification failed for snapshot $SNAPSHOT_URL"
+        ok "snapshot cosign signature verified"
+
+        bootstrap_args+=(--archive "$archive_file")
+        if [[ "$SHA256_URL_SET" == "1" ]]; then
+            bootstrap_args+=(--sha256-url "$SHA256_URL")
+        else
+            bootstrap_args+=(--sha256-url "${SNAPSHOT_URL}.sha256")
+        fi
+    elif [[ "$SHA256_URL_SET" == "1" ]]; then
         bootstrap_args+=(--sha256-url "$SHA256_URL")
+    fi
+    if [[ "$MODE" == "observer" ]]; then
+        bootstrap_args+=(--observer)
+    else
+        bootstrap_args+=(--i-fenced-all-signers)
     fi
     if [[ "$REQUIRE_SHA256" == "1" ]]; then
         bootstrap_args+=(--require-sha256)
@@ -378,8 +486,13 @@ else
     if [[ "$REFRESH_STORE" == "1" ]]; then
         bootstrap_args+=(--refresh-if-stale)
     fi
-    bash "$BOOTSTRAP_SCRIPT" "${bootstrap_args[@]}"
-    ok "snapshot extracted to $HOME_DIR/data/store (safety record initialised for this node)"
+    "$BINARY" "${bootstrap_args[@]}"
+    cleanup_cosign_work
+    if [[ "$MODE" == "observer" ]]; then
+        ok "snapshot extracted to $HOME_DIR/data/store (foreign safety record cleared for observer)"
+    else
+        ok "snapshot extracted to $HOME_DIR/data/store (safety record initialised for this node)"
+    fi
 fi
 
 printf '\n================ NEXT STEPS (%s) ================\n' "$MODE"

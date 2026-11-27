@@ -95,9 +95,9 @@ impl InMemoryStateEngine {
                 | SysCallTokenApprove { .. }
                 | SysCallTokenBalanceOf { .. }
                 | SysCallTokenCreate { .. } => touches_tokens = true,
-                SysCallDeployContract { .. } | SysCallCallContract { .. } => {
-                    touches_contracts = true
-                }
+                SysCallDeployContract { .. }
+                | SysCallDeployContractWithAbi { .. }
+                | SysCallCallContract { .. } => touches_contracts = true,
                 SysCallCallContractArgs { .. } if exec_hardening => touches_contracts = true,
                 SysCallPlaceOrder { .. } | SysCallCancelOrder { .. } => {
                     touches_books = true;
@@ -319,13 +319,19 @@ impl InMemoryStateEngine {
         }
         self.restore_pmm_native(&actions.pmm_native_snapshot).await;
         // Trie: drop touched keys, then re-add exactly what restored state holds.
+        // Only sync when this rolled-back tx actually mutated `tokens` or
+        // `contracts`: a bare VM revert (`OutOfGas`/`Reverted`) never touched
+        // them (`dead_keys` is empty), and running `sync_aux_trie` there
+        // would leak earlier transactions' uncommitted token-trie entries into
+        // `state_trie`, breaking commutativity across disjoint parallel waves.
         if !dead_keys.is_empty() {
             let mut trie = self.state_trie.write().await;
             for k in dead_keys {
                 trie.remove(&k);
             }
+            drop(trie);
+            self.sync_aux_trie().await;
         }
-        self.sync_aux_trie().await;
     }
 
     /// Payload execution through the block-path VM entry point
@@ -1776,10 +1782,13 @@ impl InMemoryStateEngine {
         // never speculatively inside execution (B1: the trie has no undo).
         // Read (never write-locked together with the trie below): lock order
         // is contracts-then-trie everywhere, or ABBA-deadlock with writers.
-        let has_deploy = tx
-            .payload
-            .iter()
-            .any(|op| matches!(op, crate::svm::OpCode::SysCallDeployContract { .. }));
+        let has_deploy = tx.payload.iter().any(|op| {
+            matches!(
+                op,
+                crate::svm::OpCode::SysCallDeployContract { .. }
+                    | crate::svm::OpCode::SysCallDeployContractWithAbi { .. }
+            )
+        });
         let pre_contracts = if has_deploy {
             domain_snap.as_ref().and_then(|s| s.contracts.as_ref())
         } else {

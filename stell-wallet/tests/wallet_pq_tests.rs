@@ -34,7 +34,7 @@ use pq::{
     derive_pq_address, format_address_with_visual_checksum, format_pq_address,
     format_pq_address_hex, generate_sample_keypair, PqGenScheme, PqScheme, PqSignatureEnvelope,
     DEFAULT_SALT, ED25519_PUBKEY_LEN, FALCON512_PUBKEY_LEN, FALCON512_SIG_LEN, HYBRID_PUBKEY_LEN,
-    HYBRID_SIG_LEN, MLDSA44_PUBKEY_LEN, PQ_ADDRESS_DOMAIN, PQ_ENVELOPE_MAGIC,
+    MLDSA44_PUBKEY_LEN, PQ_ADDRESS_DOMAIN, PQ_ENVELOPE_MAGIC,
 };
 use std::process::Command;
 use stellereum::sharding::Transaction;
@@ -316,85 +316,70 @@ fn test_cli_pq_generate_help() {
 fn test_cli_pq_generate_execution_all_schemes() {
     let bin = env!("CARGO_BIN_EXE_stell");
 
-    for scheme_str in ["falcon512", "hybrid"] {
-        let out = Command::new(bin)
-            .args(["pq-generate", "--scheme", scheme_str])
-            .output()
-            .expect("exec");
-        assert!(out.status.success(), "Failed for scheme {scheme_str}");
-
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(stdout.contains("STELLEREUM POST-QUANTUM KEY GENERATOR"));
-        assert!(stdout.contains("Scheme ID:"));
-        assert!(stdout.contains("Public Key Size:"));
-        assert!(stdout.contains("Public Key (Hex):"));
-        assert!(stdout.contains("Derived PQ Address:"));
-        assert!(stdout.contains("Raw Address Hex:"));
-        assert!(stdout.contains("Private keys are safely held in scrubbed memory"));
-
-        // Extract raw address hex line
-        let raw_hex_line = stdout
-            .lines()
-            .find(|l| l.contains("Raw Address Hex:"))
-            .expect("must contain raw address hex line");
-        let hex_part = raw_hex_line.split(':').nth(1).unwrap().trim();
-        assert_eq!(hex_part.len(), 64);
-        assert!(parse_hex32(hex_part).is_ok());
-    }
-    // Audit HIGH-2: disabled scheme must refuse generation fail-closed.
     let out = Command::new(bin)
-        .args(["pq-generate", "--scheme", "mldsa44"])
+        .args(["pq-generate", "--scheme", "falcon512"])
         .output()
         .expect("exec");
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        !out.status.success()
-            && combined.to_lowercase().contains("disabled")
-            && combined.contains("falcon512")
-            && combined.contains("hybrid"),
-        "mldsa44 generation must refuse fail-closed pointing to falcon512/hybrid; got: {combined}"
-    );
+    assert!(out.status.success(), "Failed for scheme falcon512");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("STELLEREUM POST-QUANTUM KEY GENERATOR"));
+    assert!(stdout.contains("Scheme ID:"));
+    assert!(stdout.contains("Public Key Size:"));
+    assert!(stdout.contains("Public Key (Hex):"));
+    assert!(stdout.contains("Derived PQ Address:"));
+    assert!(stdout.contains("Raw Address Hex:"));
+    assert!(stdout.contains("Private keys are safely held in scrubbed memory"));
+
+    let raw_hex_line = stdout
+        .lines()
+        .find(|l| l.contains("Raw Address Hex:"))
+        .expect("must contain raw address hex line");
+    let hex_part = raw_hex_line.split(':').nth(1).unwrap().trim();
+    assert_eq!(hex_part.len(), 64);
+    assert!(parse_hex32(hex_part).is_ok());
+
+    // FULL-PQ: disabled/legacy schemes must refuse generation fail-closed.
+    for refused_scheme in ["mldsa44", "hybrid"] {
+        let out = Command::new(bin)
+            .args(["pq-generate", "--scheme", refused_scheme])
+            .output()
+            .expect("exec");
+        assert!(
+            !out.status.success(),
+            "{refused_scheme} generation must refuse fail-closed under FULL-PQ"
+        );
+    }
 }
 
 #[test]
 fn test_cli_pq_address_execution_all_schemes() {
     let bin = env!("CARGO_BIN_EXE_stell");
 
-    for scheme_str in ["falcon512", "hybrid", "ed25519"] {
-        let out = Command::new(bin)
-            .args(["pq-address", "--scheme", scheme_str])
-            .output()
-            .expect("exec");
-        assert!(out.status.success(), "Failed for scheme {scheme_str}");
-
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(stdout.contains("STELLEREUM POST-QUANTUM ADDRESS DERIVATION"));
-        assert!(stdout.contains("Scheme:"));
-        assert!(stdout.contains("Public Key Size:"));
-        assert!(stdout.contains("Derived PQ Address:"));
-        assert!(stdout.contains("Raw Address Hex:"));
-    }
-    // Audit HIGH-2: disabled scheme refused even for address derivation.
     let out = Command::new(bin)
-        .args(["pq-address", "--scheme", "mldsa44"])
+        .args(["pq-address", "--scheme", "falcon512"])
         .output()
         .expect("exec");
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        !out.status.success()
-            && combined.to_lowercase().contains("disabled")
-            && combined.contains("falcon512")
-            && combined.contains("hybrid"),
-        "mldsa44 address derivation must refuse fail-closed pointing to falcon512/hybrid; got: {combined}"
-    );
+    assert!(out.status.success(), "Failed for scheme falcon512");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("STELLEREUM POST-QUANTUM ADDRESS DERIVATION"));
+    assert!(stdout.contains("Scheme:"));
+    assert!(stdout.contains("Public Key Size:"));
+    assert!(stdout.contains("Derived PQ Address:"));
+    assert!(stdout.contains("Raw Address Hex:"));
+
+    // FULL-PQ: disabled/legacy schemes refused even for address derivation.
+    for refused_scheme in ["mldsa44", "hybrid", "ed25519"] {
+        let out = Command::new(bin)
+            .args(["pq-address", "--scheme", refused_scheme])
+            .output()
+            .expect("exec");
+        assert!(
+            !out.status.success(),
+            "{refused_scheme} address derivation must refuse fail-closed under FULL-PQ"
+        );
+    }
 }
 
 #[test]
@@ -507,7 +492,8 @@ fn test_tx_construction_explicit_falcon512_activation_envelope() {
     let shard = 1;
     let is_activation = true;
 
-    let tx = LightClient::build_pq_transfer_tx(&kp, to, amount, nonce, shard, is_activation);
+    let tx = LightClient::build_pq_transfer_tx(&kp, to, amount, nonce, shard, is_activation)
+        .expect("Falcon-512 transfer");
 
     let from_addr = kp.derive_address(&DEFAULT_SALT);
     assert_eq!(
@@ -533,11 +519,13 @@ fn test_tx_construction_explicit_falcon512_activation_envelope() {
         "Signature wire must start with PQ1"
     );
 
-    // Decode and verify envelope
-    let envelope = PqSignatureEnvelope::decode(&tx.signature).expect("Valid PQ1 envelope");
-    assert_eq!(envelope.scheme, PqScheme::Falcon512);
+    // Decode and verify canonical salted PQ1 envelope
+    let envelope = stellereum::sharding::PqSignatureEnvelope::decode_canonical(&tx.signature)
+        .expect("Valid canonical PQ1 envelope");
+    assert_eq!(envelope.scheme, stellereum::post_quantum::PqScheme::Falcon512);
     assert!(!envelope.is_implicit, "Envelope must be explicit");
     assert_eq!(envelope.pubkey, Some(kp.public_key().to_vec()));
+    assert_eq!(envelope.salt, DEFAULT_SALT);
     assert_eq!(envelope.signature_bytes.len(), FALCON512_SIG_LEN);
 
     // Self-verification against global implicit registry
@@ -576,7 +564,8 @@ fn test_tx_construction_implicit_falcon512_envelope() {
         )
         .expect("Pre-registration must succeed");
 
-    let tx = LightClient::build_pq_transfer_tx(&kp, to, amount, nonce, shard, is_activation);
+    let tx = LightClient::build_pq_transfer_tx(&kp, to, amount, nonce, shard, is_activation)
+        .expect("Falcon-512 transfer");
 
     assert_eq!(tx.from, from_addr);
     assert_eq!(tx.to, to);
@@ -593,9 +582,10 @@ fn test_tx_construction_implicit_falcon512_envelope() {
     );
     assert!(tx.signature.starts_with(PQ_ENVELOPE_MAGIC));
 
-    // Decode and verify envelope
-    let envelope = PqSignatureEnvelope::decode(&tx.signature).expect("Valid PQ1 envelope");
-    assert_eq!(envelope.scheme, PqScheme::Falcon512);
+    // Decode and verify canonical implicit PQ1 envelope
+    let envelope = stellereum::sharding::PqSignatureEnvelope::decode_canonical(&tx.signature)
+        .expect("Valid canonical PQ1 envelope");
+    assert_eq!(envelope.scheme, stellereum::post_quantum::PqScheme::Falcon512);
     assert!(envelope.is_implicit, "Envelope must be implicit");
     assert_eq!(
         envelope.pubkey, None,
@@ -612,42 +602,12 @@ fn test_tx_construction_implicit_falcon512_envelope() {
 
 #[test]
 fn test_tx_construction_hybrid_activation_and_implicit_envelopes() {
+    // FULL-PQ: legacy Hybrid keys are refused when constructing consensus txs.
     let kp = generate_sample_keypair(PqScheme::Hybrid);
-    let from_addr = kp.derive_address(&DEFAULT_SALT);
     let to = [0x77u8; 32];
     let amount = 2_500_000_000;
-
-    // 1. Explicit activation
-    let tx_act = LightClient::build_pq_transfer_tx(&kp, to, amount, 0, 1, true);
-    assert_eq!(tx_act.from, from_addr);
-    assert!(tx_act.is_pq());
-    assert!(tx_act.is_pq_activation());
-    assert!(!tx_act.is_pq_implicit());
-    assert!(tx_act.signature.starts_with(PQ_ENVELOPE_MAGIC));
-
-    let env_act = PqSignatureEnvelope::decode(&tx_act.signature).expect("Valid PQ1 envelope");
-    assert_eq!(env_act.scheme, PqScheme::Hybrid);
-    assert_eq!(env_act.pubkey, Some(kp.public_key().to_vec()));
-    assert_eq!(env_act.signature_bytes.len(), HYBRID_SIG_LEN);
-    assert!(
-        tx_act.verify_signature(),
-        "Hybrid activation tx must verify"
-    );
-
-    // 2. Implicit steady-state spend
-    let tx_imp = LightClient::build_pq_transfer_tx(&kp, to, amount, 1, 1, false);
-    assert!(tx_imp.is_pq());
-    assert!(!tx_imp.is_pq_activation());
-    assert!(tx_imp.is_pq_implicit());
-
-    let env_imp = PqSignatureEnvelope::decode(&tx_imp.signature).expect("Valid PQ1 envelope");
-    assert_eq!(env_imp.scheme, PqScheme::Hybrid);
-    assert_eq!(env_imp.pubkey, None);
-    assert_eq!(env_imp.signature_bytes.len(), HYBRID_SIG_LEN);
-    assert!(
-        tx_imp.verify_signature(),
-        "Hybrid implicit tx must verify against registered key"
-    );
+    assert!(LightClient::build_pq_transfer_tx(&kp, to, amount, 0, 1, true).is_err());
+    assert!(LightClient::build_pq_transfer_tx(&kp, to, amount, 1, 1, false).is_err());
 }
 
 #[test]
@@ -685,18 +645,11 @@ fn test_deterministic_keypair_derivation_from_seed() {
         &sig2
     ));
 
-    // Hybrid determinism
+    // FULL-PQ: Hybrid deterministic key derivation succeeds, while converting to consensus PqScheme refuses legacy Hybrid.
     let kp_hyb1 = pq::PqKeyPair::from_seed(PqScheme::Hybrid, &seed);
     let kp_hyb2 = pq::PqKeyPair::from_seed(PqScheme::Hybrid, &seed);
     assert_eq!(kp_hyb1.public_key(), kp_hyb2.public_key());
-    let sig_hyb = kp_hyb1.sign(msg);
-    assert_eq!(sig_hyb.len(), HYBRID_SIG_LEN);
-    assert!(pq::verify_pq_signature(
-        PqScheme::Hybrid.into(),
-        kp_hyb1.public_key(),
-        msg,
-        &sig_hyb
-    ));
+    assert!(PqScheme::Hybrid.try_consensus_scheme().is_err());
 }
 
 // =============================================================================
@@ -925,19 +878,10 @@ fn test_cli_pq_transfer_dry_run_hybrid_explicit() {
         .expect("exec dry run");
 
     let _ = std::fs::remove_file(&wallet_path);
-    assert!(out.status.success(), "Dry run must succeed");
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("POST-QUANTUM TRANSACTION DRY-RUN (NOT BROADCAST)"));
-    assert!(stdout.contains("DRY RUN"));
-    assert!(stdout.contains("Hybrid"));
-    assert!(stdout.contains("Explicit Carrier (Tx #1 Account Activation)"));
-    assert!(stdout.contains("3.75 STELL"));
-    assert!(stdout.contains("Envelope Format: PQ1"));
-    assert!(stdout.contains("Carried PubKey:  929 bytes"));
-    assert!(stdout.contains("Computed TxHash:"));
-    assert!(stdout.contains("✅ Valid PQ1 Frame"));
-    assert!(stdout.contains("✅ Signature Verifies"));
+    assert!(
+        !out.status.success(),
+        "Hybrid dry run must be refused under FULL-PQ"
+    );
 }
 
 // =============================================================================
@@ -1003,44 +947,28 @@ fn test_cli_wallet_creation_default_falcon512_scheme() {
 
     let _ = std::fs::remove_file(&tmp);
 
-    // 4. Test explicit --scheme ed25519 and --scheme hybrid options
-    let tmp_ed = std::env::temp_dir().join(format!("stell_ed_{}.json", rand::random::<u64>()));
-    let out_ed = Command::new(bin)
-        .args([
-            "--wallet",
-            tmp_ed.to_str().unwrap(),
-            "new",
-            "--scheme",
-            "ed25519",
-            "--password",
-            password,
-        ])
-        .output()
-        .expect("exec new ed25519");
-    assert!(out_ed.status.success());
-    let ks_ed = security::HardenedKeystore::load(&tmp_ed).unwrap();
-    assert_eq!(ks_ed.scheme, "ed25519");
-    assert!(!ks_ed.is_pq());
-    let _ = std::fs::remove_file(&tmp_ed);
-
-    let tmp_hyb = std::env::temp_dir().join(format!("stell_hyb_{}.json", rand::random::<u64>()));
-    let out_hyb = Command::new(bin)
-        .args([
-            "--wallet",
-            tmp_hyb.to_str().unwrap(),
-            "new",
-            "--scheme",
-            "hybrid",
-            "--password",
-            password,
-        ])
-        .output()
-        .expect("exec new hybrid");
-    assert!(out_hyb.status.success());
-    let ks_hyb = security::HardenedKeystore::load(&tmp_hyb).unwrap();
-    assert_eq!(ks_hyb.scheme, "hybrid");
-    assert!(ks_hyb.is_pq());
-    let _ = std::fs::remove_file(&tmp_hyb);
+    // 4. FULL-PQ: explicit --scheme ed25519 and --scheme hybrid must be refused.
+    for refused in ["ed25519", "hybrid"] {
+        let tmp_bad =
+            std::env::temp_dir().join(format!("stell_{refused}_{}.json", rand::random::<u64>()));
+        let out_bad = Command::new(bin)
+            .args([
+                "--wallet",
+                tmp_bad.to_str().unwrap(),
+                "new",
+                "--scheme",
+                refused,
+                "--password",
+                password,
+            ])
+            .output()
+            .expect("exec new legacy scheme");
+        assert!(
+            !out_bad.status.success(),
+            "{refused} wallet creation must be refused under FULL-PQ"
+        );
+        let _ = std::fs::remove_file(&tmp_bad);
+    }
 }
 
 #[test]
@@ -1116,7 +1044,7 @@ fn test_cli_pay_routing_to_pq_transfer_when_falcon512() {
     assert!(stdout_explicit.contains("Falcon-512"));
     assert!(stdout_explicit.contains("PQ1"));
 
-    // 3. Run `stell pay` with explicit `--scheme hybrid`
+    // 3. FULL-PQ: `stell pay` with explicit `--scheme hybrid` must be refused.
     let out_hyb = Command::new(bin)
         .args([
             "--wallet",
@@ -1133,11 +1061,10 @@ fn test_cli_pay_routing_to_pq_transfer_when_falcon512() {
         .output()
         .expect("exec pay explicit hybrid");
 
-    assert!(out_hyb.status.success());
-    let stdout_hyb = String::from_utf8_lossy(&out_hyb.stdout);
-    assert!(stdout_hyb.contains("POST-QUANTUM TRANSACTION DRY-RUN"));
-    assert!(stdout_hyb.contains("Hybrid"));
-    assert!(stdout_hyb.contains("PQ1"));
+    assert!(
+        !out_hyb.status.success(),
+        "hybrid pay must be refused under FULL-PQ"
+    );
 
     let _ = std::fs::remove_file(&wallet_path);
 }

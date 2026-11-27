@@ -7,18 +7,19 @@
 # without this timer is a single point of failure for the whole cluster.
 #
 # The sweeper only deletes chunk files that NO manifest in kv.json points at
-# any more, and only when they are older than the grace period (6h by
+# any more, and only when they are older than the grace period (2h by
 # default) — the node persists kv.json with a debounce, so a recent chunk may
 # not be in the index yet. It never touches the head pointer's chunks or the
 # active snapshot's chunks (those are referenced by a live manifest), never
 # touches the store, the keys or the config, and it is safe to run while the
 # node is live.
 #
-# INSTALL (per node — the paths differ):
+# INSTALL (per node — configure STELL_NODE_DIR / STELL_PRUNE_SCRIPT per host):
+#   install -m 0755 scripts/node-prune-cron.sh /usr/local/bin/node-prune-cron.sh
 #   cp stell-node-prune.service /etc/systemd/system/
 #   cp stell-node-prune.timer   /etc/systemd/system/
-#   # edit WorkingDirectory/ExecStart in the .service to THIS node's dir,
-#   # e.g. /root/nodeC
+#   # Set STELL_NODE_DIR (and optionally STELL_PRUNE_SCRIPT / STELL_PRUNE_GRACE_SECONDS)
+#   # in /etc/stellereum/node-prune.env or via `systemctl edit stell-node-prune.service`.
 #   systemctl daemon-reload
 #   systemctl enable --now stell-node-prune.timer
 #
@@ -26,17 +27,21 @@
 # run whether the node is up or down (a node that is down still holds its
 # chunk files, and they are the ones that fill the filesystem).
 Description=Stellereum orphan-chunk sweeper (DHT chunk garbage collection)
-Documentation=file:/home/imm/stellereum-project/scripts/node-prune-cron.sh
+Documentation=file:/usr/local/bin/node-prune-cron.sh
 After=network.target
 
 [Service]
 Type=oneshot
-# CHANGE THIS to the node's own directory (the one that holds data/).
-WorkingDirectory=/root/nodeC
-# CHANGE THIS to the node's own directory as well. --grace-seconds 21600 is
-# 6h: comfortably longer than any kv.json debounce, so a chunk that is not in
-# the index yet is never deleted.
-ExecStart=/bin/sh /home/imm/stellereum-project/scripts/node-prune-cron.sh --dir /root/nodeC --grace-seconds 21600
+# Configurable per-host defaults; override in /etc/stellereum/node-prune.env
+# or a systemd drop-in (`systemctl edit stell-node-prune.service`).
+Environment=STELL_NODE_DIR=/root/nodeA
+Environment=STELL_PRUNE_SCRIPT=/usr/local/bin/node-prune-cron.sh
+Environment=STELL_PRUNE_GRACE_SECONDS=7200
+EnvironmentFile=-/etc/stellereum/node-prune.env
+# --grace-seconds 7200 is 2h: comfortably longer than any kv.json debounce,
+# so a chunk that is not in the index yet is never deleted while keeping
+# steady-state inode usage bounded.
+ExecStart=/bin/sh -c 'exec /bin/sh "$STELL_PRUNE_SCRIPT" --dir "$STELL_NODE_DIR" --grace-seconds "$STELL_PRUNE_GRACE_SECONDS"'
 # The sweep walks the chunk directory; on a node with hundreds of thousands
 # of chunks that takes a while. The timeout is generous on purpose: a killed
 # sweep is harmless (it deletes nothing it has not verified), but a sweep that

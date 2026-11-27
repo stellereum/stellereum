@@ -96,8 +96,8 @@ CLUSTER
   --local-cluster             derive RPC/metrics/pids from run/cluster (N=4
                               layout: rpc 18646, metrics 18081). --rpc may be
                               omitted; if given it is still guarded.
-  --cpu-pids 1,2,3            fallback CPU source: sum /proc/<pid> CPU and
-                              divide by the cell's finalized-block delta.
+  --cpu-pids 1,2,3            fallback CPU source: sum /proc/<pid> CPU normalized by
+                              sampled PID count, divided by finalized-block delta.
   --allow-remote              permit a non-loopback test endpoint
   --allow-validator-mismatch  do not refuse when stell_getValidators != N
   --allow-floor-mismatch      do not refuse when the local node env disagrees
@@ -404,7 +404,7 @@ snap_metrics() {
 }
 
 proc_cpu_ticks() {
-  local pids="$1" total=0 pid t
+  local pids="$1" total=0 count=0 pid t
   local -a list
   IFS=',' read -r -a list <<< "$pids"
   for pid in "${list[@]}"; do
@@ -415,8 +415,9 @@ proc_cpu_ticks() {
     t="$(awk '{ sub(/^.*\) /, ""); print $12+$13 }' "/proc/$pid/stat" 2>/dev/null || printf '0')"
     is_uint "$t" || t=0
     total=$(( total + t ))
+    count=$(( count + 1 ))
   done
-  printf '%s' "$total"
+  printf '%s %s\n' "$total" "$count"
 }
 
 # --- harness -----------------------------------------------------------------
@@ -687,19 +688,24 @@ run_cell() {
 
   # /proc fallback for CPU when the node's histogram is unavailable.
   if [[ "$cpu" == "null" && -f "$dir/cpu-before.txt" && -f "$dir/cpu-after.txt" && "$hdelta" != "null" ]]; then
-    local cb ca clk dticks blocks cpus
-    cb="$(cat "$dir/cpu-before.txt")"
-    ca="$(cat "$dir/cpu-after.txt")"
+    local cb cb_n="" ca ca_n="" clk dticks blocks cpus node_count=1
+    read -r cb cb_n < "$dir/cpu-before.txt" || true
+    read -r ca ca_n < "$dir/cpu-after.txt" || true
     clk="$(getconf CLK_TCK 2>/dev/null || printf '100')"
     is_uint "$cb" || cb=0
     is_uint "$ca" || ca=0
     is_uint "$hdelta" || hdelta=0
-    if (( ca >= cb && hdelta > 0 && clk > 0 )); then
+    if is_uint "${ca_n:-}" && (( ca_n > 0 )) && [[ "${cb_n:-}" == "$ca_n" ]]; then
+      node_count="$ca_n"
+    elif is_uint "${cb_n:-}" && (( cb_n > 0 )); then
+      node_count="$cb_n"
+    fi
+    if (( ca >= cb && hdelta > 0 && clk > 0 && node_count > 0 )); then
       dticks=$(( ca - cb ))
       blocks="$hdelta"
-      cpus="$(awk -v t="$dticks" -v c="$clk" -v b="$blocks" 'BEGIN{printf "%.6f", (t/c)/b}')"
+      cpus="$(awk -v t="$dticks" -v c="$clk" -v b="$blocks" -v n="$node_count" 'BEGIN{printf "%.6f", ((t/c)/n)/b}')"
       cpu="$cpus"
-      notes="${notes:+$notes; }CPU from host /proc (sum of ${CPU_PIDS}), not the node histogram"
+      notes="${notes:+$notes; }CPU from host /proc (mean across ${node_count} sampled PID(s): ${CPU_PIDS}), not the node histogram"
     fi
   fi
 
@@ -1037,7 +1043,7 @@ if [[ -n "$RENDER_ONLY" ]]; then
   [[ -f "$OUT/meta.json" ]] || die "--render-only: $OUT/meta.json is missing"
   # Restore the scope recorded by the run so a re-render shows the same rows.
   _meta="$OUT/meta.json"
-  MATRIX_NS="$(jq -r '.declared.matrix_ns // .declared.rates // "4,32,128"' "$_meta" 2>/dev/null || printf '4,32,128')"
+  MATRIX_NS="$(jq -r '.declared.matrix_ns // "4,32,128"' "$_meta" 2>/dev/null || printf '4,32,128')"
   MATRIX_FLOORS="$(jq -r '.declared.matrix_floors // "400,250"' "$_meta" 2>/dev/null || printf '400,250')"
   RATES="$(jq -r '.declared.rates // "100,1000,5000"' "$_meta" 2>/dev/null || printf '100,1000,5000')"
   SETTLE="$(jq -r '.declared.settle_s // 30' "$_meta" 2>/dev/null || printf '30')"
@@ -1124,9 +1130,18 @@ CHAIN_ID="$(rpc_call stell_chainId 2>/dev/null | jq -r '.result // empty' 2>/dev
 [[ -n "$CHAIN_ID" ]] || die "cannot read stell_chainId from $RPC (is the node up?)"
 HEIGHT_NOW="$(rpc_height)"
 (( HEIGHT_NOW > 0 )) || die "cannot read a non-zero stell_blockNumber from $RPC"
-VALIDATORS_NOW="$(rpc_call stell_getValidators 2>/dev/null | jq -r '.result.validators | length' 2>/dev/null || true)"
+SYNCING_NOW="$(rpc_call stell_syncing 2>/dev/null | jq -r 'if .result == null then "" else (.result | tostring) end' 2>/dev/null || true)"
+if [[ "$SYNCING_NOW" != "false" ]]; then
+  die "node at $RPC reports stell_syncing=${SYNCING_NOW:-unknown} (must be false before running perf matrix)"
+fi
+VALS_JSON="$(rpc_call stell_getValidators 2>/dev/null || true)"
+VALIDATORS_NOW="$(printf '%s' "$VALS_JSON" | jq -r '.result.validators | length' 2>/dev/null || true)"
 if [[ -z "$VALIDATORS_NOW" || "$VALIDATORS_NOW" == "null" ]]; then
   die "stell_getValidators returned no validator list; cannot verify N=$VALIDATORS"
+fi
+FRAGILE_NOW="$(printf '%s' "$VALS_JSON" | jq -r 'if .result.fragile == null then "false" else (.result.fragile | tostring) end' 2>/dev/null || printf 'unknown')"
+if [[ "$FRAGILE_NOW" != "false" ]]; then
+  die "cluster at $RPC reports fragile=${FRAGILE_NOW} (must be false before running perf matrix)"
 fi
 if [[ "$VALIDATORS_NOW" != "$VALIDATORS" ]]; then
   if (( ALLOW_VALIDATOR_MISMATCH == 1 )); then

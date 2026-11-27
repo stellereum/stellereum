@@ -3,9 +3,21 @@ use super::types::{
     BridgeSnapshot, ClobQuoteMode, EscrowRecord, NativeMove,
 };
 use super::{AccountState, ActorMessage, InMemoryStateEngine};
-use crate::token::{TokenOp, TokenRegistry};
+use crate::token::{TokenOp, TokenRegistry, TokenTxDelta};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Planned CLOB settlement effects produced by [`InMemoryStateEngine::plan_clob_effects`]
+/// against immutable state snapshots for Phase 13a parallel orderbook execution.
+pub(super) struct PlannedClobEffects {
+    pub(super) escrow_updates: HashMap<(u32, u64), Option<EscrowRecord>>,
+    pub(super) native_moves: Vec<NativeMove>,
+    pub(super) native_touched_addrs: HashSet<[u8; 32]>,
+    pub(super) token_delta: Option<TokenTxDelta>,
+    pub(super) quote_id: Option<[u8; 32]>,
+    pub(super) token_touched: HashSet<[u8; 32]>,
+    pub(super) supply_dirty: bool,
+}
 
 /// S4 perf instrumentation: how many times a CLOB settlement cloned the WHOLE
 /// token registry to plan against a private copy.
@@ -1246,6 +1258,374 @@ impl InMemoryStateEngine {
             trie.insert(&addr, &data);
         }
         Ok(clob_snapshot)
+    }
+
+    /// Read-only CLOB settlement planner for Phase 13a parallel `SysCallPlaceOrder`
+    /// execution: plans all escrow mutations, native STELL moves, and `wUSDT` token
+    /// deltas against immutable snapshots without mutating consensus domains.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: read-only CLOB planner mirrors settle_clob_effects context to guarantee 100% parity.
+    pub(super) fn plan_clob_effects(
+        events: &[crate::orderbook::ClobEvent],
+        mode: ClobQuoteMode,
+        quote_id: Option<[u8; 32]>,
+        tokens: &TokenRegistry,
+        escrow: &HashMap<(u32, u64), EscrowRecord>,
+        live: &HashMap<[u8; 32], AccountState>,
+        sender: [u8; 32],
+        reserve_floor: u64,
+        order_absent: impl Fn(u32, u64) -> bool,
+    ) -> Result<PlannedClobEffects, String> {
+        use crate::orderbook::{ClobEvent, OrderSide, OrderType};
+
+        let mut work_overrides: HashMap<(u32, u64), Option<EscrowRecord>> = HashMap::new();
+        let mut token_delta = crate::token::TokenTxDelta::default();
+        let mut has_token_ops = false;
+        let mut native_moves: Vec<NativeMove> = Vec::new();
+        let mut native_touched_addrs: HashSet<[u8; 32]> = HashSet::new();
+        native_touched_addrs.insert(sender);
+        let mut token_touched: HashSet<[u8; 32]> = HashSet::new();
+        let mut supply_dirty = false;
+        let qid = quote_id;
+        let minter: Option<[u8; 32]> = qid.and_then(|q| tokens.get(&q).map(|t| t.metadata.minter));
+        let mut proj: HashMap<[u8; 32], i128> = HashMap::new();
+
+        macro_rules! debit {
+            ($addr:expr, $amount:expr, $what:expr) => {{
+                native_touched_addrs.insert($addr);
+                Self::plan_native_debit(&mut proj, live, &mut native_moves, $addr, $amount, $what)?
+            }};
+        }
+        macro_rules! credit {
+            ($addr:expr, $amount:expr, $what:expr) => {{
+                native_touched_addrs.insert($addr);
+                Self::plan_native_credit(&mut proj, live, &mut native_moves, $addr, $amount, $what)?
+            }};
+        }
+
+        let get_escrow = |overrides: &HashMap<(u32, u64), Option<EscrowRecord>>,
+                          key: &(u32, u64)|
+         -> Option<EscrowRecord> {
+            match overrides.get(key) {
+                Some(opt) => opt.clone(),
+                None => escrow.get(key).cloned(),
+            }
+        };
+
+        let mut tok_op = |caller: [u8; 32], op: TokenOp| -> Result<(), String> {
+            let q = qid.ok_or_else(|| "CLOB settlement: quote token not configured".to_string())?;
+            has_token_ops = true;
+            match op {
+                TokenOp::Transfer { to, amount } => {
+                    token_touched.insert(caller);
+                    token_touched.insert(to);
+                    tokens
+                        .plan_transfer_into(&mut token_delta, &q, caller, to, amount)
+                        .map_err(|e| format!("CLOB settlement: token op failed: {e}"))
+                }
+                TokenOp::Mint { to, amount } => {
+                    token_touched.insert(to);
+                    supply_dirty = true;
+                    tokens
+                        .plan_mint_into(&mut token_delta, &q, caller, to, amount)
+                        .map_err(|e| format!("CLOB settlement: token op failed: {e}"))
+                }
+                TokenOp::Burn { from, amount } => {
+                    token_touched.insert(from);
+                    supply_dirty = true;
+                    tokens
+                        .plan_burn_into(&mut token_delta, &q, caller, from, amount)
+                        .map_err(|e| format!("CLOB settlement: token op failed: {e}"))
+                }
+                _ => Err("CLOB settlement: unsupported token op".to_string()),
+            }
+        };
+        let minter_or_err = || -> Result<[u8; 32], String> {
+            minter.ok_or_else(|| "CLOB settlement: quote token not configured".to_string())
+        };
+
+        for ev in events {
+            match ev {
+                ClobEvent::Place {
+                    pair_id,
+                    order_id,
+                    trader,
+                    side,
+                    order_type,
+                    price,
+                    amount,
+                    filled,
+                    trades,
+                } => {
+                    native_touched_addrs.insert(*trader);
+                    let taker_is_buyer = matches!(side, OrderSide::Buy);
+                    let maker_is_buyer = !taker_is_buyer;
+
+                    for t in trades {
+                        native_touched_addrs.insert(t.maker);
+                        native_touched_addrs.insert(t.taker);
+                        let mkey = (*pair_id, t.maker_order_id);
+                        let (buyer, seller) = if taker_is_buyer {
+                            (t.taker, t.maker)
+                        } else {
+                            (t.maker, t.taker)
+                        };
+                        let maker_rec = get_escrow(&work_overrides, &mkey);
+
+                        if buyer == seller {
+                            if let Some(mut rec) = maker_rec {
+                                if !maker_is_buyer {
+                                    let take = rec.locked_base_stell.min(t.amount);
+                                    rec.locked_base_stell -= take;
+                                    credit!(buyer, take, "self-trade escrow refund");
+                                } else if rec.locked_quote_wusdt > 0 {
+                                    let q = ClobQuoteMode::Wusdt.quote(t.price, t.amount);
+                                    let take = rec.locked_quote_wusdt.min(q);
+                                    rec.locked_quote_wusdt -= take;
+                                    tok_op(
+                                        minter_or_err()?,
+                                        TokenOp::Mint {
+                                            to: buyer,
+                                            amount: take,
+                                        },
+                                    )?;
+                                } else {
+                                    let qn = ClobQuoteMode::NativeSvm.quote(t.price, t.amount);
+                                    let take = rec.locked_quote_native.min(qn);
+                                    rec.locked_quote_native -= take;
+                                    credit!(buyer, take, "self-trade escrow refund");
+                                }
+                                if rec.locked_base_stell == 0
+                                    && rec.locked_quote_wusdt == 0
+                                    && rec.locked_quote_native == 0
+                                {
+                                    work_overrides.insert(mkey, None);
+                                } else {
+                                    work_overrides.insert(mkey, Some(rec));
+                                }
+                            }
+                            continue;
+                        }
+
+                        let q_wusdt = ClobQuoteMode::Wusdt.quote(t.price, t.amount);
+                        let q_native = ClobQuoteMode::NativeSvm.quote(t.price, t.amount);
+                        let maker_escrowed_quote = maker_is_buyer
+                            && maker_rec.as_ref().is_some_and(|r| {
+                                r.locked_quote_wusdt > 0 || r.locked_quote_native > 0
+                            });
+                        let pays_wusdt = if maker_escrowed_quote {
+                            let r = maker_rec.as_ref().unwrap();
+                            if r.locked_quote_wusdt >= q_wusdt {
+                                true
+                            } else if q_native > 0 && r.locked_quote_native >= q_native {
+                                false
+                            } else {
+                                return Err(format!(
+                                    "CLOB settlement: escrow for order {} cannot fund the quote leg",
+                                    t.maker_order_id
+                                ));
+                            }
+                        } else {
+                            matches!(mode, ClobQuoteMode::Wusdt)
+                        };
+                        let q = if pays_wusdt { q_wusdt } else { q_native };
+                        if q == 0 {
+                            return Err("CLOB settlement: zero quote value (dust)".to_string());
+                        }
+                        let mut updated_rec = maker_rec.clone();
+                        if maker_escrowed_quote {
+                            if pays_wusdt {
+                                if let Some(ref mut rec) = updated_rec {
+                                    rec.locked_quote_wusdt -= q;
+                                }
+                                tok_op(
+                                    minter_or_err()?,
+                                    TokenOp::Mint {
+                                        to: seller,
+                                        amount: q,
+                                    },
+                                )?;
+                            } else {
+                                if let Some(ref mut rec) = updated_rec {
+                                    rec.locked_quote_native -= q;
+                                }
+                                credit!(seller, q, "escrow quote release");
+                            }
+                        } else if pays_wusdt {
+                            tok_op(
+                                buyer,
+                                TokenOp::Transfer {
+                                    to: seller,
+                                    amount: q,
+                                },
+                            )?;
+                        } else {
+                            debit!(buyer, q, "buyer");
+                            credit!(seller, q, "quote settlement");
+                        }
+
+                        let maker_escrowed_base = taker_is_buyer
+                            && maker_rec.as_ref().is_some_and(|r| r.locked_base_stell > 0);
+                        if maker_escrowed_base {
+                            let r = maker_rec.as_ref().unwrap();
+                            if r.locked_base_stell < t.amount {
+                                return Err(format!(
+                                    "CLOB settlement: escrow for order {} cannot fund the base leg",
+                                    t.maker_order_id
+                                ));
+                            }
+                            if let Some(ref mut rec) = updated_rec {
+                                rec.locked_base_stell -= t.amount;
+                            }
+                            credit!(buyer, t.amount, "escrow base release");
+                        } else {
+                            debit!(seller, t.amount, "seller");
+                            credit!(buyer, t.amount, "base settlement");
+                        }
+
+                        if let Some(rec) = updated_rec {
+                            if rec.locked_base_stell == 0
+                                && rec.locked_quote_wusdt == 0
+                                && rec.locked_quote_native == 0
+                            {
+                                work_overrides.insert(mkey, None);
+                            } else {
+                                work_overrides.insert(mkey, Some(rec));
+                            }
+                        }
+                    }
+
+                    let unfilled = amount.saturating_sub(*filled);
+                    if matches!(order_type, OrderType::Limit)
+                        && unfilled > 0
+                        && !order_absent(*pair_id, *order_id)
+                    {
+                        let okey = (*pair_id, *order_id);
+                        let mut rec = get_escrow(&work_overrides, &okey).unwrap_or(EscrowRecord {
+                            trader: *trader,
+                            locked_base_stell: 0,
+                            locked_quote_wusdt: 0,
+                            locked_quote_native: 0,
+                        });
+                        if taker_is_buyer {
+                            let q = mode.quote(*price, unfilled);
+                            if q > 0 {
+                                debit!(*trader, q, "buyer escrow lock");
+                                match mode {
+                                    ClobQuoteMode::Wusdt => {
+                                        rec.locked_quote_wusdt =
+                                            rec.locked_quote_wusdt.saturating_add(q);
+                                    }
+                                    ClobQuoteMode::NativeSvm => {
+                                        rec.locked_quote_native =
+                                            rec.locked_quote_native.saturating_add(q);
+                                    }
+                                }
+                            }
+                        } else {
+                            debit!(*trader, unfilled, "seller escrow lock");
+                            rec.locked_base_stell = rec.locked_base_stell.saturating_add(unfilled);
+                        }
+                        work_overrides.insert(okey, Some(rec));
+                    }
+                }
+                ClobEvent::Cancel {
+                    pair_id,
+                    order_id,
+                    trader,
+                } => {
+                    native_touched_addrs.insert(*trader);
+                    if !order_absent(*pair_id, *order_id) {
+                        return Err(format!(
+                            "CLOB settlement: cancelled order {} is still in the book",
+                            order_id
+                        ));
+                    }
+                    let ckey = (*pair_id, *order_id);
+                    if let Some(rec) = get_escrow(&work_overrides, &ckey) {
+                        work_overrides.insert(ckey, None);
+                        let native = rec
+                            .locked_base_stell
+                            .saturating_add(rec.locked_quote_native);
+                        credit!(*trader, native, "cancel refund");
+                        if rec.locked_quote_wusdt > 0 {
+                            tok_op(
+                                minter_or_err()?,
+                                TokenOp::Mint {
+                                    to: *trader,
+                                    amount: rec.locked_quote_wusdt,
+                                },
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
+        let sender_after = proj
+            .get(&sender)
+            .copied()
+            .unwrap_or_else(|| live.get(&sender).map(|a| a.balance as i128).unwrap_or(0));
+        if sender_after < reserve_floor as i128 {
+            return Err(format!(
+                "CLOB settlement: the sender would keep {} of the {reserve_floor} reserved for the transfer and the fee",
+                sender_after.max(0)
+            ));
+        }
+
+        Ok(PlannedClobEffects {
+            escrow_updates: work_overrides,
+            native_moves,
+            native_touched_addrs,
+            token_delta: if has_token_ops {
+                Some(token_delta)
+            } else {
+                None
+            },
+            quote_id: qid,
+            token_touched,
+            supply_dirty,
+        })
+    }
+
+    #[allow(clippy::type_complexity)]
+    // GATE: exposes apply_native_moves tuple layout for Phase 13a parallel CLOB commit.
+    pub(super) async fn apply_planned_clob_native_moves(
+        &self,
+        moves: &[NativeMove],
+    ) -> Result<
+        (
+            Vec<([u8; 32], u64, u64)>,
+            Vec<([u8; 32], Option<(u64, u64)>)>,
+        ),
+        String,
+    > {
+        self.apply_native_moves(moves).await
+    }
+
+    #[allow(clippy::type_complexity)]
+    // GATE: accounts-only rollback for planned CLOB native moves prior to trie commit.
+    pub(super) async fn restore_native_accounts_snapshot(
+        &self,
+        snapshot: &[([u8; 32], Option<(u64, u64)>)],
+    ) {
+        if snapshot.is_empty() {
+            return;
+        }
+        let mut map = self.accounts.write().await;
+        for (addr, prev) in snapshot.iter().rev() {
+            match prev {
+                Some((balance, nonce)) => {
+                    if let Some(acc) = map.get_mut(addr) {
+                        acc.balance = *balance;
+                        acc.nonce = *nonce;
+                    }
+                }
+                None => {
+                    map.remove(addr);
+                }
+            }
+        }
     }
 
     // ==================== Primary Market Maker (on-chain) ====================

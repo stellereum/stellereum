@@ -28,6 +28,7 @@ set -u
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PUBLIC_RPC="${STELL_PUBLIC_RPC:-https://rpc.stellereum.org}"
+FALLBACK_RPCS="${STELL_FALLBACK_RPCS:-http://127.0.0.1:8546}"
 MAX_GAP="${AUTO_UNJAIL_MAX_GAP:-20}"
 COOLDOWN="${AUTO_UNJAIL_COOLDOWN:-300}"
 STATE_DIR="${AUTO_UNJAIL_STATE_DIR:-${XDG_RUNTIME_DIR:-$HOME/.local/state}/stellereum-auto-unjail}"
@@ -70,35 +71,163 @@ parse_uint_or_hex() {
     fi
 }
 
-rpc() { curl -s -m 8 -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":$3}" "$1"; }
+rpc() {
+    curl -s -m 8 -H 'content-type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":$3}" "$1" 2>/dev/null || true
+}
+
+json_extract_result() {
+    local payload="$1"
+    [ -n "$payload" ] || return 1
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(d, dict) or d.get("error") is not None:
+    sys.exit(1)
+r = d.get("result")
+if r is None:
+    sys.exit(1)
+if isinstance(r, bool):
+    print("true" if r else "false")
+elif isinstance(r, (int, float, str)):
+    print(r)
+else:
+    print(json.dumps(r))
+' <<<"$payload" 2>/dev/null
+        return $?
+    fi
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$payload" | jq -er 'select(.error == null and .result != null) | .result' 2>/dev/null
+        return $?
+    fi
+    local val
+    val="$(printf '%s' "$payload" | sed -n 's/.*"result"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    [ -n "$val" ] || return 1
+    printf '%s\n' "$val"
+}
+
+validator_status_field() { # $1 json payload, $2 field
+    local payload="$1" field="$2"
+    [ -n "$payload" ] || return 1
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import json, sys
+field = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(d, dict) or d.get("error") is not None:
+    sys.exit(1)
+r = d.get("result")
+if not isinstance(r, dict):
+    sys.exit(1)
+v = r.get(field)
+if v is None:
+    print("")
+elif isinstance(v, bool):
+    print("true" if v else "false")
+else:
+    print(v)
+' "$field" <<<"$payload" 2>/dev/null
+        return $?
+    fi
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$payload" | jq -er --arg f "$field" \
+            'select(.error == null and (.result | type == "object")) | (.result[$f] // "") | tostring' 2>/dev/null
+        return $?
+    fi
+    printf '%s' "$payload" | sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" | head -n1
+}
+
+rpc_node() { # transport target port method params
+    local transport="$1" target="$2" port="$3" method="$4" params="$5"
+    if [ "$transport" = local ]; then
+        rpc "http://127.0.0.1:8546" "$method" "$params"
+    else
+        local payload="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"${method}\",\"params\":${params}}"
+        ssh -p "$port" -o ConnectTimeout=8 -o BatchMode=yes "$target" \
+            "curl -s -m 4 -H 'content-type: application/json' -d $(printf '%q' "$payload") http://127.0.0.1:8545" 2>/dev/null || true
+    fi
+}
+
+query_with_fallback() { # method params [prefer_transport prefer_target prefer_port]
+    local method="$1" params="$2" p_tr="${3:-}" p_tgt="${4:-}" p_port="${5:-}"
+    local resp url fb_list row r_name r_tr r_tgt r_port r_dir r_vid
+
+    resp="$(rpc "$PUBLIC_RPC" "$method" "$params")"
+    if json_extract_result "$resp" >/dev/null 2>&1; then
+        printf '%s' "$resp"
+        return 0
+    fi
+
+    fb_list="${FALLBACK_RPCS//,/ }"
+    for url in $fb_list; do
+        [ -n "$url" ] || continue
+        [ "$url" = "$PUBLIC_RPC" ] && continue
+        resp="$(rpc "$url" "$method" "$params")"
+        if json_extract_result "$resp" >/dev/null 2>&1; then
+            printf '%s' "$resp"
+            return 0
+        fi
+    done
+
+    if [ -n "$p_tr" ]; then
+        resp="$(rpc_node "$p_tr" "$p_tgt" "$p_port" "$method" "$params")"
+        if json_extract_result "$resp" >/dev/null 2>&1; then
+            printf '%s' "$resp"
+            return 0
+        fi
+    fi
+
+    for row in "${NODES[@]}"; do
+        IFS='|' read -r r_name r_tr r_tgt r_port r_dir r_vid <<<"$row"
+        resp="$(rpc_node "$r_tr" "$r_tgt" "$r_port" "$method" "$params")"
+        if json_extract_result "$resp" >/dev/null 2>&1; then
+            printf '%s' "$resp"
+            return 0
+        fi
+    done
+    return 1
+}
+
 tip() {
-    local raw
-    raw="$(rpc "$PUBLIC_RPC" stell_blockNumber '[]' | sed -n 's/.*"result":"\([^"]*\)".*/\1/p' | head -n1)"
+    local resp raw
+    resp="$(query_with_fallback stell_blockNumber '[]' || true)"
+    raw="$(json_extract_result "$resp" 2>/dev/null || true)"
     parse_uint_or_hex "$raw" 2>/dev/null || true
 }
 
-status_field() { # $1 validator, $2 field
-    rpc "$PUBLIC_RPC" stell_getValidatorStatus "{\"validator\":\"$1\"}" |
-        python3 -c "import sys,json
-r=json.load(sys.stdin).get('result') or {}
-print(r.get('$2'))" 2>/dev/null
+fetch_validator_status() { # validator [transport target port]
+    local vid="$1" tr="${2:-}" tgt="${3:-}" port="${4:-}"
+    query_with_fallback stell_getValidatorStatus "{\"validator\":\"$vid\"}" "$tr" "$tgt" "$port"
 }
 
 node_height() { # transport target port
-    local transport="$1" target="$2" port="$3" raw
-    if [ "$transport" = local ]; then
-        raw="$(rpc "http://127.0.0.1:8546" stell_blockNumber '[]' | sed -n 's/.*"result":"\([^"]*\)".*/\1/p' | head -n1)"
-    else
-        raw="$(ssh -p "$port" -o ConnectTimeout=8 -o BatchMode=yes "$target" \
-            "curl -s -m 4 -H 'content-type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"stell_blockNumber\",\"params\":[]}' http://127.0.0.1:8545" |
-            sed -n 's/.*"result":"\([^"]*\)".*/\1/p' | head -n1)"
-    fi
+    local transport="$1" target="$2" port="$3" resp raw
+    resp="$(rpc_node "$transport" "$target" "$port" stell_blockNumber '[]')"
+    raw="$(json_extract_result "$resp" 2>/dev/null || true)"
     parse_uint_or_hex "$raw" 2>/dev/null || true
+}
+
+check_withdrawal_key() { # transport target port dir
+    local transport="$1" target="$2" port="$3" dir="$4"
+    local key_path="$dir/keys/withdrawal.key"
+    if [ "$transport" = local ]; then
+        [ -f "$key_path" ] && [ -r "$key_path" ]
+    else
+        ssh -p "$port" -o ConnectTimeout=8 -o BatchMode=yes "$target" \
+            "test -f $(printf '%q' "$key_path") && test -r $(printf '%q' "$key_path")" 2>/dev/null
+    fi
 }
 
 do_unjail() { # transport target port dir validator rpc
     local transport="$1" target="$2" port="$3" dir="$4" vid="$5" rpc_url="$6"
-    local suffix q_dir q_parent q_suffix q_vid q_rpc cmd
+    local suffix q_dir q_parent q_suffix q_vid q_rpc cmd rc=0
     suffix="$(basename "$dir" | sed 's/^node//')"
     q_dir="$(printf '%q' "$dir")"
     q_parent="$(printf '%q' "$(dirname "$dir")")"
@@ -112,24 +241,32 @@ do_unjail() { # transport target port dir validator rpc
     cmd="set -a; if [ -f $q_dir/env.$q_suffix ]; then . $q_dir/env.$q_suffix; elif [ -f $q_parent/env.$q_suffix ]; then . $q_parent/env.$q_suffix; fi; set +a; $cli validator unjail --withdrawal-key-file $q_dir/keys/withdrawal.key --validator-id $q_vid --rpc $q_rpc"
     if [ "$transport" = local ]; then
         bash -c "$cmd" 2>&1 | tail -n 4
+        rc=${PIPESTATUS[0]}
     else
         ssh -p "$port" -o ConnectTimeout=10 -o BatchMode=yes "$target" "$cmd" 2>&1 | tail -n 4
+        rc=${PIPESTATUS[0]}
     fi
+    return "$rc"
 }
 
 pass() {
     local t; t="$(tip)"
     if [[ ! "$t" =~ ^[0-9]+$ ]]; then
-        echo "[auto-unjail] public RPC unreachable or invalid height; skipping pass"
+        echo "[auto-unjail] all RPC endpoints unreachable or invalid height; skipping pass"
         return 0
     fi
     t=$((10#$t))
     for row in "${NODES[@]}"; do
         IFS='|' read -r name transport target port dir vid <<<"$row"
-        local jailed rel
-        jailed="$(status_field "$vid" jailed)"
-        [ "$jailed" = "True" ] || continue
-        rel="$(status_field "$vid" release_height)"
+        local status_json jailed rel waddr
+        status_json="$(fetch_validator_status "$vid" "$transport" "$target" "$port" || true)"
+        if [ -z "$status_json" ]; then
+            echo "[auto-unjail] $name: could not read stell_getValidatorStatus from any RPC; skipping"
+            continue
+        fi
+        jailed="$(validator_status_field "$status_json" jailed 2>/dev/null || true)"
+        [ "$jailed" = "true" ] || continue
+        rel="$(validator_status_field "$status_json" release_height 2>/dev/null || true)"
         if [[ "$rel" =~ ^0[xX][0-9a-fA-F]+$ ]]; then
             rel=$((16#${rel:2}))
         elif [[ "$rel" =~ ^[0-9]+$ ]]; then
@@ -139,6 +276,15 @@ pass() {
         fi
         if [ "$t" -lt "$rel" ]; then
             echo "[auto-unjail] $name jailed; waiting for release $rel (tip $t, $((rel - t)) blocks)"
+            continue
+        fi
+        waddr="$(validator_status_field "$status_json" withdrawal_address 2>/dev/null || true)"
+        if [ -z "$waddr" ] || [ "$waddr" = "null" ] || [ "$waddr" = "None" ]; then
+            echo "[auto-unjail] $name jailed and release passed, but withdrawal_address is unset; claim cold withdrawal address first"
+            continue
+        fi
+        if ! check_withdrawal_key "$transport" "$target" "$port" "$dir"; then
+            echo "[auto-unjail] $name jailed and release passed, but $dir/keys/withdrawal.key is missing or unreadable on target; skipping"
             continue
         fi
         local stamp="$STATE_DIR/$name.last"
@@ -168,14 +314,36 @@ pass() {
             continue
         fi
         if [ "$DRY" = 1 ]; then
-            echo "[auto-unjail] DRY RUN: would unjail $name (tip=$t release=$rel local=$h gap=$gap)"
+            echo "[auto-unjail] DRY RUN: would unjail $name (tip=$t release=$rel local=$h gap=$gap withdrawal=$waddr)"
             continue
         fi
         echo "[auto-unjail] unjailing $name (tip=$t release=$rel local=$h gap=$gap)"
-        date +%s > "$stamp"
         local rpc_url="http://127.0.0.1:8545"
         [ "$transport" = local ] && rpc_url="http://127.0.0.1:8546"
-        do_unjail "$transport" "$target" "$port" "$dir" "$vid" "$rpc_url"
+        local unjail_rc=0
+        if do_unjail "$transport" "$target" "$port" "$dir" "$vid" "$rpc_url"; then
+            unjail_rc=0
+        else
+            unjail_rc=$?
+        fi
+        if [ "$unjail_rc" -ne 0 ]; then
+            echo "[auto-unjail] ERROR: unjail command for $name failed (exit $unjail_rc); cooldown not updated" >&2
+            continue
+        fi
+        date +%s > "$stamp"
+        local verify_attempt post_json post_jailed="unknown" post_in_set="unknown"
+        for verify_attempt in 1 2 3 4 5; do
+            sleep 1
+            post_json="$(fetch_validator_status "$vid" "$transport" "$target" "$port" || true)"
+            if [ -n "$post_json" ]; then
+                post_jailed="$(validator_status_field "$post_json" jailed 2>/dev/null || echo "unknown")"
+                post_in_set="$(validator_status_field "$post_json" in_set 2>/dev/null || echo "unknown")"
+                if [ "$post_jailed" = "false" ]; then
+                    break
+                fi
+            fi
+        done
+        echo "[auto-unjail] post-unjail status for $name: jailed=$post_jailed in_set=$post_in_set"
     done
 }
 

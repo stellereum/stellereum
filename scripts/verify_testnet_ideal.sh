@@ -6,6 +6,7 @@
 # Exit 0 = ideal. Anything else = FAIL with the stage that broke.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export CARGO_NET_OFFLINE=true
 FAST=0; SIM=1
 for a in "$@"; do
   case "$a" in
@@ -18,6 +19,7 @@ fail() { echo "[GATE FAIL] $1"; exit 1; }
 info() { echo "[gate] $1"; }
 
 RUST_WS="stellereum infnode stellereum-contracts stellereum-indexer stellereum-sdk stell-wallet scripts/tools/stelops"
+mkdir -p "$ROOT/artifacts"
 
 # ---- STAGE 0: fake-code scan (hard fail) ----
 info "stage 0: fake-code scan"
@@ -36,10 +38,10 @@ DUMMY_N=$(rg -l --glob '*.rs' -g '!target/**' -g '!node_modules/**' -g '!.archiv
 info "advisory: 'dummy' appears in $DUMMY_N rs files (known-legit, see gate docs)"
 
 # ---- STAGE 1: clippy -D warnings, every workspace ----
-info "stage 1: clippy --all-targets -- -D warnings"
+info "stage 1: clippy --locked --all-targets -- -D warnings"
 for ws in $RUST_WS; do
   if [ ! -f "$ROOT/$ws/Cargo.toml" ]; then info "skip $ws (no manifest)"; continue; fi
-  (cd "$ROOT/$ws" && cargo clippy --all-targets -- -D warnings) \
+  (cd "$ROOT/$ws" && cargo clippy --locked --all-targets -- -D warnings) \
     || fail "stage 1: clippy in $ws"
   pass "stage 1: $ws"
 done
@@ -67,16 +69,20 @@ command -v cargo-nextest >/dev/null 2>&1 && RUNNER="cargo nextest run" && info "
 # `--test-threads=1`. Do not "fix" this by weakening the assertions.
 for ws in $RUST_WS; do
   if [ ! -f "$ROOT/$ws/Cargo.toml" ]; then continue; fi
+  ws_flag=""
+  if grep -q '^\[workspace\]' "$ROOT/$ws/Cargo.toml" 2>/dev/null; then
+    ws_flag="--workspace"
+  fi
   if [ "$ws" = "stellereum" ] && [ "$RUNNER" = "cargo test" ]; then
     if [ "$FAST" = 1 ]; then
-      (cd "$ROOT/$ws" && $RUNNER --lib --no-fail-fast -- --test-threads=1) || fail "stage 3: $ws lib"
+      (cd "$ROOT/$ws" && $RUNNER --locked --lib --no-fail-fast -- --test-threads=1) || fail "stage 3: $ws lib"
     else
-      (cd "$ROOT/$ws" && $RUNNER --workspace --no-fail-fast -- --test-threads=1) || fail "stage 3: $ws"
+      (cd "$ROOT/$ws" && $RUNNER --locked --no-fail-fast -- --test-threads=1) || fail "stage 3: $ws"
     fi
   elif [ "$FAST" = 1 ] && [ "$ws" = "stellereum" ]; then
-    (cd "$ROOT/$ws" && $RUNNER --lib --no-fail-fast) || fail "stage 3: $ws lib"
+    (cd "$ROOT/$ws" && $RUNNER --locked --lib --no-fail-fast) || fail "stage 3: $ws lib"
   else
-    (cd "$ROOT/$ws" && $RUNNER --workspace --no-fail-fast) || fail "stage 3: $ws"
+    (cd "$ROOT/$ws" && $RUNNER --locked ${ws_flag:+$ws_flag} --no-fail-fast) || fail "stage 3: $ws"
   fi
   pass "stage 3: $ws"
 done
@@ -84,9 +90,9 @@ done
 # ---- STAGE 4: 4-node sim harness (the virtual testnet) ----
 if [ "$SIM" = 1 ]; then
   info "stage 4: sim harness (consensus_liveness_harness + proposal_refire)"
-  (cd "$ROOT/stellereum" && cargo test --test consensus_liveness_harness --no-fail-fast) \
+  (cd "$ROOT/stellereum" && cargo test --locked --test consensus_liveness_harness --no-fail-fast) \
     || fail "stage 4: consensus_liveness_harness"
-  (cd "$ROOT/stellereum" && cargo test --test proposal_refire_tests --no-fail-fast) \
+  (cd "$ROOT/stellereum" && cargo test --locked --test proposal_refire_tests --no-fail-fast) \
     || fail "stage 4: proposal_refire_tests"
   pass "stage 4: sim harness"
 else

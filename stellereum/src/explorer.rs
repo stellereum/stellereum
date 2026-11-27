@@ -1057,10 +1057,10 @@ async fn nested_rpc_rate_limit(
     next.run(req).await
 }
 
-/// Explorer HTML template. `%TS_SCRIPT%` / `%TS_WIDGET%` / `%TS_REQUIRED%`
-/// are substituted by [`render_index`] (plain `str::replace`, no template
-/// engine — the page must keep working byte-for-byte identical when the
-/// captcha is off).
+/// Explorer HTML template. `%TS_SCRIPT%` / `%TS_WIDGET%` / `%TS_REQUIRED%` /
+/// `%FAUCET_DRIP%` / `%FAUCET_COOLDOWN%` are substituted by [`render_index`]
+/// (plain `str::replace`, no template engine — the page must keep working
+/// byte-for-byte identical when the captcha is off).
 const INDEX_HTML: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1080,9 +1080,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <pre id="out"></pre>
 </div>
 <div class="card"><h3>Public faucet</h3>
-  <div class="k">5 STELL per address every 45 minutes</div>
+  <div class="k">%FAUCET_DRIP% per address every %FAUCET_COOLDOWN%</div>
   <input id="fa" placeholder="address (hex)" size="70">
-  <button onclick="faucetGo()">Request 5 STELL</button>
+  <button onclick="faucetGo()">Request %FAUCET_DRIP%</button>
   %TS_WIDGET%
   <pre id="fout"></pre>
 </div>
@@ -1135,11 +1135,41 @@ async function faucetGo(){
 loadStats();loadBlocks();setInterval(()=>{loadStats();loadBlocks();},4000);
 </script></body></html>"#;
 
-/// Substitute the Turnstile placeholders in [`INDEX_HTML`]. With
-/// `site_key = None` (captcha disabled) the page is the pre-captcha explorer
-/// plus a plain faucet form; no external script is referenced.
+fn format_stell_amount(nano: u64) -> String {
+    const NANO_PER_STELL: u64 = 1_000_000_000;
+    let whole = nano / NANO_PER_STELL;
+    let frac = nano % NANO_PER_STELL;
+    if frac == 0 {
+        format!("{whole} STELL")
+    } else {
+        let frac_str = format!("{frac:09}");
+        let trimmed = frac_str.trim_end_matches('0');
+        format!("{whole}.{trimmed} STELL")
+    }
+}
+
+fn format_cooldown_window(secs: u64) -> String {
+    if secs.is_multiple_of(60) {
+        let mins = secs / 60;
+        if mins == 1 {
+            "1 minute".to_string()
+        } else {
+            format!("{mins} minutes")
+        }
+    } else if secs == 1 {
+        "1 second".to_string()
+    } else {
+        format!("{secs} seconds")
+    }
+}
+
+/// Substitute the Turnstile and public-faucet placeholders in [`INDEX_HTML`].
+/// With `site_key = None` (captcha disabled) the page is the pre-captcha
+/// explorer plus a plain faucet form; no external script is referenced.
 fn render_index(site_key: Option<&str>) -> String {
-    match site_key {
+    let drip_label = format_stell_amount(crate::rpc::public_drip_nano());
+    let cooldown_label = format_cooldown_window(crate::rpc::public_drip_cooldown_secs());
+    let html = match site_key {
         Some(key) => INDEX_HTML
             .replace(
                 "%TS_SCRIPT%",
@@ -1164,7 +1194,9 @@ fn render_index(site_key: Option<&str>) -> String {
             .replace("%TS_SCRIPT%", "")
             .replace("%TS_WIDGET%", "")
             .replace("%TS_REQUIRED%", "false"),
-    }
+    };
+    html.replace("%FAUCET_DRIP%", &drip_label)
+        .replace("%FAUCET_COOLDOWN%", &cooldown_label)
 }
 
 async fn index(State(st): State<Arc<GatewayState>>) -> (HeaderMap, Html<String>) {
@@ -1220,10 +1252,59 @@ async fn api_stats(State(st): State<Arc<GatewayState>>) -> Json<serde_json::Valu
 }
 
 async fn api_blocks(State(st): State<Arc<GatewayState>>) -> Json<serde_json::Value> {
-    let rb = st.rpc.recent_blocks.read().await;
-    let list: Vec<serde_json::Value> = rb
-        .iter()
-        .map(|b| json!({ "height": b.height, "hash": b.hash, "txs": b.tx_count, "timestamp": b.timestamp }))
+    let hosted = st.rpc.all_hosted_shards().await;
+    if hosted.is_empty() {
+        let rb = st.rpc.recent_blocks.read().await;
+        let list: Vec<serde_json::Value> = rb
+            .iter()
+            .map(|b| {
+                json!({
+                    "height": b.height,
+                    "hash": b.hash,
+                    "txs": b.tx_count,
+                    "timestamp": b.timestamp,
+                })
+            })
+            .collect();
+        return Json(json!(list));
+    }
+    let mut merged: Vec<(u32, crate::rpc::BlockSummary)> = Vec::new();
+    let local_shard = st.rpc.engine.shard_id();
+    let mut seen_local = false;
+    for (sid, peer) in &hosted {
+        if *sid == local_shard {
+            seen_local = true;
+        }
+        let rb = peer.recent_blocks.read().await;
+        for b in rb.iter() {
+            merged.push((*sid, b.clone()));
+        }
+    }
+    if !seen_local {
+        let rb = st.rpc.recent_blocks.read().await;
+        for b in rb.iter() {
+            merged.push((local_shard, b.clone()));
+        }
+    }
+    merged.sort_by_key(|(sid, b)| {
+        (
+            std::cmp::Reverse(b.timestamp),
+            std::cmp::Reverse(b.height),
+            *sid,
+        )
+    });
+    merged.truncate(crate::rpc::MAX_RECENT_BLOCKS);
+    let list: Vec<serde_json::Value> = merged
+        .into_iter()
+        .map(|(sid, b)| {
+            json!({
+                "height": b.height,
+                "hash": b.hash,
+                "txs": b.tx_count,
+                "timestamp": b.timestamp,
+                "shard_id": sid,
+            })
+        })
         .collect();
     Json(json!(list))
 }
@@ -1237,15 +1318,18 @@ pub fn parse_addr(s: &str) -> Option<[u8; 32]> {
     hex::decode(s).ok()?.try_into().ok()
 }
 
-/// Explorer-facing counterpart of `rpc::reads::foreign_shard_refusal`.
+/// Explorer-facing counterpart of `rpc::reads::resolve_shard_target_for_address`.
 ///
-/// The gateway serves this process's ONE engine/trie. A balance, SPV proof or
-/// account view for an address that routes to another shard must be refused,
-/// not answered with a locally-verifiable zero/exclusion answer. Single-shard
-/// nodes (the default) are unchanged.
-async fn foreign_shard_response(st: &GatewayState, address: [u8; 32]) -> Option<Response> {
+/// Routes an address-scoped explorer read to the hosted shard's `RpcState`
+/// when `peer_shards` is populated, and refuses unhosted foreign shards with
+/// 404 (never answering with a locally-verifiable zero/exclusion answer).
+/// Single-shard nodes (the default) are unchanged.
+async fn resolve_shard_target_for_explorer(
+    st: &GatewayState,
+    address: [u8; 32],
+) -> Result<Option<Arc<RpcState>>, Response> {
     if !st.rpc.shard_registry.is_sharded() {
-        return None;
+        return Ok(None);
     }
     let target = {
         let topology = st.rpc.engine.shard_topology().await;
@@ -1256,15 +1340,18 @@ async fn foreign_shard_response(st: &GatewayState, address: [u8; 32]) -> Option<
     };
     let local = st.rpc.engine.shard_id();
     if target == local {
-        return None;
+        return Ok(None);
     }
-    Some(
-        (
-            StatusCode::NOT_FOUND,
-            format!("address belongs to shard {target}, but this node serves shard {local}"),
-        )
-            .into_response(),
+    if let Some(peer) = st.rpc.state_for_shard(target).await {
+        if peer.engine.shard_id() == target {
+            return Ok(Some(peer));
+        }
+    }
+    Err((
+        StatusCode::NOT_FOUND,
+        format!("address belongs to shard {target}, but this node serves shard {local}"),
     )
+        .into_response())
 }
 
 /// GET hint for the POST-only faucet (see the route above).
@@ -1476,8 +1563,9 @@ fn extract_turnstile_token(headers: &HeaderMap, body: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Public testnet faucet (TON-style, tokenless): fixed 5 STELL per address
-/// per 45 minutes. Deliberately POST-only (GET would let crawlers drain it).
+/// Public testnet faucet (TON-style, tokenless): default 2 STELL per address
+/// per 45 minutes (configurable via `STELL_PUBLIC_DRIP_NANO` and
+/// `STELL_PUBLIC_DRIP_COOLDOWN_SECS`). Deliberately POST-only (GET would let crawlers drain it).
 /// Defenses, all enforced before any mint:
 /// - per-address 45-minute cooldown (persisted, survives restarts);
 /// - per-IP hourly budget (shared throttle with the token faucet path);
@@ -1695,10 +1783,12 @@ async fn api_balance(
     let Some(a) = parse_addr(&addr) else {
         return (StatusCode::BAD_REQUEST, "bad address").into_response();
     };
-    if let Some(denied) = foreign_shard_response(&st, a).await {
-        return denied;
-    }
-    let acc = st.rpc.engine.get_account(&a).await;
+    let peer_opt = match resolve_shard_target_for_explorer(&st, a).await {
+        Ok(p) => p,
+        Err(denied) => return denied,
+    };
+    let target_rpc = peer_opt.as_deref().unwrap_or(&st.rpc);
+    let acc = target_rpc.engine.get_account(&a).await;
     let (balance, nonce) = acc.map(|x| (x.balance, x.nonce)).unwrap_or((0, 0));
     Json(json!({ "address": hex::encode(a), "balance": balance.to_string(), "nonce": nonce }))
         .into_response()
@@ -1711,13 +1801,15 @@ async fn api_spv(
     let Some(a) = parse_addr(&addr) else {
         return (StatusCode::BAD_REQUEST, "bad address").into_response();
     };
-    if let Some(denied) = foreign_shard_response(&st, a).await {
-        return denied;
-    }
-    let acc = st.rpc.engine.get_account(&a).await;
+    let peer_opt = match resolve_shard_target_for_explorer(&st, a).await {
+        Ok(p) => p,
+        Err(denied) => return denied,
+    };
+    let target_rpc = peer_opt.as_deref().unwrap_or(&st.rpc);
+    let acc = target_rpc.engine.get_account(&a).await;
     let (balance, nonce) = acc.map(|x| (x.balance, x.nonce)).unwrap_or((0, 0));
-    let root = st.rpc.engine.get_state_root().await;
-    let proof = st.rpc.engine.get_account_proof(&a).await;
+    let root = target_rpc.engine.get_state_root().await;
+    let proof = target_rpc.engine.get_account_proof(&a).await;
     Json(json!({
         "address": hex::encode(a),
         "balance": balance.to_string(),
@@ -1743,6 +1835,48 @@ async fn api_contracts(
         .get("offset")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    let requested_shard: Option<u32> = match query
+        .get("shard_id")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => match raw.parse::<u32>() {
+            Ok(sid) => Some(sid),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "invalid shard_id (expected non-negative integer u32)",
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+    let peer_opt = if let Some(target) = requested_shard {
+        let local = st.rpc.engine.shard_id();
+        if target == local {
+            None
+        } else if let Some(peer) = st.rpc.state_for_shard(target).await {
+            if peer.engine.shard_id() == target {
+                Some(peer)
+            } else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!("shard {target} is not hosted on this node (local shard {local})"),
+                )
+                    .into_response();
+            }
+        } else {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("shard {target} is not hosted on this node (local shard {local})"),
+            )
+                .into_response();
+        }
+    } else {
+        None
+    };
+    let target_rpc = peer_opt.as_deref().unwrap_or(&st.rpc);
     let after = match query
         .get("after")
         .map(|s| s.trim())
@@ -1760,15 +1894,25 @@ async fn api_contracts(
         }
         None => None,
     };
-    let contracts = st.rpc.engine.contracts_read().await;
-    let total = contracts.contracts.len();
-    if let Some(cursor) = after {
-        let mut keys: Vec<[u8; 32]> = contracts
-            .contracts
-            .keys()
-            .copied()
-            .filter(|k| *k > cursor)
-            .collect();
+    let (total, mut keys): (usize, Vec<[u8; 32]>) = {
+        let contracts = target_rpc.engine.contracts_read().await;
+        let total = contracts.contracts.len();
+        let keys = if let Some(cursor) = after {
+            contracts
+                .contracts
+                .keys()
+                .copied()
+                .filter(|k| *k > cursor)
+                .collect()
+        } else if limit == 0 || offset >= total {
+            Vec::new()
+        } else {
+            contracts.contracts.keys().copied().collect()
+        };
+        drop(contracts);
+        (total, keys)
+    };
+    if after.is_some() {
         keys.sort_unstable();
         let has_more = keys.len() > limit;
         let page: Vec<[u8; 32]> = keys.into_iter().take(limit).collect();
@@ -1793,7 +1937,6 @@ async fn api_contracts(
     let addrs: Vec<String> = if limit == 0 || offset >= total {
         Vec::new()
     } else {
-        let mut keys: Vec<[u8; 32]> = contracts.contracts.keys().copied().collect();
         keys.sort_unstable();
         keys.into_iter()
             .skip(offset)
@@ -1818,6 +1961,39 @@ pub const MAX_ACCOUNT_DELEGATIONS: usize = 50;
 /// iteration: a hostile ledger must not pin the handler).
 const ACCOUNT_SCAN_BUDGET: usize = 20_000;
 
+/// Check active consensus-set membership (mirrors `StakingLedger::to_validator_set`
+/// eligibility + top-`MAX_ACTIVE_VALIDATORS` ranking) without allocating or
+/// sorting a full `ValidatorSet`.
+fn is_active_validator_in_set(ledger: &crate::staking::StakingLedger, addr: &[u8; 32]) -> bool {
+    let Some(v) = ledger.validators.get(addr) else {
+        return false;
+    };
+    let min_bond = ledger
+        .min_validator_bond
+        .unwrap_or(crate::staking::MIN_VALIDATOR_BOND);
+    let power = v.total();
+    if v.self_bond < min_bond || power == 0 || ledger.jail.contains_key(addr) {
+        return false;
+    }
+    let mut ahead = 0usize;
+    for (other_id, other_v) in &ledger.validators {
+        if other_id == addr || other_v.self_bond < min_bond || ledger.jail.contains_key(other_id) {
+            continue;
+        }
+        let other_power = other_v.total();
+        if other_power == 0 {
+            continue;
+        }
+        if other_power > power || (other_power == power && other_id < addr) {
+            ahead += 1;
+            if ahead >= crate::staking::MAX_ACTIVE_VALIDATORS {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// `GET /api/validator/:address` — human validator summary.
 ///
 /// Read-only over the indexed staking ledger (`RpcState::staking`, same
@@ -1834,7 +2010,7 @@ async fn api_validator(
     let ledger = st.rpc.staking.read().await;
     let rec = ledger.validators.get(&a).cloned();
     let jail = ledger.jail_record(&a);
-    let in_set = ledger.to_validator_set().validators.contains_key(&a);
+    let in_set = is_active_validator_in_set(&ledger, &a);
     let pending = ledger
         .commission_schedule_of(&a)
         .and_then(|s| s.pending)
@@ -1911,11 +2087,15 @@ async fn api_finals(
     }
     let counts: std::collections::HashMap<u64, usize> = {
         let receipts = st.rpc.receipts.read().await;
-        let mut m: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
-        for r in receipts.values() {
-            *m.entry(r.height).or_insert(0) += 1;
-        }
-        m
+        blocks
+            .iter()
+            .map(|b| {
+                (
+                    b.height,
+                    receipts.by_height.get(&b.height).map_or(0, Vec::len),
+                )
+            })
+            .collect()
     };
     let rows: Vec<serde_json::Value> = blocks
         .iter()
@@ -1955,12 +2135,13 @@ async fn api_account(
     let Some(a) = parse_addr(&addr) else {
         return (StatusCode::BAD_REQUEST, "bad address").into_response();
     };
-    if let Some(denied) = foreign_shard_response(&st, a).await {
-        return denied;
-    }
+    let peer_opt = match resolve_shard_target_for_explorer(&st, a).await {
+        Ok(p) => p,
+        Err(denied) => return denied,
+    };
+    let target_rpc = peer_opt.as_deref().unwrap_or(&st.rpc);
     let hex_addr = hex::encode(a);
-    let (balance, nonce) = st
-        .rpc
+    let (balance, nonce) = target_rpc
         .engine
         .get_account(&a)
         .await
@@ -1974,7 +2155,7 @@ async fn api_account(
             "power": r.total().to_string(),
             "commission_bps": r.commission_bps,
             "jailed": ledger.jail.contains_key(&a),
-            "in_set": ledger.to_validator_set().validators.contains_key(&a),
+            "in_set": is_active_validator_in_set(&ledger, &a),
         }),
         None => serde_json::Value::Null,
     };
@@ -2013,7 +2194,7 @@ async fn api_account(
     }
     drop(ledger);
     let (recent_tx_count, pending_sorted) = {
-        let pool = st.rpc.mempool.read().await;
+        let pool = target_rpc.mempool.read().await;
         pool.matching_account(&a, MAX_ACCOUNT_TXS)
     };
     let truncated = recent_tx_count > MAX_ACCOUNT_TXS;
@@ -2263,6 +2444,13 @@ pub fn describe_intent_op(op: &crate::svm::OpCode) -> String {
         ),
         Op::SysCallDeployContract { code } => {
             format!("deploy-contract bytes={}", code.len())
+        }
+        Op::SysCallDeployContractWithAbi { code, abi_json } => {
+            format!(
+                "deploy-contract-with-abi bytes={} abi-bytes={}",
+                code.len(),
+                abi_json.len()
+            )
         }
         Op::SysCallCallContract {
             contract,
@@ -2780,7 +2968,7 @@ async fn api_block_detail(
 /// Data-dir scan with its own TTL. Returns `(bytes, snapshot_files)`, each
 /// either observed or `null` with a reason. The scan is capped by
 /// [`DATA_DIR_SCAN_FILE_CAP`] and runs off the async worker thread.
-async fn data_dir_health(st: &GatewayState, now_ms: u64) -> (Measured<u64>, Measured<u64>) {
+async fn data_dir_health(st: &GatewayState, sample_ms: u64) -> (Measured<u64>, Measured<u64>) {
     let Some(dir) = st.health_options.data_dir.clone() else {
         return (
             Measured::missing("bytes", "data-dir scan disabled"),
@@ -2793,7 +2981,7 @@ async fn data_dir_health(st: &GatewayState, now_ms: u64) -> (Measured<u64>, Meas
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some((at, (bytes, snaps))) = *cache {
-            if now_ms.saturating_sub(at) < HEALTH_DATA_DIR_CACHE_TTL_MS {
+            if sample_ms.saturating_sub(at) < HEALTH_DATA_DIR_CACHE_TTL_MS {
                 return (
                     Measured::observed(bytes, "bytes"),
                     Measured::observed(snaps, "files"),
@@ -2810,7 +2998,7 @@ async fn data_dir_health(st: &GatewayState, now_ms: u64) -> (Measured<u64>, Meas
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some((at, (bytes, snaps))) = *cache {
-            if now_ms.saturating_sub(at) < HEALTH_DATA_DIR_CACHE_TTL_MS {
+            if sample_ms.saturating_sub(at) < HEALTH_DATA_DIR_CACHE_TTL_MS {
                 return (
                     Measured::observed(bytes, "bytes"),
                     Measured::observed(snaps, "files"),
@@ -2829,7 +3017,7 @@ async fn data_dir_health(st: &GatewayState, now_ms: u64) -> (Measured<u64>, Meas
         Ok((bytes, snaps)) => {
             *st.health_data_dir_cache
                 .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some((now_ms, (bytes, snaps)));
+                .unwrap_or_else(|e| e.into_inner()) = Some((now_ms(), (bytes, snaps)));
             (
                 Measured::observed(bytes, "bytes"),
                 Measured::observed(snaps, "files"),
@@ -3521,18 +3709,13 @@ pub fn data_dir_path() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from("./data"))
 }
 
-/// Best-effort `(bytes, snapshot_files)` under `dir`.
-///
-/// Never fails a scrape: unreadable entries are skipped, symlinks are not
-/// followed, traversal is capped, and a missing dir reads as `(0, 0)`.
-/// `snapshot_files` counts files whose name contains `snapshot` — an estimate
-/// for dashboards, not the sled tree count.
-pub fn data_dir_stats(dir: &std::path::Path) -> (u64, u64) {
+fn data_dir_stats_with_cap(dir: &std::path::Path, cap: usize) -> (u64, u64) {
     let mut bytes = 0u64;
     let mut snaps = 0u64;
     let mut visited = 0usize;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(path) = stack.pop() {
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(dir.to_path_buf());
+    while let Some(path) = queue.pop_front() {
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
@@ -3540,15 +3723,18 @@ pub fn data_dir_stats(dir: &std::path::Path) -> (u64, u64) {
             continue;
         }
         if meta.is_dir() {
+            if visited >= cap {
+                continue;
+            }
             let Ok(entries) = std::fs::read_dir(&path) else {
                 continue;
             };
             for entry in entries.flatten() {
-                if visited >= DATA_DIR_SCAN_FILE_CAP {
-                    return (bytes, snaps);
+                if visited >= cap {
+                    break;
                 }
                 visited += 1;
-                stack.push(entry.path());
+                queue.push_back(entry.path());
             }
         } else if meta.is_file() {
             bytes = bytes.saturating_add(meta.len());
@@ -3563,6 +3749,16 @@ pub fn data_dir_stats(dir: &std::path::Path) -> (u64, u64) {
         }
     }
     (bytes, snaps)
+}
+
+/// Best-effort `(bytes, snapshot_files)` under `dir`.
+///
+/// Never fails a scrape: unreadable entries are skipped, symlinks are not
+/// followed, traversal is capped, and a missing dir reads as `(0, 0)`.
+/// `snapshot_files` counts files whose name contains `snapshot` — an estimate
+/// for dashboards, not the sled tree count.
+pub fn data_dir_stats(dir: &std::path::Path) -> (u64, u64) {
+    data_dir_stats_with_cap(dir, DATA_DIR_SCAN_FILE_CAP)
 }
 
 /// `GET /api/version` — build identity of this binary.
@@ -3696,8 +3892,8 @@ pub fn router(gateway: Arc<GatewayState>) -> Router {
             "/api/faucet/:address",
             post(api_faucet).get(faucet_get_hint),
         )
-        // Public testnet drip (TON-style, tokenless): POST-only, 5 STELL per
-        // address per 45 minutes. Separate route so the token gate on the
+        // Public testnet drip (TON-style, tokenless): POST-only, default 2 STELL
+        // per address per 45 minutes. Separate route so the token gate on the
         // operator faucet above is never weakened.
         .route(
             "/api/faucet-public/:address",
@@ -3900,5 +4096,243 @@ mod tests {
         assert_eq!(ready_code, StatusCode::SERVICE_UNAVAILABLE);
         let (health_headers, _) = health(State(gw_off)).await;
         assert!(health_headers.contains_key("cache-control"));
+    }
+
+    fn make_test_rpc(shard_id: u32) -> Arc<RpcState> {
+        let engine = Arc::new(crate::state_engine::InMemoryStateEngine::new());
+        engine.set_shard_id(shard_id);
+        Arc::new(RpcState {
+            engine,
+            mempool: Arc::new(tokio::sync::RwLock::new(crate::mempool::Mempool::default())),
+            height: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            node_id: format!("inf1:test-shard-{shard_id}"),
+            chain_id: 5757,
+            staking: Arc::new(tokio::sync::RwLock::new(
+                crate::staking::StakingLedger::new(),
+            )),
+            governance: Arc::new(tokio::sync::RwLock::new(
+                crate::governance::Governance::new(),
+            )),
+            recent_blocks: Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::new())),
+            receipts: Arc::new(tokio::sync::RwLock::new(crate::rpc::ReceiptIndex::default())),
+            auth_token: None,
+            tx_broadcast: None,
+            faucet: None,
+            faucet_token: None,
+            archive_store: None,
+            msg_signing_seed: None,
+            shard_registry: crate::sharding::ShardRegistry::single(),
+        })
+    }
+
+    fn dummy_contract(address: [u8; 32]) -> crate::contract::Contract {
+        crate::contract::Contract {
+            address,
+            creator: [0x01u8; 32],
+            code_hash: [0u8; 32],
+            code: Vec::new(),
+            storage: HashMap::new(),
+            created_at: 1,
+            paused: false,
+            balance: 0,
+            abi: None,
+            source_hash: None,
+        }
+    }
+
+    #[test]
+    fn data_dir_stats_bfs_fairness_and_drains_queued_files_under_cap() {
+        let uniq = format!(
+            "stell_explorer_bfs_test_{}_{}",
+            std::process::id(),
+            now_ms()
+        );
+        let base = std::path::PathBuf::from("/tmp/opencode");
+        let root = if base.is_dir() {
+            base.join(uniq)
+        } else {
+            std::env::temp_dir().join(uniq)
+        };
+        let _ = std::fs::remove_dir_all(&root);
+
+        // (a) Flat directory exceeding cap must still stat the cap-many files
+        // already queued in VecDeque rather than returning (0, 0).
+        let flat = root.join("flat");
+        std::fs::create_dir_all(&flat).unwrap();
+        for i in 0..5 {
+            std::fs::write(flat.join(format!("snapshot-{i}.bin")), vec![0xABu8; 17]).unwrap();
+        }
+        let (flat_bytes, flat_snaps) = data_dir_stats_with_cap(&flat, 3);
+        assert_eq!(flat_bytes, 51);
+        assert_eq!(flat_snaps, 3);
+
+        // (b) BFS fairness: a deep chain under `a/` must not starve sibling `b/`
+        // at level 1 when the cap allows level-1 directory reads.
+        let bfs = root.join("bfs");
+        let deep = bfs.join("a/d1/d2/d3/d4");
+        let sibling = bfs.join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(deep.join("deep.bin"), vec![0x11u8; 500]).unwrap();
+        std::fs::write(sibling.join("snapshot-b.bin"), vec![0x22u8; 120]).unwrap();
+
+        let (bfs_bytes, bfs_snaps) = data_dir_stats_with_cap(&bfs, 4);
+        assert_eq!(bfs_bytes, 120);
+        assert_eq!(bfs_snaps, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn api_contracts_routes_shard_id_and_sorts_deterministically() {
+        let rpc0 = make_test_rpc(0);
+        let rpc1 = make_test_rpc(1);
+
+        let c_a = [0x10u8; 32];
+        let c_b = [0x20u8; 32];
+        let c_c = [0x30u8; 32];
+        {
+            let mut reg0 = rpc0.engine.contracts_write().await;
+            reg0.contracts.insert(c_c, dummy_contract(c_c));
+            reg0.contracts.insert(c_a, dummy_contract(c_a));
+            reg0.contracts.insert(c_b, dummy_contract(c_b));
+        }
+
+        let c_s1_hi = [0xB0u8; 32];
+        let c_s1_lo = [0xA0u8; 32];
+        {
+            let mut reg1 = rpc1.engine.contracts_write().await;
+            reg1.contracts.insert(c_s1_hi, dummy_contract(c_s1_hi));
+            reg1.contracts.insert(c_s1_lo, dummy_contract(c_s1_lo));
+        }
+        rpc0.register_peer_shard(1, rpc1).await;
+
+        let gw = Arc::new(
+            GatewayState::with_captcha(
+                rpc0,
+                100,
+                ReadinessConfig::default(),
+                Arc::new(crate::turnstile::CaptchaGate::disabled()),
+            )
+            .with_health_options(HealthOptions {
+                data_dir: None,
+                ..Default::default()
+            }),
+        );
+
+        // Default (local shard 0): sorted ascending.
+        let resp = api_contracts(State(gw.clone()), Query(HashMap::new())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["total"], 3);
+        assert_eq!(v["offset"], 0);
+        assert_eq!(
+            v["contracts"],
+            json!([hex::encode(c_a), hex::encode(c_b), hex::encode(c_c)])
+        );
+
+        // Offset + limit pagination on sorted keys.
+        let q_page = HashMap::from([
+            ("offset".to_string(), "1".to_string()),
+            ("limit".to_string(), "1".to_string()),
+        ]);
+        let resp_page = api_contracts(State(gw.clone()), Query(q_page)).await;
+        assert_eq!(resp_page.status(), StatusCode::OK);
+        let body_page = axum::body::to_bytes(resp_page.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v_page: serde_json::Value = serde_json::from_slice(&body_page).unwrap();
+        assert_eq!(v_page["total"], 3);
+        assert_eq!(v_page["offset"], 1);
+        assert_eq!(v_page["contracts"], json!([hex::encode(c_b)]));
+
+        // Cursor pagination (`after`).
+        let q_after = HashMap::from([
+            ("after".to_string(), hex::encode(c_a)),
+            ("limit".to_string(), "1".to_string()),
+        ]);
+        let resp_after = api_contracts(State(gw.clone()), Query(q_after)).await;
+        assert_eq!(resp_after.status(), StatusCode::OK);
+        let body_after = axum::body::to_bytes(resp_after.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v_after: serde_json::Value = serde_json::from_slice(&body_after).unwrap();
+        assert_eq!(v_after["contracts"], json!([hex::encode(c_b)]));
+        assert_eq!(v_after["has_more"], true);
+        assert_eq!(v_after["next_cursor"], hex::encode(c_b));
+
+        // Hosted peer shard (`?shard_id=1`).
+        let q_s1 = HashMap::from([("shard_id".to_string(), "1".to_string())]);
+        let resp_s1 = api_contracts(State(gw.clone()), Query(q_s1)).await;
+        assert_eq!(resp_s1.status(), StatusCode::OK);
+        let body_s1 = axum::body::to_bytes(resp_s1.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v_s1: serde_json::Value = serde_json::from_slice(&body_s1).unwrap();
+        assert_eq!(v_s1["total"], 2);
+        assert_eq!(
+            v_s1["contracts"],
+            json!([hex::encode(c_s1_lo), hex::encode(c_s1_hi)])
+        );
+
+        // Unhosted shard -> 404.
+        let q_unhosted = HashMap::from([("shard_id".to_string(), "99".to_string())]);
+        let resp_unhosted = api_contracts(State(gw.clone()), Query(q_unhosted)).await;
+        assert_eq!(resp_unhosted.status(), StatusCode::NOT_FOUND);
+
+        // Invalid shard_id -> 400.
+        let q_bad = HashMap::from([("shard_id".to_string(), "not-a-u32".to_string())]);
+        let resp_bad = api_contracts(State(gw), Query(q_bad)).await;
+        assert_eq!(resp_bad.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn is_active_validator_in_set_matches_to_validator_set() {
+        let mut ledger = crate::staking::StakingLedger::new();
+        let min = crate::staking::MIN_VALIDATOR_BOND;
+        for i in 0..260u16 {
+            let mut id = [0u8; 32];
+            id[0..2].copy_from_slice(&i.to_be_bytes());
+            let (self_bond, delegated) = if i < 5 {
+                (min - 1, min * 100)
+            } else if i < 20 {
+                (min + 100, 0)
+            } else {
+                (min + u64::from(i) * 1_000, u64::from(i % 7) * 500)
+            };
+            ledger.validators.insert(
+                id,
+                crate::staking::ValidatorStake {
+                    self_bond,
+                    delegated,
+                    commission_bps: 1_000,
+                    pending_rewards: 0,
+                    total_slashed: 0,
+                    missed: 0,
+                    last_downtime_penalty: 0,
+                    withdrawal_address: None,
+                },
+            );
+            if (5..10).contains(&i) {
+                ledger.jail.insert(
+                    id,
+                    crate::staking::JailRecord {
+                        jailed_at_height: 1,
+                        release_height: 4_001,
+                    },
+                );
+            }
+        }
+        let vs = ledger.to_validator_set();
+        for id in ledger.validators.keys() {
+            assert_eq!(
+                is_active_validator_in_set(&ledger, id),
+                vs.validators.contains_key(id)
+            );
+        }
+        assert!(!is_active_validator_in_set(&ledger, &[0xFFu8; 32]));
     }
 }

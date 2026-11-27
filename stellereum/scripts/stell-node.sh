@@ -28,6 +28,8 @@ ENV_D="$ROOT/env.D"
 # Ready-wait budget. A cold start has to warm the DHT and find its peer; if the peer
 # is late the node idles in round changes until it appears, so this is generous.
 READY_TIMEOUT="${STELL_READY_TIMEOUT:-120}"
+# Default shard id (masterchain = 0). Overridable via STELL_SHARD in caller or env file.
+SHARD="${STELL_SHARD:-0}"
 
 red()  { printf '\033[31m%s\033[0m\n' "$*"; }
 grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -58,7 +60,7 @@ start_one() {
   # file and made the stale-chain detector fire on a perfectly healthy chain.
   : > "$log"
   ( cd "$dir" && set -a && . "$env" && set +a && \
-      setsid nohup "$BIN" run --config node.yaml --shard 1 >> "$log" 2>&1 < /dev/null & )
+      setsid nohup "$BIN" run --config node.yaml --shard "${STELL_SHARD:-$SHARD}" >> "$log" 2>&1 < /dev/null & )
   printf '  started %s (log %s)\n' "$name" "$log"
 }
 

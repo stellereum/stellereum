@@ -4,9 +4,9 @@
 //!
 //! * **Falcon-512 keys** — generate, save/load a versioned JSON key file,
 //!   derive the on-chain 32-byte address and sign.
-//! * **PQ1 transaction construction** — native transfer, WASM contract call,
-//!   validator stake/top-up and unjail, with the node's exact payload bytes,
-//!   chain-id binding and activation surcharge.
+//! * **PQ1 transaction construction** — native transfer, WASM contract deploy
+//!   and call, validator stake/top-up and unjail, with the node's exact payload
+//!   bytes, chain-id binding and activation surcharge.
 //! * **SF1 session grants** — mint a Falcon master grant and sign delegated
 //!   transactions.
 //! * **JSON-RPC client** — `stell_*` reads, fee estimation, submission with
@@ -60,7 +60,11 @@ pub use key::{
     derive_pq_address, verify_pq_signature, FalconKeypair, KeyFile, DEFAULT_SALT,
     FALCON512_PUBKEY_LEN, FALCON512_SIG_LEN,
 };
-pub use opcode::{CallArg, Op, GAS_BASIC_TRANSFER};
+pub use opcode::{
+    contract_deploy_gas, contract_deploy_with_abi_gas, CallArg, Op, GAS_BASIC_TRANSFER,
+    GAS_CONTRACT_DEPLOY_BASE, GAS_CONTRACT_DEPLOY_PER_BYTE, MAX_CONTRACT_ABI_BYTES,
+    OP_DEPLOY_CONTRACT, OP_DEPLOY_CONTRACT_WITH_ABI,
+};
 pub use protocol::{
     capability_names, local_version_info, ProtocolIdentity, CAPABILITIES, FORK_ID, PROTOCOL_MAJOR,
     PROTOCOL_MINOR,

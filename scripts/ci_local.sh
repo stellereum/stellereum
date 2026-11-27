@@ -10,7 +10,7 @@
 #   scripts/ci_local.sh --loadtest      # also build the load-test harness
 #   JOBS=8 TEST_THREADS=4 scripts/ci_local.sh --full
 #
-# The curated suites are the same six groups as .github/workflows/ci.yml.
+# The curated suites are the same seven groups as .github/workflows/ci.yml.
 # `--full` is the nightly authoritative run: scripts/test_parallel.sh with
 # three binaries at a time, two threads inside each binary.
 #
@@ -37,7 +37,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --full) MODE="full"; shift ;;
     --suite)
-      [ $# -ge 2 ] || { echo "--suite needs a name (consensus|state|rpc|compact|sync|xshard)" >&2; exit 2; }
+      [ $# -ge 2 ] || { echo "--suite needs a name (consensus|state|rpc|compact|sync|xshard|hardening)" >&2; exit 2; }
       ONLY_SUITE="$2"; shift 2 ;;
     --sdk) WITH_SDK=1; shift ;;
     --loadtest) WITH_LOADTEST=1; shift ;;
@@ -63,17 +63,19 @@ echo "    jobs=$JOBS test_threads=$TEST_THREADS build_jobs=$CARGO_BUILD_JOBS off
 if command -v rustc >/dev/null 2>&1; then rustc -V; fi
 if command -v cargo >/dev/null 2>&1; then cargo -V; fi
 
-SUITES=(consensus state rpc compact sync xshard)
+SUITES=(consensus state rpc compact sync xshard hardening)
 
-# Keep these lists in sync with the test-suites matrix in ci.yml.
+# Keep these seven groups in sync with the test-suites matrix in ci.yml; every
+# name here must also appear under the matching suite in that matrix.
 suite_tests() {
   case "$1" in
-    consensus) echo "consensus_liveness_harness consensus_byzantine_tests consensus_security_tests bft_lock_safety_tests liveness_horizon_tests sim_tempo_target06_tests" ;;
-    state) echo "state_root_completeness_tests state_commit_batch_tests apply_floor_tests parallel_apply_parity_tests block_packing_scale_tests" ;;
-    rpc) echo "rpc_tests rpc_batch_tests rpc_ws_tests rpc_surface_audit_tests" ;;
+    consensus) echo "consensus_liveness_harness consensus_byzantine_tests consensus_security_tests bft_lock_safety_tests liveness_horizon_tests sim_tempo_target06_tests w10_sortition_and_jail_gates_tests w11_cnvrf_epoch_churn_tests w12_pipeline_gate_tests w12_pipeline_runtime_state_tests" ;;
+    state) echo "state_root_completeness_tests state_commit_batch_tests apply_floor_tests parallel_apply_parity_tests block_packing_scale_tests w13_domain_overlays_tests w13_parallel_native_and_stm_parity_tests w10_deploy_contract_abi_tests w9_core_polish_tests" ;;
+    rpc) echo "rpc_tests rpc_batch_tests rpc_ws_tests rpc_surface_audit_tests w14_shard_rpc_router_tests" ;;
     compact) echo "compact_gossip_tests pentest2_network_compact" ;;
     sync) echo "sync_adversarial_tests sync_walk_concurrency_tests catch_up_tests epoch_sync_tests" ;;
-    xshard) echo "xshard_2pc_tests xshard_replay_tests cross_shard_e2e_pq_tests cross_shard_anchor_tests" ;;
+    xshard) echo "xshard_2pc_tests xshard_replay_tests cross_shard_e2e_pq_tests cross_shard_anchor_tests w16_bridge_deposit_height_key_tests w14_dynamic_sharding_tests" ;;
+    hardening) echo "w8_cli_unjail_and_upgrader_tests w8_cnvrf_and_mev_hardening_tests w8_polish_hardening_tests w8_supply_and_network_fixes w9_cli_wallet_and_config_tests w11_mev_kem_registry_wiring_tests w13_scheduler_access_tests w13_contract_stm_trace_tests" ;;
     *) return 1 ;;
   esac
 }
@@ -138,8 +140,11 @@ stage_clippy() {
 }
 
 stage_lib() {
-  run_in . "cargo test --workspace --locked --lib" \
-    cargo test --workspace --locked --lib -- --test-threads="$TEST_THREADS"
+  # `stellereum` unit tests share the process-global PQ_COMMITTED_REGISTRY;
+  # `--lib` must run with TEST_THREADS=1 to avoid cross-test key races
+  # (see docs/CI.md).
+  run_in . "cargo test --workspace --locked --lib (TEST_THREADS=1)" \
+    env TEST_THREADS=1 cargo test --workspace --locked --lib -- --test-threads=1
 }
 
 stage_suite() {
@@ -165,10 +170,33 @@ stage_full() {
     ./scripts/test_parallel.sh -p stellereum
 }
 
+stage_sibling_suites() {
+  local pkg rc=0
+  for pkg in stellereum-verifier stellereum-indexer stellereum-ledger-tool stellereum-upgrader infnode infmail; do
+    run_in . "cargo test --locked -p $pkg --tests" \
+      cargo test --locked -p "$pkg" --tests -- --test-threads="$TEST_THREADS" || rc=1
+  done
+  run_in . "cargo test --locked -p stellereum-sdk --features node-parity" \
+    cargo test --locked -p stellereum-sdk --features node-parity -- --test-threads="$TEST_THREADS" || rc=1
+  return "$rc"
+}
+
 stage_sdk() {
   local rc=0
   run_in . "cargo test -p stellereum-sdk" cargo test --locked -p stellereum-sdk || rc=1
+  run_in . "cargo test -p stellereum-sdk --features node-parity" \
+    cargo test --locked -p stellereum-sdk --features node-parity || rc=1
+  run_in stellereum-wasm "cargo test (stellereum-wasm)" \
+    cargo test --locked || rc=1
+  if command -v rustup >/dev/null 2>&1 && rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown; then
+    run_in stellereum-wasm "cargo build (stellereum-wasm wasm32-unknown-unknown)" \
+      cargo build --locked --target wasm32-unknown-unknown --release || rc=1
+  else
+    SKIPPED+=("stellereum-wasm(wasm32-unknown-unknown absent)")
+    echo "-- SKIP stellereum-wasm wasm32 build: wasm32-unknown-unknown target is not installed."
+  fi
   if [ -d "$ROOT/sdk-js/node_modules" ]; then
+    run_in sdk-js "npm run check:rpc-types (sdk-js)" npm run check:rpc-types || rc=1
     run_in sdk-js "npm run typecheck (sdk-js)" npm run typecheck || rc=1
     run_in sdk-js "npm test (sdk-js)" npm test || rc=1
     run_in sdk-js "npm run build (sdk-js)" npm run build || rc=1
@@ -195,6 +223,7 @@ else
   else
     run_stage test-suites stage_all_suites
   fi
+  run_stage sibling-suites stage_sibling_suites
   if [ "$WITH_SDK" -eq 1 ]; then
     run_stage sdk stage_sdk
   fi

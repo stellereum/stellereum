@@ -128,6 +128,9 @@ pub enum MevKemRegistryError {
     /// `announce_rotation` with `now` before the current key's activation
     /// (history must never be rewritten).
     ActivationInPast,
+    /// Future activation in a peer announcement: `activation_height > now_height`
+    /// would leave `get_active_ek(..., now_height)` returning `None`.
+    ActivationInFuture,
     /// Key bytes are not exactly [`MEV_KEM_EK_LEN`] (a removed classical
     /// X25519 key or any other shape is refused here — never silently
     /// encapsulated to).
@@ -136,6 +139,12 @@ pub enum MevKemRegistryError {
     NoPendingRotation,
     /// `apply_rotation` before the announced effective height.
     RotationNotDue,
+    /// Pending rotation or superseded history violates height invariants.
+    InvalidHeightInvariant,
+    /// ML-KEM-768 encapsulation key is already registered or pending for another validator.
+    DuplicateKey,
+    /// Height arithmetic overflowed `u64::MAX`.
+    ArithmeticOverflow,
 }
 
 impl std::fmt::Display for MevKemRegistryError {
@@ -153,12 +162,24 @@ impl std::fmt::Display for MevKemRegistryError {
             MevKemRegistryError::ActivationInPast => {
                 "activation height is in the past: KEM key history is append-only, backdating refused"
             }
+            MevKemRegistryError::ActivationInFuture => {
+                "peer KEM key activation height is in the future relative to current height: refusing"
+            }
             MevKemRegistryError::MalformedKey => {
                 "KEM key bytes must be exactly 1184 bytes (ML-KEM-768 encapsulation key): refusing"
             }
             MevKemRegistryError::NoPendingRotation => "no KEM rotation is pending: nothing to apply",
             MevKemRegistryError::RotationNotDue => {
                 "KEM rotation is not yet effective: apply at or after the announced effective height"
+            }
+            MevKemRegistryError::InvalidHeightInvariant => {
+                "KEM key record violates pending/history height invariants: refusing"
+            }
+            MevKemRegistryError::DuplicateKey => {
+                "ML-KEM-768 encapsulation key is already bound to another validator: refusing"
+            }
+            MevKemRegistryError::ArithmeticOverflow => {
+                "MEV KEM registry height arithmetic overflow"
             }
         };
         write!(f, "{s}")
@@ -221,7 +242,7 @@ pub struct MevKemKeyRecord {
 /// node. Pure state machine: validator-set membership arrives as an explicit
 /// `validator_known` bool, keeping every transition a deterministic function
 /// of its inputs (no wall clock, no env, no global state).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MevKemRegistry {
     keys: BTreeMap<ValidatorId, MevKemKeyRecord>,
 }
@@ -264,12 +285,28 @@ impl MevKemRegistry {
         self.keys.get(validator).map(|r| r.history.as_slice())
     }
 
+    /// Returns `true` if `ek` is currently active or pending on any validator
+    /// other than `exclude_validator`.
+    fn ek_used_by_other(&self, exclude_validator: &ValidatorId, ek: &[u8]) -> bool {
+        self.keys.iter().any(|(id, rec)| {
+            if id == exclude_validator {
+                return false;
+            }
+            if rec.ek.as_slice() == ek {
+                return true;
+            }
+            rec.pending.as_ref().is_some_and(|p| p.ek.as_slice() == ek)
+        })
+    }
+
     /// Register a validator's FIRST KEM key.
     ///
     /// Effective at `activation_height` (may be `now` or the future — never
     /// the past). Fail-closed: unknown validator, existing record
     /// ([`MevKemRegistryError::AlreadyRegistered`] — rotate, do not
-    /// re-register), wrong-size key, or `activation_height < now_height`.
+    /// re-register), duplicate key on another validator
+    /// ([`MevKemRegistryError::DuplicateKey`]), wrong-size key, or
+    /// `activation_height < now_height`.
     pub fn register(
         &mut self,
         validator: ValidatorId,
@@ -285,6 +322,9 @@ impl MevKemRegistry {
             return Err(MevKemRegistryError::AlreadyRegistered);
         }
         validate_ek_bytes(&ek)?;
+        if self.ek_used_by_other(&validator, &ek) {
+            return Err(MevKemRegistryError::DuplicateKey);
+        }
         if activation_height < now_height {
             return Err(MevKemRegistryError::ActivationInPast);
         }
@@ -306,7 +346,8 @@ impl MevKemRegistry {
     ///
     /// Fail-closed: unknown validator (or no tracked key — `register`
     /// first), wrong-size key, backdated announcement (`now_height` before
-    /// the current key's activation), or a rotation already in flight
+    /// the current key's activation), duplicate key bound to another
+    /// validator, height overflow, or a rotation already in flight
     /// ([`MevKemRegistryError::RotationAlreadyPending`]).
     ///
     /// Cancelling: announcing a key IDENTICAL to the current one clears a
@@ -323,23 +364,40 @@ impl MevKemRegistry {
             return Err(MevKemRegistryError::UnknownValidator);
         }
         validate_ek_bytes(&ek)?;
+        let is_cancel = {
+            let rec = self
+                .keys
+                .get(&validator)
+                .ok_or(MevKemRegistryError::UnknownValidator)?;
+            if now_height < rec.activated_at {
+                return Err(MevKemRegistryError::ActivationInPast);
+            }
+            if rec.ek == ek {
+                true
+            } else if rec.pending.is_some() {
+                return Err(MevKemRegistryError::RotationAlreadyPending);
+            } else {
+                false
+            }
+        };
+        if is_cancel {
+            // Cancel-by-reannounce: the operator re-asserts the current key,
+            // dropping a pending rotation that never took effect.
+            if let Some(rec) = self.keys.get_mut(&validator) {
+                rec.pending = None;
+            }
+            return Ok(());
+        }
+        if self.ek_used_by_other(&validator, &ek) {
+            return Err(MevKemRegistryError::DuplicateKey);
+        }
+        let effective_height = now_height
+            .checked_add(MEV_KEM_ROTATION_DELAY_HEIGHTS)
+            .ok_or(MevKemRegistryError::ArithmeticOverflow)?;
         let rec = self
             .keys
             .get_mut(&validator)
             .ok_or(MevKemRegistryError::UnknownValidator)?;
-        if now_height < rec.activated_at {
-            return Err(MevKemRegistryError::ActivationInPast);
-        }
-        if rec.ek == ek {
-            // Cancel-by-reannounce: the operator re-asserts the current key,
-            // dropping a pending rotation that never took effect.
-            rec.pending = None;
-            return Ok(());
-        }
-        if rec.pending.is_some() {
-            return Err(MevKemRegistryError::RotationAlreadyPending);
-        }
-        let effective_height = now_height.saturating_add(MEV_KEM_ROTATION_DELAY_HEIGHTS);
         rec.pending = Some(PendingMevKemRotation {
             ek,
             announced_height: now_height,
@@ -435,6 +493,154 @@ impl MevKemRegistry {
             .map(|e| e.ek.clone())
     }
 
+    /// Deterministically upsert a peer's ML-KEM-768 encapsulation key, or
+    /// confirm an identical re-announcement (idempotent).
+    ///
+    /// Fail-closed:
+    /// * `validator_known == false` -> [`MevKemRegistryError::UnknownValidator`].
+    /// * Invalid / non-1184-byte key -> [`MevKemRegistryError::MalformedKey`].
+    /// * `activation_height > now_height` ->
+    ///   [`MevKemRegistryError::ActivationInFuture`] (a peer cannot insert an
+    ///   inactive future key that would cause `get_active_ek(..., now_height)`
+    ///   to return `None`).
+    /// * Validator already holds a DIFFERENT current key ->
+    ///   [`MevKemRegistryError::AlreadyRegistered`] (never overwrites silently
+    ///   without an explicit rotation).
+    ///
+    /// Returns `Ok(true)` if a new key record was inserted, `Ok(false)` if the
+    /// validator already holds the exact same current key.
+    pub fn upsert_registered_ek(
+        &mut self,
+        validator: ValidatorId,
+        ek: Vec<u8>,
+        activation_height: u64,
+        now_height: u64,
+        validator_known: bool,
+    ) -> Result<bool, MevKemRegistryError> {
+        if !validator_known {
+            return Err(MevKemRegistryError::UnknownValidator);
+        }
+        validate_ek_bytes(&ek)?;
+        if activation_height > now_height {
+            return Err(MevKemRegistryError::ActivationInFuture);
+        }
+        if let Some(existing) = self.keys.get(&validator) {
+            if existing.ek == ek {
+                return Ok(false);
+            }
+            return Err(MevKemRegistryError::AlreadyRegistered);
+        }
+        if self.ek_used_by_other(&validator, &ek) {
+            return Err(MevKemRegistryError::DuplicateKey);
+        }
+        self.keys.insert(
+            validator,
+            MevKemKeyRecord {
+                ek,
+                activated_at: activation_height,
+                pending: None,
+                history: Vec::new(),
+            },
+        );
+        Ok(true)
+    }
+
+    /// Deterministically merge entries from `other` into `self` in `ValidatorId`
+    /// order.
+    ///
+    /// Atomic and fail-closed: validates every key and height invariant in
+    /// `other` (current, pending, and history) and verifies there are no
+    /// conflicting current/pending keys before mutating `self`. Identical
+    /// entries are idempotent; conflicting current keys return
+    /// [`MevKemRegistryError::AlreadyRegistered`] without modifying `self`.
+    /// Returns the number of newly inserted/updated records.
+    pub fn merge_from(&mut self, other: &MevKemRegistry) -> Result<usize, MevKemRegistryError> {
+        for (id, rec) in &other.keys {
+            validate_record_invariants(rec)?;
+            if let Some(existing) = self.keys.get(id) {
+                if existing.ek != rec.ek {
+                    return Err(MevKemRegistryError::AlreadyRegistered);
+                }
+                if existing.pending.is_some()
+                    && rec.pending.is_some()
+                    && existing.pending != rec.pending
+                {
+                    return Err(MevKemRegistryError::RotationAlreadyPending);
+                }
+            }
+        }
+        let mut merged = 0usize;
+        for (id, rec) in &other.keys {
+            match self.keys.get_mut(id) {
+                Some(existing) => {
+                    if existing.pending.is_none() && rec.pending.is_some() {
+                        existing.pending = rec.pending.clone();
+                        merged += 1;
+                    }
+                }
+                None => {
+                    let mut cloned = rec.clone();
+                    truncate_history(&mut cloned.history);
+                    self.keys.insert(*id, cloned);
+                    merged += 1;
+                }
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Deterministically merge all valid, non-conflicting entries from `other`
+    /// into `self` in `ValidatorId` (`BTreeMap`) order.
+    ///
+    /// Unlike [`Self::merge_from`] (which aborts atomically on the first
+    /// conflict), this skips individual invalid or conflicting validator
+    /// entries with a warning rather than discarding all other peers' valid
+    /// keys. Returns the number of newly inserted or updated records.
+    pub fn merge_non_conflicting(&mut self, other: &MevKemRegistry) -> usize {
+        let mut merged = 0usize;
+        for (id, rec) in &other.keys {
+            if let Err(e) = validate_record_invariants(rec) {
+                tracing::warn!(
+                    "[mev-kem] skipping invalid peer KEM record for {}: {e}",
+                    hex::encode(&id[..6])
+                );
+                continue;
+            }
+            match self.keys.get_mut(id) {
+                Some(existing) => {
+                    if existing.ek != rec.ek {
+                        tracing::warn!(
+                            "[mev-kem] skipping conflicting peer KEM key for {} (existing key preserved)",
+                            hex::encode(&id[..6])
+                        );
+                        continue;
+                    }
+                    if existing.pending.is_some()
+                        && rec.pending.is_some()
+                        && existing.pending != rec.pending
+                    {
+                        tracing::warn!(
+                            "[mev-kem] skipping conflicting pending KEM rotation for {}",
+                            hex::encode(&id[..6])
+                        );
+                        continue;
+                    }
+                    if existing.pending.is_none() && rec.pending.is_some() {
+                        existing.pending = rec.pending.clone();
+                        merged += 1;
+                    }
+                }
+                None => {
+                    let mut cloned = rec.clone();
+                    truncate_history(&mut cloned.history);
+                    self.keys.insert(*id, cloned);
+                    merged += 1;
+                }
+            }
+        }
+        merged
+    }
+
     /// Move a validator's whole KEM record to a new consensus id (call
     /// alongside a consensus-key rotation: rotation state must travel with
     /// the record — the same precedent as
@@ -476,12 +682,37 @@ fn truncate_history(history: &mut Vec<SupersededMevKemKey>) {
     }
 }
 
+/// Validate key bytes and height invariants on a [`MevKemKeyRecord`] before
+/// merging it from another registry.
+fn validate_record_invariants(rec: &MevKemKeyRecord) -> Result<(), MevKemRegistryError> {
+    validate_ek_bytes(&rec.ek)?;
+    if let Some(p) = &rec.pending {
+        validate_ek_bytes(&p.ek)?;
+        let Some(min_effective) = p
+            .announced_height
+            .checked_add(MEV_KEM_ROTATION_DELAY_HEIGHTS)
+        else {
+            return Err(MevKemRegistryError::InvalidHeightInvariant);
+        };
+        if p.announced_height < rec.activated_at || p.effective_height < min_effective {
+            return Err(MevKemRegistryError::InvalidHeightInvariant);
+        }
+    }
+    for h in &rec.history {
+        validate_ek_bytes(&h.ek)?;
+        if h.activated_at >= h.superseded_at {
+            return Err(MevKemRegistryError::InvalidHeightInvariant);
+        }
+    }
+    Ok(())
+}
+
 /// Fail-closed KEM admission: the bytes must be EXACTLY the ML-KEM-768
 /// encapsulation size ([`MEV_KEM_EK_LEN`]) and a valid FIPS-203 ML-KEM-768
 /// encapsulation key (`ml_kem::EncapsulationKey768::new`) — a removed classical
 /// X25519 key or non-canonical/malformed encoding is refused here, never
 /// silently accepted or encapsulated to.
-fn validate_ek_bytes(ek: &[u8]) -> Result<(), MevKemRegistryError> {
+pub fn validate_ek_bytes(ek: &[u8]) -> Result<(), MevKemRegistryError> {
     if ek.len() != MEV_KEM_EK_LEN {
         return Err(MevKemRegistryError::MalformedKey);
     }
@@ -489,4 +720,141 @@ fn validate_ek_bytes(ek: &[u8]) -> Result<(), MevKemRegistryError> {
         .map_err(|_| MevKemRegistryError::MalformedKey)?;
     ml_kem::EncapsulationKey768::new(&key).map_err(|_| MevKemRegistryError::MalformedKey)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_ek(tag: u8) -> Vec<u8> {
+        crate::mev_epoch::pq_kem_ek_from_seed(&[tag; 64])
+    }
+
+    #[test]
+    fn merge_validates_pending_and_history_height_invariants() {
+        let id0 = [0x11; 32];
+        let id1 = [0x22; 32];
+        let ek0 = test_ek(0x01);
+        let ek1 = test_ek(0x02);
+
+        // 1. Pending rotation with insufficient delay is refused by merge_from
+        // and skipped by merge_non_conflicting.
+        let mut bad_delay = MevKemRegistry::new();
+        bad_delay.keys.insert(
+            id0,
+            MevKemKeyRecord {
+                ek: ek0.clone(),
+                activated_at: 10,
+                pending: Some(PendingMevKemRotation {
+                    ek: ek1.clone(),
+                    announced_height: 10,
+                    effective_height: 10 + MEV_KEM_ROTATION_DELAY_HEIGHTS - 1,
+                }),
+                history: Vec::new(),
+            },
+        );
+        let mut reg = MevKemRegistry::new();
+        assert_eq!(
+            reg.merge_from(&bad_delay),
+            Err(MevKemRegistryError::InvalidHeightInvariant)
+        );
+        assert_eq!(reg.merge_non_conflicting(&bad_delay), 0);
+        assert!(reg.is_empty());
+
+        // 2. Pending rotation with announced_height < activated_at is refused.
+        let mut bad_announced = MevKemRegistry::new();
+        bad_announced.keys.insert(
+            id0,
+            MevKemKeyRecord {
+                ek: ek0.clone(),
+                activated_at: 20,
+                pending: Some(PendingMevKemRotation {
+                    ek: ek1.clone(),
+                    announced_height: 19,
+                    effective_height: 19 + MEV_KEM_ROTATION_DELAY_HEIGHTS,
+                }),
+                history: Vec::new(),
+            },
+        );
+        assert_eq!(
+            reg.merge_from(&bad_announced),
+            Err(MevKemRegistryError::InvalidHeightInvariant)
+        );
+
+        // 3. History entry with activated_at >= superseded_at is refused,
+        // while valid sibling entry (id1) is still absorbed by merge_non_conflicting.
+        let mut bad_history = MevKemRegistry::new();
+        bad_history.keys.insert(
+            id0,
+            MevKemKeyRecord {
+                ek: ek0.clone(),
+                activated_at: 20,
+                pending: None,
+                history: vec![SupersededMevKemKey {
+                    ek: ek1.clone(),
+                    activated_at: 15,
+                    superseded_at: 15,
+                }],
+            },
+        );
+        bad_history.keys.insert(
+            id1,
+            MevKemKeyRecord {
+                ek: ek1.clone(),
+                activated_at: 0,
+                pending: None,
+                history: Vec::new(),
+            },
+        );
+        assert_eq!(
+            reg.merge_from(&bad_history),
+            Err(MevKemRegistryError::InvalidHeightInvariant)
+        );
+        assert!(reg.is_empty());
+        assert_eq!(reg.merge_non_conflicting(&bad_history), 1);
+        assert!(reg.record_of(&id0).is_none());
+        assert_eq!(reg.get_active_ek(&id1, 0), Some(ek1));
+    }
+
+    #[test]
+    fn announce_rotation_near_u64_max_returns_err() {
+        let id = [0x33; 32];
+        let ek0 = test_ek(0x11);
+        let ek1 = test_ek(0x12);
+        let mut reg = MevKemRegistry::new();
+        let start = u64::MAX - 10;
+        reg.register(id, ek0, start, start, true)
+            .expect("register near u64::MAX");
+        let err = reg
+            .announce_rotation(id, ek1, u64::MAX - 5, true)
+            .expect_err("rotation near u64::MAX must fail on overflow");
+        assert_eq!(err, MevKemRegistryError::ArithmeticOverflow);
+        assert!(reg.pending_of(&id).is_none());
+    }
+
+    #[test]
+    fn duplicate_ek_across_validators_is_refused() {
+        let id0 = [0x41; 32];
+        let id1 = [0x42; 32];
+        let ek0 = test_ek(0x21);
+        let ek1 = test_ek(0x22);
+        let mut reg = MevKemRegistry::new();
+        reg.register(id0, ek0.clone(), 0, 0, true)
+            .expect("initial registration succeeds");
+
+        assert_eq!(
+            reg.register(id1, ek0.clone(), 0, 0, true),
+            Err(MevKemRegistryError::DuplicateKey)
+        );
+        assert_eq!(
+            reg.upsert_registered_ek(id1, ek0.clone(), 0, 0, true),
+            Err(MevKemRegistryError::DuplicateKey)
+        );
+        reg.register(id1, ek1, 0, 0, true)
+            .expect("distinct key succeeds");
+        assert_eq!(
+            reg.announce_rotation(id1, ek0, 10, true),
+            Err(MevKemRegistryError::DuplicateKey)
+        );
+    }
 }

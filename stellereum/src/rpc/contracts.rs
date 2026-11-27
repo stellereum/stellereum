@@ -305,9 +305,18 @@ pub(super) async fn preview_contract_call(
             Some(_) => {}
         }
     }
-    let mut work = st.engine.contracts_read().await.clone();
-    // Read-only mirror of `sync_contract_balance` plus the value leg: the
-    // contract observes the live account balance plus the transferred value.
+    let mut work = {
+        let reg = st.engine.contracts_read().await;
+        let mut isolated = crate::contract::ContractRegistry::new();
+        isolated.next_nonce = reg.next_nonce;
+        if let Some(c) = reg.contracts.get(contract_addr) {
+            isolated.contracts.insert(*contract_addr, c.clone());
+        }
+        isolated
+    };
+    // Read-only mirror of `ensure_working` balance sync: the contract observes
+    // the live account balance without pre-crediting `value`, matching on-chain
+    // `svm.rs` where `commit_native_at` moves `tx.amount` after the VM runs.
     // Applied to the CLONE only; the live registry and accounts are untouched.
     if work.contracts.contains_key(contract_addr) {
         let acct_bal = st
@@ -317,7 +326,7 @@ pub(super) async fn preview_contract_call(
             .map(|a| a.balance)
             .unwrap_or(0);
         if let Some(c) = work.contracts.get_mut(contract_addr) {
-            c.balance = c.balance.max(acct_bal).saturating_add(value);
+            c.balance = c.balance.max(acct_bal);
         }
     }
     let ctx = preview_call_context(*sender, block_time);
@@ -797,23 +806,50 @@ async fn dispatch_contracts_inner(
                 if !tx.verify_signature_at_height(current_height) {
                     return err(id, -32000, "invalid transaction signature");
                 }
-                let deploy_code = tx.payload.iter().find_map(|op| {
-                    if let crate::svm::OpCode::SysCallDeployContract { code } = op {
-                        Some(code.clone())
-                    } else {
-                        None
+                let deploy_op = tx.payload.iter().find_map(|op| match op {
+                    crate::svm::OpCode::SysCallDeployContract { code } => {
+                        Some((code.clone(), None))
                     }
+                    crate::svm::OpCode::SysCallDeployContractWithAbi { code, abi_json } => {
+                        Some((code.clone(), Some(abi_json.clone())))
+                    }
+                    _ => None,
                 });
-                let code = match deploy_code {
-                    Some(c) => c,
+                let (code, abi_json_opt) = match deploy_op {
+                    Some(v) => v,
                     None => {
                         return err(
                             id,
                             -32602,
-                            "transaction does not contain SysCallDeployContract payload",
+                            "transaction does not contain SysCallDeployContract or SysCallDeployContractWithAbi payload",
                         )
                     }
                 };
+                if let Some(ref abi_bytes) = abi_json_opt {
+                    if abi_bytes.len() > crate::svm::MAX_CONTRACT_ABI_BYTES {
+                        return err(
+                            id,
+                            -32602,
+                            format!(
+                                "invalid abi parameter: exceeds maximum {} bytes",
+                                crate::svm::MAX_CONTRACT_ABI_BYTES
+                            ),
+                        );
+                    }
+                    let abi_str = match std::str::from_utf8(abi_bytes) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return err(
+                                id,
+                                -32602,
+                                format!("invalid abi parameter: not valid UTF-8: {e}"),
+                            )
+                        }
+                    };
+                    if let Err(e) = ContractAbi::from_json(abi_str) {
+                        return err(id, -32602, format!("invalid abi parameter: {e}"));
+                    }
+                }
                 // H-04: validate read-only. The contract is NOT deployed here:
                 // this arm only previews the signed tx (state changes
                 // exclusively when a block applies a tx submitted via
@@ -862,6 +898,7 @@ async fn dispatch_contracts_inner(
                     "predicted": true,
                     "deployed": false,
                     "preview_only": true,
+                    "has_abi": abi_json_opt.is_some(),
                     "address_derivation": if hardened {
                         "contract_address(tx.from, tx.nonce)"
                     } else {
@@ -1566,14 +1603,22 @@ async fn dispatch_contracts_inner(
                 Some(c) => c.creator,
                 None => return err(id, -32602, "contract not found"),
             };
-            if let Err(e) = crate::contract_source::verify_register_signature_with_pubkey(
-                &creator,
-                &contract_addr,
-                &shash,
-                sig_str,
-                pubkey_str,
-            ) {
-                return err(id, -32602, e);
+            let sig_owned = sig_str.to_string();
+            let pubkey_owned = pubkey_str.map(str::to_string);
+            match tokio::task::spawn_blocking(move || {
+                crate::contract_source::verify_register_signature_with_pubkey(
+                    &creator,
+                    &contract_addr,
+                    &shash,
+                    &sig_owned,
+                    pubkey_owned.as_deref(),
+                )
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return err(id, -32602, e),
+                Err(_) => return err(id, -32000, "signature verification task failed"),
             }
 
             // The rebuild half: without it the badge would be a signature
@@ -1605,15 +1650,22 @@ async fn dispatch_contracts_inner(
                 .or_else(|| p.get("flags"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let verification = match crate::contract_source::verify_registration(
-                &onchain,
-                &source_bytes,
-                &shash,
-                compiler,
-                flags,
-            ) {
-                Ok(v) => v,
-                Err(e) => return err(id, -32000, e),
+            let compiler_owned = compiler.to_string();
+            let flags_owned = flags.to_string();
+            let verification = match tokio::task::spawn_blocking(move || {
+                crate::contract_source::verify_registration(
+                    &onchain,
+                    &source_bytes,
+                    &shash,
+                    &compiler_owned,
+                    &flags_owned,
+                )
+            })
+            .await
+            {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => return err(id, -32000, e),
+                Err(_) => return err(id, -32000, "source verification task failed"),
             };
             if !verification.verified {
                 return err(

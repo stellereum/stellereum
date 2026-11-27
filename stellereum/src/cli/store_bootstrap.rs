@@ -7,9 +7,11 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const SNAPSHOT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SNAPSHOT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 const SHA256_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SHA256_MANIFEST_BYTES: usize = 4096;
+const MAX_SNAPSHOT_DOWNLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
 
 pub(crate) struct StoreBootstrapOptions {
     pub data_dir: PathBuf,
@@ -236,6 +238,15 @@ pub(crate) fn run_store_bootstrap(opts: StoreBootstrapOptions) -> Result<()> {
         return Ok(());
     }
 
+    // Acquire exclusive node data-dir lock BEFORE downloading, extracting, or
+    // modifying/wiping store/ so store bootstrap can never race with a running node.
+    let data_dir_preexisted = opts.data_dir.exists();
+    let mut data_dir_guard = TempDirGuard::new(opts.data_dir.clone());
+    if data_dir_preexisted {
+        data_dir_guard.disarm();
+    }
+    let _node_dir_lock = crate::node::policy::acquire_node_dir_lock(&opts.data_dir)?;
+
     // Check database locks BEFORE downloading, extracting, or mutating anything.
     ensure_data_dir_stores_unlocked(&opts.data_dir)?;
 
@@ -282,16 +293,6 @@ pub(crate) fn run_store_bootstrap(opts: StoreBootstrapOptions) -> Result<()> {
         bail!("snapshot archive {} is empty", archive_path.display());
     }
 
-    // Create data_dir if missing (track cleanup on failure prior to commit).
-    let data_dir_preexisted = opts.data_dir.exists();
-    if !data_dir_preexisted {
-        fs::create_dir_all(&opts.data_dir)
-            .with_context(|| format!("create data dir {}", opts.data_dir.display()))?;
-    }
-    let mut data_dir_guard = TempDirGuard::new(opts.data_dir.clone());
-    if data_dir_preexisted {
-        data_dir_guard.disarm();
-    }
     set_dir_mode_0700(&opts.data_dir)?;
 
     // Stage extraction inside data_dir so final move into place is an atomic rename.
@@ -484,16 +485,62 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+fn validate_snapshot_url(url: &str) -> Result<bool> {
+    let trimmed = url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return Ok(true);
+    }
+    if lower.starts_with("http://") {
+        if stellereum::remote_signer::is_loopback_base_url(trimmed) {
+            return Ok(false);
+        }
+        bail!(
+            "refusing non-HTTPS URL '{url}': plain http:// is only allowed for loopback hosts (127.0.0.1, localhost, [::1])"
+        );
+    }
+    bail!("invalid URL '{url}': expected https:// (or http:// for loopback)")
+}
+
+fn build_bootstrap_agent(timeout: Duration, https_only: bool) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(SNAPSHOT_CONNECT_TIMEOUT)
+        .timeout_read(timeout)
+        .timeout(timeout)
+        .redirects(0)
+        .https_only(https_only)
+        .build()
+}
+
 fn download_snapshot(url: &str, dest: &Path) -> Result<()> {
-    let resp = ureq::get(url)
-        .timeout(SNAPSHOT_DOWNLOAD_TIMEOUT)
+    let trimmed = url.trim();
+    let https_only = validate_snapshot_url(trimmed)?;
+    let agent = build_bootstrap_agent(SNAPSHOT_DOWNLOAD_TIMEOUT, https_only);
+    let resp = agent
+        .get(trimmed)
         .call()
-        .map_err(|e| anyhow!("failed to download snapshot from {url}: {e}"))?;
-    let mut reader = resp.into_reader();
+        .map_err(|e| anyhow!("failed to download snapshot from {trimmed}: {e}"))?;
+    let status = resp.status();
+    if (300..400).contains(&status) {
+        bail!("refusing HTTP redirect (status {status}) while downloading snapshot from {trimmed}");
+    }
+    if !(200..300).contains(&status) {
+        bail!("failed to download snapshot from {trimmed}: unexpected HTTP status {status}");
+    }
+    let mut reader = resp
+        .into_reader()
+        .take(MAX_SNAPSHOT_DOWNLOAD_BYTES.saturating_add(1));
     let mut out = fs::File::create(dest)
         .with_context(|| format!("create staging archive {}", dest.display()))?;
-    std::io::copy(&mut reader, &mut out)
+    let copied = std::io::copy(&mut reader, &mut out)
         .with_context(|| format!("write downloaded snapshot to {}", dest.display()))?;
+    if copied > MAX_SNAPSHOT_DOWNLOAD_BYTES {
+        drop(out);
+        let _ = fs::remove_file(dest);
+        bail!(
+            "downloaded snapshot from {trimmed} exceeded maximum allowed size of {MAX_SNAPSHOT_DOWNLOAD_BYTES} bytes"
+        );
+    }
     out.flush()?;
     Ok(())
 }
@@ -505,20 +552,34 @@ enum Sha256FetchOutcome {
 }
 
 fn fetch_sha256_manifest(url: &str) -> Result<Sha256FetchOutcome> {
-    match ureq::get(url).timeout(SHA256_FETCH_TIMEOUT).call() {
+    let trimmed = url.trim();
+    let https_only = validate_snapshot_url(trimmed)?;
+    let agent = build_bootstrap_agent(SHA256_FETCH_TIMEOUT, https_only);
+    match agent.get(trimmed).call() {
         Ok(resp) => {
+            let status = resp.status();
+            if (300..400).contains(&status) {
+                return Ok(Sha256FetchOutcome::Unavailable(format!(
+                    "HTTP redirect refused (status {status})"
+                )));
+            }
+            if !(200..300).contains(&status) {
+                return Ok(Sha256FetchOutcome::Unavailable(format!(
+                    "unexpected HTTP status {status}"
+                )));
+            }
             let mut reader = resp
                 .into_reader()
                 .take((MAX_SHA256_MANIFEST_BYTES + 1) as u64);
             let mut buf = Vec::new();
             reader.read_to_end(&mut buf)?;
             if buf.len() > MAX_SHA256_MANIFEST_BYTES {
-                bail!("SHA-256 manifest at {url} exceeded {MAX_SHA256_MANIFEST_BYTES} bytes");
+                bail!("SHA-256 manifest at {trimmed} exceeded {MAX_SHA256_MANIFEST_BYTES} bytes");
             }
             let text = String::from_utf8(buf)
-                .map_err(|e| anyhow!("SHA-256 manifest at {url} is not valid UTF-8: {e}"))?;
+                .map_err(|e| anyhow!("SHA-256 manifest at {trimmed} is not valid UTF-8: {e}"))?;
             let digest = parse_sha256_manifest_text(&text)
-                .with_context(|| format!("invalid SHA-256 manifest format at {url}"))?;
+                .with_context(|| format!("invalid SHA-256 manifest format at {trimmed}"))?;
             Ok(Sha256FetchOutcome::Digest(digest))
         }
         Err(ureq::Error::Status(404, _)) => Ok(Sha256FetchOutcome::NotFound),
@@ -664,14 +725,107 @@ fn validate_archive_entry_path(entry: &str) -> Result<()> {
     Ok(())
 }
 
+fn looks_like_iso_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[0..4].iter().all(|c| c.is_ascii_digit())
+        && b[4] == b'-'
+        && b[5..7].iter().all(|c| c.is_ascii_digit())
+        && b[7] == b'-'
+        && b[8..10].iter().all(|c| c.is_ascii_digit())
+}
+
+fn split_whitespace_offsets(s: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::with_capacity(9);
+    let mut in_word = false;
+    let mut start = 0usize;
+    for (idx, ch) in s.char_indices() {
+        if ch.is_ascii_whitespace() {
+            if in_word {
+                out.push((start, idx));
+                in_word = false;
+                if out.len() >= 9 {
+                    return out;
+                }
+            }
+        } else if !in_word {
+            start = idx;
+            in_word = true;
+        }
+    }
+    if in_word {
+        out.push((start, s.len()));
+    }
+    out
+}
+
+fn parse_tar_tvf_line(line: &str) -> Result<&str> {
+    let Some(type_byte) = line.bytes().next() else {
+        bail!("invalid empty tar listing line");
+    };
+    match type_byte {
+        b'-' | b'd' => {}
+        b'l' => bail!("refusing snapshot archive: symlink entry '{line}'"),
+        b'h' => bail!("refusing snapshot archive: hardlink entry '{line}'"),
+        b'b' | b'c' | b'p' => {
+            bail!(
+                "refusing snapshot archive: device/FIFO node entry (type '{}') '{line}'",
+                type_byte as char
+            )
+        }
+        other => {
+            bail!(
+                "refusing snapshot archive: unsupported entry type '{}' in '{line}'",
+                other as char
+            )
+        }
+    }
+
+    let tokens = split_whitespace_offsets(line);
+    if tokens.len() < 6 {
+        bail!("malformed tar listing line '{line}'");
+    }
+    let t1 = &line[tokens[1].0..tokens[1].1];
+    let t3 = &line[tokens[3].0..tokens[3].1];
+    let path_start = if t1.contains('/') && looks_like_iso_date(t3) {
+        // GNU tar `-tvf`: perms owner/group size YYYY-MM-DD HH:MM[:SS] <path>
+        tokens[4].1
+    } else if tokens.len() >= 9 {
+        // BSD tar `-tvf`: perms links owner group size month day time_or_year <path>
+        tokens[7].1
+    } else {
+        tokens[4].1
+    };
+
+    let rest = line.get(path_start..).unwrap_or("");
+    let path = rest.strip_prefix(' ').unwrap_or_else(|| rest.trim_start());
+    if path.is_empty() {
+        bail!("malformed tar listing line missing path: '{line}'");
+    }
+    Ok(path)
+}
+
+fn validate_tar_tvf_listing(stdout: &str) -> Result<Vec<String>> {
+    let mut entries = Vec::new();
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let entry = parse_tar_tvf_line(line)?;
+        validate_archive_entry_path(entry)?;
+        entries.push(entry.to_string());
+    }
+    Ok(entries)
+}
+
 fn inspect_tar_zst_entries(archive: &Path) -> Result<Vec<String>> {
     let output = Command::new("tar")
         .arg("-I")
         .arg("zstd")
-        .arg("-tf")
+        .arg("-tvf")
         .arg(archive)
         .output()
-        .map_err(|e| anyhow!("failed to execute 'tar -I zstd -tf': {e}"))?;
+        .map_err(|e| anyhow!("failed to execute 'tar -I zstd -tvf': {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
@@ -682,18 +836,16 @@ fn inspect_tar_zst_entries(archive: &Path) -> Result<Vec<String>> {
     }
     let stdout = String::from_utf8(output.stdout)
         .map_err(|e| anyhow!("archive listing contains non-UTF-8 paths: {e}"))?;
-    let mut entries = Vec::new();
-    for line in stdout.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        validate_archive_entry_path(line)?;
-        entries.push(line.to_string());
-    }
-    Ok(entries)
+    validate_tar_tvf_listing(&stdout)
 }
 
 fn extract_tar_zst(archive: &Path, dest: &Path) -> Result<()> {
+    // Re-validate full `-tvf` listing before `tar -xf` ever writes to disk so
+    // symlinks, hardlinks, device/FIFO nodes, and path traversals are refused.
+    let entries = inspect_tar_zst_entries(archive)?;
+    if entries.is_empty() {
+        bail!("snapshot archive {} is empty", archive.display());
+    }
     let output = Command::new("tar")
         .arg("-I")
         .arg("zstd")
@@ -1100,6 +1252,164 @@ mod tests {
             b"victim-secret"
         );
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn tvf_listing_rejects_symlinks_hardlinks_devices_fifos_and_traversal() {
+        let valid = "\
+drwxr-xr-x root/root         0 2026-11-27 12:00 store/
+-rw-r--r-- root/root      1024 2026-11-27 12:00 store/db
+-rw-r--r-- root/root       512 2026-11-27 12:00 store/with space.dat
+-rw-r--r--  1 root   wheel     128 Nov 27 12:00 store/bsd_entry
+";
+        let entries = validate_tar_tvf_listing(valid).unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                "store/",
+                "store/db",
+                "store/with space.dat",
+                "store/bsd_entry",
+            ]
+        );
+
+        for (label, line) in [
+            (
+                "symlink",
+                "lrwxrwxrwx root/root 0 2026-11-27 12:00 store/link -> /etc/passwd",
+            ),
+            (
+                "hardlink",
+                "hrw-r--r-- root/root 0 2026-11-27 12:00 store/hard link to store/db",
+            ),
+            (
+                "block device",
+                "brw-rw---- root/disk 8, 0 2026-11-27 12:00 store/sda",
+            ),
+            (
+                "char device",
+                "crw-rw-rw- root/tty 1, 3 2026-11-27 12:00 store/null",
+            ),
+            ("fifo", "prw-r--r-- root/root 0 2026-11-27 12:00 store/pipe"),
+            (
+                "parent traversal",
+                "-rw-r--r-- root/root 10 2026-11-27 12:00 store/../../escape",
+            ),
+            (
+                "leading slash",
+                "-rw-r--r-- root/root 10 2026-11-27 12:00 /etc/passwd",
+            ),
+        ] {
+            assert!(
+                validate_tar_tvf_listing(line).is_err(),
+                "{label} tar listing must be rejected"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_tar_zst_rejects_symlink_archive_before_writing_to_disk() {
+        let base = std::env::temp_dir().join(format!(
+            "stell-bootstrap-symlink-{}-{}",
+            std::process::id(),
+            unix_nanos()
+        ));
+        let src = base.join("src");
+        let dest = base.join("dest");
+        fs::create_dir_all(src.join("store")).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(src.join("store").join("db"), b"ok").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", src.join("store").join("evil_link")).unwrap();
+
+        let archive = base.join("symlink.tar.zst");
+        let status = Command::new("tar")
+            .args([
+                "-I",
+                "zstd",
+                "-cf",
+                archive.to_str().unwrap(),
+                "-C",
+                src.to_str().unwrap(),
+                "store",
+            ])
+            .status()
+            .expect("create tar.zst with symlink");
+        assert!(status.success(), "tar -I zstd -cf must succeed");
+
+        let err = extract_tar_zst(&archive, &dest)
+            .expect_err("extract_tar_zst must reject symlink archive before extracting");
+        assert!(
+            err.to_string().contains("symlink"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            fs::read_dir(&dest).unwrap().next().is_none(),
+            "dest must remain empty when pre-extraction -tvf rejects archive"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn download_snapshot_refuses_non_loopback_http_and_redirects() {
+        let base = std::env::temp_dir().join(format!(
+            "stell-bootstrap-http-{}-{}",
+            std::process::id(),
+            unix_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        let dest = base.join("snapshot.tar.zst");
+
+        // Plain HTTP to non-loopback host is refused.
+        let err_remote = download_snapshot("http://example.com/snapshot.tar.zst", &dest)
+            .expect_err("non-loopback http:// must be refused");
+        assert!(
+            err_remote.to_string().contains("non-HTTPS"),
+            "unexpected error: {err_remote}"
+        );
+
+        // Userinfo `@` loopback bypass is refused.
+        let err_bypass = download_snapshot(
+            "http://127.0.0.1:x@attacker.example:8443/snap.tar.zst",
+            &dest,
+        )
+        .expect_err("@ userinfo loopback bypass must be refused");
+        assert!(
+            err_bypass.to_string().contains("non-HTTPS"),
+            "unexpected error: {err_bypass}"
+        );
+
+        // HTTPS URL passes scheme policy check.
+        assert!(validate_snapshot_url("https://snapshots.stellereum.org/latest.tar.zst").unwrap());
+
+        // Loopback HTTP redirect (302) is refused without following.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req_buf = [0u8; 1024];
+                let _ = stream.read(&mut req_buf);
+                let resp = "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let redirect_url = format!("http://{addr}/snapshot.tar.zst");
+        let err_redirect =
+            download_snapshot(&redirect_url, &dest).expect_err("302 redirect must be refused");
+        assert!(
+            err_redirect.to_string().contains("redirect"),
+            "unexpected redirect error: {err_redirect}"
+        );
+        assert!(
+            !dest.exists(),
+            "refused redirect must not create output file"
+        );
+
+        handle.join().expect("server thread");
         let _ = fs::remove_dir_all(&base);
     }
 }

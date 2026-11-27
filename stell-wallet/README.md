@@ -86,34 +86,22 @@ always verify the full string.
 ### 4. Send STELL
 
 ```bash
-stell pay <RECIPIENT_HEX32> 15.5
+stell pay <RECIPIENT_STL57_OR_HEX32> 15.5
 # Cross-shard: --source-shard/--target-shard override --shard (default: both = --shard, old behavior)
-stell pay <RECIPIENT_HEX32> 15.5 --source-shard 1 --target-shard 2
+stell pay <RECIPIENT_STL57_OR_HEX32> 15.5 --source-shard 1 --target-shard 2
 ```
 
-Signs a native transfer (fee = `GAS_BASIC_TRANSFER` = 280_000 nano-STELL) and
-either applies it to the local cache (simulated) or submits it to the node
-and polls the receipt. Finality is reported honestly, never `Confirmed`
-before finality.
+Signs a chain-bound Falcon-512 native transfer and either applies it to the
+local cache (simulated) or submits it to the node and polls the receipt.
+Finality is reported honestly, never `Confirmed` before finality.
 
-### 5. Confidential transfers
+### 5. Confidential & Stealth transfers (removed in PQ migration)
 
-```bash
-# Local commitment demo (NOT submitted anywhere):
-stell stealth-pay <STEALTH_HEX32> 25.0
-# Real shielded tx (SysCallConfidentialTransfer): conservation-checked,
-# signed, submitted; prints tx hash + auditor viewing info:
-stell confidential-pay <SHIELDED_ADDR_HEX32> 25.0 [--fee 1500]
-stell --rpc-url http://127.0.0.1:8545 confidential-pay <ADDR> 25.0
-```
-
-Amounts are hidden in Pedersen commitments; conservation (`Σin − Σout = fee·G`)
-is verified before signing. Forged transfers are rejected before signing.
-The chain enforces conservation on inclusion; range proofs are not attached
-yet, so these are *confidential (hidden-amount)* transfers, not full ZK
-with inflation-proof range checks. For audits, `confidential-pay` prints your
-viewing public key and the output blinding factor — share those with YOUR
-auditor only.
+The legacy Ristretto confidential and stealth commands (`confidential-pay`,
+`confidential-shield`, `confidential-unshield`, `stealth-pay`, `stealth-scan`,
+and `stealth-spend`) were **removed in the post-quantum migration** and fail
+closed if invoked. `stell shield-balance` remains available to inspect
+existing encrypted local shielded-note stores (`~/.stellereum/shielded_notes.json`).
 
 ### 6. STS tokens
 

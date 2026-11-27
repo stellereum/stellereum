@@ -115,6 +115,34 @@ pub(crate) async fn try_snapshot_sync(
     try_snapshot_sync_with_persistence(adapter, rt, shard, peer_height, None).await
 }
 
+async fn wait_snapshot_persistence_drain(
+    ap: &stellereum::storage::AsyncPersistence,
+    boundary: u64,
+) -> Result<(), &'static str> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let drained = ap.pending() == 0
+            && ap.storage().get_state(boundary).ok().flatten().is_some()
+            && ap.storage().domain_at(boundary).ok().flatten().is_some()
+            && ap
+                .storage()
+                .finalized()
+                .ok()
+                .flatten()
+                .is_some_and(|(h, _)| h >= boundary);
+        if drained {
+            let _ = ap.storage().flush();
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(
+                "snapshot persistence drain timed out; refusing to advance safety ahead of disk",
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+}
+
 pub(crate) async fn try_snapshot_sync_with_persistence(
     adapter: &Arc<P2pNetworkAdapter>,
     rt: &mut ValidatorRuntime,
@@ -237,33 +265,14 @@ pub(crate) async fn try_snapshot_sync_with_persistence(
             continue;
         }
 
-        // Prefer content-addressed SnapV4 manifest (small pre-fetch metadata);
-        // fall back to legacy monolithic state snapshot if no SnapV4 Base manifest is served.
-        let snapv4_manifest = adapter
-            .fetch_snapv4_manifest(shard, boundary, &next_hdr.state_root, None)
-            .await
-            .filter(|m| matches!(m.kind, stellereum::snapshot_v4::SnapshotKind::Base));
-        let legacy_snapshot = if snapv4_manifest.is_none() {
-            let Some(snapshot) = adapter.fetch_state_snapshot(shard, boundary).await else {
-                miss_snapshot += 1;
-                consecutive_misses = consecutive_misses.saturating_add(1);
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
-                ))
-                .await;
-                boundary = boundary.saturating_sub(probe_step);
-                continue;
-            };
-            Some(snapshot)
-        } else {
-            None
-        };
-        consecutive_misses = 0;
-
         // F1: the peer header is only trustworthy if it is part of OUR chain.
         // A1: linkage PLUS a precommit QC per height (verified against OUR
         // committed set, with the scheduled proposer). Hash linkage alone
         // accepts fully-forged chains; only quorum agreement proves finality.
+        //
+        // Verify the header anchor & QC BEFORE fetching any large snapshot blob
+        // (up to 512 MiB) so an unanchored or forged boundary is refused before
+        // paying the download cost.
         //
         // Which proof depends on the anchor:
         // * chain-anchored (we hold a finalized head): prove hash linkage from
@@ -407,6 +416,13 @@ pub(crate) async fn try_snapshot_sync_with_persistence(
             boundary = boundary.saturating_sub(probe_step);
             continue;
         };
+
+        // Prefer content-addressed SnapV4 manifest (small pre-fetch metadata);
+        // fall back to legacy monolithic state snapshot if no SnapV4 Base manifest is served.
+        let snapv4_manifest = adapter
+            .fetch_snapv4_manifest(shard, boundary, &next_hdr.state_root, None)
+            .await
+            .filter(|m| matches!(m.kind, stellereum::snapshot_v4::SnapshotKind::Base));
         let mut installed_via_snapv4 = false;
         if let Some(manifest) = snapv4_manifest {
             let snap_anchor = stellereum::snapshot_v4::TrustedSnapshotAnchor {
@@ -455,11 +471,7 @@ pub(crate) async fn try_snapshot_sync_with_persistence(
             }
         }
         if !installed_via_snapv4 {
-            let snapshot = if let Some(s) = legacy_snapshot {
-                s
-            } else if let Some(s) = adapter.fetch_state_snapshot(shard, boundary).await {
-                s
-            } else {
+            let Some(snapshot) = adapter.fetch_state_snapshot(shard, boundary).await else {
                 miss_snapshot += 1;
                 consecutive_misses = consecutive_misses.saturating_add(1);
                 tokio::time::sleep(std::time::Duration::from_millis(
@@ -533,23 +545,11 @@ pub(crate) async fn try_snapshot_sync_with_persistence(
             let _ = ap.storage().put_finalized_post_root(boundary, trusted_root);
             ap.enqueue_finalized(boundary, boundary_hash);
             ap.request_flush();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                let drained = ap.pending() == 0
-                    && ap.storage().get_state(boundary).ok().flatten().is_some()
-                    && ap.storage().domain_at(boundary).ok().flatten().is_some()
-                    && ap
-                        .storage()
-                        .finalized()
-                        .ok()
-                        .flatten()
-                        .is_some_and(|(h, _)| h >= boundary);
-                if drained || std::time::Instant::now() >= deadline {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            if let Err(e) = wait_snapshot_persistence_drain(ap, boundary).await {
+                eprintln!("[sync] REFUSING snapshot at {boundary}: {e}");
+                tracing::error!(shard, boundary, "[sync] {e}");
+                return None;
             }
-            let _ = ap.storage().flush();
         }
         //
         // Safety invariant (W1 §2.6): snapshot sync NEVER clears, overwrites, or
@@ -1604,11 +1604,12 @@ async fn walk_chain_once_with_lanes(
     // Drop any leading block at or below our finalized height (at genesis this is
     // the height-0 root block), so validation starts exactly at the first height
     // we have not already applied.
-    while blocks
-        .first()
-        .is_some_and(|b| b.height < expected_first_height)
-    {
-        blocks.remove(0);
+    let remove_count = blocks
+        .iter()
+        .take_while(|b| b.height < expected_first_height)
+        .count();
+    if remove_count > 0 {
+        blocks.drain(..remove_count);
     }
     if blocks.is_empty() {
         return None;
@@ -2180,10 +2181,9 @@ pub(crate) async fn retro_publish_pass(
     let to = (from + RETRO_PUBLISH_MAX_PER_PASS as u64 - 1).min(tip);
 
     // This run's bodies: no disk I/O, and `finalized` is in height order.
-    let mut bodies: Vec<stellereum::sharding::Block> = rt
-        .finalized
+    let start_idx = rt.finalized.partition_point(|(h, _)| *h < from);
+    let mut bodies: Vec<stellereum::sharding::Block> = rt.finalized[start_idx..]
         .iter()
-        .skip_while(|(h, _)| *h < from)
         .take_while(|(h, _)| *h <= to)
         .filter_map(|(_, hash)| rt.blocks.get(hash).cloned())
         .collect();
@@ -2208,7 +2208,8 @@ pub(crate) async fn retro_publish_pass(
     };
     let mut boundary_wanted: Vec<u64> = Vec::new();
     for h in &boundary_heights {
-        if let Some((_, hash)) = rt.finalized.iter().find(|(fh, _)| fh == h) {
+        if let Ok(idx) = rt.finalized.binary_search_by_key(h, |(fh, _)| *fh) {
+            let (_, hash) = &rt.finalized[idx];
             if let Some(b) = rt.blocks.get(hash) {
                 boundary_bodies.push(b.clone());
                 continue;

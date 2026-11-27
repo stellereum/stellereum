@@ -78,6 +78,10 @@ jobs:
         with:
           shared-key: test-lib
       - name: workspace lib tests
+        # `stellereum` unit tests share the process-global PQ_COMMITTED_REGISTRY;
+        # `--lib` must run with TEST_THREADS=1 (see docs/CI.md).
+        env:
+          TEST_THREADS: '1'
         run: cargo test --workspace --locked --lib -- --test-threads="$TEST_THREADS"
 
   # (d) The curated heavy integration suites, one matrix leg per category.
@@ -99,6 +103,10 @@ jobs:
               bft_lock_safety_tests
               liveness_horizon_tests
               sim_tempo_target06_tests
+              w10_sortition_and_jail_gates_tests
+              w11_cnvrf_epoch_churn_tests
+              w12_pipeline_gate_tests
+              w12_pipeline_runtime_state_tests
           - suite: state
             tests: >-
               state_root_completeness_tests
@@ -106,12 +114,17 @@ jobs:
               apply_floor_tests
               parallel_apply_parity_tests
               block_packing_scale_tests
+              w13_domain_overlays_tests
+              w13_parallel_native_and_stm_parity_tests
+              w10_deploy_contract_abi_tests
+              w9_core_polish_tests
           - suite: rpc
             tests: >-
               rpc_tests
               rpc_batch_tests
               rpc_ws_tests
               rpc_surface_audit_tests
+              w14_shard_rpc_router_tests
           - suite: compact
             tests: >-
               compact_gossip_tests
@@ -128,6 +141,18 @@ jobs:
               xshard_replay_tests
               cross_shard_e2e_pq_tests
               cross_shard_anchor_tests
+              w16_bridge_deposit_height_key_tests
+              w14_dynamic_sharding_tests
+          - suite: hardening
+            tests: >-
+              w8_cli_unjail_and_upgrader_tests
+              w8_cnvrf_and_mev_hardening_tests
+              w8_polish_hardening_tests
+              w8_supply_and_network_fixes
+              w9_cli_wallet_and_config_tests
+              w11_mev_kem_registry_wiring_tests
+              w13_scheduler_access_tests
+              w13_contract_stm_trace_tests
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -147,8 +172,33 @@ jobs:
             echo "::endgroup::"
           done
 
-  # (e) The two client SDKs. The Rust SDK tests use a loopback TCP mock; the
-  # JS suite uses node:test and a mock fetch, so neither needs a live node.
+  # (d2) Integration suites for the sibling workspace crates and SDK node-parity.
+  sibling-suites:
+    name: sibling-suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          shared-key: sibling-suites
+      - name: Sibling workspace integration tests
+        run: |
+          set -euo pipefail
+          for pkg in stellereum-verifier stellereum-indexer stellereum-ledger-tool stellereum-upgrader infnode infmail; do
+            echo "::group::cargo test --locked -p $pkg --tests"
+            cargo test --locked -p "$pkg" --tests -- --test-threads="$TEST_THREADS"
+            echo "::endgroup::"
+          done
+      - name: Rust SDK node-parity tests
+        run: cargo test --locked -p stellereum-sdk --features node-parity -- --test-threads="$TEST_THREADS"
+
+  # (e) The two client SDKs and the browser WASM signer. The Rust SDK tests use
+  # a loopback TCP mock; the JS suite uses node:test and a mock fetch, so neither
+  # needs a live node.
   sdk:
     name: sdk
     runs-on: ubuntu-latest
@@ -187,6 +237,28 @@ jobs:
       - name: sdk-js build
         working-directory: sdk-js
         run: npm run build
+
+  # (e2) Standalone browser WASM Falcon-512 signer (`stellereum-wasm`).
+  wasm:
+    name: wasm (stellereum-wasm)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          workspaces: stellereum-wasm
+          shared-key: stellereum-wasm
+      - name: stellereum-wasm tests
+        working-directory: stellereum-wasm
+        run: cargo test --locked
+      - name: stellereum-wasm wasm32 build
+        working-directory: stellereum-wasm
+        run: cargo build --locked --target wasm32-unknown-unknown --release
 
   # (f) The operator load-test harness is a standalone crate (it embeds node
   # sources via #[path]). Build it so refactors cannot silently break it.

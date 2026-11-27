@@ -172,12 +172,14 @@ pub fn decode_event(abi: Option<&ContractAbi>, raw: &RawEvent) -> DecodedEvent {
 
 /// Find the ABI event an emitted event refers to.
 ///
-/// Three ways, in order of certainty:
+/// Four ways, in order of certainty:
 ///
 /// 1. **by name** — the node named the event;
 /// 2. **by the numeric topic id** — the native VM's event id, which is the
 ///    index of the event in the contract's manifest;
-/// 3. **by shape, but only when UNAMBIGUOUS** — the event carries exactly as
+/// 3. **by `topic0` signature hash** — canonical `EventName(type1,type2,...)`
+///    matched against BLAKE3, SHA-256, or Keccak-256;
+/// 4. **by shape, but only when UNAMBIGUOUS** — the event carries exactly as
 ///    many indexed and non-indexed fields as one candidate of the manifest.
 ///    When two candidates fit, the event is NOT decoded: an explorer that
 ///    guesses which of two events fired is worse than one that says "the
@@ -196,6 +198,16 @@ fn resolve_abi_event<'a>(
             if let Some(e) = abi.events.get(idx as usize) {
                 return Some(e);
             }
+        }
+    }
+    if let Some(topic0_bytes) = decode_topic0_bytes(raw.topic0.as_deref()) {
+        let sig_matches: Vec<&AbiEvent> = abi
+            .events
+            .iter()
+            .filter(|e| event_matches_topic0(e, &topic0_bytes))
+            .collect();
+        if sig_matches.len() == 1 {
+            return Some(sig_matches[0]);
         }
     }
 
@@ -226,6 +238,62 @@ fn resolve_abi_event<'a>(
     } else {
         None
     }
+}
+
+fn decode_topic0_bytes(topic0: Option<&str>) -> Option<[u8; 32]> {
+    let raw = topic0?.trim();
+    let clean = raw
+        .strip_prefix("0x")
+        .or_else(|| raw.strip_prefix("0X"))
+        .unwrap_or(raw);
+    if clean.len() != 64 || !clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let decoded = hex::decode(clean).ok()?;
+    decoded.try_into().ok()
+}
+
+fn sol_abi_type_name(ty: AbiType) -> &'static str {
+    match ty {
+        AbiType::I64 => "int64",
+        AbiType::U64 => "uint64",
+        AbiType::I32 => "int32",
+        AbiType::Bool => "bool",
+        AbiType::Bytes => "bytes",
+        AbiType::Address => "address",
+        AbiType::String => "string",
+    }
+}
+
+fn hash_matches_topic0(sig: &str, want: &[u8; 32]) -> bool {
+    let bytes = sig.as_bytes();
+    stellereum::contract_source::code_hash_blake3(bytes) == *want
+        || stellereum::contract_source::code_hash_sha256(bytes) == *want
+        || stellereum::evm_adapter::keccak256(bytes) == *want
+}
+
+fn event_matches_topic0(e: &AbiEvent, want: &[u8; 32]) -> bool {
+    let abi_params: Vec<&str> = e
+        .topics
+        .iter()
+        .chain(e.data.iter())
+        .map(|p| p.ty.as_str())
+        .collect();
+    let abi_sig = format!("{}({})", e.name, abi_params.join(","));
+    if hash_matches_topic0(&abi_sig, want) {
+        return true;
+    }
+    let sol_params: Vec<&str> = e
+        .topics
+        .iter()
+        .chain(e.data.iter())
+        .map(|p| sol_abi_type_name(p.ty))
+        .collect();
+    let sol_sig = format!("{}({})", e.name, sol_params.join(","));
+    if sol_sig != abi_sig && hash_matches_topic0(&sol_sig, want) {
+        return true;
+    }
+    false
 }
 
 /// Decode the indexed fields into named values.
@@ -581,5 +649,85 @@ mod tests {
         assert_eq!(parsed.events[0].name, "Transfer");
         // A manifest-less answer parses to "no ABI", not to a broken one.
         assert!(AbiCache::parse_abi(&json!({ "abi": Value::Null })).is_none());
+    }
+
+    #[test]
+    fn resolves_ambiguous_arity_events_by_topic0_signature_hash() {
+        let mut abi = ContractAbi::default();
+        abi.add_event(AbiEvent::new(
+            "Transfer",
+            vec![
+                AbiParam::new("from", AbiType::Address),
+                AbiParam::new("to", AbiType::Address),
+            ],
+            vec![AbiParam::new("amount", AbiType::U64)],
+        ));
+        abi.add_event(AbiEvent::new(
+            "Approval",
+            vec![
+                AbiParam::new("owner", AbiType::Address),
+                AbiParam::new("spender", AbiType::Address),
+            ],
+            vec![AbiParam::new("value", AbiType::U64)],
+        ));
+
+        let topics = vec![
+            json!(format!("0x{}", "aa".repeat(32))),
+            json!(format!("0x{}", "bb".repeat(32))),
+        ];
+
+        // 1. BLAKE3 over `Approval(address,address,u64)`
+        let blake3_topic0 = format!(
+            "0x{}",
+            hex::encode(stellereum::contract_source::code_hash_blake3(
+                b"Approval(address,address,u64)"
+            ))
+        );
+        let d_blake3 = decode_event(
+            Some(&abi),
+            &RawEvent {
+                contract: "0xaa".to_string(),
+                topic0: Some(blake3_topic0),
+                topics: topics.clone(),
+                data: Some(json!([42])),
+                ..Default::default()
+            },
+        );
+        assert_eq!(d_blake3.event_name.as_deref(), Some("Approval"));
+        assert_eq!(d_blake3.args.unwrap()["data"]["value"], 42);
+
+        // 2. Keccak-256 over `Transfer(address,address,uint64)`
+        let keccak_topic0 = format!(
+            "0x{}",
+            hex::encode(stellereum::evm_adapter::keccak256(
+                b"Transfer(address,address,uint64)"
+            ))
+        );
+        let d_keccak = decode_event(
+            Some(&abi),
+            &RawEvent {
+                contract: "0xaa".to_string(),
+                topic0: Some(keccak_topic0),
+                topics: topics.clone(),
+                data: Some(json!([99])),
+                ..Default::default()
+            },
+        );
+        assert_eq!(d_keccak.event_name.as_deref(), Some("Transfer"));
+        assert_eq!(d_keccak.args.unwrap()["data"]["amount"], 99);
+
+        // 3. Unknown topic0 with ambiguous arity must NOT guess
+        let d_unknown = decode_event(
+            Some(&abi),
+            &RawEvent {
+                contract: "0xaa".to_string(),
+                topic0: Some(format!("0x{}", "ff".repeat(32))),
+                topics,
+                data: Some(json!([7])),
+                ..Default::default()
+            },
+        );
+        assert!(d_unknown.event_name.is_none());
+        assert!(d_unknown.args.is_none());
     }
 }

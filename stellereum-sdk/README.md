@@ -23,9 +23,10 @@ governance payloads, and a synchronous `stell_*` JSON-RPC client.
 - **Is not** the validator remote-signing seam. `RemoteSigner` lives in the
   node crate (`stellereum/src/remote_signer.rs`) for consensus vote keys; this
   SDK exposes no `RemoteSigner` and does not sign validator votes.
-- **Is not** an audited product and has no deploy builder: `Op` has no
-  `SysCallDeployContract` variant, so contract deployment must be built by the
-  caller (see [`stellereum-contracts`](../stellereum-contracts/README.md)).
+- **Is not** an audited product. It ships draft contract-deploy builders
+  (`TxBuilder::contract_deploy` / `contract_deploy_with_abi`), but the
+  ABI-persisting variant is gated off on today's chain; see
+  [Contract deployment](#contract-deployment).
 
 ## Install and build
 
@@ -113,7 +114,11 @@ transaction (or answers “already in mempool”).
 | `PqEnvelope::implicit/implicit_with_chain` | `PQ1` envelope omitting the public key; no activation surcharge. |
 | `PqEnvelope::encode/decode` | Wire encoding and decoding. |
 | `TxBuilder::transfer(to, amount)` | Native value transfer (empty payload). |
-| `TxBuilder::contract_call(contract, method, args, value)?` | `SysCallCallContractArgs` with typed `CallArg`s. |
+| `TxBuilder::contract_call(contract, method, args, value)?` | `SysCallCallContractArgs` with typed `CallArg`s (ABI-encoded calldata). |
+| `TxBuilder::contract_deploy(code)` | `SysCallDeployContract` (discriminant 19); self-addressed with `amount == 0`. |
+| `TxBuilder::contract_deploy_with_abi(code, abi_json)` | `SysCallDeployContractWithAbi` (discriminant 65); gated, see below. |
+| `contract_deploy_gas(code_len)` / `contract_deploy_with_abi_gas(code_len, abi_len)` | Deploy gas helpers: `2_000 + 2/byte`, plus `2/byte` of ABI capped at 64 KiB. |
+| `MAX_CONTRACT_ABI_BYTES` / `OP_DEPLOY_CONTRACT` / `OP_DEPLOY_CONTRACT_WITH_ABI` | `65_536` / `19` / `65`. |
 | `TxBuilder::stake(validator, amount)` | `SysCallStake`. |
 | `TxBuilder::unjail(validator, top_up)` | Optional `SysCallStake` followed by `SysCallUnjail`. |
 | `TxBuilder::gov_propose(id, title, action, height)?` | `SysCallGovPropose`; self-addressed, no value. |
@@ -134,6 +139,89 @@ Every builder runs the protocol/fork guard before signing.
 v7, fork id `0x3ae00ebc`. A foreign chain id is `SdkError::ChainIdMismatch`; a
 foreign fork id is `SdkError::ForkIdMismatch`. Use `.identity(identity)` or
 `Wallet::with_identity` for a different node identity.
+
+### Contract deployment
+
+`TxBuilder::contract_deploy(code)` and
+`TxBuilder::contract_deploy_with_abi(code, abi_json)` mint the two deploy
+opcodes. Both build a self-addressed (`to == from`) transaction with
+`amount == 0`; the payload is `bincode(Vec<OpCode>)` carrying exactly one
+element.
+
+Wire layout of that element (little-endian, `bincode 1.3`):
+
+```text
+payload (Vec<OpCode>): u64 LE 1 || <one opcode>
+SysCallDeployContract        (19): u32 19 || code (u64 len || bytes)
+SysCallDeployContractWithAbi (65): u32 65 || code (u64 len || bytes)
+                                            || abi_json (u64 len || bytes)
+```
+
+Limits: `abi_json` is a UTF-8 JSON `ContractAbi` manifest
+(`{"methods":…,"events":…}`) and `MAX_CONTRACT_ABI_BYTES = 65_536` (64 KiB).
+The VM rejects a larger blob at apply and the gas helper prices
+`min(abi_len, 65_536)`. The Rust builder itself does not validate the JSON or
+reject an oversized manifest; `ContractAbi::from_json` and the 64 KiB cap are
+enforced by the VM and by the `stell_deployContract` preview.
+
+Gas:
+
+```text
+contract_deploy_gas(n)             = 2_000 + 2 * n
+contract_deploy_with_abi_gas(c, a) = contract_deploy_gas(c)
+                                   + 2 * min(a, 65_536)
+
+gas_limit = max(opcode_gas, base_fee, 280_000)
+          + 45_000 (explicit PQ1)
+          + priority_fee_per_gas
+```
+
+A tiny module therefore still declares 325,000 gas: the 280,000 frozen floor
+plus the explicit-envelope surcharge.
+
+```rust
+use stellereum_sdk::{FalconKeypair, RpcClient, TxBuilder};
+
+let key = FalconKeypair::load_key_file(std::path::Path::new("wallet.json"))?;
+let rpc = RpcClient::new("http://127.0.0.1:8545");
+let code = std::fs::read("token.wasm")?;
+
+// Plain deploy: the form that executes on today's chain.
+let signed = TxBuilder::contract_deploy(code.clone()).nonce(7).sign(&key)?;
+let hash = rpc.send_raw(&signed)?;
+```
+
+```rust
+// ABI-carrying deploy (discriminant 65). It mints and signs, but see the gate.
+let abi_json = br#"{"methods":[],"events":[]}"#.to_vec();
+let signed = TxBuilder::contract_deploy_with_abi(code, abi_json)
+    .nonce(7)
+    .sign(&key)?;
+```
+
+**Gate: `SysCallDeployContractWithAbi` is INERT today.** Execution calls
+`chain_spec::contract_abi_onchain_active_at(height)` before deploying; when it
+is false the opcode reverts with
+`SysCallDeployContractWithAbi inactive at height <h>`. The compiled
+`CONTRACT_ABI_ONCHAIN_ACTIVATION_HEIGHT` is `u64::MAX`, and that helper returns
+`false` for **every** height — including `u64::MAX` — when the gate is
+`u64::MAX` (`GatedOff`). Consequences:
+
+- On today's chain a `contract_deploy_with_abi` transaction is admitted and can
+  be previewed, but it reverts when a block applies it.
+- Use `TxBuilder::contract_deploy` and submit. No manifest is committed, so
+  `stell_getContractAbi` answers `abi: null` for a plain deploy (it stays
+  `null` until a height-armed chain executes the ABI variant).
+- `stell_deployContract`'s signed-`tx` preview reports `has_abi: true` when the
+  transaction carries the ABI opcode. That is a preview only: it deploys
+  nothing, files no receipt, and does not consult the activation gate, so it
+  can succeed for a transaction that would revert at apply.
+- The CLI `stellereum contract deploy` has no `--abi` flag and always builds
+  the plain opcode.
+
+`Wallet` has no deploy convenience (it wraps transfer, contract call, staking,
+EVM and governance). For a deploy, sign the `TxBuilder` and submit with
+`RpcClient::send_raw` (or `Wallet::rpc()`), as above.
 
 ### Signed transactions and reads
 
@@ -261,12 +349,14 @@ serial-lib wrapper; it can run alongside other workspace suites. The
 
 ## Status
 
-Testnet only. No external audit. The key file is plaintext, there is no HSM or
-hardware-wallet path, and contract deployment is not built into this crate.
-Treat the SDK as unaudited client software and do not use it with funds you
-cannot afford to lose.
+Testnet only. No external audit. The key file is plaintext and there is no HSM
+or hardware-wallet path. The deploy builders are draft surface: the plain
+opcode works, while the ABI-persisting opcode is gated off (`u64::MAX`) and has
+never executed on a live chain. Treat the SDK as unaudited client software and
+do not use it with funds you cannot afford to lose.
 
-Open work before any production use: an external audit; a first-class deploy
-builder (the `Op` enum currently has no deploy variant); and a vetted
-remote/HSM story for wallet keys. `RemoteSigner` in the node crate is for
-validator consensus keys, not for this SDK's wallet keys.
+Open work before any production use: an external audit; arming and testing the
+`CONTRACT_ABI_ONCHAIN` gate (plus a typed raw-calldata call path for the
+production-shape contract entrypoints); and a vetted remote/HSM story for
+wallet keys. `RemoteSigner` in the node crate is for validator consensus keys,
+not for this SDK's wallet keys.

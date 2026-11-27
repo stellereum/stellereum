@@ -511,6 +511,9 @@ pub fn eip155_tx_signing_hash(
 
 /// Computes the signing hash for an EIP-1559 typed transaction (Type 0x02):
 /// `keccak256(0x02 || RLP([chain_id, nonce, max_priority_fee, max_fee, gas_limit, to, value, data, access_list]))`.
+///
+/// Rejects malformed hex / wrong-length access list entries with `invalid_params`
+/// instead of silently zero-filling.
 #[allow(clippy::too_many_arguments)]
 // GATE: EIP-1559 signing hash takes the full tx field set per spec; grouping would diverge from the yellow-paper layout.
 pub fn eip1559_tx_signing_hash(
@@ -523,27 +526,32 @@ pub fn eip1559_tx_signing_hash(
     value: u128,
     data: &[u8],
     access_list: &[EvmAccessListItem],
-) -> [u8; 32] {
+) -> Result<[u8; 32], JsonRpcError> {
     let to_enc = match to {
         Some(addr) => rlp::encode_bytes(addr),
         None => rlp::encode_bytes(&[]),
     };
 
-    let access_list_items: Vec<Vec<u8>> = access_list
-        .iter()
-        .map(|item| {
-            let addr_bytes = parse_address(&item.address).unwrap_or([0u8; 20]);
-            let keys: Vec<Vec<u8>> = item
-                .storage_keys
-                .iter()
-                .map(|k| {
-                    let k_bytes = parse_h256(k).unwrap_or([0u8; 32]);
-                    rlp::encode_bytes(&k_bytes)
-                })
-                .collect();
-            rlp::encode_list(&[rlp::encode_bytes(&addr_bytes), rlp::encode_list(&keys)])
-        })
-        .collect();
+    let mut access_list_items = Vec::with_capacity(access_list.len());
+    for item in access_list {
+        let addr_bytes = parse_address(&item.address).map_err(|e| {
+            JsonRpcError::invalid_params(format!(
+                "invalid accessList address '{}': {e}",
+                item.address
+            ))
+        })?;
+        let mut keys = Vec::with_capacity(item.storage_keys.len());
+        for k in &item.storage_keys {
+            let k_bytes = parse_h256(k).map_err(|e| {
+                JsonRpcError::invalid_params(format!("invalid accessList storage key '{k}': {e}"))
+            })?;
+            keys.push(rlp::encode_bytes(&k_bytes));
+        }
+        access_list_items.push(rlp::encode_list(&[
+            rlp::encode_bytes(&addr_bytes),
+            rlp::encode_list(&keys),
+        ]));
+    }
 
     let items = vec![
         rlp::encode_u64(chain_id),
@@ -561,5 +569,35 @@ pub fn eip1559_tx_signing_hash(
     let mut message = Vec::with_capacity(1 + rlp_payload.len());
     message.push(0x02);
     message.extend_from_slice(&rlp_payload);
-    keccak256(&message)
+    Ok(keccak256(&message))
+}
+
+#[cfg(test)]
+mod eip1559_signing_hash_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_invalid_access_list_hex() {
+        let bad_addr = [EvmAccessListItem {
+            address: "0xnot_hex".to_string(),
+            storage_keys: vec![],
+        }];
+        let err = eip1559_tx_signing_hash(CHAIN_ID, 0, 1, 2, 21_000, None, 0, &[], &bad_addr)
+            .expect_err("invalid access list address must error");
+        assert_eq!(err.code, INVALID_PARAMS_CODE);
+
+        let bad_key = [EvmAccessListItem {
+            address: format!("0x{}", "11".repeat(20)),
+            storage_keys: vec!["0xzzzz".to_string()],
+        }];
+        let err = eip1559_tx_signing_hash(CHAIN_ID, 0, 1, 2, 21_000, None, 0, &[], &bad_key)
+            .expect_err("invalid access list storage key must error");
+        assert_eq!(err.code, INVALID_PARAMS_CODE);
+
+        let valid = [EvmAccessListItem {
+            address: format!("0x{}", "11".repeat(20)),
+            storage_keys: vec![format!("0x{}", "aa".repeat(32))],
+        }];
+        assert!(eip1559_tx_signing_hash(CHAIN_ID, 0, 1, 2, 21_000, None, 0, &[], &valid).is_ok());
+    }
 }

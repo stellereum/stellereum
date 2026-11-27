@@ -201,10 +201,12 @@ impl Fixture {
                 epoch_key_commitment: [0u8; 32],
                 round: 0,
             };
-            // 3 of 4 signatures: a genuine power quorum, so these headers also
-            // satisfy the block-level quorum check.
-            for k in keys.iter().take(3) {
-                b.sign_block(k);
+            // 3 of 4 Falcon-512 signatures: a genuine power quorum under FULL-PQ,
+            // so these headers also satisfy the block-level quorum check.
+            let bh = b.compute_hash();
+            for (k, fk) in keys.iter().zip(fks.iter()).take(3) {
+                b.validator_signatures
+                    .push((k.verifying_key().to_bytes(), fk.sign(&bh)));
             }
             prev = b.compute_hash();
             blocks.push(b);
@@ -296,8 +298,10 @@ impl Fixture {
         header.body_commitment = Some(new_hash);
         header.block_hash = actual_hash;
         header.signatures.clear();
-        for k in keys.iter().take(3) {
-            header.sign_with(k);
+        for (k, fk) in keys.iter().zip(fks.iter()).take(3) {
+            header
+                .signatures
+                .push((k.verifying_key().to_bytes(), fk.sign(&actual_hash)));
         }
         header.cert = cert(
             &keys[..3],

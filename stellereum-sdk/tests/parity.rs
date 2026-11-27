@@ -6,9 +6,16 @@
 
 use stellereum_sdk::address;
 use stellereum_sdk::key::{FalconKeypair, FALCON512_SIG_LEN};
-use stellereum_sdk::opcode::{encode_calldata, CallArg};
-use stellereum_sdk::session::{SessionGrant, SCOPE_ALL};
-use stellereum_sdk::tx::{SignedTx, TxBuilder, DEFAULT_CHAIN_ID, PQ_ACTIVATION_SURCHARGE_GAS};
+use stellereum_sdk::opcode::{
+    contract_deploy_gas, contract_deploy_with_abi_gas, encode_calldata, CallArg, Op,
+    MAX_CONTRACT_ABI_BYTES,
+};
+use stellereum_sdk::session::{SessionGrant, SCOPE_ALL, SCOPE_SVM_PAYLOAD, SCOPE_TRANSFER};
+use stellereum_sdk::tx::{
+    SignedTx, Transaction, TxBuilder, DEFAULT_CHAIN_ID, MASTERCHAIN_SHARD,
+    PQ_ACTIVATION_SURCHARGE_GAS, SPONSOR_AUTH_MAX_BYTES, SPONSOR_COMMITMENT_TAG,
+    SPONSOR_FEE_DOMAIN, SPONSOR_MAX_TARGETS, SPONSOR_SIG_TAG,
+};
 
 use stellereum::post_quantum::{derive_pq_address, verify_pq_signature, PqScheme, DEFAULT_SALT};
 use stellereum::sharding::Transaction as NodeTransaction;
@@ -216,6 +223,35 @@ fn contract_call_payload_matches_node_bincode_and_abi_encoder() {
 }
 
 #[test]
+fn contract_call_raw_payload_matches_node_bincode() {
+    let key = FalconKeypair::generate().unwrap();
+    let contract = [0x99u8; 32];
+    let mut raw_cd = Vec::with_capacity(40);
+    raw_cd.extend_from_slice(&42u64.to_le_bytes());
+    raw_cd.extend_from_slice(&[0xABu8; 32]);
+
+    let signed = TxBuilder::contract_call_raw(contract, "set_target_pq", &[42], raw_cd.clone(), 7)
+        .unwrap()
+        .nonce(9)
+        .sign(&key)
+        .unwrap();
+
+    let expected = bincode::serialize(&vec![NodeOpCode::SysCallCallContractArgs {
+        contract,
+        method: b"set_target_pq".to_vec(),
+        args: vec![42],
+        calldata: raw_cd,
+    }])
+    .unwrap();
+    assert_eq!(signed.transaction().payload, expected);
+    let tx = node_tx(&signed);
+    assert_eq!(tx.amount, 7);
+    assert_eq!(tx.to, contract);
+    assert!(tx.verify_signature());
+    assert_eq!(tx.compute_tx_hash(), signed.tx_hash());
+}
+
+#[test]
 fn session_grant_and_sf1_tx_verify_in_node() {
     let master = FalconKeypair::generate().unwrap();
     let session = FalconKeypair::generate().unwrap();
@@ -231,8 +267,11 @@ fn session_grant_and_sf1_tx_verify_in_node() {
     .unwrap();
 
     // Grant bytes decode into the node's own struct and its own verifier.
+    let grant_bytes = grant.encode().unwrap();
     let node_grant: stellereum::zkml::SessionKeyAuthorization =
-        bincode::deserialize(&grant.encode()).expect("node must decode the grant");
+        bincode::deserialize(&grant_bytes).expect("node must decode the grant");
+    assert_eq!(grant_bytes, bincode::serialize(&node_grant).unwrap());
+    assert_eq!(SessionGrant::decode(&grant_bytes).unwrap(), grant);
     assert!(node_grant.verify_signature());
 
     let signed = TxBuilder::transfer([0x99u8; 32], 55)
@@ -247,7 +286,47 @@ fn session_grant_and_sf1_tx_verify_in_node() {
         tx.verify_signature(),
         "node verify_signature refused the SDK's SF1 transaction"
     );
+    assert_eq!(tx.signing_message(), signed.signing_message());
     assert_eq!(tx.compute_tx_hash(), signed.tx_hash());
+
+    // Contract call under SCOPE_SVM_PAYLOAD matches node policy and verification.
+    let svm_grant = SessionGrant::new(
+        &master,
+        session.public_key(),
+        4_000_000_000,
+        100_000_000,
+        SCOPE_SVM_PAYLOAD,
+        1_000_000,
+        DEFAULT_CHAIN_ID,
+    )
+    .unwrap();
+    let call_signed = TxBuilder::contract_call([0x88u8; 32], "ping", &[CallArg::U64(9)], 0)
+        .unwrap()
+        .nonce(13)
+        .sign_with_session(&session, &svm_grant)
+        .unwrap();
+    let call_tx = node_tx(&call_signed);
+    assert!(call_tx.verify_signature());
+    assert!(call_tx.check_session_policy(4_000_000_000).is_ok());
+    assert_eq!(call_tx.signing_message(), call_signed.signing_message());
+    assert_eq!(call_tx.compute_tx_hash(), call_signed.tx_hash());
+
+    // Transfer-only grant cannot sign a contract call.
+    let transfer_only = SessionGrant::new(
+        &master,
+        session.public_key(),
+        4_000_000_000,
+        100_000_000,
+        SCOPE_TRANSFER,
+        1_000_000,
+        DEFAULT_CHAIN_ID,
+    )
+    .unwrap();
+    assert!(TxBuilder::contract_call([0x88u8; 32], "ping", &[], 0)
+        .unwrap()
+        .nonce(14)
+        .sign_with_session(&session, &transfer_only)
+        .is_err());
 }
 
 #[test]
@@ -351,7 +430,8 @@ fn eip1559_raw(nonce: u64, value_wei: u128, to: [u8; 20]) -> Vec<u8> {
         value_wei,
         &[],
         &[],
-    );
+    )
+    .unwrap();
     let (sig, recid) = sk.sign_prehash_recoverable(&hash).unwrap();
     let mut r = [0u8; 32];
     let mut s = [0u8; 32];
@@ -770,5 +850,323 @@ fn every_supported_gov_action_serializes_identically() {
             theirs.action_type(),
             "GovAction action_type differs for {ours:?}"
         );
+    }
+}
+
+#[test]
+fn deploy_contract_payload_gas_and_tx_match_node() {
+    let key = FalconKeypair::generate().unwrap();
+    let code = b"\0asm\x01\0\0\0\x01\x04\x01\x60\0\0".to_vec();
+    let signed = TxBuilder::contract_deploy(code.clone())
+        .nonce(10)
+        .sign(&key)
+        .unwrap();
+
+    let node_op = NodeOpCode::SysCallDeployContract { code: code.clone() };
+    let expected = bincode::serialize(&vec![node_op.clone()]).unwrap();
+    assert_eq!(signed.transaction().payload, expected);
+    assert_eq!(
+        Op::DeployContract { code: code.clone() }.encode(),
+        bincode::serialize(&node_op).unwrap()
+    );
+    assert_eq!(
+        &Op::DeployContract { code: code.clone() }.encode()[..4],
+        &19u32.to_le_bytes()
+    );
+    assert_eq!(
+        Op::DeployContract { code: code.clone() }.gas(),
+        stellereum::svm::opcode_gas(&node_op)
+    );
+    assert_eq!(
+        contract_deploy_gas(code.len()),
+        stellereum::svm::contract_deploy_gas(code.len())
+    );
+
+    let tx = node_tx(&signed);
+    assert!(tx.verify_signature());
+    assert_eq!(tx.from, key.address());
+    assert_eq!(tx.to, key.address());
+    assert_eq!(tx.amount, 0);
+    assert_eq!(tx.payload.len(), 1);
+    assert_eq!(tx.compute_tx_hash(), signed.tx_hash());
+}
+
+#[test]
+fn deploy_contract_with_abi_payload_gas_and_tx_match_node() {
+    assert_eq!(
+        MAX_CONTRACT_ABI_BYTES,
+        stellereum::svm::MAX_CONTRACT_ABI_BYTES
+    );
+
+    let key = FalconKeypair::generate().unwrap();
+    let code = b"\0asm\x01\0\0\0".to_vec();
+    let abi_json =
+        br#"{"methods":[{"name":"get","params":[],"returns":"i64","mutates_state":false}],"events":[]}"#
+            .to_vec();
+    let signed = TxBuilder::contract_deploy_with_abi(code.clone(), abi_json.clone())
+        .nonce(11)
+        .sign(&key)
+        .unwrap();
+
+    let node_op = NodeOpCode::SysCallDeployContractWithAbi {
+        code: code.clone(),
+        abi_json: abi_json.clone(),
+    };
+    let expected = bincode::serialize(&vec![node_op.clone()]).unwrap();
+    assert_eq!(signed.transaction().payload, expected);
+    assert_eq!(
+        Op::DeployContractWithAbi {
+            code: code.clone(),
+            abi_json: abi_json.clone(),
+        }
+        .encode(),
+        bincode::serialize(&node_op).unwrap()
+    );
+    assert_eq!(
+        &Op::DeployContractWithAbi {
+            code: code.clone(),
+            abi_json: abi_json.clone(),
+        }
+        .encode()[..4],
+        &65u32.to_le_bytes()
+    );
+    assert_eq!(
+        Op::DeployContractWithAbi {
+            code: code.clone(),
+            abi_json: abi_json.clone(),
+        }
+        .gas(),
+        stellereum::svm::opcode_gas(&node_op)
+    );
+
+    for (code_len, abi_len) in [
+        (0, 0),
+        (8, 64),
+        (200_000, 10_000),
+        (1_000, MAX_CONTRACT_ABI_BYTES),
+        (1_000, MAX_CONTRACT_ABI_BYTES + 512),
+    ] {
+        assert_eq!(
+            contract_deploy_with_abi_gas(code_len, abi_len),
+            stellereum::svm::contract_deploy_with_abi_gas(code_len, abi_len)
+        );
+    }
+
+    let tx = node_tx(&signed);
+    assert!(tx.verify_signature());
+    assert_eq!(tx.from, key.address());
+    assert_eq!(tx.to, key.address());
+    assert_eq!(tx.amount, 0);
+    assert_eq!(tx.payload.len(), 1);
+    assert_eq!(tx.compute_tx_hash(), signed.tx_hash());
+}
+
+#[test]
+fn stake_with_commission_payload_gas_and_tx_match_node() {
+    let key = FalconKeypair::generate().unwrap();
+    let validator = [0x67u8; 32];
+    let amount = 5_000_000u64;
+    let commission_bps = 750u64;
+    let signed = TxBuilder::stake_with_commission(validator, amount, commission_bps)
+        .unwrap()
+        .nonce(12)
+        .sign(&key)
+        .unwrap();
+
+    let node_op = NodeOpCode::SysCallStakeWithCommission {
+        validator,
+        amount,
+        commission_bps,
+    };
+    let expected = bincode::serialize(&vec![node_op.clone()]).unwrap();
+    assert_eq!(signed.transaction().payload, expected);
+    assert_eq!(
+        Op::StakeWithCommission {
+            validator,
+            amount,
+            commission_bps,
+        }
+        .encode(),
+        bincode::serialize(&node_op).unwrap()
+    );
+    assert_eq!(
+        &Op::StakeWithCommission {
+            validator,
+            amount,
+            commission_bps,
+        }
+        .encode()[..4],
+        &52u32.to_le_bytes()
+    );
+    assert_eq!(
+        Op::StakeWithCommission {
+            validator,
+            amount,
+            commission_bps,
+        }
+        .gas(),
+        stellereum::svm::opcode_gas(&node_op)
+    );
+
+    let tx = node_tx(&signed);
+    assert!(tx.verify_signature());
+    assert_eq!(tx.from, key.address());
+    assert_eq!(tx.to, key.address());
+    assert_eq!(tx.amount, amount);
+    assert_eq!(tx.payload.len(), 1);
+    assert_eq!(tx.compute_tx_hash(), signed.tx_hash());
+}
+
+#[test]
+fn sponsor_sp1_constants_and_roundtrip_match_node_bit_for_bit() {
+    assert_eq!(SPONSOR_SIG_TAG, stellereum::sharding::SPONSOR_SIG_TAG);
+    assert_eq!(
+        SPONSOR_COMMITMENT_TAG,
+        stellereum::sharding::SPONSOR_COMMITMENT_TAG
+    );
+    assert_eq!(SPONSOR_FEE_DOMAIN, stellereum::sharding::SPONSOR_FEE_DOMAIN);
+    assert_eq!(
+        SPONSOR_AUTH_MAX_BYTES,
+        stellereum::sharding::SPONSOR_AUTH_MAX_BYTES
+    );
+    assert_eq!(
+        SPONSOR_MAX_TARGETS,
+        stellereum::sharding::SPONSOR_MAX_TARGETS
+    );
+
+    let user = FalconKeypair::generate().unwrap();
+    let sponsor = FalconKeypair::generate().unwrap();
+    let to = [0x33u8; 32];
+    let valid_until = 4_000_000_000;
+
+    // 1. SDK -> Node parity (transfer with priority fee and allowlist).
+    let signed = TxBuilder::transfer(to, 12_345)
+        .nonce(9)
+        .priority_fee_per_gas(250)
+        .sign_with_sponsor(&user, &sponsor, 500_000, valid_until, vec![to])
+        .unwrap();
+    let tx = node_tx(&signed);
+    assert!(tx.is_sponsored());
+    assert!(!tx.sponsor_malformed());
+    assert_eq!(tx.effective_sponsor(), Some(sponsor.address()));
+    assert_eq!(tx.fee_payer(), sponsor.address());
+    assert_eq!(tx.chain_id(), Some(DEFAULT_CHAIN_ID));
+    assert_eq!(signed.chain_id(), tx.chain_id());
+    assert_eq!(signed.signing_message(), tx.signing_message());
+    assert_eq!(signed.tx_hash(), tx.compute_tx_hash());
+    assert!(
+        tx.verify_signature(),
+        "node verify_signature refused SDK SP1 transaction"
+    );
+    assert!(tx.verify_signature_for_chain(DEFAULT_CHAIN_ID, true));
+    assert!(tx.check_sponsor_policy(valid_until, tx.gas_limit).is_ok());
+
+    let sdk_auth = signed.sponsor_authorization().unwrap();
+    let node_auth = tx.sponsor_auth().unwrap();
+    assert_eq!(
+        bincode::serialize(&sdk_auth).unwrap(),
+        bincode::serialize(&node_auth).unwrap()
+    );
+    assert_eq!(
+        signed.transaction().sponsor_message(&sdk_auth),
+        tx.sponsor_message(&node_auth)
+    );
+
+    // 2. SDK -> Node parity for a sponsored contract call.
+    let contract = [0x88u8; 32];
+    let call_signed = TxBuilder::contract_call(contract, "sum", &[CallArg::U64(42)], 7)
+        .unwrap()
+        .nonce(10)
+        .sign_with_sponsor(&user, &sponsor, 600_000, valid_until, vec![contract])
+        .unwrap();
+    let call_tx = node_tx(&call_signed);
+    assert!(call_tx.verify_signature());
+    assert!(call_tx
+        .check_sponsor_policy(valid_until, call_tx.gas_limit)
+        .is_ok());
+    assert_eq!(call_signed.signing_message(), call_tx.signing_message());
+    assert_eq!(call_signed.tx_hash(), call_tx.compute_tx_hash());
+
+    // 3. Node -> SDK parity (node constructs SP1 tx, SDK decodes & verifies).
+    let node_user = stellereum::post_quantum::FalconKeypair::generate_from_seed(11);
+    let node_sponsor = stellereum::post_quantum::FalconKeypair::generate_from_seed(22);
+    let node_sponsored = NodeTransaction::sign_with_sponsor_falcon512(
+        &node_user,
+        &node_sponsor,
+        to,
+        999,
+        350_000,
+        4,
+        MASTERCHAIN_SHARD,
+        MASTERCHAIN_SHARD,
+        Vec::new(),
+        75,
+        400_000,
+        valid_until,
+        vec![to],
+        DEFAULT_CHAIN_ID,
+    );
+    assert!(node_sponsored.verify_signature());
+    let wire = bincode::serialize(&node_sponsored).unwrap();
+    let sdk_decoded = SignedTx::decode(&wire).unwrap();
+    assert!(sdk_decoded.is_sponsored());
+    assert!(sdk_decoded.pq_envelope().is_some());
+    assert_eq!(sdk_decoded.chain_id(), node_sponsored.chain_id());
+    assert_eq!(
+        sdk_decoded.signing_message(),
+        node_sponsored.signing_message()
+    );
+    assert_eq!(sdk_decoded.tx_hash(), node_sponsored.compute_tx_hash());
+    assert_eq!(sdk_decoded.to_bytes(), wire);
+}
+
+#[test]
+fn empty_payload_signing_message_and_hash_match_node_bit_for_bit() {
+    let key = FalconKeypair::generate().unwrap();
+    let to = [0x44u8; 32];
+
+    for priority_fee in [0u64, 777u64] {
+        let mut sdk_tx = Transaction {
+            from: key.address(),
+            to,
+            amount: 555,
+            gas_limit: 325_000,
+            nonce: 17,
+            source_shard: MASTERCHAIN_SHARD,
+            target_shard: MASTERCHAIN_SHARD,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: priority_fee,
+        };
+        let msg = sdk_tx.signing_message_for_chain(DEFAULT_CHAIN_ID);
+        let sig = key.sign(&msg).unwrap();
+        let env = stellereum_sdk::PqEnvelope::explicit_with_chain(
+            key.public_key().to_vec(),
+            sig,
+            DEFAULT_CHAIN_ID,
+        );
+        sdk_tx.signature = env.encode().unwrap();
+
+        let node_tx = NodeTransaction {
+            from: sdk_tx.from,
+            to: sdk_tx.to,
+            amount: sdk_tx.amount,
+            gas_limit: sdk_tx.gas_limit,
+            nonce: sdk_tx.nonce,
+            source_shard: sdk_tx.source_shard,
+            target_shard: sdk_tx.target_shard,
+            signature: sdk_tx.signature.clone(),
+            payload: Vec::new(),
+            priority_fee_per_gas: priority_fee,
+        };
+
+        assert_eq!(sdk_tx.encode(), bincode::serialize(&node_tx).unwrap());
+        assert_eq!(sdk_tx.signing_message(), node_tx.signing_message());
+        assert_eq!(
+            sdk_tx.signing_message_for_chain(DEFAULT_CHAIN_ID),
+            node_tx.signing_message_for_chain(DEFAULT_CHAIN_ID)
+        );
+        assert_eq!(sdk_tx.compute_tx_hash(), node_tx.compute_tx_hash());
+        assert!(node_tx.verify_signature());
     }
 }

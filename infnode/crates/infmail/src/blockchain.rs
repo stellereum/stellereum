@@ -28,12 +28,26 @@ fn with_key(req: ureq::Request) -> ureq::Request {
     }
 }
 
+const MAX_TON_RPC_BYTES: usize = 4 * 1024 * 1024;
+
 /// HTTP-агент с таймаутами: зависший TON Center не должен вечно держать blocking-поток.
 fn http_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(10))
         .timeout_read(std::time::Duration::from_secs(20))
+        .redirects(0)
         .build()
+}
+
+fn read_json_limited(resp: ureq::Response) -> Option<Value> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let limit = (MAX_TON_RPC_BYTES as u64) + 1;
+    resp.into_reader().take(limit).read_to_end(&mut buf).ok()?;
+    if buf.len() > MAX_TON_RPC_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&buf).ok()
 }
 
 fn registry_address() -> String {
@@ -57,7 +71,7 @@ fn run_get_method(address: &str, method: &str, stack: Value) -> Option<Value> {
     let url = format!("{}/runGetMethod", base_url());
     let body = json!({ "address": address, "method": method, "stack": stack });
     let resp = with_key(http_agent().post(&url)).send_json(body).ok()?;
-    let j: Value = resp.into_json().ok()?;
+    let j: Value = read_json_limited(resp)?;
     if j["ok"].as_bool() != Some(true) {
         return None;
     }
@@ -99,7 +113,7 @@ fn extract_addr_hash_from_stack(first: &Value) -> String {
                 // биты MSB-first
                 let bit = |i: usize| (bytes[i / 8] >> (7 - (i % 8))) & 1;
                 // addr_std: 10 + anycast(0) + wc(8) + hash(256) = 267 бит
-                if nbits == 267 && bit(0) == 1 && bit(1) == 0 && bit(2) == 0 {
+                if nbits == 267 && bytes.len() >= 34 && bit(0) == 1 && bit(1) == 0 && bit(2) == 0 {
                     let mut h = [0u8; 32];
                     for (j, b) in h.iter_mut().enumerate() {
                         let mut v = 0u8;
@@ -111,7 +125,7 @@ fn extract_addr_hash_from_stack(first: &Value) -> String {
                     return hex::encode(h);
                 }
                 // голый uint256 ячейкой
-                if nbits == 256 {
+                if nbits == 256 && bytes.len() >= 32 {
                     return hex::encode(&bytes[..32]);
                 }
             }
@@ -304,9 +318,9 @@ fn tier_price_nano_with(prices: &[u64; 5], local_len: usize) -> u64 {
 /// Поддерживаем и классический magic 68ff65f3 с индексной таблицей.
 /// Ищем первую ячейку без refs с данными >= 69 байт:
 /// op u32 + emailHash u256 + walletRef u256 + len u8.
-fn parse_register_body(boc: &[u8]) -> Option<(u32, String, u8)> {
+fn parse_register_body_checked(boc: &[u8]) -> std::result::Result<(u32, String, u8), &'static str> {
     if boc.len() < 14 {
-        return None;
+        return Err("boc too short");
     }
     // старт данных ячеек после заголовка
     let pos = if boc[0..4] == [0x68, 0xff, 0x65, 0xf3] {
@@ -314,48 +328,63 @@ fn parse_register_body(boc: &[u8]) -> Option<(u32, String, u8)> {
         let sz = boc[5] as usize;
         let off_bytes = boc[6] as usize;
         if !(1..=4).contains(&sz) || off_bytes == 0 || off_bytes > 8 {
-            return None;
+            return Err("invalid boc header sizes");
         }
-        let roots = read_uint_be(boc, 7 + sz, sz)?;
-        if roots == 0 {
-            return None;
+        let roots_off = 7usize.checked_add(sz).ok_or("header offset overflow")?;
+        let roots_u64 = read_uint_be(boc, roots_off, sz).ok_or("truncated roots")?;
+        if roots_u64 == 0 {
+            return Err("zero roots");
         }
-        let idx_pos = 7 + 4 * sz;
-        let first_root_off = read_uint_be(boc, idx_pos, off_bytes)? as usize;
-        idx_pos + (roots as usize) * off_bytes + first_root_off
+        let roots = usize::try_from(roots_u64).map_err(|_| "roots overflow")?;
+        let idx_pos = 7usize
+            .checked_add(4usize.checked_mul(sz).ok_or("sz overflow")?)
+            .ok_or("idx_pos overflow")?;
+        let first_root_off =
+            usize::try_from(read_uint_be(boc, idx_pos, off_bytes).ok_or("truncated root offset")?)
+                .map_err(|_| "first_root_off overflow")?;
+        let idx_len = roots.checked_mul(off_bytes).ok_or("idx_len overflow")?;
+        idx_pos
+            .checked_add(idx_len)
+            .and_then(|v| v.checked_add(first_root_off))
+            .ok_or("cell position overflow")?
     } else if boc[0..4] == [0xb5, 0xee, 0x9c, 0x72] {
         // без индексной таблицы: magic flags sz off cells roots absent total (по 1 байту при sz=1)
         let sz = boc[5] as usize;
         if sz != 1 || boc.len() < 11 {
-            return None;
+            return Err("invalid compact boc header");
         }
         4 + 3 + 4 * sz
     } else {
-        return None;
+        return Err("unknown boc magic");
     };
     // первая ячейка: d1 (младшие 3 бита = число refs), d2 (длина данных)
-    if pos + 2 > boc.len() {
-        return None;
+    let dp = pos.checked_add(2).ok_or("cell header overflow")?;
+    if dp > boc.len() {
+        return Err("truncated cell header");
     }
     let d1 = boc[pos];
     let d2 = boc[pos + 1] as usize;
     if d1 & 0x07 != 0 || d1 & 0x08 != 0 {
-        return None;
+        return Err("unexpected cell descriptors");
     }
     // d2 = число БАЙТ данных*2 (+1 если неполный последний байт, здесь не ждём)
     let data_len = d2 / 2;
-    let dp = pos + 2;
-    if data_len < 69 || dp + 69 > boc.len() {
-        return None;
+    let end = dp.checked_add(69).ok_or("cell data overflow")?;
+    if data_len < 69 || end > boc.len() {
+        return Err("truncated cell data");
     }
     let op = u32::from_be_bytes([boc[dp], boc[dp + 1], boc[dp + 2], boc[dp + 3]]);
     let eh = hex::encode(&boc[dp + 4..dp + 36]);
     let len = boc[dp + 68];
-    Some((op, eh, len))
+    Ok((op, eh, len))
+}
+
+fn parse_register_body(boc: &[u8]) -> Option<(u32, String, u8)> {
+    parse_register_body_checked(boc).ok()
 }
 
 fn read_uint_be(boc: &[u8], pos: usize, sz: usize) -> Option<u64> {
-    if pos + sz > boc.len() {
+    if pos.checked_add(sz)? > boc.len() {
         return None;
     }
     let mut v = 0u64;
@@ -417,9 +446,9 @@ pub fn verify_registry_payment(email: &str, addr: &str, wallet_hash: &str) -> bo
             Ok(r) => r,
             Err(_) => return false,
         };
-        let j: Value = match resp.into_json() {
-            Ok(v) => v,
-            Err(_) => return false,
+        let j: Value = match read_json_limited(resp) {
+            Some(v) => v,
+            None => return false,
         };
         let txs = match j["result"].as_array() {
             Some(a) => a,
@@ -476,7 +505,7 @@ pub fn get_contract_balance(address: &str) -> u64 {
     let Ok(resp) = with_key(http_agent().get(&url)).call() else {
         return 0;
     };
-    let Ok(j) = resp.into_json::<Value>() else {
+    let Some(j) = read_json_limited(resp) else {
         return 0;
     };
     if j["ok"].as_bool() != Some(true) {
@@ -571,7 +600,7 @@ fn run_get_method_strict(address: &str, method: &str, stack: Value) -> Result<Va
     let resp = with_key(http_agent().post(&url))
         .send_json(body)
         .map_err(|_| ())?;
-    let j: Value = resp.into_json().map_err(|_| ())?;
+    let j: Value = read_json_limited(resp).ok_or(())?;
     if j["ok"].as_bool() != Some(true) {
         // 429/5xx: состояние chain НЕИЗВЕСТНО — это не ответ «NFT нет».
         return Err(());
@@ -690,7 +719,7 @@ pub fn get_payment_comments(contract: &str, limit: u32) -> Vec<(String, u64, Str
     let Ok(resp) = with_key(http_agent().get(&url)).call() else {
         return Vec::new();
     };
-    let Ok(j) = resp.into_json::<Value>() else {
+    let Some(j) = read_json_limited(resp) else {
         return Vec::new();
     };
     if j["ok"].as_bool() != Some(true) {
@@ -796,5 +825,32 @@ mod cell_parse_tests {
             extract_addr_hash_from_stack(&entry),
             "ca25fd31c3796e5a17bca5ac6aa155def7863f990cde81bb59065ac0a45373a2"
         );
+    }
+
+    #[test]
+    fn parse_register_body_rejects_integer_overflow() {
+        // Classic BOC (0x68ff65f3): sz=1, off_bytes=8, roots=1, first_root_off=u64::MAX.
+        // Without checked_add, idx_pos (11) + 1*8 + u64::MAX wraps around to 18,
+        // landing inside the trailing fake cell payload.
+        let mut boc = vec![
+            0x68, 0xff, 0x65, 0xf3, // magic
+            0x00, // flags
+            0x01, // sz = 1
+            0x08, // off_bytes = 8
+            0x01, // cells = 1
+            0x01, // roots = 1
+            0x00, // absent = 0
+            0x00, // total = 0
+        ];
+        // first_root_off = u64::MAX - 5 (wraps to a small offset if unchecked)
+        boc.extend_from_slice(&(u64::MAX - 5).to_be_bytes());
+        // Pad enough bytes so wrapped pos + 2 + 69 would be in-bounds
+        boc.extend_from_slice(&[0x00, 138]); // d1=0, d2=138 (69*2)
+        boc.extend_from_slice(&[0x52, 0x47, 0x5a, 0x4b]); // op
+        boc.extend_from_slice(&[0xaa; 65]);
+
+        let res = parse_register_body_checked(&boc);
+        assert!(res.is_err(), "overflowing BOC offset must return Err");
+        assert!(parse_register_body(&boc).is_none());
     }
 }

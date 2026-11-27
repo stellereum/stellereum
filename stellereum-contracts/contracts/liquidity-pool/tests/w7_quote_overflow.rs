@@ -17,8 +17,13 @@ fn w7_swap_quote_overflow_returns_err_overflow_without_panic() {
     sstore(2, i64::MAX - 1);
     sstore(3, i64::MAX - 1);
 
-    assert_eq!(swap_quote(i64::MAX), ERR_OVERFLOW);
-    assert_eq!(swap_quote_b_for_a(i64::MAX), ERR_OVERFLOW);
+    // Wave 22B upgraded `compute_swap_quote` to exact 256-bit `mul_div_u128`,
+    // so read-only quotes no longer suffer spurious `u128` intermediate overflow
+    // and return the exact bounded output (< reserve_out) without panicking.
+    let qa = swap_quote(i64::MAX);
+    let qb = swap_quote_b_for_a(i64::MAX);
+    assert!(qa >= 0 && qa < i64::MAX - 1);
+    assert!(qb >= 0 && qb < i64::MAX - 1);
 
     // Swap entry points propagate ERR_OVERFLOW and leave reserves untouched.
     assert_eq!(swap_a_for_b(i64::MAX), ERR_OVERFLOW);

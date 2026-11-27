@@ -1423,3 +1423,188 @@ number.
 | 3 | The "SPV" path still requires 2/3 over an arbitrary, unlinked `StoredHeader`, with custom leaf encodings and evidence-supplied finality; those deposits are unchallengeable | **S1 High** | `stellereum/src/bridge_adapters.rs:644-691`, `:143-192`; `stellereum/src/bridge.rs:1461-1468`, `:1513-1517` |
 | 4 | The attester set is the whole bonded validator set with no epoch snapshot; a 2/3 coalition mints to the cap and a rotation can leave a challenged deposit resolvable only by the current quorum | **S1 High** | `stellereum/src/state_engine/apply.rs:877-881`; `stellereum/src/bridge.rs:1597-1677` |
 | 5 | Inbound deposits have no timeout or trust-minimized exit; slightly over one third of the set (2 of 3 at n=3) can censor a chosen claim indefinitely | **S1 High** | `stellereum/src/bridge.rs:232-377`, `:1401-1413`; `stellereum/src/bridge_adapters.rs:644-665` |
+
+---
+
+## Addendum 2026-11-26 (post-Ruleset-v7)
+
+> **Dated addendum. Every section above this line is the 2026-11-20 pin and is kept
+> byte-intact.** This addendum does not rewrite the original findings; it records what the
+> bridge code looks like now, which original statements are obsolete, and which findings are
+> still open. Current claims below were read from the working tree at HEAD
+> `ab0adbf086779a5638459e58d7e6a5e9949ffdad` on 2026-11-26; no test or `cargo` command was run
+> for this addendum.
+
+### Addendum A — Why this addendum exists: the original pin is pre-R4/R5
+
+The original pin is **pre-R4/R5** in the sense that matters for this document: it was written on
+2026-11-20, before the unified R1..R4 gate activation that shipped as **Ruleset v7** (2026-11-22,
+deployed in the R5 wave — `docs/OPEN_DEFECTS.md:251`, `docs/RULESET_V7.md`). The bridge V2
+release-authorization, retraction-precedence, refund-tombstone and committed height-indexed PQ-key
+code documented below is not the code that was pinned: `bridge.rs` and `bridge_adapters.rs` both
+have different SHA-256 hashes now (Addendum E), and `docs/OPEN_DEFECTS.md:167-168` records the
+bridge fixes as v7 work.
+
+Precision note: `protocol.rs` dates the R4 ruleset bump to 2026-11-19, one day before the original
+pin. If "R4" means that ruleset bump, the pin is post-R4. It is unambiguously **pre-R5/v7** and
+pre every bridge V2 change. Either way, the `file:line` citations in the body above are
+historical and must not be used to audit the current tree.
+
+### Addendum B — The bridge code as it exists now (exact `file:line`)
+
+All paths are relative to `stellereum/src/`. Line numbers are for the working-tree file whose
+hash is in Addendum E.
+
+**Entry points and dispatch**
+
+| Item | Location |
+|---|---|
+| Cheap VM-side validation (height-less; delegates at height 0) | `bridge.rs:596-608` (`BridgeIntent::validate`) |
+| Height-indexed validation | `bridge.rs:610-734` (`BridgeIntent::validate_at_height`) |
+| Target-address length check | `bridge.rs:68-90` (`validate_bridge_target_address_len`), called at `bridge.rs:640-643` and `bridge.rs:2069-2074` |
+| PRE-V2 compatibility planner (height 0, legacy lookup) | `bridge.rs:1785-1804` (`BridgeState::plan`) |
+| Current planner (height, chain id, committed PQ lookup) | `bridge.rs:1806-2579` (`BridgeState::plan_at_height`) |
+| Settlement wiring (the only production caller) | `state_engine/settlement.rs:2094-2120` (`settle_bridge_native` → `plan_at_height` at `:2109`) |
+| V2 activation predicate | `bridge.rs:318-327` (`bridge_v2_active_at`); constant `bridge.rs:294` (`BRIDGE_V2_ACTIVATION_HEIGHT = 0`) |
+| Height-indexed quorum helper | `bridge.rs:935-1010` (`verify_quorum_signatures_at_height`, `distinct_falcon_signers_at_height`) |
+| Payout-receipt verifier | `bridge.rs:2582-2646` (`verify_release_receipt_v2`) |
+| Receipt signing preimage | `bridge.rs:152-168` (`release_receipt_signing_message_v2`, domain `STELL_BRIDGE_RELEASE_RECEIPT_V2` at `:99`) |
+| Max receipt age | `bridge.rs:329-336` (`MAX_BRIDGE_ATTESTATION_AGE_HEIGHTS = PQ_EVIDENCE_RETENTION_HEIGHTS = 720_000`) |
+
+**Release / refund / challenge / resolve behaviour**
+
+| Behaviour | Location |
+|---|---|
+| `Release` arm; pre-v2 legacy finalize vs v2 receipt-gated release | `bridge.rs:2082-2167` |
+| Bare `Release` fails closed at v2 (`verified payout receipt required`) | `bridge.rs:2091-2122` |
+| Receipt must bind req_id/chain/address/amount, be fresh, not replay | `bridge.rs:2123-2153`, verifier `:2600-2645` |
+| `processed_payout_txs` replay guard | `bridge.rs:1476`, checked `:2618-2620`, inserted `:2153` |
+| `Refund` arm with durable tombstone | `bridge.rs:2168-2239`; tombstone insert `:2234` |
+| Late `ReleaseProof` after refund fails (`Withdrawal already refunded`) | `bridge.rs:2097-2099`, `:2186-2188` |
+| Refund rate-window accounting fix | `bridge.rs:2218-2233` (only subtract if the request was counted in the current window) |
+| `Challenge` arm | `bridge.rs:2241-2313` |
+| Challengeability of evidence-path deposits at v2 | `bridge.rs:2251-2263` (the `!v2 && !record.via_quorum` guard is bypassed at/after v2, so every admitted deposit is challengeable) |
+| `Resolve` arm | `bridge.rs:2315-2549` |
+| Truth grading (math/testimony/retraction) | `bridge.rs:2356-2440` |
+| Quorum `RETRACTION` check | `bridge.rs:2424-2434` (`bridge_adapters::verify_quorum_retraction_at_height`) |
+| V2 precedence: retraction beats any confirm bucket | `bridge.rs:2441-2447` |
+| Retraction verifier / preimage | `bridge_adapters.rs:1273-1305`; domain `STELL_BRIDGE_DEPOSIT_FAILURE_V1` at `bridge.rs:1177-1192` |
+| Adapter evidence verifier | `bridge_adapters.rs:1375-1410` (`verify_evidence_at_height`) |
+| V2 adapter header domain | `bridge_adapters.rs:210` (`STELL_BRIDGE_HEADER_V2`) |
+| Attestation signature cap | `bridge.rs:646-663`; `MAX_HEADER_SIGNATURES = 1024` at `bridge_adapters.rs:92` |
+
+**`BRIDGE_TARGET_ADDRESS_CAP_HEIGHT` specifically**
+
+| Item | Location |
+|---|---|
+| Constant (`u64::MAX`, INERT) | `chain_spec.rs:100-115` |
+| Active predicate | `chain_spec.rs:408` (`bridge_target_address_cap_active_at`) |
+| Limit (`128` UTF-8 bytes) | `bridge.rs:60-66` (`MAX_BRIDGE_TARGET_ADDRESS_BYTES`) |
+| Enforcement in `validate_at_height` | `bridge.rs:640-643` |
+| Enforcement in `plan_at_height` (the settlement path that parks) | `bridge.rs:2069-2074` |
+| Not enforced on release/refund | `Release`/`Refund` arms `bridge.rs:2082-2239` never inspect `target_address.len()` |
+
+At the current compiled value the cap is a **no-op**: a 1 MiB address still parks. The code
+exists at both validation layers, so arming the constant is a one-line consensus change, but it
+is not armed on this chain.
+
+### Addendum C — Status of the original bridge findings
+
+**C.1 Closed in code but still INERT behind activation**
+
+Only one bridge hardening is in this category: the **target-address cap**. The code is present
+at both `validate_at_height` and `plan_at_height`, but `BRIDGE_TARGET_ADDRESS_CAP_HEIGHT =
+u64::MAX` (`chain_spec.rs:115`), so the on-chain vector from A-14 (arbitrary-length
+`target_address` parked into consensus state for zero bridge value) remains open. `Release` and
+`Refund` also remain length-agnostic, so any pre-activation oversized parked request would still
+be releasable/refundable unless an explicit migration is specified
+(`stellereum/docs/specs/ACTIVATION_BATCH_1.md:151-184`).
+
+Everything else that the v7 bridge work **fully** closed is **active from height 0**, not inert,
+because `BRIDGE_V2_ACTIVATION_HEIGHT = 0` (`bridge.rs:294`). The `Attest` path is the exception:
+it is active but only partially closed (C.2).
+
+**C.2 Closed or partially closed in code, ACTIVE at height 0 (`BRIDGE_V2_ACTIVATION_HEIGHT = 0`)**
+
+| Original finding | Current closure | Residual |
+|---|---|---|
+| **A-1** double-spend of a release (external leg paid twice) | `Release` requires a `ReleaseProof`; `external_tx_hash` is unique via `processed_payout_txs`; a late proof after refund fails. `bridge.rs:2082-2166`, `:2591-2646`. | The foreign payout is still an off-chain relayer action; no relayer daemon exists in this repo. The chain can now *detect* a duplicate receipt, but the foreign contract must still dedup and the relayer must journal. |
+| **A-10** refund-after-release theft | `Refund` writes `refunded_withdrawals`; a release/receipt after that fails loudly. `bridge.rs:2168-2239`. | Same external-leg caveat as A-1; a crash between foreign payout and on-chain receipt is still an operator-discipline window. |
+| **A-13** unauthenticated `Release` closes the refund | At v2 a bare `Release` fails closed (`verified payout receipt required`). `bridge.rs:2091-2122`. | Pre-v2 replay keeps the legacy rule for historical blocks only. |
+| **A-3** forged attestation / node-local key registry — **only partially closed** | The v2 receipt, evidence and retraction paths use the committed height-indexed `PqKeyLookup` (`&staking_ledger, &pq_registry`): `bridge.rs:1844-1851`, `:935-1010`; `state_engine/settlement.rs:2104-2119`. **The plain `Deposit` + `Attest` quorum path does not**: `plan_at_height` calls `process_deposit` (`bridge.rs:1962`), which calls the pre-v2 wrapper `verify_quorum_signatures` at height 0 (`bridge.rs:1208-1218`, wrapper `:899-917`), which reads process-global `consensus::pq_key_at_height` (`bridge.rs:887-897`; `consensus/rotation.rs:43-81`). | The `Attest` path still resolves at height 0 through the process-global mirror, not the passed committed lookup; a rotation or a divergent mirror can change the verdict for the same payload. The original "poisoned local key table" vector is narrowed (an untracked validator fails closed at a lifecycle-active height) but **not eliminated for attestations**. Key lifecycle retention is also bounded at 720 000 heights. |
+| **A-12** "unchallengeable evidence-path deposit" half | At v2 every admitted deposit is challengeable within `CHALLENGE_MAX_AGE_SECS`, including `DepositProof` deposits. `bridge.rs:2251-2263`. | The other half — header linkage (`prev_hash`), a committed foreign head, foreign validator signatures — is **still NOT IMPLEMENTED**. The adapter still verifies a quorum-signed `StoredHeader`, not a trustless foreign light client. |
+| **A-14** unattested state bloat, `Attest` half | `validate_at_height` caps `Attest` signatures at `MAX_HEADER_SIGNATURES = 1024`. `bridge.rs:646-663`. | `target_address` cap is inert (C.1); deposit records and resolved disputes are still never pruned (`bridge.rs:1067-1076` in the original pin; no pruning arm was found in the current `plan_at_height`). |
+| **I-7** no release without a payout authorization | Now implemented on-chain via `ReleaseProof` + receipt verification. `bridge.rs:2082-2166`. | As A-1/A-10. |
+
+> **Do not quote `docs/OPEN_DEFECTS.md:168` as "A-3 closed" without reading
+> `process_deposit`.** The registry says `BRIDGE-PQ-HEIGHT-KEY` is fixed because
+> `plan_at_height` uses the height-indexed evidence/retraction verifiers. That is true for those
+> paths, but the ordinary `Deposit`+`Attest` quorum path still calls the pre-v2 wrapper at
+> height 0 (`bridge.rs:1208-1218`). A differential test (two nodes, two key tables, same
+> attestation payload, compare verdict and `state_root`) is the missing proof. This addendum did
+> not run it; the residual is reported as **open / `UNVERIFIED`**, not as closed.
+
+**C.3 Still open (unchanged by v7)**
+
+| Finding | Why it is still open | Current citation |
+|---|---|---|
+| **A-4 / A-5** no timeout or trust-minimized exit for an inbound deposit | `Deposit` still has no deadline/cancel/expire variant; the only exit remains the foreign chain. | `BridgeIntent` variants `bridge.rs:532-595`; `plan_at_height` deposit arm `bridge.rs:1953-2063`. |
+| **A-11** a challenge cannot claw back funds the recipient already spent | Pass-1 balance failure still fails the whole challenge; there is no hold period or debt model. | `state_engine/settlement.rs` bridge settlement path (unchanged in this read); `bridge.rs:2304-2313` parks the bond before the clawback. |
+| **A-12** header linkage / committed foreign head | Still a quorum-signed arbitrary `StoredHeader`; no `prev_hash` walk on-chain. | `bridge_adapters.rs:1375-1410` and the adapter header path; `bridge_adapters.rs:210` only binds `chain_id`/kind/finalized head. |
+| **A-14** pruning of deposit records/resolved disputes | No prune/limit arm in `plan_at_height`. | `bridge.rs:2567-2578` writes the maps back without a prune. |
+| **5.5** per-deposit validator-set snapshot | The set is still the whole current bonded set; a rotation can strand a challenged deposit. | `state_engine/settlement.rs:2094-2119` passes the current `validators`. |
+| **5.7** relayer daemon / journal / fee model | Still no production relayer in this repository. | `MultisigRelayer` / `TonMultisigReleaseOrder` / `EvmReleaseOrder` remain library models. |
+
+### Addendum D — What the rest of the original document still gets right
+
+* The bridge is **quorum-attested on inbound paths** and the "SPV" path still reduces to the
+  same 2/3 trust root (original §0). The new domain separation and receipt binding raise the
+  cost of cross-context replay; they do not create a trustless foreign light client.
+* The **foreign leg is still not linked to the native chain** by a proof. v7 adds an on-chain
+  *receipt* that the relayer quorum signs, but a receipt is testimony, not a foreign-chain
+  inclusion proof.
+* The **2/3 quorum assumption** and the `B < W/3` safety assumption are unchanged. The
+  receipt/evidence/retraction paths now use committed keys at a height; the plain
+  `Deposit`+`Attest` path does not (C.2). Either way the bridge still trusts 2/3 of the set.
+* `docs/BRIDGE_THREAT_MODEL.md` remains the right threat catalog. Use its attack IDs (A-1…A-14)
+  and invariants (I-1…I-12); use this addendum only for current status and line numbers.
+
+### Addendum E — Provenance and how to re-verify
+
+Current SHA-256 (working tree, 2026-11-26):
+
+| File | SHA-256 |
+|---|---|
+| `stellereum/src/bridge.rs` | `427f47bb2d68b2235b49dc04f461cef979a459bbeb8bc01ee6dcb1573f0b3c1c` |
+| `stellereum/src/bridge_adapters.rs` | `dfeddd114dccb62069053a5c0b4e640ab7921e6f9ffd1b04c8b98dd4a25e9fb4` |
+| `stellereum/src/state_engine/settlement.rs` | `dcd2474555fd2f5483612845b8ec42eb2e929ec06dcd898f5389eea63bb844c4` |
+| `stellereum/src/pq_registry.rs` | `511d7cc72b8663042a3fa61f7fb2d0f58206134033e5f47fe376b48864d5a89f` |
+| `stellereum/src/chain_spec.rs` (working tree; dirty) | `49a2dbf8cffd4b470adade2a3b449ff686a76fed0ec5095eab4e827f5f5fce28` |
+| `stellereum/src/consensus/rotation.rs` | `bf791f67736edbc650f675d702f87fcd6f3998a127ada16cd582cb52613e7c4d` |
+
+Re-grep before trusting a line number:
+
+```sh
+cd /home/imm/stellereum-project/stellereum
+rg -n "fn plan_at_height|fn plan\b|fn validate_at_height|BRIDGE_TARGET_ADDRESS_CAP_HEIGHT|MAX_BRIDGE_TARGET_ADDRESS_BYTES" src/bridge.rs src/chain_spec.rs
+rg -n "fn verify_quorum_retraction_at_height|fn verify_evidence_at_height|BRIDGE_HEADER_SIGN_DOMAIN_V2" src/bridge_adapters.rs
+rg -n "plan_at_height|PqKeyLookup" src/state_engine/settlement.rs
+```
+
+Candidate regression suites (not run for this addendum; names from `docs/OPEN_DEFECTS.md` and the
+tree):
+
+```sh
+cargo test --locked -p stellereum --test bridge_dispute_tests
+cargo test --locked -p stellereum --test bridge_challenge_tests
+cargo test --locked -p stellereum --test h9_bridge_target_address_cap
+cargo test --locked -p stellereum --test activation_gate_bridge_target_address_cap_tests
+```
+
+`docs/OPEN_DEFECTS.md:167-168` records `bridge_dispute_tests` 12/12 and
+`bridge_challenge_tests` 5/5 for the local (pre-deployment) fixes; that is a recorded result,
+not a re-run. The target-address test file is uncommitted work in this snapshot, so treat its
+status as `UNVERIFIED` until run.
+
+**What did not change in this addendum:** every byte above the `## Addendum 2026-11-26` heading.
+The original pin, severity scale, attack catalog and appendices remain as written on 2026-11-20.

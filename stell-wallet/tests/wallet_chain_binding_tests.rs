@@ -47,7 +47,8 @@ fn bound_pq_transfer_verifies_only_on_its_chain() {
         0,
         true,
         CHAIN,
-    );
+    )
+    .expect("bound pq transfer");
     let from_addr = kp.derive_address(&DEFAULT_SALT);
     assert_eq!(tx.from, from_addr);
     assert_eq!(tx.chain_id(), Some(CHAIN), "the bound builder must bind");
@@ -74,7 +75,8 @@ fn bound_pq_payload_carries_stake_and_binds() {
         amount: 2_000_000_000_000,
     }];
     let tx =
-        LightClient::build_pq_payload_tx_bound(&kp, val, 0, 500_000, 3, 0, 0, true, payload, CHAIN);
+        LightClient::build_pq_payload_tx_bound(&kp, val, 0, 500_000, 3, 0, 0, true, payload, CHAIN)
+            .expect("bound pq payload");
     assert_eq!(tx.chain_id(), Some(CHAIN));
     assert!(tx.verify_signature());
     assert!(tx.verify_signature_for_chain(CHAIN, true));
@@ -84,7 +86,8 @@ fn bound_pq_payload_carries_stake_and_binds() {
 #[test]
 fn legacy_pq_builders_stay_unbound_but_verifying() {
     let kp = generate_sample_keypair(PqScheme::Falcon512);
-    let legacy = LightClient::build_pq_transfer_tx(&kp, [0x55u8; 32], 1_000, 0, 0, true);
+    let legacy = LightClient::build_pq_transfer_tx(&kp, [0x55u8; 32], 1_000, 0, 0, true)
+        .expect("legacy unbound transfer");
     assert_eq!(
         legacy.chain_id(),
         None,
@@ -110,7 +113,8 @@ fn legacy_pq_builders_stay_unbound_but_verifying() {
         0,
         false,
         CHAIN,
-    );
+    )
+    .expect("bound steady transfer");
     assert_eq!(steady.chain_id(), Some(CHAIN));
     assert!(steady.verify_signature());
     assert!(!steady.verify_signature_for_chain(OTHER_CHAIN, true));
@@ -124,10 +128,12 @@ fn transaction_chain_parity_between_paths() {
     let kp = PqKeyPair::from_seed(PqScheme::Falcon512, &[0xABu8; 32]);
     let from = kp.derive_address(&DEFAULT_SALT);
     let to = [0x11u8; 32];
-    let bound = LightClient::build_pq_transfer_tx_bound(&kp, to, 1, 500_000, 0, 0, 0, true, CHAIN);
+    let bound = LightClient::build_pq_transfer_tx_bound(&kp, to, 1, 500_000, 0, 0, 0, true, CHAIN)
+        .expect("bound pq transfer");
     assert!(bound.verify_signature_for_chain(CHAIN, true));
     assert!(!bound.verify_signature_for_chain(OTHER_CHAIN, true));
-    let unbound = LightClient::build_pq_transfer_tx(&kp, to, 1, 0, 0, true);
+    let unbound =
+        LightClient::build_pq_transfer_tx(&kp, to, 1, 0, 0, true).expect("unbound pq transfer");
     assert_eq!(unbound.from, from);
     assert!(unbound.verify_signature());
     assert!(!unbound.verify_signature_for_chain(CHAIN, true));

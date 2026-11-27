@@ -1,6 +1,6 @@
 [Unit]
 Description=Stellereum Public Status Page & Cluster Observer
-Documentation=file:///opt/stellereum/ops/status/README.md
+Documentation=file:///home/imm/stellereum-project/ops/status/README.md
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=300
@@ -8,10 +8,13 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-# Adjust User/WorkingDirectory/ExecStart to match your checkout path.
+# Default paths match /home/imm/stellereum-project on the build host.
+# Adjust Documentation/User/Group/WorkingDirectory/ExecStart if deploying
+# under /opt/stellereum or running as another user (ensure read access when
+# ProtectHome=read-only is enabled).
 User=stell-status
 Group=stell-status
-WorkingDirectory=/opt/stellereum
+WorkingDirectory=/home/imm/stellereum-project
 Environment=STELL_STATUS_LISTEN=127.0.0.1:8095
 Environment=STELL_STATUS_INTERVAL=15
 Environment=STELL_STATUS_TIMEOUT=3
@@ -20,7 +23,7 @@ Environment=STELL_STATUS_EXPECTED_VALIDATORS=4
 Environment=STELL_STATUS_LOG_LEVEL=INFO
 # Optional override file (STELL_STATUS_TARGETS, STELL_STATUS_TARGETS_FILE, etc.)
 EnvironmentFile=-/etc/stellereum/stell-status.env
-ExecStart=/usr/bin/python3 /opt/stellereum/ops/status/status_server.py
+ExecStart=/usr/bin/python3 /home/imm/stellereum-project/ops/status/status_server.py
 Restart=always
 RestartSec=5
 StandardOutput=journal

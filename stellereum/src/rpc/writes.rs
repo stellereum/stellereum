@@ -276,6 +276,33 @@ async fn dispatch_writes_inner(
 
         // ---- accounts ----
         "stell_faucet" => {
+            if st.faucet.is_none() {
+                if st.shard_registry.is_sharded() {
+                    if let Some(addr_str) = params["address"].as_str().or_else(|| params.as_str()) {
+                        if let Ok((a, hint)) =
+                            super::faucet::parse_rpc_address_with_shard_hint(addr_str)
+                        {
+                            if let Ok(Some(peer)) =
+                                super::reads::resolve_shard_target_for_address(st, &id, a, hint)
+                                    .await
+                            {
+                                if peer.faucet.is_some() {
+                                    return Box::pin(dispatch_writes_inner(
+                                        &peer,
+                                        id,
+                                        method,
+                                        params,
+                                        header_token,
+                                        peer_ip,
+                                    ))
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                }
+                return err(id, -32601, "faucet is disabled on this node");
+            }
             let Some(faucet) = st.faucet.clone() else {
                 return err(id, -32601, "faucet is disabled on this node");
             };
@@ -311,6 +338,26 @@ async fn dispatch_writes_inner(
                 Some(a) => a,
                 None => return err(id, -32602, "missing address"),
             };
+            if st.shard_registry.is_sharded() {
+                if let Ok((a, hint)) = super::faucet::parse_rpc_address_with_shard_hint(addr) {
+                    let target_shard = super::faucet::resolve_shard_for_address(st, a, hint).await;
+                    if target_shard != st.engine.shard_id() {
+                        if let Some(peer) = st.state_for_shard(target_shard).await {
+                            if peer.engine.shard_id() == target_shard {
+                                return Box::pin(dispatch_writes_inner(
+                                    &peer,
+                                    id,
+                                    method,
+                                    params,
+                                    header_token,
+                                    peer_ip,
+                                ))
+                                .await;
+                            }
+                        }
+                    }
+                }
+            }
             // Shard scope BEFORE any nonce is reserved: a recipient that
             // routes to another shard is refused here (not queued), so the
             // refusal burns no nonce and touches no lifetime cap — the next
@@ -741,30 +788,55 @@ async fn dispatch_writes_inner(
             if !tx.verify_signature() {
                 return err(id, -32000, "invalid transaction signature");
             }
+            // Sharded nodes route `stell_sendRawTransaction` to the hosted
+            // shard matching `tx.source_shard`, or refuse fail-closed when that
+            // shard is not hosted by this node. Single-shard `{0}` stays
+            // untouched (legacy tests submit arbitrary shard tags).
+            let target_peer =
+                if st.shard_registry.is_sharded() && tx.source_shard != st.engine.shard_id() {
+                    match st.state_for_shard(tx.source_shard).await {
+                        Some(peer) if peer.engine.shard_id() == tx.source_shard => Some(peer),
+                        _ => {
+                            return err(
+                                id,
+                                -32004,
+                                format!(
+                                    "transaction source_shard {} is not hosted on this node \
+                                     (local shard {})",
+                                    tx.source_shard,
+                                    st.engine.shard_id()
+                                ),
+                            );
+                        }
+                    }
+                } else {
+                    None
+                };
+            let target_st = target_peer.as_deref().unwrap_or(st);
             // A14 phase 3: refuse unbound envelopes at/after activation, with
             // the check's message verbatim (refused counts as refused, not as
             // metered admission).
             // GATE: height is finalized-tip+1 — the earliest height this tx
-            // could be included at — derived from COMMITTED `st.height`,
+            // could be included at — derived from COMMITTED `target_st.height`,
             // never caller params. Default-off always passes: phase-1
             // admit+meter below is byte-identical.
-            let next_height = st
+            let next_height = target_st
                 .height
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .saturating_add(1);
-            if let Some(reason) = chain_binding_refusal(&tx, next_height, st.chain_id) {
+            if let Some(reason) = chain_binding_refusal(&tx, next_height, target_st.chain_id) {
                 crate::metrics::global().inc_unbound_refused();
                 return err(id, -32000, reason);
             }
             // A14 phase 1: unbound admission is loud + metered, never silent.
             note_unbound_admission(&tx);
-            let acct = st.engine.get_account(&tx.from).await;
+            let acct = target_st.engine.get_account(&tx.from).await;
             let balance = acct.as_ref().map(|a| a.balance).unwrap_or(0);
             let onchain_nonce = acct.as_ref().map(|a| a.nonce).unwrap_or(0);
             // PAYMASTER: carry the sponsor's balance head for sponsored
             // transactions (fail-closed without it); legacy ignores it.
             let mut actx = AdmissionCtx::wall_now().with_chain_height(next_height);
-            if let Some(sbal) = st.engine.sponsor_balance_of(&tx).await {
+            if let Some(sbal) = target_st.engine.sponsor_balance_of(&tx).await {
                 actx = actx.with_sponsor_balance(sbal);
             }
             // Release the mempool write guard before the throttled save, which
@@ -774,7 +846,7 @@ async fn dispatch_writes_inner(
             // engine nesting the other way would deadlock against paths that
             // take them in the opposite order.)
             let admitted = {
-                let mut pool = st.mempool.write().await;
+                let mut pool = target_st.mempool.write().await;
                 // Nonce-gap fail-fast (audit: blocks troubles): far-future
                 // nonces sat in the pool forever behind an unreachable head.
                 if let Some(gap) = pool.check_nonce_gap(&tx.from, tx.nonce, onchain_nonce) {
@@ -789,13 +861,13 @@ async fn dispatch_writes_inner(
             match admitted {
                 Ok(hash) => {
                     // Propagate verified transaction to P2P peers via gossip:
-                    if let Some(bcast) = &st.tx_broadcast {
+                    if let Some(bcast) = &target_st.tx_broadcast {
                         let _ = bcast.send(tx);
                     }
                     crate::evm_adapter::notify_pending_tx(crate::evm_adapter::stell_hash_to_evm(
                         &hash,
                     ));
-                    st.save_mempool_throttled().await;
+                    target_st.save_mempool_throttled().await;
                     ok(id, json!(hex::encode(hash)))
                 }
                 Err(e) => {

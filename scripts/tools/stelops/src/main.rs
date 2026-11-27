@@ -24,10 +24,9 @@
 //! * `sled` takes an EXCLUSIVE file lock on the store. While the node runs,
 //!   every command here fails with "could not acquire lock" — that is the
 //!   intended behaviour, not a bug: a live store must never be rewritten.
-//! * `clear-lock` is the only mutating command. It refuses without
-//!   `--force`, it backs the removed bytes up next to the store, and it never
-//!   touches the finalized pointer (`finalized_blob`), so the node keeps its
-//!   finalized head and only loses the stuck lock.
+//! * `clear-lock` and `compact` are the mutating commands. Both refuse
+//!   without `--force`, both back up the previous state next to the store, and
+//!   `clear-lock` never touches the finalized pointer (`finalized_blob`).
 //!
 //! USAGE
 //! -----
@@ -36,6 +35,7 @@
 //!   stelops meta         <store-dir> <key>        # raw meta value (hex)
 //!   stelops doctor       <store-dir> [opts]       # everything, as JSON
 //!   stelops clear-lock   <store-dir> --force      # drop the stale lock
+//!   stelops compact      <store-dir> --force      # offline store compaction
 //!   stelops diverge      <data-dir-A> <data-dir-B> [opts]  # offline fork diff
 //!
 //! `diverge` compares two node DATA dirs (the directories that hold
@@ -47,8 +47,8 @@
 //! Both nodes MUST be stopped (sled takes an exclusive lock).
 //!
 //! doctor options:
-//!   --shards <list>   the node's STELL_SHARDS value (default "0,1")
-//!   --shard-id <n>     the shard the node validates (default 1)
+//!   --shards <list>   the node's STELL_SHARDS value (default "0")
+//!   --shard-id <n>     the shard the node validates (default 0)
 //!   --text            human-readable output instead of JSON
 
 use std::collections::BTreeSet;
@@ -56,6 +56,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const CONSENSUS_TOPIC_BASE: &str = "stellereum/consensus/v1";
+
+const DEFAULT_SHARDS: &str = "0";
+const DEFAULT_SHARD_ID: u32 = 0;
 
 fn usage() -> &'static str {
     "stelops — Stellereum node store ops tool\n\
@@ -66,17 +69,18 @@ fn usage() -> &'static str {
      \x20 stelops meta         <store-dir> <key>        print a raw meta value (hex)\n\
      \x20 stelops doctor       <store-dir> [opts]       print the full diagnosis (JSON)\n\
      \x20 stelops clear-lock   <store-dir> --force      remove a stale consensus lock\n\
+     \x20 stelops compact      <store-dir> --force      offline store rebuild/compaction\n\
      \x20 stelops diverge      <data-dir-A> <data-dir-B> [opts]  offline fork diff (exit 1 on any difference)\n\
      \n\
      DOCTOR OPTIONS:\n\
-     \x20 --shards <list>    the node's STELL_SHARDS value (default \"0,1\")\n\
-     \x20 --shard-id <n>     the shard the node validates (default 1)\n\
+     \x20 --shards <list>    the node's STELL_SHARDS value (default \"0\")\n\
+     \x20 --shard-id <n>     the shard the node validates (default 0)\n\
      \x20 --text             human-readable output instead of JSON\n\
      \n\
      NOTES:\n\
      \x20 * the store is LOCKED by a running node: every command fails with\n\
      \x20   \"could not acquire lock\" while the node is up. That is by design.\n\
-     \x20 * clear-lock is the only mutating command; it refuses without --force.\n"
+     \x20 * clear-lock and compact are the mutating commands; both refuse without --force.\n"
 }
 
 fn die(msg: &str) -> ! {
@@ -84,19 +88,63 @@ fn die(msg: &str) -> ! {
     std::process::exit(2);
 }
 
+fn validate_store_dir(dir: &Path) -> Result<(), String> {
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!("store dir not found: {}", dir.display()));
+        }
+        Err(e) => {
+            return Err(format!("cannot stat store dir {}: {e}", dir.display()));
+        }
+    };
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "store dir {} is a symlink; refusing",
+            dir.display()
+        ));
+    }
+    if !meta.is_dir() {
+        return Err(format!(
+            "store path {} is not a directory",
+            dir.display()
+        ));
+    }
+    let db_path = dir.join("db");
+    let db_meta = match std::fs::symlink_metadata(&db_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "not a stellereum store (no `db` file in {}): refusing to open it \
+                 (sled would create an empty database)",
+                dir.display()
+            ));
+        }
+        Err(e) => {
+            return Err(format!("cannot stat {}: {e}", db_path.display()));
+        }
+    };
+    if db_meta.file_type().is_symlink() {
+        return Err(format!(
+            "store db file {} is a symlink; refusing",
+            db_path.display()
+        ));
+    }
+    if !db_meta.is_file() {
+        return Err(format!(
+            "store db path {} is not a regular file",
+            db_path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// The store directory must look like a Stellereum store: a `db` file next to
 /// the sled config. Opening a wrong path with sled would CREATE an empty
 /// database, which is a silent, destructive surprise.
 fn check_store(dir: &Path) {
-    if !dir.exists() {
-        die(&format!("store dir not found: {}", dir.display()));
-    }
-    if !dir.join("db").exists() {
-        die(&format!(
-            "not a stellereum store (no `db` file in {}): refusing to open it \
-             (sled would create an empty database)",
-            dir.display()
-        ));
+    if let Err(e) = validate_store_dir(dir) {
+        die(&e);
     }
 }
 
@@ -270,8 +318,8 @@ fn parse_args() -> Args {
     let mut a = Args {
         cmd: String::new(),
         positional: Vec::new(),
-        shards: "0,1".to_string(),
-        shard_id: 1,
+        shards: DEFAULT_SHARDS.to_string(),
+        shard_id: DEFAULT_SHARD_ID,
         text: false,
         force: false,
     };
@@ -319,6 +367,7 @@ fn main() -> ExitCode {
         "meta" => cmd_meta(&args),
         "doctor" => cmd_doctor(&args),
         "clear-lock" => cmd_clear_lock(&args),
+        "compact" => cmd_compact(&args),
         "diverge" => cmd_diverge(&args),
         other => {
             eprintln!("stelops: unknown command '{other}'\n");
@@ -328,49 +377,100 @@ fn main() -> ExitCode {
     }
 }
 
-fn cmd_checkpoint(args: &Args) -> ExitCode {
-    let dir = store_dir(args);
-    let db = open_db(&dir);
-    let meta = db.open_tree("meta").expect("open meta tree");
-    let raw = meta.get(b"consensus").expect("read meta");
+fn run_checkpoint(db: &sled::Db) -> Result<ExitCode, String> {
+    let meta = db
+        .open_tree("meta")
+        .map_err(|e| format!("open meta tree: {e}"))?;
+    let raw = meta
+        .get(b"consensus")
+        .map_err(|e| format!("read meta consensus: {e}"))?;
     match raw {
         None => {
             println!("NO_CHECKPOINT");
-            ExitCode::SUCCESS
+            Ok(ExitCode::SUCCESS)
         }
         Some(bytes) => match decode_checkpoint(&bytes) {
             Some(cp) => {
-                println!("height={} round={} locked_hash={} locked_round={} finalized_height={} finalized_hash={} bytes={}",
-                        cp.height,
-                        cp.round,
-                        cp.locked_hash.map(|h| hex_of(&h)).unwrap_or_else(|| "none".to_string()),
-                        cp.locked_round,
-                        cp.finalized_height,
-                        hex_of(&cp.finalized_hash),
-                        cp.raw_len
-                    );
-                ExitCode::SUCCESS
+                println!(
+                    "height={} round={} locked_hash={} locked_round={} finalized_height={} finalized_hash={} bytes={}",
+                    cp.height,
+                    cp.round,
+                    cp.locked_hash
+                        .map(|h| hex_of(&h))
+                        .unwrap_or_else(|| "none".to_string()),
+                    cp.locked_round,
+                    cp.finalized_height,
+                    hex_of(&cp.finalized_hash),
+                    cp.raw_len
+                );
+                Ok(ExitCode::SUCCESS)
             }
             None => {
                 println!("UNPARSEABLE bytes={} hex={}", bytes.len(), hex_of(&bytes));
-                ExitCode::from(1)
+                Ok(ExitCode::from(1))
             }
         },
+    }
+}
+
+fn cmd_checkpoint(args: &Args) -> ExitCode {
+    let dir = store_dir(args);
+    let db = open_db(&dir);
+    match run_checkpoint(&db) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("stelops: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_genesis_root(db: &sled::Db) -> Result<ExitCode, String> {
+    let meta = db
+        .open_tree("meta")
+        .map_err(|e| format!("open meta tree: {e}"))?;
+    match meta
+        .get(b"genesis_state_root")
+        .map_err(|e| format!("read meta genesis_state_root: {e}"))?
+    {
+        None => {
+            println!("NO_GENESIS_ROOT");
+            Ok(ExitCode::from(1))
+        }
+        Some(bytes) => {
+            println!("{}", hex_of(&bytes));
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
 fn cmd_genesis_root(args: &Args) -> ExitCode {
     let dir = store_dir(args);
     let db = open_db(&dir);
-    let meta = db.open_tree("meta").expect("open meta tree");
-    match meta.get(b"genesis_state_root").expect("read meta") {
-        None => {
-            println!("NO_GENESIS_ROOT");
+    match run_genesis_root(&db) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("stelops: {e}");
             ExitCode::from(1)
+        }
+    }
+}
+
+fn run_meta(db: &sled::Db, key: &str) -> Result<ExitCode, String> {
+    let meta = db
+        .open_tree("meta")
+        .map_err(|e| format!("open meta tree: {e}"))?;
+    match meta
+        .get(key.as_bytes())
+        .map_err(|e| format!("read meta {key}: {e}"))?
+    {
+        None => {
+            println!("NO_SUCH_KEY");
+            Ok(ExitCode::from(1))
         }
         Some(bytes) => {
             println!("{}", hex_of(&bytes));
-            ExitCode::SUCCESS
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
@@ -382,26 +482,24 @@ fn cmd_meta(args: &Args) -> ExitCode {
         None => die("missing <key>"),
     };
     let db = open_db(&dir);
-    let meta = db.open_tree("meta").expect("open meta tree");
-    match meta.get(key.as_bytes()).expect("read meta") {
-        None => {
-            println!("NO_SUCH_KEY");
+    match run_meta(&db, &key) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("stelops: {e}");
             ExitCode::from(1)
-        }
-        Some(bytes) => {
-            println!("{}", hex_of(&bytes));
-            ExitCode::SUCCESS
         }
     }
 }
 
 #[allow(clippy::needless_borrow)] // GATE: hex_of takes &[u8]; h is [u8; N] by value so &h is required for unsized coercion (clippy misfires here)
-fn cmd_doctor(args: &Args) -> ExitCode {
-    let dir = store_dir(args);
-    let db = open_db(&dir);
-    let meta = db.open_tree("meta").expect("open meta tree");
+fn run_doctor(dir: &Path, db: &sled::Db, args: &Args) -> Result<ExitCode, String> {
+    let meta = db
+        .open_tree("meta")
+        .map_err(|e| format!("open meta tree: {e}"))?;
 
-    let genesis = meta.get(b"genesis_state_root").expect("read meta");
+    let genesis = meta
+        .get(b"genesis_state_root")
+        .map_err(|e| format!("read meta genesis_state_root: {e}"))?;
     let epoch = genesis.as_deref().and_then(epoch_of);
     let shards = parse_shards(&args.shards);
     let is_sharded = shards.len() > 1;
@@ -418,10 +516,14 @@ fn cmd_doctor(args: &Args) -> ExitCode {
         _ => None,
     };
 
-    let cp_raw = meta.get(b"consensus").expect("read meta");
+    let cp_raw = meta
+        .get(b"consensus")
+        .map_err(|e| format!("read meta consensus: {e}"))?;
     let cp = cp_raw.as_deref().and_then(decode_checkpoint);
 
-    let finalized = meta.get(b"finalized_blob").expect("read meta");
+    let finalized = meta
+        .get(b"finalized_blob")
+        .map_err(|e| format!("read meta finalized_blob: {e}"))?;
     let finalized_ptr = finalized.as_deref().and_then(|b| {
         if b.len() >= 40 {
             Some((le_u64(b, 0), hex_of(&b[8..40])))
@@ -469,7 +571,7 @@ fn cmd_doctor(args: &Args) -> ExitCode {
             Some((h, hash)) => println!("finalized_pointer: height={} hash={}", h, hash),
             None => println!("finalized_pointer: n/a"),
         }
-        return ExitCode::SUCCESS;
+        return Ok(ExitCode::SUCCESS);
     }
 
     let cp_json = match &cp {
@@ -509,7 +611,19 @@ fn cmd_doctor(args: &Args) -> ExitCode {
         cp_json,
         finalized_json
     );
-    ExitCode::SUCCESS
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_doctor(args: &Args) -> ExitCode {
+    let dir = store_dir(args);
+    let db = open_db(&dir);
+    match run_doctor(&dir, &db, args) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("stelops: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// One shard's worth of fork-identity: everything two nodes must agree on
@@ -700,6 +814,53 @@ fn cmd_diverge(args: &Args) -> ExitCode {
     }
 }
 
+fn run_clear_lock(dir: &Path, db: &sled::Db) -> Result<ExitCode, String> {
+    let meta = db
+        .open_tree("meta")
+        .map_err(|e| format!("open meta tree: {e}"))?;
+    let raw = match meta
+        .get(b"consensus")
+        .map_err(|e| format!("read meta consensus: {e}"))?
+    {
+        None => {
+            println!("NO_CHECKPOINT nothing to clear");
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(b) => b,
+    };
+    let cp = decode_checkpoint(&raw);
+    // Back the bytes up next to the store (the store dir itself is sled-managed;
+    // the parent is not).
+    let backup_dir = dir.parent().unwrap_or(Path::new("."));
+    let backup = backup_dir.join("consensus-checkpoint.bak");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let stamped = backup_dir.join(format!("consensus-checkpoint.bak.{stamp}"));
+    let _ = std::fs::copy(&backup, &stamped);
+    std::fs::write(&stamped, &raw)
+        .map_err(|e| format!("could not write the backup {}: {e}", stamped.display()))?;
+    meta.remove(b"consensus")
+        .map_err(|e| format!("remove consensus key: {e}"))?;
+    db.flush().map_err(|e| format!("flush store: {e}"))?;
+    println!("CLEARED");
+    println!("backup: {}", stamped.display());
+    match cp {
+        Some(c) => println!(
+            "removed: height={} round={} locked_hash={} locked_round={}",
+            c.height,
+            c.round,
+            c.locked_hash
+                .map(|h| hex_of(&h))
+                .unwrap_or_else(|| "none".to_string()),
+            c.locked_round
+        ),
+        None => println!("removed: unparseable checkpoint ({} bytes)", raw.len()),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn cmd_clear_lock(args: &Args) -> ExitCode {
     let dir = store_dir(args);
     if !args.force {
@@ -715,47 +876,547 @@ fn cmd_clear_lock(args: &Args) -> ExitCode {
         return ExitCode::from(2);
     }
     let db = open_db(&dir);
-    let meta = db.open_tree("meta").expect("open meta tree");
-    let raw = match meta.get(b"consensus").expect("read meta") {
-        None => {
-            println!("NO_CHECKPOINT nothing to clear");
-            return ExitCode::SUCCESS;
+    match run_clear_lock(&dir, &db) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("stelops: {e}");
+            ExitCode::from(1)
         }
-        Some(b) => b,
+    }
+}
+
+struct CompactStats {
+    trees: usize,
+    keys: u64,
+    before_bytes: u64,
+    after_bytes: u64,
+    backup_path: PathBuf,
+}
+
+fn sibling_path(dir: &Path, suffix: &str) -> Result<PathBuf, String> {
+    if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+        let parent = dir.parent().unwrap_or_else(|| Path::new("."));
+        return Ok(parent.join(format!("{name}{suffix}")));
+    }
+    let canon = std::fs::canonicalize(dir)
+        .map_err(|e| format!("cannot resolve store path {}: {e}", dir.display()))?;
+    let name = canon
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("store path has no directory name: {}", canon.display()))?;
+    let parent = canon.parent().unwrap_or_else(|| Path::new("."));
+    Ok(parent.join(format!("{name}{suffix}")))
+}
+
+fn dir_size(path: &Path) -> std::io::Result<u64> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.is_file() {
+        return Ok(meta.len());
+    }
+    if !meta.is_dir() {
+        return Ok(0);
+    }
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let child_meta = std::fs::symlink_metadata(entry.path())?;
+        if child_meta.is_file() {
+            total = total.saturating_add(child_meta.len());
+        } else if child_meta.is_dir() {
+            total = total.saturating_add(dir_size(&entry.path())?);
+        }
+    }
+    Ok(total)
+}
+
+fn tree_digest(tree: &sled::Tree) -> Result<(u64, [u8; 32]), String> {
+    let mut count = 0u64;
+    let mut hasher = blake3::Hasher::new();
+    for kv in tree.iter() {
+        let (k, v) = kv.map_err(|e| format!("read error while verifying tree: {e}"))?;
+        count += 1;
+        hasher.update(&(k.len() as u64).to_le_bytes());
+        hasher.update(&k);
+        hasher.update(&(v.len() as u64).to_le_bytes());
+        hasher.update(&v);
+    }
+    Ok((count, *hasher.finalize().as_bytes()))
+}
+
+fn unique_backup_path(dir: &Path, unix_ts: u64) -> Result<PathBuf, String> {
+    let base = sibling_path(dir, &format!(".pre-compact.{unix_ts}"))?;
+    if !base.exists() {
+        return Ok(base);
+    }
+    for idx in 1u64..1000 {
+        let candidate = sibling_path(dir, &format!(".pre-compact.{unix_ts}.{idx}"))?;
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "backup path already exists for timestamp {unix_ts}"
+    ))
+}
+
+fn run_compact(dir: &Path, force: bool) -> Result<CompactStats, String> {
+    validate_store_dir(dir)?;
+    if !force {
+        return Err(format!(
+            "compact REFUSES without --force (would rebuild {} and move original to backup)",
+            dir.display()
+        ));
+    }
+
+    let tmp_dir = sibling_path(dir, ".compact.tmp")?;
+    if tmp_dir.exists() {
+        if tmp_dir.join("db").exists() {
+            let stale = sled::open(&tmp_dir).map_err(|e| {
+                format!(
+                    "stale compact temp dir {} cannot be opened (live lock?): {e}",
+                    tmp_dir.display()
+                )
+            })?;
+            drop(stale);
+        }
+        if tmp_dir.is_dir() {
+            std::fs::remove_dir_all(&tmp_dir).map_err(|e| {
+                format!(
+                    "cannot remove stale compact temp dir {}: {e}",
+                    tmp_dir.display()
+                )
+            })?;
+        } else {
+            std::fs::remove_file(&tmp_dir).map_err(|e| {
+                format!(
+                    "cannot remove stale compact temp file {}: {e}",
+                    tmp_dir.display()
+                )
+            })?;
+        }
+    }
+
+    let before_bytes =
+        dir_size(dir).map_err(|e| format!("cannot measure store {}: {e}", dir.display()))?;
+
+    let src_db = sled::open(dir).map_err(|e| {
+        format!(
+            "cannot open store {}: {e} (hint: stop the running node before compacting)",
+            dir.display()
+        )
+    })?;
+    let dst_db = match sled::open(&tmp_dir) {
+        Ok(db) => db,
+        Err(e) => {
+            drop(src_db);
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(format!(
+                "cannot create compact temp store {}: {e}",
+                tmp_dir.display()
+            ));
+        }
     };
-    let cp = decode_checkpoint(&raw);
-    // Back the bytes up next to the store (the store dir itself is sled-managed;
-    // the parent is not).
-    let backup_dir = dir.parent().unwrap_or(Path::new("."));
-    let backup = backup_dir.join("consensus-checkpoint.bak");
-    let stamp = std::time::SystemTime::now()
+
+    let mut tree_names: Vec<Vec<u8>> = src_db
+        .tree_names()
+        .into_iter()
+        .map(|n| n.to_vec())
+        .collect();
+    tree_names.sort();
+
+    let mut expected_trees: Vec<(Vec<u8>, u64, [u8; 32])> = Vec::with_capacity(tree_names.len());
+    let mut total_keys = 0u64;
+
+    const BATCH_LIMIT: usize = 4096;
+    for name in &tree_names {
+        let src_tree = match src_db.open_tree(name) {
+            Ok(t) => t,
+            Err(e) => {
+                drop(dst_db);
+                drop(src_db);
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(format!(
+                    "cannot open source tree {}: {e}",
+                    String::from_utf8_lossy(name)
+                ));
+            }
+        };
+        let dst_tree = match dst_db.open_tree(name) {
+            Ok(t) => t,
+            Err(e) => {
+                drop(dst_db);
+                drop(src_db);
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(format!(
+                    "cannot open destination tree {}: {e}",
+                    String::from_utf8_lossy(name)
+                ));
+            }
+        };
+
+        let mut count = 0u64;
+        let mut hasher = blake3::Hasher::new();
+        let mut batch = sled::Batch::default();
+        let mut pending = 0usize;
+
+        for kv in src_tree.iter() {
+            let (k, v) = match kv {
+                Ok(pair) => pair,
+                Err(e) => {
+                    drop(dst_db);
+                    drop(src_db);
+                    let _ = std::fs::remove_dir_all(&tmp_dir);
+                    return Err(format!(
+                        "cannot iterate source tree {}: {e}",
+                        String::from_utf8_lossy(name)
+                    ));
+                }
+            };
+            count += 1;
+            hasher.update(&(k.len() as u64).to_le_bytes());
+            hasher.update(&k);
+            hasher.update(&(v.len() as u64).to_le_bytes());
+            hasher.update(&v);
+            batch.insert(k.as_ref(), v.as_ref());
+            pending += 1;
+            if pending >= BATCH_LIMIT {
+                if let Err(e) = dst_tree.apply_batch(std::mem::take(&mut batch)) {
+                    drop(dst_db);
+                    drop(src_db);
+                    let _ = std::fs::remove_dir_all(&tmp_dir);
+                    return Err(format!(
+                        "cannot write batch to destination tree {}: {e}",
+                        String::from_utf8_lossy(name)
+                    ));
+                }
+                pending = 0;
+            }
+        }
+        if pending > 0 {
+            if let Err(e) = dst_tree.apply_batch(batch) {
+                drop(dst_db);
+                drop(src_db);
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(format!(
+                    "cannot flush final batch to destination tree {}: {e}",
+                    String::from_utf8_lossy(name)
+                ));
+            }
+        }
+        total_keys += count;
+        expected_trees.push((name.clone(), count, *hasher.finalize().as_bytes()));
+    }
+
+    if let Err(e) = src_db.flush() {
+        drop(dst_db);
+        drop(src_db);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(format!("cannot flush source store: {e}"));
+    }
+    if let Err(e) = dst_db.flush() {
+        drop(dst_db);
+        drop(src_db);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(format!("cannot flush compacted store: {e}"));
+    }
+
+    let mut dst_tree_names: Vec<Vec<u8>> = dst_db
+        .tree_names()
+        .into_iter()
+        .map(|n| n.to_vec())
+        .collect();
+    dst_tree_names.sort();
+    if dst_tree_names != tree_names {
+        drop(dst_db);
+        drop(src_db);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(format!(
+            "compacted tree set mismatch: expected {} trees, got {}",
+            tree_names.len(),
+            dst_tree_names.len()
+        ));
+    }
+
+    for (name, expected_count, expected_digest) in &expected_trees {
+        let dst_tree = match dst_db.open_tree(name) {
+            Ok(t) => t,
+            Err(e) => {
+                drop(dst_db);
+                drop(src_db);
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(format!(
+                    "cannot reopen compacted tree {}: {e}",
+                    String::from_utf8_lossy(name)
+                ));
+            }
+        };
+        let (actual_count, actual_digest) = match tree_digest(&dst_tree) {
+            Ok(res) => res,
+            Err(e) => {
+                drop(dst_db);
+                drop(src_db);
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(e);
+            }
+        };
+        if actual_count != *expected_count || actual_digest != *expected_digest {
+            drop(dst_db);
+            drop(src_db);
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(format!(
+                "compaction verification mismatch on tree {}: src=({}, {}) dst=({}, {})",
+                String::from_utf8_lossy(name),
+                expected_count,
+                hex_of(expected_digest),
+                actual_count,
+                hex_of(&actual_digest)
+            ));
+        }
+    }
+
+    if let Err(e) = dst_db.flush() {
+        drop(dst_db);
+        drop(src_db);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(format!("cannot flush verified compacted store: {e}"));
+    }
+
+    drop(dst_db);
+    drop(src_db);
+
+    let unix_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let stamped = backup_dir.join(format!("consensus-checkpoint.bak.{stamp}"));
-    let _ = std::fs::copy(&backup, &stamped);
-    if let Err(e) = std::fs::write(&stamped, &raw) {
+    let backup_path = unique_backup_path(dir, unix_ts)?;
+
+    std::fs::rename(dir, &backup_path).map_err(|e| {
+        format!(
+            "cannot move original store {} to {}: {e}",
+            dir.display(),
+            backup_path.display()
+        )
+    })?;
+    if let Err(e) = std::fs::rename(&tmp_dir, dir) {
+        let rollback = std::fs::rename(&backup_path, dir);
+        return Err(format!(
+            "cannot promote compacted store {} -> {}: {e} (rollback: {:?})",
+            tmp_dir.display(),
+            dir.display(),
+            rollback
+        ));
+    }
+
+    let after_bytes = dir_size(dir)
+        .map_err(|e| format!("cannot measure compacted store {}: {e}", dir.display()))?;
+
+    Ok(CompactStats {
+        trees: tree_names.len(),
+        keys: total_keys,
+        before_bytes,
+        after_bytes,
+        backup_path,
+    })
+}
+
+fn cmd_compact(args: &Args) -> ExitCode {
+    let dir = store_dir(args);
+    check_store(&dir);
+    if !args.force {
         eprintln!(
-            "stelops: could not write the backup {}: {e}",
-            stamped.display()
+            "stelops: compact REFUSES without --force.\n\
+             It exports and verifies every tree in {} into a fresh sled DB,\n\
+             moves the original store to a timestamped backup, and swaps the\n\
+             compacted DB into place. The node MUST be stopped.",
+            dir.display()
         );
-        return ExitCode::from(1);
+        return ExitCode::from(2);
     }
-    meta.remove(b"consensus").expect("remove consensus key");
-    db.flush().expect("flush");
-    println!("CLEARED");
-    println!("backup: {}", stamped.display());
-    match cp {
-        Some(c) => println!(
-            "removed: height={} round={} locked_hash={} locked_round={}",
-            c.height,
-            c.round,
-            c.locked_hash
-                .map(|h| hex_of(&h))
-                .unwrap_or_else(|| "none".to_string()),
-            c.locked_round
-        ),
-        None => println!("removed: unparseable checkpoint ({} bytes)", raw.len()),
+    match run_compact(&dir, args.force) {
+        Ok(stats) => {
+            println!(
+                "COMPACTED trees={} keys={} before_bytes={} after_bytes={}",
+                stats.trees, stats.keys, stats.before_bytes, stats.after_bytes
+            );
+            println!("backup: {}", stats.backup_path.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("stelops: compact failed: {e}");
+            ExitCode::from(1)
+        }
     }
-    ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path =
+                std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn snapshot_db(dir: &Path) -> BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>> {
+        let db = sled::open(dir).expect("open db for snapshot");
+        let mut out = BTreeMap::new();
+        for name in db.tree_names() {
+            let tree = db.open_tree(&name).expect("open tree");
+            let mut entries = BTreeMap::new();
+            for kv in tree.iter() {
+                let (k, v) = kv.expect("iter kv");
+                entries.insert(k.to_vec(), v.to_vec());
+            }
+            out.insert(name.to_vec(), entries);
+        }
+        out
+    }
+
+    #[test]
+    fn doctor_defaults_match_single_shard_testnet() {
+        assert_eq!(DEFAULT_SHARDS, "0");
+        assert_eq!(DEFAULT_SHARD_ID, 0);
+        let shards = parse_shards(DEFAULT_SHARDS);
+        assert_eq!(shards.len(), 1);
+        assert!(shards.contains(&0));
+        assert_eq!(
+            topics_for("0123456789abcdef", &shards),
+            vec!["stellereum/consensus/v1/0123456789abcdef".to_string()]
+        );
+    }
+
+    #[test]
+    fn compact_refuses_without_force_and_missing_store() {
+        let tmp = TempDir::new("stelops-compact-refuse");
+        let empty = tmp.0.join("not-a-store");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(run_compact(&empty, true).is_err());
+
+        let store = tmp.0.join("store");
+        let db = sled::open(&store).unwrap();
+        db.insert(b"k", b"v").unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        let err = run_compact(&store, false)
+            .err()
+            .expect("must fail without --force");
+        assert!(err.contains("--force"));
+        assert!(!sibling_path(&store, ".compact.tmp").unwrap().exists());
+    }
+
+    #[test]
+    fn compact_fails_when_store_is_locked() {
+        let tmp = TempDir::new("stelops-compact-locked");
+        let store = tmp.0.join("store");
+        let db = sled::open(&store).unwrap();
+        db.insert(b"k", b"v").unwrap();
+        db.flush().unwrap();
+
+        let err = run_compact(&store, true)
+            .err()
+            .expect("must fail while store is open/locked");
+        assert!(err.contains("cannot open store"));
+        drop(db);
+    }
+
+    #[test]
+    fn compact_preserves_all_trees_and_shrinks_deleted_entries() {
+        let tmp = TempDir::new("stelops-compact-ok");
+        let store = tmp.0.join("store");
+        {
+            let db = sled::open(&store).unwrap();
+            db.insert(b"default_k1", b"default_v1").unwrap();
+
+            let meta = db.open_tree("meta").unwrap();
+            meta.insert(b"genesis_state_root", &[0xaa; 32]).unwrap();
+            meta.insert(b"finalized_blob", &[0xbb; 40][..]).unwrap();
+
+            let blocks = db.open_tree("blocks").unwrap();
+            let payload = vec![0x5cu8; 4096];
+            for i in 0u32..1000 {
+                blocks.insert(i.to_be_bytes(), payload.as_slice()).unwrap();
+            }
+            blocks.flush().unwrap();
+            for i in 0u32..995 {
+                blocks.remove(i.to_be_bytes()).unwrap();
+            }
+
+            let empty_tree = db.open_tree("headers").unwrap();
+            empty_tree.flush().unwrap();
+            db.flush().unwrap();
+        }
+
+        // Plant a stale `.compact.tmp` directory to verify safe cleanup.
+        let stale_tmp = sibling_path(&store, ".compact.tmp").unwrap();
+        {
+            let stale_db = sled::open(&stale_tmp).unwrap();
+            stale_db.insert(b"stale", b"1").unwrap();
+            stale_db.flush().unwrap();
+        }
+
+        let expected = snapshot_db(&store);
+        let stats = run_compact(&store, true).expect("compact should succeed");
+        assert!(stats.backup_path.exists());
+        assert!(stats
+            .backup_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(".pre-compact."));
+        assert!(!stale_tmp.exists());
+        assert!(
+            stats.after_bytes < stats.before_bytes,
+            "expected compacted size ({}) < original size ({})",
+            stats.after_bytes,
+            stats.before_bytes
+        );
+
+        let actual = snapshot_db(&store);
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_store_dir_refuses_symlink_directory() {
+        let tmp = TempDir::new("stelops-symlink");
+        let real_store = tmp.0.join("real-store");
+        let db = sled::open(&real_store).unwrap();
+        db.insert(b"k", b"v").unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        validate_store_dir(&real_store).expect("real store dir should validate");
+
+        let link_store = tmp.0.join("link-store");
+        std::os::unix::fs::symlink(&real_store, &link_store).unwrap();
+        let err = validate_store_dir(&link_store)
+            .err()
+            .expect("symlink store dir must be refused");
+        assert!(err.contains("symlink"), "unexpected error: {err}");
+
+        let dangling = tmp.0.join("dangling-store");
+        std::os::unix::fs::symlink(tmp.0.join("missing"), &dangling).unwrap();
+        let err = validate_store_dir(&dangling)
+            .err()
+            .expect("dangling symlink must be refused");
+        assert!(err.contains("symlink"), "unexpected error: {err}");
+    }
 }

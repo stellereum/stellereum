@@ -225,6 +225,18 @@ pub fn contract_deploy_gas(code_len: usize) -> u64 {
     crate::contract::contract_deploy_gas(code_len)
 }
 
+/// Maximum size (bytes) of an inline JSON ABI manifest carried by
+/// [`OpCode::SysCallDeployContractWithAbi`].
+pub const MAX_CONTRACT_ABI_BYTES: usize = 64 * 1024;
+
+/// Variable half of `SysCallDeployContractWithAbi`: `contract_deploy_gas(code_len)`
+/// plus `abi_len.min(MAX_CONTRACT_ABI_BYTES) * GAS_PER_BYTE`.
+#[inline(always)]
+pub fn contract_deploy_with_abi_gas(code_len: usize, abi_len: usize) -> u64 {
+    contract_deploy_gas(code_len)
+        .saturating_add((abi_len.min(MAX_CONTRACT_ABI_BYTES) as u64).saturating_mul(GAS_PER_BYTE))
+}
+
 /// Variable half of `SysCallVerifyZkMlReexec`: base + per byte of proof carried.
 #[inline(always)]
 pub fn zkml_verify_in_gas(proof_wire_len: usize) -> u64 {
@@ -526,6 +538,9 @@ pub fn opcode_gas(op: &OpCode) -> u64 {
         OpCode::SysCallClaimWithdrawal(p) => claim_withdrawal_gas(p.voting_sig.len()),
         OpCode::SysCallAnnounceCommission { .. } | OpCode::SysCallApplyCommission { .. } => {
             GAS_STAKE_UNBOND
+        }
+        OpCode::SysCallDeployContractWithAbi { code, abi_json } => {
+            contract_deploy_with_abi_gas(code.len(), abi_json.len())
         }
         OpCode::Halt => GAS_HALT,
     }
@@ -1299,6 +1314,14 @@ pub enum OpCode {
     SysCallApplyCommission {
         validator: [u8; 32],
     },
+    // APPEND, never insert above: W10 ABI-at-deploy opcode (discriminant 65).
+    /// Deploy a WASM smart contract and persist its validated JSON ABI manifest
+    /// (`ContractAbi`) atomically inside `ContractRegistry` (height-gated by
+    /// [`crate::chain_spec::CONTRACT_ABI_ONCHAIN_ACTIVATION_HEIGHT`]).
+    SysCallDeployContractWithAbi {
+        code: Vec<u8>,
+        abi_json: Vec<u8>,
+    },
 }
 
 /// Payload of [`OpCode::SysCallRegisterValidator`] (discriminant 59).
@@ -1590,6 +1613,148 @@ pub struct VmExecOptions {
     /// block context (single-transaction apply, RPC preview) leave the default
     /// zero, which is the pre-gate behaviour.
     pub contract_block_hash: [u8; 32],
+}
+
+/// Validate a `SysCallRotateVotingKey` cancellation read-only against
+/// `PqRegistry` without cloning the registry map. Mirrors
+/// `StakingLedger::pq_cancel_rotation` / `PqRegistry::cancel_rotation` checks
+/// (owner authorization is already verified by the caller).
+fn validate_cancel_rotation_ro(
+    reg: &crate::pq_registry::PqRegistry,
+    validator_id: &crate::consensus::ValidatorId,
+    rotation_seq: u64,
+    now_height: u64,
+) -> Result<(), crate::staking::StakingError> {
+    use crate::pq_registry::PqRegistryError;
+    use crate::staking::StakingError;
+
+    let rec = reg.record_of(validator_id).ok_or_else(|| {
+        StakingError::PqRegistryRejected(PqRegistryError::UnknownValidator.to_string())
+    })?;
+    if rotation_seq != rec.next_seq {
+        return Err(StakingError::PqRegistryRejected(
+            PqRegistryError::InvalidRotationSeq {
+                expected: rec.next_seq,
+                got: rotation_seq,
+            }
+            .to_string(),
+        ));
+    }
+    let pending = rec.pending.as_ref().ok_or_else(|| {
+        StakingError::PqRegistryRejected(PqRegistryError::NoPendingRotation.to_string())
+    })?;
+    if now_height >= pending.effective_height {
+        return Err(StakingError::PqRegistryRejected(
+            PqRegistryError::RotationAlreadyEffective.to_string(),
+        ));
+    }
+    if rec.next_seq.checked_add(1).is_none() {
+        return Err(StakingError::ArithmeticOverflow);
+    }
+    Ok(())
+}
+
+/// Validate a `SysCallRotateVotingKey` announcement read-only against
+/// `PqRegistry` without cloning the registry map. Mirrors
+/// `StakingLedger::pq_announce_rotation_with_seq` checks (owner authorization,
+/// withdrawal address, and `verify_voting_key_pop` are already verified by
+/// the caller).
+fn validate_announce_rotation_ro(
+    ledger: &crate::staking::StakingLedger,
+    reg: &crate::pq_registry::PqRegistry,
+    validator_id: &crate::consensus::ValidatorId,
+    rotation_seq: u64,
+    new_pubkey: &[u8],
+    now_height: u64,
+) -> Result<(), crate::staking::StakingError> {
+    use crate::post_quantum::PqScheme;
+    use crate::pq_registry::{PqRegistryError, PQ_ROTATION_DELAY_HEIGHTS};
+    use crate::staking::StakingError;
+
+    let expected_seq = if let Some(rec) = reg.record_of(validator_id) {
+        rec.next_seq
+    } else if ledger.get_pq_key(validator_id).is_some() {
+        1
+    } else {
+        return Err(StakingError::PqRegistryRejected(
+            PqRegistryError::UnknownValidator.to_string(),
+        ));
+    };
+    if rotation_seq != expected_seq {
+        return Err(StakingError::PqRegistryRejected(
+            PqRegistryError::InvalidRotationSeq {
+                expected: expected_seq,
+                got: rotation_seq,
+            }
+            .to_string(),
+        ));
+    }
+
+    let duplicate = reg.records().iter().any(|(id, rec)| {
+        id != validator_id
+            && ((rec.scheme == PqScheme::Falcon512 && rec.pubkey.as_slice() == new_pubkey)
+                || rec.pending.as_ref().is_some_and(|p| {
+                    p.scheme == PqScheme::Falcon512 && p.pubkey.as_slice() == new_pubkey
+                }))
+    });
+
+    if let Some(rec) = reg.record_of(validator_id) {
+        if now_height < rec.activated_at {
+            return Err(StakingError::PqRegistryRejected(
+                PqRegistryError::ActivationInPast.to_string(),
+            ));
+        }
+        if rec.scheme == PqScheme::Falcon512 && rec.pubkey.as_slice() == new_pubkey {
+            return Err(StakingError::PqRegistryRejected(
+                PqRegistryError::SameKey.to_string(),
+            ));
+        }
+        if rec.pending.is_some() {
+            return Err(StakingError::PqRegistryRejected(
+                PqRegistryError::RotationAlreadyPending.to_string(),
+            ));
+        }
+        if duplicate {
+            return Err(StakingError::PqRegistryRejected(
+                PqRegistryError::DuplicateKey.to_string(),
+            ));
+        }
+        if now_height.checked_add(PQ_ROTATION_DELAY_HEIGHTS).is_none()
+            || rec.next_seq.checked_add(1).is_none()
+        {
+            return Err(StakingError::ArithmeticOverflow);
+        }
+    } else {
+        let Some((cur_scheme, cur_pubkey)) = ledger.get_pq_key(validator_id) else {
+            return Err(StakingError::PqRegistryRejected(
+                PqRegistryError::UnknownValidator.to_string(),
+            ));
+        };
+        if cur_scheme == PqScheme::Falcon512 && cur_pubkey.as_slice() == new_pubkey {
+            return Err(StakingError::PqRegistryRejected(
+                PqRegistryError::SameKey.to_string(),
+            ));
+        }
+        if now_height.checked_add(PQ_ROTATION_DELAY_HEIGHTS).is_none() {
+            return Err(StakingError::ArithmeticOverflow);
+        }
+        if duplicate {
+            return Err(StakingError::PqRegistryRejected(
+                PqRegistryError::DuplicateKey.to_string(),
+            ));
+        }
+        if cur_scheme.is_disabled() {
+            return Err(StakingError::PqRegistryRejected(
+                PqRegistryError::DisabledScheme.to_string(),
+            ));
+        }
+        if cur_pubkey.len() != cur_scheme.pubkey_size() {
+            return Err(StakingError::PqRegistryRejected(
+                PqRegistryError::OversizedKey.to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub struct Svm;
@@ -1925,13 +2090,16 @@ impl Svm {
                         );
                     }
 
-                    // First order op clones the book map; payloads without order
-                    // ops never pay for it (see `ensure_working`).
-                    ensure_working(&mut working_books, ctx.orderbooks.as_deref());
-                    if let Some(books) = working_books.as_mut() {
-                        let book = books
-                            .entry(*pair_id)
-                            .or_insert_with(|| OrderbookActor::new(*pair_id, 1000));
+                    // Clone only the target pair's book on first touch so unrelated
+                    // pairs are never copied; multi-op payloads reuse `working_books`.
+                    if let Some(src_books) = ctx.orderbooks.as_deref() {
+                        let books = working_books.get_or_insert_with(HashMap::new);
+                        let book = books.entry(*pair_id).or_insert_with(|| {
+                            src_books
+                                .get(pair_id)
+                                .cloned()
+                                .unwrap_or_else(|| OrderbookActor::new(*pair_id, 1000))
+                        });
                         let (placed_order, trade_events) = if opts.exec_hardening {
                             book.submit_order_bounded_with_fills(
                                 ctx.sender,
@@ -1992,16 +2160,34 @@ impl Svm {
                 OpCode::SysCallCancelOrder { order_id } => {
                     charge!(GAS_ORDER_CANCEL);
                     if opts.exec_hardening {
-                        // Read-only owner search BEFORE `ensure_working` so a stranger's
-                        // or missing cancel never pays the full book-map clone.
+                        // Read-only owner search in deterministic sorted `pair_id` order
+                        // BEFORE cloning the target pair's book so a stranger's or missing
+                        // cancel never clones anything, and gas accounting is consensus-
+                        // identical across nodes regardless of `HashMap` iteration order.
                         let mut found: Option<(u32, [u8; 32])> = None;
                         let mut scanned_orders: u64 = 0;
-                        if let Some(books) = working_books.as_ref().or(ctx.orderbooks.as_deref()) {
-                            for (pair, book) in books.iter() {
+                        if working_books.is_some() || ctx.orderbooks.is_some() {
+                            let mut pair_ids: Vec<u32> = Vec::new();
+                            if let Some(src) = ctx.orderbooks.as_deref() {
+                                pair_ids.extend(src.keys().copied());
+                            }
+                            if let Some(wb) = working_books.as_ref() {
+                                pair_ids.extend(wb.keys().copied());
+                            }
+                            pair_ids.sort_unstable();
+                            pair_ids.dedup();
+                            for pair in pair_ids {
+                                let Some(book) =
+                                    working_books.as_ref().and_then(|wb| wb.get(&pair)).or_else(
+                                        || ctx.orderbooks.as_deref().and_then(|src| src.get(&pair)),
+                                    )
+                                else {
+                                    continue;
+                                };
                                 for o in book.bids.values().chain(book.asks.values()).flatten() {
                                     scanned_orders = scanned_orders.saturating_add(1);
                                     if o.order_id == *order_id {
-                                        found = Some((*pair, o.trader));
+                                        found = Some((pair, o.trader));
                                         break;
                                     }
                                 }
@@ -2024,8 +2210,15 @@ impl Svm {
                                 let extra_base =
                                     GAS_ORDER_CANCEL_HARDENED.saturating_sub(GAS_ORDER_CANCEL);
                                 charge!(extra_base);
-                                ensure_working(&mut working_books, ctx.orderbooks.as_deref());
-                                if let Some(books) = working_books.as_mut() {
+                                if let Some(src_books) = ctx.orderbooks.as_deref() {
+                                    let books = working_books.get_or_insert_with(HashMap::new);
+                                    if let std::collections::hash_map::Entry::Vacant(e) =
+                                        books.entry(pair)
+                                    {
+                                        if let Some(src_book) = src_books.get(&pair) {
+                                            e.insert(src_book.clone());
+                                        }
+                                    }
                                     if let Some(book) = books.get_mut(&pair) {
                                         if let Some(order) = book.cancel_order(*order_id) {
                                             if matches!(order.side, OrderSide::Sell) {
@@ -2062,9 +2255,17 @@ impl Svm {
                         // The equivalent check in the engine's own cancel path is at
                         // `state_engine.rs` "Only the order owner may cancel".
                         let mut cancelled: Option<u32> = None;
-                        ensure_working(&mut working_books, ctx.orderbooks.as_deref());
-                        if let Some(books) = working_books.as_mut() {
-                            for (pair, book) in books.iter_mut() {
+                        if let Some(src_books) = ctx.orderbooks.as_deref() {
+                            let books = working_books.get_or_insert_with(HashMap::new);
+                            for (pair, book) in src_books {
+                                books.entry(*pair).or_insert_with(|| book.clone());
+                            }
+                            let mut pair_ids: Vec<u32> = books.keys().copied().collect();
+                            pair_ids.sort_unstable();
+                            for pair in pair_ids {
+                                let Some(book) = books.get_mut(&pair) else {
+                                    continue;
+                                };
                                 // Locate the trader without removing anything: the
                                 // cancel below is the only thing that should mutate.
                                 let owner = book
@@ -2098,7 +2299,7 @@ impl Svm {
                                         let refund = order.amount.saturating_sub(order.filled);
                                         current_balance = current_balance.saturating_add(refund);
                                     }
-                                    cancelled = Some(*pair);
+                                    cancelled = Some(pair);
                                     break;
                                 }
                             }
@@ -2411,12 +2612,11 @@ impl Svm {
                                     "Contract registry not available".to_string(),
                                 );
                             };
-                            match reg.deploy_with_nonce_at(
+                            match reg.deploy_with_nonce_prevalidated(
                                 ctx.sender,
                                 code.clone(),
                                 opts.tx_nonce,
                                 ctx.timestamp,
-                                opts.chain_height,
                             ) {
                                 Ok(_addr) => state.stack.push(1),
                                 Err(e) => {
@@ -2440,6 +2640,152 @@ impl Svm {
                             opts.chain_height,
                         ) {
                             Ok(_addr) => state.stack.push(1),
+                            Err(e) => {
+                                return VmExecutionResult::Reverted(format!(
+                                    "contract deploy failed: {e}"
+                                ))
+                            }
+                        }
+                    }
+                }
+                OpCode::SysCallDeployContractWithAbi { code, abi_json } => {
+                    charge!(contract_deploy_with_abi_gas(code.len(), abi_json.len()));
+                    if !crate::chain_spec::contract_abi_onchain_active_at(opts.chain_height) {
+                        return VmExecutionResult::Reverted(format!(
+                            "SysCallDeployContractWithAbi inactive at height {}",
+                            opts.chain_height
+                        ));
+                    }
+                    if abi_json.len() > MAX_CONTRACT_ABI_BYTES {
+                        return VmExecutionResult::Reverted(format!(
+                            "contract deploy ABI exceeds maximum {MAX_CONTRACT_ABI_BYTES} bytes"
+                        ));
+                    }
+                    let abi_str = match std::str::from_utf8(abi_json) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return VmExecutionResult::Reverted(format!(
+                                "contract deploy ABI is not valid UTF-8: {e}"
+                            ));
+                        }
+                    };
+                    let abi = match crate::contract_abi::ContractAbi::from_json(abi_str) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            return VmExecutionResult::Reverted(format!(
+                                "contract deploy ABI invalid: {e}"
+                            ));
+                        }
+                    };
+                    if let Err(e) = abi.validate() {
+                        return VmExecutionResult::Reverted(format!(
+                            "contract deploy ABI validation failed: {e}"
+                        ));
+                    }
+                    if opts.wasm_pmm_hardening {
+                        if crate::chain_spec::falcon_host_fuel_v2_active_at(opts.chain_height) {
+                            let start_budget = crate::contract::VALIDATE_CODE_START_FUEL_LIMIT
+                                .min(state.gas_remaining);
+                            let start_fuel_used = match crate::contract::ContractRegistry::
+                                validate_code_hardened_and_measure_at(
+                                    code,
+                                    start_budget,
+                                    opts.chain_height,
+                                ) {
+                                Ok(used) => used,
+                                Err(crate::contract::ContractError::OutOfFuel) => {
+                                    return VmExecutionResult::OutOfGas;
+                                }
+                                Err(e) => {
+                                    return VmExecutionResult::Reverted(format!(
+                                        "contract deploy failed: {e}"
+                                    ));
+                                }
+                            };
+                            if state.gas_remaining < start_fuel_used {
+                                return VmExecutionResult::OutOfGas;
+                            }
+                            state.gas_remaining -= start_fuel_used;
+                            ensure_working(&mut working_contracts, ctx.contracts.as_deref());
+                            let Some(reg) = working_contracts.as_mut() else {
+                                return VmExecutionResult::Reverted(
+                                    "Contract registry not available".to_string(),
+                                );
+                            };
+                            match reg.deploy_with_nonce_prevalidated(
+                                ctx.sender,
+                                code.clone(),
+                                opts.tx_nonce,
+                                ctx.timestamp,
+                            ) {
+                                Ok(addr) => {
+                                    if let Some(c) = reg.contracts.get_mut(&addr) {
+                                        c.abi = Some(abi);
+                                    }
+                                    state.stack.push(1);
+                                }
+                                Err(e) => {
+                                    return VmExecutionResult::Reverted(format!(
+                                        "contract deploy failed: {e}"
+                                    ))
+                                }
+                            }
+                        } else {
+                            if let Err(e) =
+                                crate::contract::ContractRegistry::validate_code_hardened_at(
+                                    code,
+                                    crate::contract::VALIDATE_CODE_START_FUEL_LIMIT,
+                                    opts.chain_height,
+                                )
+                            {
+                                return VmExecutionResult::Reverted(format!(
+                                    "contract deploy failed: {e}"
+                                ));
+                            }
+                            ensure_working(&mut working_contracts, ctx.contracts.as_deref());
+                            let Some(reg) = working_contracts.as_mut() else {
+                                return VmExecutionResult::Reverted(
+                                    "Contract registry not available".to_string(),
+                                );
+                            };
+                            match reg.deploy_with_nonce_prevalidated(
+                                ctx.sender,
+                                code.clone(),
+                                opts.tx_nonce,
+                                ctx.timestamp,
+                            ) {
+                                Ok(addr) => {
+                                    if let Some(c) = reg.contracts.get_mut(&addr) {
+                                        c.abi = Some(abi);
+                                    }
+                                    state.stack.push(1);
+                                }
+                                Err(e) => {
+                                    return VmExecutionResult::Reverted(format!(
+                                        "contract deploy failed: {e}"
+                                    ))
+                                }
+                            }
+                        }
+                    } else {
+                        ensure_working(&mut working_contracts, ctx.contracts.as_deref());
+                        let Some(reg) = working_contracts.as_mut() else {
+                            return VmExecutionResult::Reverted(
+                                "Contract registry not available".to_string(),
+                            );
+                        };
+                        match reg.deploy_at(
+                            ctx.sender,
+                            code.clone(),
+                            ctx.timestamp,
+                            opts.chain_height,
+                        ) {
+                            Ok(addr) => {
+                                if let Some(c) = reg.contracts.get_mut(&addr) {
+                                    c.abi = Some(abi);
+                                }
+                                state.stack.push(1);
+                            }
                             Err(e) => {
                                 return VmExecutionResult::Reverted(format!(
                                     "contract deploy failed: {e}"
@@ -4085,11 +4431,9 @@ impl Svm {
                             );
                         }
                         if let Some(ref reg) = opts.pq_registry {
-                            let mut probe_reg = reg.clone();
-                            if let Err(e) = ledger.pq_cancel_rotation(
-                                &mut probe_reg,
-                                p.validator_id,
-                                ctx.sender,
+                            if let Err(e) = validate_cancel_rotation_ro(
+                                reg,
+                                &p.validator_id,
                                 p.rotation_seq,
                                 opts.chain_height,
                             ) {
@@ -4113,16 +4457,12 @@ impl Svm {
                             ));
                         }
                         if let Some(ref reg) = opts.pq_registry {
-                            let mut probe_reg = reg.clone();
-                            if let Err(e) = ledger.pq_announce_rotation_with_seq(
-                                &mut probe_reg,
-                                chain_id,
-                                p.validator_id,
-                                ctx.sender,
+                            if let Err(e) = validate_announce_rotation_ro(
+                                ledger,
+                                reg,
+                                &p.validator_id,
                                 p.rotation_seq,
-                                p.new_scheme,
                                 &p.new_pubkey,
-                                &p.pop_signature,
                                 opts.chain_height,
                             ) {
                                 return VmExecutionResult::Reverted(format!(
@@ -4361,7 +4701,9 @@ impl Svm {
         }
         // Commit orderbook mutations only after the entire execution succeeded.
         if let (Some(target), Some(working)) = (ctx.orderbooks.as_mut(), working_books) {
-            **target = working;
+            for (pair_id, book) in working {
+                target.insert(pair_id, book);
+            }
         }
         // Commit contract mutations only after the entire execution succeeded.
         if let (Some(target), Some(working)) = (ctx.contracts.as_mut(), working_contracts) {
@@ -5452,5 +5794,235 @@ mod tests {
                 "{label}: a refused bond must not register the validator"
             );
         }
+    }
+
+    #[test]
+    fn cancel_order_hardened_gas_is_deterministic_across_hashmap_orders() {
+        let sender = [0x41u8; 32];
+        let other = [0x42u8; 32];
+
+        let build_books = |order: &[u32]| -> HashMap<u32, OrderbookActor> {
+            let mut books = HashMap::with_capacity(order.len() * 2);
+            // Insert and remove dummy keys to perturb bucket layout independently.
+            for &p in order {
+                books.insert(p + 1000, OrderbookActor::new(p + 1000, 1000));
+            }
+            for &p in order {
+                books.remove(&(p + 1000));
+            }
+            for &pair_id in order {
+                let mut book = OrderbookActor::new(pair_id, 1000);
+                // Give each pair a distinct number of resting orders (pair_id orders).
+                // On pair 4, give the 4th order (order_id 4) to `sender` so pairs
+                // 1..=3 only contain order_ids <= 3 and pair 4 owns order_id 4.
+                let count = if pair_id == 4 { 4 } else { pair_id };
+                for idx in 0..count {
+                    let trader = if pair_id == 4 && idx == 3 {
+                        sender
+                    } else {
+                        other
+                    };
+                    book.submit_order(
+                        trader,
+                        OrderSide::Buy,
+                        1_000_000 + (idx as u64) * 10,
+                        100,
+                        1_700_000_000 + idx as u64,
+                    );
+                }
+                books.insert(pair_id, book);
+            }
+            books
+        };
+
+        let asc: Vec<u32> = (1..=8).collect();
+        let desc: Vec<u32> = (1..=8).rev().collect();
+        let mut books_asc = build_books(&asc);
+        let mut books_desc = build_books(&desc);
+
+        let opts = VmExecOptions {
+            exec_hardening: true,
+            ..VmExecOptions::default()
+        };
+        // Pairs 1..=3 have 1+2+3 = 6 orders (all order_id <= 3); pair 4 has 4 orders
+        // sorted descending by price so order_id=4 (highest price, idx=3) sits at
+        // position 0 => 7 scanned orders before match.
+        let ops = vec![OpCode::SysCallCancelOrder { order_id: 4 }];
+
+        let run_cancel = |books: &mut HashMap<u32, OrderbookActor>, op_list: &[OpCode]| {
+            let mut ctx = VmContext {
+                sender,
+                balance: 1_000_000,
+                orderbooks: Some(books),
+                patricia_trie: None,
+                session_auth: None,
+                session_keys: None,
+                zkml_proof: None,
+                timestamp: 1_729_000_000,
+                trades: Vec::new(),
+                transfers: Vec::new(),
+                token_registry: None,
+                token_events: Vec::new(),
+                contracts: None,
+                staking: None,
+                pmm: None,
+                min_validator_bond: 1_000,
+                default_commission_bps: 100,
+                payouts: Vec::new(),
+                oracle: None,
+            };
+            let mut sends = Vec::new();
+            Svm::execute_with_confidential_and_sends_at(
+                op_list, 1_000_000, &mut ctx, &mut sends, None, &opts,
+            )
+        };
+
+        let res_asc = run_cancel(&mut books_asc, &ops);
+        let res_desc = run_cancel(&mut books_desc, &ops);
+
+        match (res_asc, res_desc) {
+            (
+                VmExecutionResult::Success {
+                    gas_used: g1,
+                    return_value: r1,
+                    clob_events: e1,
+                    ..
+                },
+                VmExecutionResult::Success {
+                    gas_used: g2,
+                    return_value: r2,
+                    clob_events: e2,
+                    ..
+                },
+            ) => {
+                assert_eq!(g1, g2, "cancel gas must be identical across HashMap orders");
+                assert_eq!(r1, Some(1));
+                assert_eq!(r1, r2);
+                assert_eq!(e1, e2);
+                // Pairs 1, 2, 3 have 1+2+3=6 orders; pair 4 has order_id=4 at index 0
+                // => total 7 scanned orders.
+                assert_eq!(
+                    g1,
+                    GAS_ORDER_CANCEL_HARDENED + 7 * GAS_PER_CANCEL_SCAN,
+                    "sorted pair_id scan must inspect pairs 1..=4 deterministically"
+                );
+            }
+            (a, b) => panic!("expected Success for both runs, got {a:?} and {b:?}"),
+        }
+
+        // Missing order must also scan deterministically across all remaining orders.
+        let miss_ops = vec![OpCode::SysCallCancelOrder { order_id: 9999 }];
+        let miss_asc = run_cancel(&mut books_asc, &miss_ops);
+        let miss_desc = run_cancel(&mut books_desc, &miss_ops);
+        match (miss_asc, miss_desc) {
+            (
+                VmExecutionResult::Success {
+                    gas_used: g1,
+                    return_value: r1,
+                    ..
+                },
+                VmExecutionResult::Success {
+                    gas_used: g2,
+                    return_value: r2,
+                    ..
+                },
+            ) => {
+                assert_eq!(g1, g2);
+                assert_eq!(r1, Some(0));
+                assert_eq!(r1, r2);
+            }
+            (a, b) => panic!("expected Success on missing cancel, got {a:?} and {b:?}"),
+        }
+    }
+
+    #[test]
+    fn place_and_cancel_multi_op_payload_sees_prior_ops_and_preserves_untouched_pairs() {
+        let sender = [0x51u8; 32];
+        let other = [0x52u8; 32];
+
+        let mut books = HashMap::new();
+        books.insert(1, OrderbookActor::new(1, 1000));
+        let mut book2 = OrderbookActor::new(2, 1000);
+        book2.submit_order(sender, OrderSide::Sell, 1_000_000, 300, 1_700_000_000);
+        books.insert(2, book2);
+        let mut book3 = OrderbookActor::new(3, 1000);
+        book3.submit_order(other, OrderSide::Buy, 900_000, 400, 1_700_000_000);
+        books.insert(3, book3);
+
+        let ops = vec![
+            OpCode::SysCallPlaceOrder {
+                pair_id: 1,
+                is_buy: false,
+                price: 1_000_000,
+                amount: 200,
+            },
+            OpCode::SysCallPlaceOrder {
+                pair_id: 1,
+                is_buy: true,
+                price: 1_000_000,
+                amount: 200,
+            },
+            OpCode::SysCallCancelOrder { order_id: 1 },
+        ];
+
+        let opts = VmExecOptions {
+            exec_hardening: true,
+            ..VmExecOptions::default()
+        };
+        let mut ctx = VmContext {
+            sender,
+            balance: 1_000_000,
+            orderbooks: Some(&mut books),
+            patricia_trie: None,
+            session_auth: None,
+            session_keys: None,
+            zkml_proof: None,
+            timestamp: 1_729_000_001,
+            trades: Vec::new(),
+            transfers: Vec::new(),
+            token_registry: None,
+            token_events: Vec::new(),
+            contracts: None,
+            staking: None,
+            pmm: None,
+            min_validator_bond: 1_000,
+            default_commission_bps: 100,
+            payouts: Vec::new(),
+            oracle: None,
+        };
+        let mut sends = Vec::new();
+        let res = Svm::execute_with_confidential_and_sends_at(
+            &ops, 1_000_000, &mut ctx, &mut sends, None, &opts,
+        );
+        match res {
+            VmExecutionResult::Success {
+                trades,
+                clob_events,
+                ..
+            } => {
+                assert_eq!(
+                    trades.len(),
+                    1,
+                    "second place must match first place on pair 1"
+                );
+                assert!(
+                    clob_events.iter().any(|ev| matches!(
+                        ev,
+                        ClobEvent::Cancel {
+                            pair_id: 2,
+                            order_id: 1,
+                            ..
+                        }
+                    )),
+                    "cancel must see and remove pair 2's resting order"
+                );
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+
+        // Untouched pair 3 must remain intact in ctx.orderbooks after commit.
+        assert!(books[&1].bids.is_empty() && books[&1].asks.is_empty());
+        assert!(books[&2].find_order(1).is_none());
+        assert!(books[&3].find_order(1).is_some());
     }
 }

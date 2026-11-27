@@ -603,15 +603,21 @@ pub struct EventFilter {
     pub contract: Option<String>,
     /// Transaction hash (any case, `0x` prefix optional).
     pub tx_hash: Option<String>,
+    /// Optional shard id filter.
+    pub shard_id: Option<u32>,
 }
 
 impl Database {
+    const TOKEN_BALANCE_HISTORY_RETENTION: u64 = 2048;
+
     pub fn open(path: &str) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;
+             PRAGMA cache_size = -16384;
 
              CREATE TABLE IF NOT EXISTS blocks (
                  shard_id INTEGER NOT NULL DEFAULT 0,
@@ -700,16 +706,29 @@ impl Database {
               CREATE INDEX IF NOT EXISTS idx_tb_owner ON token_balances(owner, token_id);
               CREATE INDEX IF NOT EXISTS idx_tb_owner_lower ON token_balances(LOWER(owner), token_id, shard_id);
               CREATE INDEX IF NOT EXISTS idx_tb_token_lower ON token_balances(LOWER(token_id), owner, shard_id);
+              CREATE INDEX IF NOT EXISTS idx_tb_token_holders_order ON token_balances(LOWER(token_id), LENGTH(balance) DESC, balance DESC, owner ASC, shard_id ASC);
               CREATE INDEX IF NOT EXISTS idx_tb_shard_height ON token_balances(shard_id, updated_height);
+
+              CREATE TABLE IF NOT EXISTS token_balance_history (
+                  shard_id INTEGER NOT NULL,
+                  token_id TEXT NOT NULL,
+                  owner TEXT NOT NULL,
+                  height INTEGER NOT NULL,
+                  prev_balance TEXT,
+                  prev_height INTEGER,
+                  PRIMARY KEY (shard_id, token_id, owner, height)
+              );
+              CREATE INDEX IF NOT EXISTS idx_tbh_shard_height ON token_balance_history(shard_id, height);
 
               -- Deployed WASM contracts (W4 contract).
               CREATE TABLE IF NOT EXISTS contracts (
                   shard_id INTEGER NOT NULL DEFAULT 0,
-                  address TEXT PRIMARY KEY,
+                  address TEXT NOT NULL,
                   creator TEXT,
                   code_hash TEXT,
                   deploy_height INTEGER NOT NULL,
-                  has_abi INTEGER NOT NULL DEFAULT 0
+                  has_abi INTEGER NOT NULL DEFAULT 0,
+                  PRIMARY KEY (shard_id, address)
               );
               CREATE INDEX IF NOT EXISTS idx_contracts_creator ON contracts(creator, deploy_height);
               CREATE INDEX IF NOT EXISTS idx_contracts_creator_lower ON contracts(LOWER(creator), deploy_height DESC, address ASC);
@@ -717,6 +736,52 @@ impl Database {
               CREATE INDEX IF NOT EXISTS idx_contracts_shard_height ON contracts(shard_id, deploy_height);
              ",
         )?;
+
+        // Idempotent schema migration: upgrade legacy single-column `address TEXT PRIMARY KEY`
+        // contracts table to composite `PRIMARY KEY (shard_id, address)`.
+        let contracts_sql: Option<String> = match conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='contracts'",
+            [],
+            |row| row.get(0),
+        ) {
+            Ok(s) => Some(s),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(sql) = contracts_sql {
+            let normalized: String = sql
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase();
+            let has_composite_pk = normalized.contains("primary key (shard_id, address)")
+                || normalized.contains("primary key(shard_id, address)")
+                || normalized.contains("primary key (shard_id,address)")
+                || normalized.contains("primary key(shard_id,address)");
+            if !has_composite_pk {
+                let tx = conn.transaction()?;
+                tx.execute_batch(
+                    "CREATE TABLE contracts_v2 (
+                         shard_id INTEGER NOT NULL DEFAULT 0,
+                         address TEXT NOT NULL,
+                         creator TEXT,
+                         code_hash TEXT,
+                         deploy_height INTEGER NOT NULL,
+                         has_abi INTEGER NOT NULL DEFAULT 0,
+                         PRIMARY KEY (shard_id, address)
+                     );
+                     INSERT INTO contracts_v2 (shard_id, address, creator, code_hash, deploy_height, has_abi)
+                     SELECT shard_id, address, creator, code_hash, deploy_height, has_abi FROM contracts;
+                     DROP TABLE contracts;
+                     ALTER TABLE contracts_v2 RENAME TO contracts;
+                     CREATE INDEX IF NOT EXISTS idx_contracts_creator ON contracts(creator, deploy_height);
+                     CREATE INDEX IF NOT EXISTS idx_contracts_creator_lower ON contracts(LOWER(creator), deploy_height DESC, address ASC);
+                     CREATE INDEX IF NOT EXISTS idx_contracts_deploy_addr ON contracts(deploy_height DESC, address ASC);
+                     CREATE INDEX IF NOT EXISTS idx_contracts_shard_height ON contracts(shard_id, deploy_height);",
+                )?;
+                tx.commit()?;
+            }
+        }
 
         // Auto-migration: ensure shard_id column exists if tables were created in an earlier version
         let _ = conn.execute(
@@ -775,6 +840,18 @@ impl Database {
         );
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_blocks_hash_lower ON blocks(LOWER(hash))",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tx_timestamp ON transactions(timestamp)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tx_shard_block_idx ON transactions(shard_id, block_height DESC, tx_index DESC)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_shard_block_id ON contract_events(shard_id, block_height DESC, id DESC)",
             [],
         );
 
@@ -840,16 +917,73 @@ impl Database {
         v.min(i64::MAX as u64) as i64
     }
 
+    fn recompute_account_tx(tx: &rusqlite::Transaction<'_>, addr: &str) -> Result<()> {
+        if addr.is_empty() {
+            return Ok(());
+        }
+        let (cnt, min_h, max_h): (u64, i64, i64) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(MIN(block_height), 0), COALESCE(MAX(block_height), 0)
+             FROM transactions WHERE LOWER(from_addr) = LOWER(?1) OR LOWER(to_addr) = LOWER(?1)",
+            params![addr],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if cnt == 0 {
+            tx.execute(
+                "DELETE FROM accounts WHERE LOWER(address) = LOWER(?1)",
+                params![addr],
+            )?;
+        } else {
+            let updated = tx.execute(
+                "UPDATE accounts
+                 SET tx_count = ?2, first_seen_height = ?3, last_seen_height = ?4
+                 WHERE LOWER(address) = LOWER(?1)",
+                params![addr, Self::clamp_u64(cnt), min_h, max_h],
+            )?;
+            if updated == 0 {
+                tx.execute(
+                    "INSERT INTO accounts (address, tx_count, first_seen_height, last_seen_height)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![addr, Self::clamp_u64(cnt), min_h, max_h],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn delete_shard_height_tx(
         tx: &rusqlite::Transaction<'_>,
         shard_id: u32,
         height: u64,
     ) -> Result<()> {
         let h = Self::clamp_u64(height);
+        let affected_addrs: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT from_addr, to_addr FROM transactions WHERE shard_id = ?1 AND block_height = ?2",
+            )?;
+            let rows = stmt.query_map(params![shard_id, h], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut addrs: Vec<String> = Vec::new();
+            for pair in rows {
+                let (from_addr, to_addr) = pair?;
+                if !from_addr.is_empty()
+                    && !addrs.iter().any(|a| a.eq_ignore_ascii_case(&from_addr))
+                {
+                    addrs.push(from_addr);
+                }
+                if !to_addr.is_empty() && !addrs.iter().any(|a| a.eq_ignore_ascii_case(&to_addr)) {
+                    addrs.push(to_addr);
+                }
+            }
+            addrs
+        };
         tx.execute(
             "DELETE FROM transactions WHERE shard_id = ?1 AND block_height = ?2",
             params![shard_id, h],
         )?;
+        for addr in affected_addrs {
+            Self::recompute_account_tx(tx, &addr)?;
+        }
         tx.execute(
             "DELETE FROM contract_events WHERE shard_id = ?1 AND block_height = ?2",
             params![shard_id, h],
@@ -859,7 +993,36 @@ impl Database {
             params![shard_id, h],
         )?;
         tx.execute(
+            "DELETE FROM token_balances
+             WHERE shard_id = ?1
+               AND updated_height <= ?2
+               AND EXISTS (
+                   SELECT 1 FROM token_balance_history h
+                   WHERE h.shard_id = token_balances.shard_id
+                     AND h.token_id = token_balances.token_id
+                     AND h.owner = token_balances.owner
+                     AND h.height = ?2
+                     AND h.prev_height IS NULL
+               )",
+            params![shard_id, h],
+        )?;
+        tx.execute(
+            "INSERT INTO token_balances (shard_id, token_id, owner, balance, updated_height)
+             SELECT shard_id, token_id, owner, COALESCE(prev_balance, '0'), prev_height
+             FROM token_balance_history
+             WHERE shard_id = ?1 AND height = ?2 AND prev_height IS NOT NULL
+             ON CONFLICT(shard_id, token_id, owner) DO UPDATE SET
+                 balance = excluded.balance,
+                 updated_height = excluded.updated_height
+             WHERE token_balances.updated_height <= ?2",
+            params![shard_id, h],
+        )?;
+        tx.execute(
             "DELETE FROM token_balances WHERE shard_id = ?1 AND updated_height = ?2",
+            params![shard_id, h],
+        )?;
+        tx.execute(
+            "DELETE FROM token_balance_history WHERE shard_id = ?1 AND height = ?2",
             params![shard_id, h],
         )?;
         tx.execute(
@@ -924,12 +1087,16 @@ impl Database {
                 }
                 out
             };
-            for (sid, h) in found {
-                Self::delete_shard_height_tx(&tx, sid, h)?;
-                if !invalidated.contains(&(sid, h)) {
-                    invalidated.push((sid, h));
+            for pair in found {
+                if !invalidated.contains(&pair) {
+                    invalidated.push(pair);
                 }
             }
+        }
+        // Roll back highest height per shard first so token_balance_history restores in reverse order.
+        invalidated.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+        for &(sid, h) in &invalidated {
+            Self::delete_shard_height_tx(&tx, sid, h)?;
         }
         tx.commit()?;
         Ok(invalidated)
@@ -940,10 +1107,22 @@ impl Database {
     }
 
     pub fn insert_transaction_in_shard(&self, shard_id: u32, tx: &TxRecord) -> Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let db_tx = conn.transaction()?;
         let h = Self::clamp_u64(tx.block_height);
         let ts = Self::clamp_u64(tx.timestamp);
-        conn.execute(
+
+        let prev_addrs: Option<(String, String)> = match db_tx.query_row(
+            "SELECT from_addr, to_addr FROM transactions WHERE tx_hash = ?1",
+            params![tx.tx_hash],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ) {
+            Ok(pair) => Some(pair),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e),
+        };
+
+        db_tx.execute(
             "INSERT OR REPLACE INTO transactions
              (shard_id, tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -962,29 +1141,97 @@ impl Database {
             ],
         )?;
 
-        // Update sender account
-        conn.execute(
-            "INSERT INTO accounts (address, tx_count, first_seen_height, last_seen_height)
-             VALUES (?1, 1, ?2, ?2)
-             ON CONFLICT(address) DO UPDATE SET
-                 tx_count = tx_count + 1,
-                 last_seen_height = MAX(last_seen_height, ?2)",
-            params![tx.from_addr, h],
-        )?;
-
-        // Update recipient account
-        if tx.to_addr != tx.from_addr {
-            conn.execute(
+        if let Some((old_from, old_to)) = prev_addrs {
+            if old_from == tx.from_addr && old_to == tx.to_addr {
+                // Re-indexing / block repair: update height bounds without inflating tx_count.
+                db_tx.execute(
+                    "INSERT INTO accounts (address, tx_count, first_seen_height, last_seen_height)
+                     VALUES (?1, 1, ?2, ?2)
+                     ON CONFLICT(address) DO UPDATE SET
+                         first_seen_height = MIN(first_seen_height, ?2),
+                         last_seen_height = MAX(last_seen_height, ?2)",
+                    params![tx.from_addr, h],
+                )?;
+                if tx.to_addr != tx.from_addr {
+                    db_tx.execute(
+                        "INSERT INTO accounts (address, tx_count, first_seen_height, last_seen_height)
+                         VALUES (?1, 1, ?2, ?2)
+                         ON CONFLICT(address) DO UPDATE SET
+                             first_seen_height = MIN(first_seen_height, ?2),
+                             last_seen_height = MAX(last_seen_height, ?2)",
+                        params![tx.to_addr, h],
+                    )?;
+                }
+            } else {
+                // Reorg replacement changed addresses: recompute all affected accounts cleanly.
+                let mut affected: Vec<&str> = Vec::new();
+                for addr in [
+                    old_from.as_str(),
+                    old_to.as_str(),
+                    tx.from_addr.as_str(),
+                    tx.to_addr.as_str(),
+                ] {
+                    if !addr.is_empty() && !affected.iter().any(|a| a.eq_ignore_ascii_case(addr)) {
+                        affected.push(addr);
+                    }
+                }
+                for addr in affected {
+                    Self::recompute_account_tx(&db_tx, addr)?;
+                }
+            }
+        } else {
+            // Update sender account
+            db_tx.execute(
                 "INSERT INTO accounts (address, tx_count, first_seen_height, last_seen_height)
                  VALUES (?1, 1, ?2, ?2)
                  ON CONFLICT(address) DO UPDATE SET
                      tx_count = tx_count + 1,
+                     first_seen_height = MIN(first_seen_height, ?2),
                      last_seen_height = MAX(last_seen_height, ?2)",
-                params![tx.to_addr, h],
+                params![tx.from_addr, h],
             )?;
+
+            // Update recipient account
+            if tx.to_addr != tx.from_addr {
+                db_tx.execute(
+                    "INSERT INTO accounts (address, tx_count, first_seen_height, last_seen_height)
+                     VALUES (?1, 1, ?2, ?2)
+                     ON CONFLICT(address) DO UPDATE SET
+                         tx_count = tx_count + 1,
+                         first_seen_height = MIN(first_seen_height, ?2),
+                         last_seen_height = MAX(last_seen_height, ?2)",
+                    params![tx.to_addr, h],
+                )?;
+            }
         }
 
+        db_tx.commit()?;
         Ok(())
+    }
+
+    pub fn get_account(&self, address: &str) -> Result<Option<AccountRecord>> {
+        let trimmed = address.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        match conn.query_row(
+            "SELECT address, tx_count, first_seen_height, last_seen_height
+             FROM accounts WHERE LOWER(address) = LOWER(?1) LIMIT 1",
+            params![trimmed],
+            |row| {
+                Ok(AccountRecord {
+                    address: row.get(0)?,
+                    tx_count: row.get(1)?,
+                    first_seen_height: row.get(2)?,
+                    last_seen_height: row.get(3)?,
+                })
+            },
+        ) {
+            Ok(acc) => Ok(Some(acc)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     #[allow(dead_code)]
@@ -1144,6 +1391,10 @@ impl Database {
                 "(LOWER(tx_hash) = ?{p1} OR LOWER(tx_hash) = ?{p2})"
             ));
         }
+        if let Some(sid) = filter.shard_id {
+            args.push((sid as i64).into());
+            clauses.push(format!("shard_id = ?{}", args.len()));
+        }
         let where_sql = if clauses.is_empty() {
             String::new()
         } else {
@@ -1297,19 +1548,41 @@ impl Database {
     /// attacker-growable (anyone can deploy a contract and emit events), so an
     /// unbounded dump would be a DoS amplifier.
     pub fn list_contracts(&self, limit: u32, offset: u32) -> Result<Vec<ContractSummary>> {
+        self.list_contracts_in_shard(None, limit, offset)
+    }
+
+    pub fn list_contracts_in_shard(
+        &self,
+        shard_id: Option<u32>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<ContractSummary>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare(
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        let where_sql = if let Some(sid) = shard_id {
+            args.push((sid as i64).into());
+            format!("WHERE shard_id = ?{}", args.len())
+        } else {
+            String::new()
+        };
+        args.push((limit as i64).into());
+        let limit_p = args.len();
+        args.push((offset as i64).into());
+        let offset_p = args.len();
+        let sql = format!(
             "SELECT contract,
                     COUNT(*)          AS event_count,
                     COUNT(DISTINCT tx_hash) AS tx_count,
                     MIN(block_height) AS first_block,
                     MAX(block_height) AS last_block
              FROM contract_events
+             {where_sql}
              GROUP BY LOWER(contract)
              ORDER BY event_count DESC, last_block DESC, LOWER(contract) ASC
-             LIMIT ?1 OFFSET ?2",
-        )?;
-        let rows = stmt.query_map(params![limit, offset], |row| {
+             LIMIT ?{limit_p} OFFSET ?{offset_p}"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
             let contract: String = row.get(0)?;
             let stl57 = to_stl57(&contract);
             Ok(ContractSummary {
@@ -1336,6 +1609,15 @@ impl Database {
         limit: u32,
         cursor: Option<(u64, u64, String)>,
     ) -> Result<KeysetPage<ContractSummary>> {
+        self.list_contracts_in_shard_keyset(None, limit, cursor)
+    }
+
+    pub fn list_contracts_in_shard_keyset(
+        &self,
+        shard_id: Option<u32>,
+        limit: u32,
+        cursor: Option<(u64, u64, String)>,
+    ) -> Result<KeysetPage<ContractSummary>> {
         if limit == 0 {
             return Ok(KeysetPage {
                 items: Vec::new(),
@@ -1344,6 +1626,12 @@ impl Database {
             });
         }
         let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        let shard_where = if let Some(sid) = shard_id {
+            args.push((sid as i64).into());
+            format!("WHERE shard_id = ?{}", args.len())
+        } else {
+            String::new()
+        };
         let cursor_where = if let Some((ec, lb, addr)) = cursor {
             args.push(Self::clamp_u64(ec).into());
             let p1 = args.len();
@@ -1370,9 +1658,9 @@ impl Database {
                         COALESCE(ev.first_block, ct.deploy_height, 0) AS first_block,
                         COALESCE(ev.last_block, ct.deploy_height, 0) AS last_block
                  FROM (
-                     SELECT LOWER(address) AS addr FROM contracts
+                     SELECT LOWER(address) AS addr FROM contracts {shard_where}
                      UNION
-                     SELECT LOWER(contract) AS addr FROM contract_events
+                     SELECT LOWER(contract) AS addr FROM contract_events {shard_where}
                  ) c
                  LEFT JOIN (
                      SELECT LOWER(contract) AS addr,
@@ -1381,11 +1669,13 @@ impl Database {
                             MIN(block_height) AS first_block,
                             MAX(block_height) AS last_block
                      FROM contract_events
+                     {shard_where}
                      GROUP BY LOWER(contract)
                  ) ev ON ev.addr = c.addr
                  LEFT JOIN (
                      SELECT LOWER(address) AS addr, MIN(deploy_height) AS deploy_height
                      FROM contracts
+                     {shard_where}
                      GROUP BY LOWER(address)
                  ) ct ON ct.addr = c.addr
              )
@@ -1432,16 +1722,30 @@ impl Database {
 
     /// How many distinct contracts are indexed (deployed or having emitted events).
     pub fn count_contracts(&self) -> Result<u64> {
+        self.count_contracts_in_shard(None)
+    }
+
+    pub fn count_contracts_in_shard(&self, shard_id: Option<u32>) -> Result<u64> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare(
-            "SELECT COUNT(*) FROM (
-                 SELECT LOWER(address) AS addr FROM contracts
-                 UNION
-                 SELECT LOWER(contract) AS addr FROM contract_events
-             )",
-        )?;
-        let count: u64 = stmt.query_row([], |row| row.get(0))?;
-        Ok(count)
+        if let Some(sid) = shard_id {
+            let mut stmt = conn.prepare(
+                "SELECT COUNT(*) FROM (
+                     SELECT LOWER(address) AS addr FROM contracts WHERE shard_id = ?1
+                     UNION
+                     SELECT LOWER(contract) AS addr FROM contract_events WHERE shard_id = ?1
+                 )",
+            )?;
+            stmt.query_row(params![sid], |row| row.get(0))
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT COUNT(*) FROM (
+                     SELECT LOWER(address) AS addr FROM contracts
+                     UNION
+                     SELECT LOWER(contract) AS addr FROM contract_events
+                 )",
+            )?;
+            stmt.query_row([], |row| row.get(0))
+        }
     }
 
     // ---- verified contract sources (audit P2-15) ----
@@ -1648,34 +1952,7 @@ impl Database {
     }
 
     pub fn get_block_by_height(&self, height: u64) -> Result<Option<BlockRecord>> {
-        if height > i64::MAX as u64 {
-            return Ok(None);
-        }
-        let h = height as i64;
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare(
-            "SELECT shard_id, height, hash, timestamp, tx_count, proposer, state_root
-             FROM blocks WHERE height = ?1 ORDER BY shard_id ASC LIMIT 1",
-        )?;
-        let mut rows = stmt.query_map(params![h], |row| {
-            let proposer: Option<String> = row.get(5)?;
-            let proposer_stl57 = proposer.as_deref().and_then(to_stl57);
-            Ok(BlockRecord {
-                shard_id: row.get(0)?,
-                height: row.get(1)?,
-                hash: row.get(2)?,
-                timestamp: row.get(3)?,
-                tx_count: row.get(4)?,
-                proposer,
-                proposer_stl57,
-                state_root: row.get(6)?,
-            })
-        })?;
-        if let Some(r) = rows.next() {
-            Ok(Some(r?))
-        } else {
-            Ok(None)
-        }
+        self.get_block_by_shard_and_height(0, height)
     }
 
     pub fn get_block_by_shard_and_height(
@@ -1748,21 +2025,7 @@ impl Database {
     }
 
     pub fn get_block_txs(&self, height: u64) -> Result<Vec<TxRecord>> {
-        if height > i64::MAX as u64 {
-            return Ok(Vec::new());
-        }
-        let h = height as i64;
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare(
-            "SELECT tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp
-             FROM transactions WHERE block_height = ?1 ORDER BY tx_index ASC",
-        )?;
-        let rows = stmt.query_map(params![h], Self::map_tx_row)?;
-        let mut res = Vec::new();
-        for r in rows {
-            res.push(r?);
-        }
-        Ok(res)
+        self.get_block_txs_for_shard(0, height)
     }
 
     /// Number of indexed transactions of one `(shard, height)` block.
@@ -1838,41 +2101,56 @@ impl Database {
     }
 
     pub fn get_account_txs(&self, address: &str, limit: u32, offset: u32) -> Result<Vec<TxRecord>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        if address.trim().is_empty() {
-            let mut stmt = conn.prepare(
-                "SELECT tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp
-                 FROM transactions
-                 ORDER BY block_height DESC, tx_index DESC, shard_id DESC
-                 LIMIT ?1 OFFSET ?2",
-            )?;
-            let rows = stmt.query_map(params![limit, offset], Self::map_tx_row)?;
-            let mut res = Vec::new();
-            for r in rows {
-                res.push(r?);
-            }
-            return Ok(res);
-        }
+        self.get_account_txs_by_shard(address, None, limit, offset)
+    }
 
-        let candidates = address_match_candidates(address);
-        if candidates.is_empty() {
-            return Ok(Vec::new());
+    pub fn get_account_txs_by_shard(
+        &self,
+        address: &str,
+        shard_id: Option<u32>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<TxRecord>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        let mut clauses: Vec<String> = Vec::new();
+        if !address.trim().is_empty() {
+            let candidates = address_match_candidates(address);
+            if candidates.is_empty() {
+                return Ok(Vec::new());
+            }
+            let ph: Vec<String> = candidates
+                .into_iter()
+                .map(|c| {
+                    args.push(c.into());
+                    format!("?{}", args.len())
+                })
+                .collect();
+            let in_list = ph.join(", ");
+            clauses.push(format!(
+                "(LOWER(from_addr) IN ({in_list}) OR LOWER(to_addr) IN ({in_list}))"
+            ));
         }
-        let ph: Vec<String> = (1..=candidates.len()).map(|i| format!("?{i}")).collect();
-        let in_list = ph.join(", ");
-        let limit_p = candidates.len() + 1;
-        let offset_p = candidates.len() + 2;
+        if let Some(sid) = shard_id {
+            args.push((sid as i64).into());
+            clauses.push(format!("shard_id = ?{}", args.len()));
+        }
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", clauses.join(" AND "))
+        };
+        args.push((limit as i64).into());
+        let limit_p = args.len();
+        args.push((offset as i64).into());
+        let offset_p = args.len();
         let sql = format!(
             "SELECT tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp
              FROM transactions
-             WHERE LOWER(from_addr) IN ({in_list}) OR LOWER(to_addr) IN ({in_list})
+             {where_sql}
              ORDER BY block_height DESC, tx_index DESC, shard_id DESC
              LIMIT ?{limit_p} OFFSET ?{offset_p}"
         );
-        let mut args: Vec<rusqlite::types::Value> =
-            candidates.into_iter().map(Into::into).collect();
-        args.push((limit as i64).into());
-        args.push((offset as i64).into());
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), Self::map_tx_row)?;
         let mut res = Vec::new();
@@ -1891,12 +2169,19 @@ impl Database {
     /// row; a legacy cursor carries no shard and keeps the pre-v2 predicate
     /// (`block_height`, then `tx_index`), which is what single-shard clients
     /// already paginate with.
-    ///
-    /// The transaction endpoints are not shard-filtered, so the cursor shard is
-    /// only a tie-breaker; there is no request-shard/filter conflict to reject.
     pub fn get_account_txs_keyset(
         &self,
         address: &str,
+        limit: u32,
+        cursor: Option<TxCursor>,
+    ) -> Result<KeysetPage<TxRecord>> {
+        self.get_account_txs_by_shard_keyset(address, None, limit, cursor)
+    }
+
+    pub fn get_account_txs_by_shard_keyset(
+        &self,
+        address: &str,
+        shard_id: Option<u32>,
         limit: u32,
         cursor: Option<TxCursor>,
     ) -> Result<KeysetPage<TxRecord>> {
@@ -1930,6 +2215,10 @@ impl Database {
             clauses.push(format!(
                 "(LOWER(from_addr) IN ({in_list}) OR LOWER(to_addr) IN ({in_list}))"
             ));
+        }
+        if let Some(sid) = shard_id {
+            args.push((sid as i64).into());
+            clauses.push(format!("shard_id = ?{}", args.len()));
         }
         if let Some(c) = cursor {
             args.push(Self::clamp_u64(c.height).into());
@@ -2000,21 +2289,68 @@ impl Database {
             return Ok(());
         }
         let balance = canonical_decimal_string(&rec.balance);
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute(
+        let height_i64 = Self::clamp_u64(rec.updated_height);
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction()?;
+
+        let existing: Option<(String, i64)> = match tx.query_row(
+            "SELECT balance, updated_height
+             FROM token_balances
+             WHERE shard_id = ?1 AND token_id = ?2 AND owner = ?3",
+            params![rec.shard_id, token_id, owner],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ) {
+            Ok(row) => Some(row),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e),
+        };
+
+        match existing {
+            None => {
+                tx.execute(
+                    "INSERT OR IGNORE INTO token_balance_history
+                     (shard_id, token_id, owner, height, prev_balance, prev_height)
+                     VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
+                    params![rec.shard_id, token_id, owner, height_i64],
+                )?;
+            }
+            Some((prev_balance, prev_height)) if prev_height < height_i64 => {
+                tx.execute(
+                    "INSERT OR IGNORE INTO token_balance_history
+                     (shard_id, token_id, owner, height, prev_balance, prev_height)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        rec.shard_id,
+                        token_id,
+                        owner,
+                        height_i64,
+                        prev_balance,
+                        prev_height,
+                    ],
+                )?;
+            }
+            Some(_) => {}
+        }
+
+        tx.execute(
             "INSERT INTO token_balances (shard_id, token_id, owner, balance, updated_height)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(shard_id, token_id, owner) DO UPDATE SET
                  balance = excluded.balance,
                  updated_height = excluded.updated_height",
-            params![
-                rec.shard_id,
-                token_id,
-                owner,
-                balance,
-                Self::clamp_u64(rec.updated_height),
-            ],
+            params![rec.shard_id, token_id, owner, balance, height_i64],
         )?;
+
+        if rec.updated_height > Self::TOKEN_BALANCE_HISTORY_RETENTION {
+            let cutoff =
+                Self::clamp_u64(rec.updated_height - Self::TOKEN_BALANCE_HISTORY_RETENTION);
+            tx.execute(
+                "DELETE FROM token_balance_history WHERE shard_id = ?1 AND height < ?2",
+                params![rec.shard_id, cutoff],
+            )?;
+        }
+
+        tx.commit()?;
         Ok(())
     }
 
@@ -2386,8 +2722,7 @@ impl Database {
         conn.execute(
             "INSERT INTO contracts (shard_id, address, creator, code_hash, deploy_height, has_abi)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(address) DO UPDATE SET
-                 shard_id = excluded.shard_id,
+             ON CONFLICT(shard_id, address) DO UPDATE SET
                  creator = COALESCE(excluded.creator, contracts.creator),
                  code_hash = COALESCE(excluded.code_hash, contracts.code_hash),
                  deploy_height = MIN(contracts.deploy_height, excluded.deploy_height),
@@ -2413,6 +2748,24 @@ impl Database {
         conn.execute(
             "UPDATE contracts SET has_abi = ?1 WHERE LOWER(address) = ?2",
             params![i64::from(has_abi), key],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_contract_has_abi_in_shard(
+        &self,
+        shard_id: u32,
+        address: &str,
+        has_abi: bool,
+    ) -> Result<()> {
+        let key = normalize_contract_key(address);
+        if key.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "UPDATE contracts SET has_abi = ?1 WHERE shard_id = ?2 AND LOWER(address) = ?3",
+            params![i64::from(has_abi), shard_id, key],
         )?;
         Ok(())
     }
@@ -2558,6 +2911,32 @@ impl Database {
         Ok(count)
     }
 
+    fn compute_window_stats(conn: &Connection, shard_id: u32) -> Result<(f64, f64)> {
+        let mut stmt = conn.prepare(
+            "SELECT timestamp, tx_count FROM blocks WHERE shard_id = ?1 ORDER BY height DESC LIMIT 100",
+        )?;
+        let rows = stmt.query_map(params![shard_id], |r| {
+            Ok((r.get::<_, u64>(0)?, r.get::<_, u64>(1)?))
+        })?;
+        let samples: Vec<(u64, u64)> = rows.flatten().collect();
+
+        let mut avg_block_time = 0.0;
+        let mut current_tps = 0.0;
+        if samples.len() >= 2 {
+            let t_newest = samples.first().unwrap().0;
+            let t_oldest = samples.last().unwrap().0;
+            let dt = t_newest.saturating_sub(t_oldest);
+            if dt > 0 {
+                let blocks_count = (samples.len() - 1) as f64;
+                avg_block_time = dt as f64 / blocks_count;
+                let txs_sum: u64 = samples.iter().map(|s| s.1).sum();
+                current_tps = txs_sum as f64 / dt as f64;
+            }
+        }
+
+        Ok((avg_block_time, current_tps))
+    }
+
     pub fn get_stats(&self) -> Result<NetworkStats> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tip_height: u64 =
@@ -2570,27 +2949,39 @@ impl Database {
         let total_accounts: u64 =
             conn.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))?;
 
-        // Calculate avg block time and current TPS over last 100 blocks (shard 0)
-        let mut stmt = conn.prepare("SELECT timestamp, tx_count FROM blocks WHERE shard_id = 0 ORDER BY height DESC LIMIT 100")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, u64>(1)?)))?;
-        let samples: Vec<(u64, u64)> = rows.flatten().collect();
+        let (avg_block_time, current_tps) = Self::compute_window_stats(&conn, 0)?;
 
-        let mut avg_block_time = 0.49;
-        let mut current_tps = 1.0;
-        if samples.len() >= 2 {
-            let t_newest = samples.first().unwrap().0;
-            let t_oldest = samples.last().unwrap().0;
-            let dt = t_newest.saturating_sub(t_oldest);
-            // If dt is within normal running window (< 200s for 100 blocks), compute exact time
-            if dt > 0 && dt < 200 {
-                let blocks_count = (samples.len() - 1) as f64;
-                let raw_time = dt as f64 / blocks_count;
-                avg_block_time = (raw_time * 100.0).round() / 100.0;
-                avg_block_time = avg_block_time.clamp(0.48, 0.50);
-                let txs_sum: u64 = samples.iter().map(|s| s.1).sum();
-                current_tps = (txs_sum as f64 / dt as f64).max(1.0);
-            }
-        }
+        Ok(NetworkStats {
+            tip_height,
+            total_blocks,
+            total_transactions,
+            total_accounts,
+            current_tps,
+            avg_block_time,
+        })
+    }
+
+    pub fn get_stats_for_shard(&self, shard_id: u32) -> Result<NetworkStats> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tip_height: u64 = conn.query_row(
+            "SELECT COALESCE(MAX(height), 0) FROM blocks WHERE shard_id = ?1",
+            params![shard_id],
+            |r| r.get(0),
+        )?;
+        let total_blocks: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM blocks WHERE shard_id = ?1",
+            params![shard_id],
+            |r| r.get(0),
+        )?;
+        let total_transactions: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM transactions WHERE shard_id = ?1",
+            params![shard_id],
+            |r| r.get(0),
+        )?;
+        let total_accounts: u64 =
+            conn.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))?;
+
+        let (avg_block_time, current_tps) = Self::compute_window_stats(&conn, shard_id)?;
 
         Ok(NetworkStats {
             tip_height,

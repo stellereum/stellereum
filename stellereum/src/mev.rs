@@ -277,6 +277,11 @@ pub enum OrderVerdict {
 /// false gate failure).
 const ORDER_COMMIT_LOOKBACK: u64 = 4;
 
+/// Maximum number of rounds retained in `round_keys`, `round_commits`, and
+/// `threshold_shares` so long-running nodes cannot accumulate unbounded
+/// historical round state.
+pub const MAX_RETAINED_ROUNDS: usize = 64;
+
 /// Domain separator of the ORDER commitment (the order Merkle root).
 ///
 /// Every hash of the construction below is mixed with this tag and a role
@@ -460,11 +465,40 @@ impl MevPreemptionEngine {
         }
     }
 
+    fn enforce_round_cap<V>(
+        map: &mut std::collections::HashMap<u64, V>,
+        max_entries: usize,
+        pinned_round: Option<u64>,
+    ) {
+        while map.len() > max_entries {
+            let Some(&oldest) = map.keys().filter(|&&r| Some(r) != pinned_round).min() else {
+                break;
+            };
+            map.remove(&oldest);
+        }
+    }
+
+    /// Prune historical MEV round state older than `min_round` across
+    /// `round_keys`, `round_commits`, `threshold_shares`, and `order_commits`
+    /// while preserving the node-local mempool sealing key (`POOL_ROUND`).
+    pub fn prune_before(&mut self, min_round: u64) {
+        self.round_keys
+            .retain(|&r, _| r == Self::POOL_ROUND || r >= min_round);
+        self.round_commits.retain(|&r, _| r >= min_round);
+        self.threshold_shares.retain(|&r, _| r >= min_round);
+        self.order_commits.retain(|&(h, _), _| h >= min_round);
+    }
+
     /// Generate an ephemeral round key for the upcoming blind round
     pub fn prepare_round(&mut self, round: u64) -> [u8; 32] {
         let mut key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut key);
         self.round_keys.insert(round, key);
+        Self::enforce_round_cap(
+            &mut self.round_keys,
+            MAX_RETAINED_ROUNDS,
+            Some(Self::POOL_ROUND),
+        );
         key
     }
 
@@ -478,6 +512,7 @@ impl MevPreemptionEngine {
         let key = self.prepare_round(round);
         let shares = ShamirSecretSharing::split(&key, threshold, total_validators);
         self.threshold_shares.insert(round, shares.clone());
+        Self::enforce_round_cap(&mut self.threshold_shares, MAX_RETAINED_ROUNDS, None);
         (key, shares)
     }
 
@@ -535,6 +570,7 @@ impl MevPreemptionEngine {
         };
 
         self.round_commits.insert(round, commitment.clone());
+        Self::enforce_round_cap(&mut self.round_commits, MAX_RETAINED_ROUNDS, None);
         commitment
     }
 
@@ -926,5 +962,44 @@ mod tests {
             engine.verify_block_order(7, [0x11; 32], &reordered),
             OrderVerdict::Mismatch
         );
+    }
+
+    #[test]
+    fn round_state_is_bounded_and_prune_before_preserves_pool_round() {
+        let mut engine = MevPreemptionEngine::new();
+        let (tx, _) = tx_pair();
+        let tx_hash = tx.compute_tx_hash();
+        let tx_bytes = bincode::serialize(&tx).unwrap();
+        engine.seal_admitted(&tx_hash, &tx_bytes);
+        assert_eq!(engine.verify_pool_tx(&tx), SealVerdict::Match);
+
+        let signers = vec![SigningKey::generate(&mut OsRng)];
+        let env = MevPreemptionEngine::seal_transaction(1, &[0x42; 32], b"payload").unwrap();
+
+        for r in 1..=(MAX_RETAINED_ROUNDS as u64 + 25) {
+            let _ = engine.prepare_threshold_round(r, 1, 2);
+            let _ = engine.commit_blind_round(r, std::slice::from_ref(&env), &signers);
+        }
+
+        assert!(engine.round_keys.len() <= MAX_RETAINED_ROUNDS);
+        assert!(engine.threshold_shares.len() <= MAX_RETAINED_ROUNDS);
+        assert!(engine.round_commits.len() <= MAX_RETAINED_ROUNDS);
+        assert!(
+            engine.round_keys.contains_key(&0),
+            "POOL_ROUND key must never be evicted by round cap"
+        );
+        assert_eq!(engine.verify_pool_tx(&tx), SealVerdict::Match);
+
+        let cutoff = MAX_RETAINED_ROUNDS as u64 + 20;
+        engine.commit_block_order(cutoff - 5, [0x01; 32], std::slice::from_ref(&tx), &signers);
+        engine.commit_block_order(cutoff, [0x02; 32], std::slice::from_ref(&tx), &signers);
+        engine.prune_before(cutoff);
+
+        assert!(engine.round_keys.contains_key(&0));
+        assert!(engine.round_keys.keys().all(|&r| r == 0 || r >= cutoff));
+        assert!(engine.round_commits.keys().all(|&r| r >= cutoff));
+        assert!(engine.threshold_shares.keys().all(|&r| r >= cutoff));
+        assert!(engine.order_commits.keys().all(|&(h, _)| h >= cutoff));
+        assert_eq!(engine.verify_pool_tx(&tx), SealVerdict::Match);
     }
 }

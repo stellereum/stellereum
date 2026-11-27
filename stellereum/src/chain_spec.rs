@@ -193,6 +193,64 @@ pub const FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT: u64 = u64::MAX;
 ///   `GAS_ACTOR_DELIVER + body.gas_budget` against the caller's remaining gas.
 pub const ACTOR_MAILBOX_HARDENING_HEIGHT: u64 = u64::MAX;
 
+/// Unbiased sortition and proposer selection activation height (`u64::MAX` =
+/// disabled, the compiled default).
+///
+/// Below this gate (`height < H`), committee sortition (`select_committee_from_seed`
+/// / `derive_sortition_committee`) and proposer selection (`proposer_from_digest` /
+/// `proposer_for`) use legacy modulo reduction (`rand_val % total_power` and
+/// `digest[..8] % range`), keeping historical replay 100% byte-identical.
+///
+/// At/above this gate (`height >= H`), both paths use exact 64-bit rejection
+/// sampling (`limit = (1u128 << 64) - ((1u128 << 64) % modulus)`) so non-power-of-two
+/// stake totals introduce zero modulo bias (`W6-A7-7`).
+pub const SORTITION_UNBIASED_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+/// Jail budget v2 (200-miss downtime threshold) activation height (`u64::MAX` =
+/// disabled, the compiled default).
+///
+/// Below this gate (`height < H`), `StakingLedger::note_missed_heights` uses the
+/// legacy [`crate::staking::DOWNTIME_MISS_THRESHOLD`] (`42` heights).
+///
+/// At/above this gate (`height >= H`), `downtime_miss_threshold_at(height)`
+/// switches to [`crate::staking::DOWNTIME_MISS_THRESHOLD_V2`] (`200` heights,
+/// `200 * 400 ms = 80.0 s` outage tolerance).
+pub const JAIL_BUDGET_V2_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+/// On-chain contract ABI manifest persistence at deploy time
+/// (`OpCode::SysCallDeployContractWithAbi`, discriminant 65) activation height
+/// (`u64::MAX` = disabled, the compiled default).
+///
+/// Below this gate (`height < H`), `SysCallDeployContractWithAbi` reverts
+/// fail-closed so historical replay is 100% byte-identical.
+///
+/// At/above this gate (`height >= H`), `SysCallDeployContractWithAbi` validates
+/// the inline JSON ABI manifest (`<= MAX_CONTRACT_ABI_BYTES`), deploys the
+/// WASM contract identically to `SysCallDeployContract`, and persists the
+/// parsed [`crate::contract_abi::ContractAbi`] on the deployed contract in
+/// [`crate::contract::ContractRegistry`] (committed into `state_root` and
+/// `state_trie` and served by `stell_getContractAbi`).
+pub const CONTRACT_ABI_ONCHAIN_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+/// Consensus <-> execution pipeline (lag-2 state-root binding) activation
+/// height (`u64::MAX` = disabled, the compiled default; INERT).
+///
+/// Today `block(H).state_root` is the post-state of block `H - 1` (lag 1): a
+/// header commits to the state BEFORE its own block applies. Arming this gate
+/// moves the commitment to lag 2, so `block(H).state_root` is the post-state of
+/// block `H - 2`:
+/// * [`committed_state_height_at`] answers which state height a block at `H`
+///   commits, and
+/// * [`anchor_height_for_post_state_at`] answers which block header anchors
+///   the post-state of a given state height.
+///
+/// Every consumer (block persistence, snapshot restore verification, archive
+/// historical roots, light-client checkpoints and the sync anchor walk)
+/// resolves through those two pure helpers, so below the gate every value is
+/// byte-identical to the lag-1 chain. The consensus apply loop itself is NOT
+/// restructured by this gate yet: at `u64::MAX` the entire path is inert.
+pub const EXECUTION_PIPELINE_V1_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
 #[cfg(any(test, debug_assertions))]
 thread_local! {
     static EXEC_HARDENING_V1_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
@@ -212,6 +270,14 @@ thread_local! {
     static FALCON_HOST_FUEL_V2_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
     static ACTOR_MAILBOX_HARDENING_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    static SORTITION_UNBIASED_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    static JAIL_BUDGET_V2_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    static CONTRACT_ABI_ONCHAIN_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    static EXECUTION_PIPELINE_V1_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -450,6 +516,153 @@ pub fn actor_mailbox_hardening_height() -> u64 {
 pub fn actor_mailbox_hardening_active_at(height: u64) -> bool {
     let gate = actor_mailbox_hardening_height();
     gate != u64::MAX && height >= gate
+}
+
+/// Set (or clear with `None`) the TEST/DEBUG-ONLY `SORTITION_UNBIASED`
+/// activation height override for the calling thread. Absent from release
+/// builds.
+#[cfg(any(test, debug_assertions))]
+pub fn set_sortition_unbiased_activation_override(activation: Option<u64>) {
+    SORTITION_UNBIASED_ACTIVATION_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// Effective `SORTITION_UNBIASED_ACTIVATION_HEIGHT` for the calling thread.
+pub fn sortition_unbiased_activation_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(h) = SORTITION_UNBIASED_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    SORTITION_UNBIASED_ACTIVATION_HEIGHT
+}
+
+/// True iff `SORTITION_UNBIASED` (exact rejection-sampling committee and
+/// proposer selection) is active at `height`.
+///
+/// Strictly returns `false` for EVERY height (including `u64::MAX`) when the
+/// effective gate is `u64::MAX` (`GatedOff`, the compiled default).
+pub fn sortition_unbiased_active_at(height: u64) -> bool {
+    let gate = sortition_unbiased_activation_height();
+    gate != u64::MAX && height >= gate
+}
+
+/// Set (or clear with `None`) the TEST/DEBUG-ONLY `JAIL_BUDGET_V2`
+/// activation height override for the calling thread. Absent from release
+/// builds.
+#[cfg(any(test, debug_assertions))]
+pub fn set_jail_budget_v2_activation_override(activation: Option<u64>) {
+    JAIL_BUDGET_V2_ACTIVATION_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// Effective `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` for the calling thread.
+pub fn jail_budget_v2_activation_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(h) = JAIL_BUDGET_V2_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    JAIL_BUDGET_V2_ACTIVATION_HEIGHT
+}
+
+/// True iff `JAIL_BUDGET_V2` (`DOWNTIME_MISS_THRESHOLD_V2 = 200` heights) is
+/// active at `height`.
+///
+/// Strictly returns `false` for EVERY height (including `u64::MAX`) when the
+/// effective gate is `u64::MAX` (`GatedOff`, the compiled default).
+pub fn jail_budget_v2_active_at(height: u64) -> bool {
+    let gate = jail_budget_v2_activation_height();
+    gate != u64::MAX && height >= gate
+}
+
+/// Set (or clear with `None`) the TEST/DEBUG-ONLY `CONTRACT_ABI_ONCHAIN`
+/// activation height override for the calling thread. Absent from release
+/// builds.
+#[cfg(any(test, debug_assertions))]
+pub fn set_contract_abi_onchain_activation_override(activation: Option<u64>) {
+    CONTRACT_ABI_ONCHAIN_ACTIVATION_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// Effective `CONTRACT_ABI_ONCHAIN_ACTIVATION_HEIGHT` for the calling thread.
+pub fn contract_abi_onchain_activation_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(h) = CONTRACT_ABI_ONCHAIN_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    CONTRACT_ABI_ONCHAIN_ACTIVATION_HEIGHT
+}
+
+/// True iff `CONTRACT_ABI_ONCHAIN` (`OpCode::SysCallDeployContractWithAbi`)
+/// is active at `height`.
+///
+/// Strictly returns `false` for EVERY height (including `u64::MAX`) when the
+/// effective gate is `u64::MAX` (`GatedOff`, the compiled default).
+pub fn contract_abi_onchain_active_at(height: u64) -> bool {
+    let gate = contract_abi_onchain_activation_height();
+    gate != u64::MAX && height >= gate
+}
+
+/// Set (or clear with `None`) the TEST/DEBUG-ONLY `EXECUTION_PIPELINE_V1`
+/// activation height override for the calling thread. Absent from release
+/// builds.
+#[cfg(any(test, debug_assertions))]
+pub fn set_execution_pipeline_v1_activation_override(activation: Option<u64>) {
+    EXECUTION_PIPELINE_V1_ACTIVATION_OVERRIDE.with(|c| c.set(activation));
+}
+
+/// Effective `EXECUTION_PIPELINE_V1_ACTIVATION_HEIGHT` for the calling thread.
+pub fn execution_pipeline_v1_activation_height() -> u64 {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(h) = EXECUTION_PIPELINE_V1_ACTIVATION_OVERRIDE.with(|c| c.get()) {
+        return h;
+    }
+    EXECUTION_PIPELINE_V1_ACTIVATION_HEIGHT
+}
+
+/// True iff the lag-2 execution pipeline is active at `height`.
+///
+/// Strictly returns `false` for EVERY height (including `u64::MAX`) when the
+/// effective gate is `u64::MAX` (`GatedOff`, the compiled default).
+pub fn execution_pipeline_v1_active_at(height: u64) -> bool {
+    let gate = execution_pipeline_v1_activation_height();
+    gate != u64::MAX && height >= gate
+}
+
+/// The state height whose post-state a block at `height` commits.
+///
+/// Pure, no I/O. Below [`execution_pipeline_v1_activation_height`] this is
+/// `height - 1` (today's lag-1 binding, byte-identical). At/above the gate it
+/// is `height - 2`: the block commits the post-state of the height before its
+/// parent. Saturating at zero so heights 0 and 1 can never underflow.
+pub fn committed_state_height_at(height: u64) -> u64 {
+    let lag = if execution_pipeline_v1_active_at(height) {
+        2
+    } else {
+        1
+    };
+    height.saturating_sub(lag)
+}
+
+/// The block height whose `state_root` anchors the post-state of
+/// `state_height`.
+///
+/// Pure, no I/O. Below the gate this is `state_height + 1` (today's binding).
+/// When the anchoring block itself commits with lag 2
+/// ([`execution_pipeline_v1_active_at`] at `state_height + 2`) it is
+/// `state_height + 2`.
+///
+/// The gate decision is deliberately taken at the ANCHOR height, not at
+/// `state_height`: the block that commits the root is the one that must follow
+/// the new rule. `state_height == activation - 2` is therefore anchored by
+/// `activation` (and still by `activation - 1`, which already committed the
+/// same post-state under the legacy rule).
+///
+/// Saturating arithmetic: no height can wrap, and `u64::MAX` anchors at
+/// `u64::MAX` (there is no successor that could commit beyond it).
+pub fn anchor_height_for_post_state_at(state_height: u64) -> u64 {
+    let gate_anchor = state_height.saturating_add(2);
+    if execution_pipeline_v1_active_at(gate_anchor) {
+        gate_anchor
+    } else {
+        state_height.saturating_add(1)
+    }
 }
 
 /// The parts of a chain's identity that are fixed when genesis is built.
@@ -818,6 +1031,30 @@ pub fn current_activation_schedule() -> ChainActivationSchedule {
                 actor_mailbox_hardening_height(),
                 "Hardens non-self actor mailbox delivery against debiting opcodes and bounds/bills contract host.send_message ActorSendBody gas_budget (compiled default u64::MAX: legacy behavior unchanged)",
             ),
+            ActivationGate::new(
+                "SORTITION_UNBIASED_ACTIVATION_HEIGHT",
+                "stellereum::chain_spec",
+                sortition_unbiased_activation_height(),
+                "Switches committee sortition and proposer selection from modulo reduction to exact 64-bit rejection sampling (compiled default u64::MAX: legacy modulo unchanged)",
+            ),
+            ActivationGate::new(
+                "JAIL_BUDGET_V2_ACTIVATION_HEIGHT",
+                "stellereum::chain_spec",
+                jail_budget_v2_activation_height(),
+                "Raises the downtime miss threshold from 42 to 200 heights (80s at 400ms cadence; compiled default u64::MAX: legacy 42-miss threshold unchanged)",
+            ),
+            ActivationGate::new(
+                "CONTRACT_ABI_ONCHAIN_ACTIVATION_HEIGHT",
+                "stellereum::chain_spec",
+                contract_abi_onchain_activation_height(),
+                "Enables OpCode::SysCallDeployContractWithAbi (discriminant 65) for consensus-committed ABI persistence at deploy time (compiled default u64::MAX: inactive)",
+            ),
+            ActivationGate::new(
+                "EXECUTION_PIPELINE_V1_ACTIVATION_HEIGHT",
+                "stellereum::chain_spec",
+                execution_pipeline_v1_activation_height(),
+                "Moves the block state-root binding from lag 1 to lag 2: block H commits post_state(H-2) and snapshots/historical roots anchor state S at block S+2 (compiled default u64::MAX: INERT, lag-1 values unchanged)",
+            ),
         ],
     }
 }
@@ -1009,6 +1246,22 @@ mod tests {
             (
                 "ACTOR_MAILBOX_HARDENING_HEIGHT",
                 ACTOR_MAILBOX_HARDENING_HEIGHT,
+            ),
+            (
+                "SORTITION_UNBIASED_ACTIVATION_HEIGHT",
+                SORTITION_UNBIASED_ACTIVATION_HEIGHT,
+            ),
+            (
+                "JAIL_BUDGET_V2_ACTIVATION_HEIGHT",
+                JAIL_BUDGET_V2_ACTIVATION_HEIGHT,
+            ),
+            (
+                "CONTRACT_ABI_ONCHAIN_ACTIVATION_HEIGHT",
+                CONTRACT_ABI_ONCHAIN_ACTIVATION_HEIGHT,
+            ),
+            (
+                "EXECUTION_PIPELINE_V1_ACTIVATION_HEIGHT",
+                EXECUTION_PIPELINE_V1_ACTIVATION_HEIGHT,
             ),
         ];
 

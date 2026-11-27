@@ -18,6 +18,64 @@ pub(super) fn proposal_parent_is_finalized(finalized_tip: u64, hc_height: u64) -
     finalized_tip.checked_add(1) == Some(hc_height)
 }
 
+/// Admit a gossiped or overlay-polled transaction into `mempool`.
+///
+/// Lock order (`accounts.rs:953`): reads `state` (`get_account` and
+/// `sponsor_balance_of`) BEFORE acquiring `mempool.write()`, never holding the
+/// pool write guard across an `accounts` read.
+async fn admit_tx_from_ingress(
+    state: &stellereum::state_engine::InMemoryStateEngine,
+    mempool: &tokio::sync::RwLock<stellereum::mempool::Mempool>,
+    is_sharded: bool,
+    shard_id: u32,
+    ingress_height: u64,
+    tx: stellereum::sharding::Transaction,
+    log_refusals: bool,
+) {
+    let from = tx.from;
+    let nonce = tx.nonce;
+    let acct = state.get_account(&from).await;
+    let bal = acct.as_ref().map(|a| a.balance).unwrap_or(0);
+    let onchain = acct.as_ref().map(|a| a.nonce).unwrap_or(0);
+    // PAYMASTER: pre-fetch sponsor balance BEFORE acquiring `mempool.write()`
+    // (engine read before pool write guard, see `accounts.rs:953`).
+    let sponsor_bal = state.sponsor_balance_of(&tx).await;
+    let mut pool = mempool.write().await;
+    // Same nonce-gap fail-fast as the RPC path (audit: blocks troubles):
+    // gossiped far-future nonces clogged both pools behind unreachable heads.
+    if let Some(gap) = pool.check_nonce_gap(&from, nonce, onchain) {
+        if log_refusals {
+            tracing::debug!(
+                "[mempool] gossip tx gapped from {}: {gap}",
+                hex::encode(&from[..6])
+            );
+        }
+        return;
+    }
+    // P2 shard gate + F-02 nonce head, carried into the choke point (not just
+    // pre-checked above): foreign-shard gossip can no longer squat in this
+    // shard's pool. The pool-level pin is the backstop; this is the explicit
+    // first line.
+    let mut ctx = stellereum::mempool::AdmissionCtx::wall_now()
+        .with_onchain_nonce(onchain)
+        .with_chain_height(ingress_height);
+    if let Some(sbal) = sponsor_bal {
+        ctx = ctx.with_sponsor_balance(sbal);
+    }
+    if is_sharded {
+        ctx = ctx.with_shard(shard_id);
+    }
+    if let Err(e) = pool.add_checked_ctx(tx, bal, ctx) {
+        if log_refusals {
+            tracing::debug!(
+                "[mempool] gossip admission refused from {} nonce={}: {e}",
+                hex::encode(&from[..6]),
+                nonce
+            );
+        }
+    }
+}
+
 /// Ingest gossiped & overlay mempool transactions, evaluate `can_vote`, run
 /// the propose gate (1), and cast value prevote (2) or timeout nil prevote (2b).
 pub(super) async fn run_mempool_and_propose_and_prevote(
@@ -61,80 +119,49 @@ pub(super) async fn run_mempool_and_propose_and_prevote(
         }
         st.chain_binding_drained = true;
     }
-    while let Ok(raw) = st.tx_rx.try_recv() {
+    for _ in 0..MAX_TX_RX_PER_TICK {
+        let Ok(raw) = st.tx_rx.try_recv() else {
+            break;
+        };
         // The epoch-seal frames share the transaction-gossip channel:
         // the sealed ciphertext, the DKG contribution, the order
         // commitment and the share release.
         match stellereum::consensus_net::parse_tx_gossip_payload(&raw) {
             Some(stellereum::consensus_net::TxGossipPayload::Mev(frame)) => {
                 st.rt.on_mev_frame(frame).await;
-                continue;
             }
             Some(stellereum::consensus_net::TxGossipPayload::Plain(tx)) => {
-                let acct = st.rt.state.get_account(&tx.from).await;
-                let bal = acct.as_ref().map(|a| a.balance).unwrap_or(0);
-                let onchain = acct.as_ref().map(|a| a.nonce).unwrap_or(0);
-                let mut pool = st.rt.mempool.write().await;
-                // Same nonce-gap fail-fast as the RPC path (audit:
-                // blocks troubles): gossiped far-future nonces clogged
-                // both pools behind unreachable heads.
-                if let Some(gap) = pool.check_nonce_gap(&tx.from, tx.nonce, onchain) {
-                    tracing::debug!(
-                        "[mempool] gossip tx gapped from {}: {gap}",
-                        hex::encode(&tx.from[..6])
-                    );
-                    continue;
-                }
-                // P2 shard gate + F-02 nonce head, carried into the choke
-                // point (not just pre-checked above): foreign-shard
-                // gossip can no longer squat in this shard's pool. The
-                // pool-level pin is the backstop; this is the explicit
-                // first line.
-                let mut gctx = stellereum::mempool::AdmissionCtx::wall_now()
-                    .with_onchain_nonce(onchain)
-                    .with_chain_height(ingress_height);
-                // PAYMASTER: gossiped sponsored transactions carry their
-                // sponsor's balance head (fail-closed without it).
-                if let Some(sbal) = st.rt.state.sponsor_balance_of(&tx).await {
-                    gctx = gctx.with_sponsor_balance(sbal);
-                }
-                if st.rt.shard_registry.is_sharded() {
-                    gctx = gctx.with_shard(st.rt.shard_id);
-                }
-                if let Err(e) = pool.add_checked_ctx(tx.clone(), bal, gctx) {
-                    tracing::debug!(
-                        "[mempool] gossip admission refused from {} nonce={}: {e}",
-                        hex::encode(&tx.from[..6]),
-                        tx.nonce
-                    );
-                }
-                continue;
+                admit_tx_from_ingress(
+                    &st.rt.state,
+                    &st.rt.mempool,
+                    st.rt.shard_registry.is_sharded(),
+                    st.rt.shard_id,
+                    ingress_height,
+                    tx,
+                    true,
+                )
+                .await;
             }
-            None => continue,
+            None => {}
         }
     }
 
-    // 0. pull mempool txs from the infnode overlay into our mempool
-    for tx in cfg.adapter.fetch_mempool_transactions(cfg.shard).await {
-        let acct = st.rt.state.get_account(&tx.from).await;
-        let bal = acct.as_ref().map(|a| a.balance).unwrap_or(0);
-        let onchain = acct.as_ref().map(|a| a.nonce).unwrap_or(0);
-        let mut pool = st.rt.mempool.write().await;
-        if pool.check_nonce_gap(&tx.from, tx.nonce, onchain).is_some() {
-            continue;
+    // 0. pull mempool txs from the infnode overlay into our mempool (throttled
+    //    to `MEMPOOL_KV_POLL_INTERVAL_MS` rather than every 50ms tick).
+    if st.last_mempool_kv_poll.elapsed() >= Duration::from_millis(MEMPOOL_KV_POLL_INTERVAL_MS) {
+        st.last_mempool_kv_poll = std::time::Instant::now();
+        for tx in cfg.adapter.fetch_mempool_transactions(cfg.shard).await {
+            admit_tx_from_ingress(
+                &st.rt.state,
+                &st.rt.mempool,
+                st.rt.shard_registry.is_sharded(),
+                st.rt.shard_id,
+                ingress_height,
+                tx,
+                false,
+            )
+            .await;
         }
-        // Same P2/F-02 pinning as the gossip path above.
-        let mut octx = stellereum::mempool::AdmissionCtx::wall_now()
-            .with_onchain_nonce(onchain)
-            .with_chain_height(ingress_height);
-        // PAYMASTER: same sponsor head as the gossip path above.
-        if let Some(sbal) = st.rt.state.sponsor_balance_of(&tx).await {
-            octx = octx.with_sponsor_balance(sbal);
-        }
-        if st.rt.shard_registry.is_sharded() {
-            octx = octx.with_shard(st.rt.shard_id);
-        }
-        let _ = pool.add_checked_ctx(tx, bal, octx);
     }
 
     // 1. propose if we are the proposer for this (height, round)
@@ -197,6 +224,11 @@ pub(super) async fn run_mempool_and_propose_and_prevote(
             _ => {}
         }
     }
+    if stellereum::chain_spec::execution_pipeline_v1_active_at(st.rt.hc.height) {
+        st.rt.ensure_genesis_root_seeded().await;
+    }
+    let decided_tip = st.rt.decided_tip_height_for_height(st.rt.hc.height);
+    let can_propose_now = st.rt.can_propose_at_height(st.rt.hc.height);
     if st.last_gate_diag != Some((height, round)) {
         st.last_gate_diag = Some((height, round));
         // Enterprise KPI: one "expected" opportunity per HEIGHT+ROUND-0
@@ -215,13 +247,14 @@ pub(super) async fn run_mempool_and_propose_and_prevote(
         if st.rt.is_proposer() && !st.rt.hc.has_live_proposal() {
             let reason = if !can_vote {
                 Some("not_can_vote")
-            } else if !proposal_parent_is_finalized(
-                st.rt.finalized.last().map(|(h, _)| *h).unwrap_or(0),
-                st.rt.hc.height,
-            ) {
+            } else if !proposal_parent_is_finalized(decided_tip, st.rt.hc.height) {
                 Some("parent_not_finalized")
-            } else if st.rt.has_pending_apply() {
-                Some("pending_apply")
+            } else if !can_propose_now {
+                Some(if st.rt.has_pending_apply() {
+                    "pending_apply"
+                } else {
+                    "missing_committed_root"
+                })
             } else if st.last_block_at.elapsed() < cfg.min_block_time {
                 Some("min_block_time")
             } else {
@@ -232,18 +265,16 @@ pub(super) async fn run_mempool_and_propose_and_prevote(
             }
         }
         tracing::debug!(
-            "[consensus] propose-gate h={} r={} can_vote={} pending_apply={} is_proposer={} live_proposal={} min_time_ok={} parent_ready={} scheduled={}",
+            "[consensus] propose-gate h={} r={} can_vote={} can_propose={} pending_apply={} is_proposer={} live_proposal={} min_time_ok={} parent_ready={} scheduled={}",
             height,
             round,
             can_vote,
+            can_propose_now,
             st.rt.has_pending_apply(),
             st.rt.is_proposer(),
             st.rt.hc.has_live_proposal(),
             st.last_block_at.elapsed() >= cfg.min_block_time,
-            proposal_parent_is_finalized(
-                st.rt.finalized.last().map(|(h, _)| *h).unwrap_or(0),
-                st.rt.hc.height
-            ),
+            proposal_parent_is_finalized(decided_tip, st.rt.hc.height),
             st.rt
                 .hc
                 .proposer()
@@ -262,22 +293,21 @@ pub(super) async fn run_mempool_and_propose_and_prevote(
     // per-tx revalidation + top-up, so the worst case is one bounded
     // O(block) revalidation before a fresh-equivalent build.
     // PARENT-BOUND PROPOSAL GATE (HEIGHT-SPLIT, propose half): a block's
-    // `prev_hash` is always our finalized tip, so the only height we may
-    // build at is `tip + 1` (height 1 at genesis). Proposing at any other
-    // height emits a block that either skips heights or reuses a decided
-    // parent — peers refuse it as a stale/wrong height and ours burns the
-    // round. This is also the backstop for a restored head that could not
-    // be reconciled: fail closed (no proposal) rather than fork.
-    let parent_is_finalized = proposal_parent_is_finalized(
-        st.rt.finalized.last().map(|(h, _)| *h).unwrap_or(0),
-        st.rt.hc.height,
-    );
-    if can_vote && !st.rt.has_pending_apply() && parent_is_finalized {
+    // `prev_hash` is always our decided parent (`finalized` below the gate,
+    // or the queued `height - 1` parent in `apply_in_flight` at/above it),
+    // so the only height we may build at is `decided_tip + 1` (height 1 at
+    // genesis). Proposing at any other height emits a block that either skips
+    // heights or reuses a decided parent — peers refuse it as a stale/wrong
+    // height and ours burns the round. This is also the backstop for a
+    // restored head that could not be reconciled: fail closed (no proposal)
+    // rather than fork.
+    let parent_is_finalized = proposal_parent_is_finalized(decided_tip, st.rt.hc.height);
+    if can_vote && can_propose_now && parent_is_finalized {
         st.rt.prebuild_next_proposal(now_secs()).await;
     }
     if can_vote
         && parent_is_finalized
-        && !st.rt.has_pending_apply()
+        && can_propose_now
         && st.rt.is_proposer()
         && !st.rt.hc.has_live_proposal()
         && st.last_block_at.elapsed() >= cfg.min_block_time
@@ -580,12 +610,13 @@ pub(super) async fn fast_forward_propose(
     // blocks hit trivially (empty selection revalidates vacuously).
     // Timeouts never move safety (lock rules untouched); earlier
     // proposals only improve liveness.
+    if stellereum::chain_spec::execution_pipeline_v1_active_at(st.rt.hc.height) {
+        st.rt.ensure_genesis_root_seeded().await;
+    }
+    let decided_tip = st.rt.decided_tip_height_for_height(st.rt.hc.height);
     if step.can_vote
-        && proposal_parent_is_finalized(
-            st.rt.finalized.last().map(|(h, _)| *h).unwrap_or(0),
-            st.rt.hc.height,
-        )
-        && !st.rt.has_pending_apply()
+        && proposal_parent_is_finalized(decided_tip, st.rt.hc.height)
+        && st.rt.can_propose_at_height(st.rt.hc.height)
         && st.rt.is_proposer()
         && !st.rt.hc.has_live_proposal()
         && st.last_block_at.elapsed() >= cfg.min_block_time
@@ -629,5 +660,78 @@ pub(super) async fn fast_forward_propose(
                 ntx
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod wave23b_propose_tests {
+    use super::*;
+    use std::sync::Arc;
+    use stellereum::mempool::Mempool;
+    use stellereum::sharding::Transaction;
+    use stellereum::state_engine::InMemoryStateEngine;
+
+    #[tokio::test]
+    async fn admit_tx_from_ingress_does_not_hold_mempool_write_across_accounts_read() {
+        let state = Arc::new(InMemoryStateEngine::new());
+        let mempool = Arc::new(tokio::sync::RwLock::new(Mempool::default()));
+        let tx = Transaction {
+            from: [0x11u8; 32],
+            to: [0x22u8; 32],
+            amount: 10,
+            gas_limit: 280_000,
+            nonce: 0,
+            source_shard: 0,
+            target_shard: 0,
+            signature: vec![],
+            payload: vec![],
+            priority_fee_per_gas: 0,
+        };
+
+        // Hold `state.accounts.write()` so `get_account` / `sponsor_balance_of`
+        // must wait inside `admit_tx_from_ingress`.
+        let acct_write = state.accounts.write().await;
+        let state_bg = Arc::clone(&state);
+        let mempool_bg = Arc::clone(&mempool);
+        let handle = tokio::spawn(async move {
+            admit_tx_from_ingress(&state_bg, &mempool_bg, false, 0, 1, tx, false).await;
+        });
+
+        tokio::task::yield_now().await;
+
+        // `mempool.write()` must remain immediately acquirable while the
+        // spawned task is blocked on `state.accounts` (proving lock order
+        // `accounts` before `mempool.write()` with no nested hold).
+        let pool_guard = tokio::time::timeout(Duration::from_millis(500), mempool.write())
+            .await
+            .expect("mempool.write() must not be held while awaiting state.accounts");
+        drop(pool_guard);
+        drop(acct_write);
+
+        handle.await.expect("ingress task must finish cleanly");
+    }
+
+    #[test]
+    fn tx_rx_cap_leaves_excess_for_next_tick() {
+        assert_eq!(MAX_TX_RX_PER_TICK, 256);
+        assert_eq!(MEMPOOL_KV_POLL_INTERVAL_MS, 2_000);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        for i in 0..(MAX_TX_RX_PER_TICK + 17) {
+            tx.send(i).unwrap();
+        }
+        let mut drained = 0usize;
+        for _ in 0..MAX_TX_RX_PER_TICK {
+            let Ok(_item) = rx.try_recv() else {
+                break;
+            };
+            drained += 1;
+        }
+        assert_eq!(drained, MAX_TX_RX_PER_TICK);
+        let mut remaining = 0usize;
+        while rx.try_recv().is_ok() {
+            remaining += 1;
+        }
+        assert_eq!(remaining, 17);
     }
 }

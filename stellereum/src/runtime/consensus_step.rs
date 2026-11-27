@@ -1,9 +1,8 @@
 use super::lanes::{block_actor_sends_exceed_cap, count_block_actor_sends};
 use super::{
-    master_set_stamp, publish_master_set_stamp, set_fingerprint, workchain_set_activation_height,
-    BlockHash, DecidedParentVotes, ValidatorRuntime, MAX_BLOCK_GAS, MAX_BLOCK_TXS,
-    MAX_COMMIT_CERT_SIGNERS, PROPOSAL_ALIGN_WINDOW_ROUNDS, SLOW_VALIDATION_THRESHOLD_MS,
-    VALIDATOR_SET_HISTORY_CAP,
+    master_set_stamp, publish_master_set_stamp, set_fingerprint, BlockHash, DecidedParentVotes,
+    ValidatorRuntime, MAX_BLOCK_GAS, MAX_BLOCK_TXS, MAX_COMMIT_CERT_SIGNERS,
+    PROPOSAL_ALIGN_WINDOW_ROUNDS, SLOW_VALIDATION_THRESHOLD_MS, VALIDATOR_SET_HISTORY_CAP,
 };
 use crate::consensus::{
     CommitteeSchedule, Height, Round, Step, ValidatorId, ValidatorSet, Vote, VoteKind, VoteSet,
@@ -73,7 +72,11 @@ impl ValidatorRuntime {
     /// useful copy is lost and the peer must retransmit it. One unauthenticated
     /// frame could evict it, so refuse to park non-replayable heights.
     pub(super) fn park_proposal(&mut self, proposer: ValidatorId, block: Block, round: Round) {
-        if block.height != self.hc.height.saturating_add(1) {
+        let allow_current_pipelined =
+            crate::chain_spec::execution_pipeline_v1_active_at(block.height)
+                && block.height == self.hc.height
+                && !self.can_validate_proposal_at_height(block.height);
+        if block.height != self.hc.height.saturating_add(1) && !allow_current_pipelined {
             tracing::debug!(
                 height = block.height,
                 round,
@@ -101,15 +104,20 @@ impl ValidatorRuntime {
     /// parked commit, so at most one is ever held).
     ///
     /// Same replayable-target rule as [`Self::park_proposal`]: only
-    /// `hc.height + 1` can be adopted after the install, so a commit for any
-    /// other height must never evict the useful slot (park depth 1).
+    /// `hc.height + 1` (or `hc.height` at/above `EXECUTION_PIPELINE_V1` while
+    /// waiting for its lag-2 committed post-state root) can be adopted after
+    /// the install, so a commit for any other height must never evict the
+    /// useful slot (park depth 1).
     pub(super) fn park_commit(
         &mut self,
         height: Height,
         block: Block,
         certificate: crate::consensus::QuorumCertificate,
     ) {
-        if height != self.hc.height.saturating_add(1) {
+        let allow_current_pipelined = crate::chain_spec::execution_pipeline_v1_active_at(height)
+            && height == self.hc.height
+            && !self.can_validate_proposal_at_height(height);
+        if height != self.hc.height.saturating_add(1) && !allow_current_pipelined {
             tracing::debug!(
                 height,
                 local_height = self.hc.height,
@@ -143,14 +151,24 @@ impl ValidatorRuntime {
     /// the H apply) and replay (H installed), which is why the check is
     /// "target == current height" rather than "no advance happened".
     ///
+    /// At/above `EXECUTION_PIPELINE_V1`, a depth-2 item at `hc.height` can also
+    /// be parked with `parked_at.0 == now.0` while waiting for its lag-2
+    /// committed post-state root to finish applying; once
+    /// [`Self::can_validate_proposal_at_height`] holds, it is returned here
+    /// for replay instead of being discarded.
+    ///
     /// Returns at most one of each (two entries total, fixed memory).
     pub fn take_parked(&mut self) -> (Option<ParkedProposal>, Option<ParkedCommit>) {
         let now = (self.hc.height, self.hc.round);
         let proposal = self.parked_proposal.take().filter(|p| {
-            // The apply window that parked this item must have closed (a
-            // height advance happened) AND the body must target the height
-            // now in progress, with a non-superseded envelope round.
-            p.parked_at.0 < now.0
+            let window_ready = if crate::chain_spec::execution_pipeline_v1_active_at(p.block.height)
+            {
+                p.parked_at.0 < now.0
+                    || (p.parked_at.0 == now.0 && self.can_validate_proposal_at_height(now.0))
+            } else {
+                p.parked_at.0 < now.0
+            };
+            window_ready
                 && p.block.height == now.0
                 && p.round
                     .saturating_add(crate::consensus_net::SUPERSEDED_ROUND_LAG)
@@ -158,8 +176,8 @@ impl ValidatorRuntime {
         });
         // A commit parked while the PREVIOUS height applied targets the height
         // that just became current; one parked during the CURRENT height's own
-        // apply is redundant after the advance and is dropped by the same
-        // target-height rule.
+        // depth-2 wait becomes replayable once `can_validate_proposal_at_height`
+        // opens.
         let commit = self
             .parked_commit
             .take()
@@ -722,8 +740,13 @@ impl ValidatorRuntime {
     }
 
     pub(super) fn try_admit_late_parent_precommit(&mut self, v: &Vote) -> bool {
-        let eligible = v.height.checked_add(1) == Some(self.hc.height)
-            || (v.height == self.hc.height && self.apply_in_flight.is_some());
+        let eligible = if crate::chain_spec::execution_pipeline_v1_active_at(v.height) {
+            v.height.checked_add(1) == Some(self.hc.height)
+                || self.apply_in_flight.iter().any(|a| a.height == v.height)
+        } else {
+            v.height.checked_add(1) == Some(self.hc.height)
+                || (v.height == self.hc.height && !self.apply_in_flight.is_empty())
+        };
         if !eligible {
             return false;
         }
@@ -1057,7 +1080,7 @@ impl ValidatorRuntime {
         if !self.verify_proposer_sig_cached(block, bh, true) {
             return Err("proposal: invalid or missing proposer signature".to_string());
         }
-        let expected_prev = self.finalized.last().map(|(_, h)| *h).unwrap_or([0u8; 32]);
+        let expected_prev = self.expected_parent_hash_for_height(block.height);
         if block.prev_hash != expected_prev {
             return Err("proposal: wrong prev_hash (not chained to finalized head)".to_string());
         }
@@ -1152,14 +1175,11 @@ impl ValidatorRuntime {
         // never a network split, and closed the moment its live path
         // re-feeds. Coordinated rollout: all validators run the identical
         // floor config, exactly like admission today.
-        {
+        if !block.transactions.is_empty() {
             let pool = self
                 .mempool
                 .try_read()
                 .map_err(|_| "proposal: fee floor unavailable (fail-closed)".to_string())?;
-            // Snapshot once for the diagnostic breakdown below; the verdict
-            // itself comes from the single helper (cannot drift).
-            let penalty_snapshot = pool.penalty_snapshot();
             // The CONSENSUS floor the apply path will charge with (the D2
             // penalty - the governed base is already covered by `base_fee`,
             // which is synced to `max(frozen, governed)`), snapshotted once. The
@@ -1173,10 +1193,26 @@ impl ValidatorRuntime {
             // A contended read fails CLOSED (the block is refused), exactly
             // like the mempool floor read above: a floor that cannot be read
             // must never be silently lowered.
-            let consensus_penalties = self
-                .state
-                .consensus_penalty_try_read()
-                .map_err(|_| "proposal: fee floor unavailable (fail-closed)".to_string())?;
+            let consensus_penalties: std::borrow::Cow<
+                '_,
+                std::collections::HashMap<[u8; 32], u64>,
+            > =
+                if crate::chain_spec::execution_pipeline_v1_active_at(block.height) {
+                    let state_h = crate::chain_spec::committed_state_height_at(block.height);
+                    if let Some(snap) = self.consensus_penalties_at.get(&state_h) {
+                        std::borrow::Cow::Borrowed(snap)
+                    } else {
+                        std::borrow::Cow::Owned(self.state.consensus_penalty_try_read().map_err(
+                            |_| "proposal: fee floor unavailable (fail-closed)".to_string(),
+                        )?)
+                    }
+                } else {
+                    std::borrow::Cow::Owned(
+                        self.state.consensus_penalty_try_read().map_err(|_| {
+                            "proposal: fee floor unavailable (fail-closed)".to_string()
+                        })?,
+                    )
+                };
             for tx in &block.transactions {
                 // THE SAME FLOOR AS ADMISSION AND AS THE PROPOSER'S OWN
                 // FILTER: `required_fee_for_tx` = base + D2 failure penalty +
@@ -1206,7 +1242,7 @@ impl ValidatorRuntime {
                         tx.gas_limit,
                         floor,
                         pool.base_fee,
-                        penalty_snapshot.get(&tx.from).copied().unwrap_or(0),
+                        pool.failed_penalty_of(&tx.from),
                         surcharge,
                         tx.priority_fee_per_gas,
                         consensus_penalties.get(&tx.from).copied().unwrap_or(0),
@@ -1341,7 +1377,7 @@ impl ValidatorRuntime {
             .unwrap_or_else(|| Transaction::verify_signatures_batch_parallel(&block.transactions));
         stages.push(("tx_batch_verify".into(), t.elapsed().as_millis() as u64));
         let t = std::time::Instant::now();
-        {
+        if !block.transactions.is_empty() {
             if let Ok(pool) = self.mempool.try_read() {
                 for tx in &block.transactions {
                     let _ = pool.required_fee_for_tx(tx);
@@ -1707,25 +1743,49 @@ impl ValidatorRuntime {
         envelope_round: Round,
     ) -> Result<BlockHash, String> {
         let _phase = phase_timer("on_proposal");
-        // §7 Phase 2 gate: the header's root check below reads OUR root, which
-        // is PRE-H while a decided block is still executing. Checking now
-        // would compare the proposal against the wrong parent state (a valid
-        // H+1 proposal looks corrupt, a stale one looks fine), so the
-        // proposal is deferred, not validated, until the worker reports back.
-        // No state is read and none moves.
-        //
-        // PARK-AND-REPLAY (liveness, incident #21508): the proposal used to be
-        // DROPPED here, so recovering it cost a full retransmit cycle (the
-        // first vote retransmit alone was >=1.5s before the retransmit fix).
-        // It is now parked in a bounded one-slot buffer and replayed through
-        // this same function (all checks run) as soon as the worker reports.
-        if self.apply_in_flight.is_some() {
-            self.park_proposal(proposer, block, envelope_round);
-            return Err("proposal parked for replay: apply in flight".to_string());
-        }
-        // Read our root BEFORE accepting, so the header is checked against the
-        // state the block would actually extend.
-        let our_root = self.state.get_state_root().await;
+        // §7 Phase 2 gate: below EXECUTION_PIPELINE_V1, our root is PRE-H
+        // while a decided block is still executing, so the proposal is parked
+        // for replay until the worker reports back. At/above the gate,
+        // `can_validate_proposal_at_height(block.height)` checks whether the
+        // worker-certified root for `committed_state_height_at(block.height)`
+        // is already recorded in `post_state_roots`, allowing lag-2 overlap
+        // without parking when `apply_in_flight` holds `block.height - 1`.
+        let our_root = if crate::chain_spec::execution_pipeline_v1_active_at(block.height) {
+            self.ensure_genesis_root_seeded().await;
+            if block.height != self.hc.height && !self.apply_in_flight.is_empty() {
+                self.park_proposal(proposer, block, envelope_round);
+                return Err("proposal parked for replay: apply in flight".to_string());
+            }
+            if !self.can_validate_proposal_at_height(block.height) {
+                if block.height == self.hc.height && !self.apply_in_flight.is_empty() {
+                    self.park_proposal(proposer, block, envelope_round);
+                    return Err(
+                        "proposal parked for replay: committed post-state root in flight"
+                            .to_string(),
+                    );
+                }
+                return Err(format!(
+                    "proposal deferred: committed post-state root for height {} (state height {}) not yet available",
+                    block.height,
+                    crate::chain_spec::committed_state_height_at(block.height)
+                ));
+            }
+            let Some(root) = self.state_root_for_committed_height(block.height) else {
+                return Err(format!(
+                    "proposal deferred: missing committed post-state root for height {}",
+                    block.height
+                ));
+            };
+            root
+        } else {
+            if !self.apply_in_flight.is_empty() {
+                self.park_proposal(proposer, block, envelope_round);
+                return Err("proposal parked for replay: apply in flight".to_string());
+            }
+            // Read our root BEFORE accepting, so the header is checked against the
+            // state the block would actually extend.
+            self.state.get_state_root().await
+        };
         let bh = block.compute_hash();
         // Authenticity FIRST, before height/state checks: only the declared
         // proposer could have signed this, so a verified signature makes the
@@ -2412,13 +2472,13 @@ impl ValidatorRuntime {
                 self.validator_set_history.push_back((ledger_height, vs));
             }
         }
-        self.install_validator_set_from_ledger(
-            ledger,
-            state_height,
-            ledger_height,
-            crate::sharding::validator_set_adoption_height(ledger_height),
-        )
-        .await
+        let activation = if crate::chain_spec::execution_pipeline_v1_active_at(ledger_height) {
+            ledger_height.saturating_add(2)
+        } else {
+            crate::sharding::validator_set_adoption_height(ledger_height)
+        };
+        self.install_validator_set_from_ledger(ledger, state_height, ledger_height, activation)
+            .await
     }
 
     /// Install the validator set derived from `ledger` (already known to be
@@ -2487,12 +2547,13 @@ impl ValidatorRuntime {
                         .map(|(h, _)| *h)
                         // Not in the bounded history: publish the conservative
                         // (later) boundary rather than an early one.
-                        .unwrap_or_else(|| workchain_set_activation_height(ledger_height))
+                        .unwrap_or(activation)
                 }
             } else {
-                // A rotation: the masterchain's own W10.5 boundary for the
-                // ledger height it derived the new set at.
-                workchain_set_activation_height(ledger_height)
+                // A rotation: the masterchain's own activation boundary for the
+                // ledger height it derived the new set at (`height + 1` below
+                // `EXECUTION_PIPELINE_V1`, `height + 2` at/above it).
+                activation
             };
             publish_master_set_stamp(
                 &self.state.staking_handle(),
@@ -2532,7 +2593,7 @@ impl ValidatorRuntime {
         // that case is the unchanged-set branch above.
         if matches!(
             &self.pending_validators,
-            Some((staged_at, staged)) if *staged_at == activation && staged.validators == vs.validators
+            Some((staged_at, staged)) if *staged_at <= activation && staged.validators == vs.validators
         ) {
             self.clear_validator_set_stale();
             self.validator_set_state_height = Some(state_height);
@@ -3002,6 +3063,14 @@ impl ValidatorRuntime {
         self.refresh_validator_set_from_staking_checked(h, h).await
     }
 
+    /// Apply-path wrapper with an explicit applied height `height`: used at/above
+    /// `EXECUTION_PIPELINE_V1` where `self.hc.height` may already have moved to
+    /// `height + 1` while `height` was executing on `ApplyLane`.
+    pub async fn refresh_validator_set_from_staking_at(&mut self, height: u64) -> bool {
+        self.refresh_validator_set_from_staking_checked(height, height)
+            .await
+    }
+
     /// Periodic workchain validator-set repair (R3 CODE-TAILS sweep).
     ///
     /// Every other refresh site sits on a height-advance path (live finalize,
@@ -3059,6 +3128,23 @@ impl ValidatorRuntime {
     /// own scheduled proposal slot) — even though it had just made more
     /// progress than any single finalize would.
     pub fn advance_to_verified_snapshot(&mut self, boundary: u64, boundary_hash: [u8; 32]) {
+        if !self.post_state_roots.contains_key(&boundary) {
+            let root = self.state.state_trie.try_read().ok().map(|t| t.root_hash());
+            if let Some(root) = root {
+                self.note_post_state_root(boundary, root);
+            }
+        }
+        let prev_root = boundary.checked_sub(1).and_then(|prev_h| {
+            self.blocks
+                .values()
+                .find(|b| b.height == boundary.saturating_add(1) && b.prev_hash == boundary_hash)
+                .map(|b| (prev_h, b.state_root))
+        });
+        if let Some((prev_h, prev_r)) = prev_root {
+            if !self.post_state_roots.contains_key(&prev_h) {
+                self.note_post_state_root(prev_h, prev_r);
+            }
+        }
         self.finalized.push((boundary, boundary_hash));
         if let Err(e) = self
             .safety
@@ -3078,6 +3164,23 @@ impl ValidatorRuntime {
         // use the same parent, or they elect different committees.
         self.hc.set_parent_hash(boundary_hash);
         self.record_progress();
+    }
+
+    /// Snapshot-sync jump with explicitly provided `snapshot_root` (at
+    /// `boundary`) and optional `prev_root` (at `boundary - 1`, e.g. from the
+    /// successor header `boundary + 1` under lag-2 `EXECUTION_PIPELINE_V1`).
+    pub fn advance_to_verified_snapshot_with_roots(
+        &mut self,
+        boundary: u64,
+        boundary_hash: [u8; 32],
+        snapshot_root: [u8; 32],
+        prev_root: Option<[u8; 32]>,
+    ) {
+        self.note_post_state_root(boundary, snapshot_root);
+        if let (Some(prev_h), Some(prev_r)) = (boundary.checked_sub(1), prev_root) {
+            self.note_post_state_root(prev_h, prev_r);
+        }
+        self.advance_to_verified_snapshot(boundary, boundary_hash);
     }
 
     /// View change: move to the next round.
@@ -3106,15 +3209,33 @@ impl ValidatorRuntime {
         if self.parallel_exec {
             self.state.set_parallel_exec(true);
         }
-        // §7 Phase 2 gate: adopting means executing, and execution is still
-        // running for the decided height. The checks below read our root
-        // (PRE-H until the worker reports back) and `apply_and_advance` would
-        // queue a second apply behind it — for a height we have not advanced
-        // past. PARK-AND-REPLAY (liveness): the commit used to be dropped, so
-        // the peer had to rebroadcast; it is now parked (one slot, newest
-        // wins) and replayed through this same function, fail-closed, when
-        // the worker reports.
-        if self.apply_in_flight.is_some() {
+        // §7 Phase 2 gate: below EXECUTION_PIPELINE_V1, adopting while an
+        // apply is in flight parks the commit for replay. At/above the gate,
+        // `can_validate_proposal_at_height(height)` validates against
+        // `post_state_roots[committed_state_height_at(height)]`; if `height`
+        // is ahead of `hc.height` while a prior height applies (transition
+        // boundary), it still parks for replay.
+        if crate::chain_spec::execution_pipeline_v1_active_at(height) {
+            self.ensure_genesis_root_seeded().await;
+            if height != self.hc.height && !self.apply_in_flight.is_empty() {
+                self.park_commit(height, block, certificate);
+                return Err("committed block parked for replay: apply in flight".to_string());
+            }
+            if !self.can_validate_proposal_at_height(height) {
+                if height == self.hc.height && !self.apply_in_flight.is_empty() {
+                    self.park_commit(height, block, certificate);
+                    return Err(
+                        "committed block parked for replay: committed post-state root in flight"
+                            .to_string(),
+                    );
+                }
+                return Err(format!(
+                    "committed block deferred: committed post-state root for height {} (state height {}) not yet available",
+                    height,
+                    crate::chain_spec::committed_state_height_at(height)
+                ));
+            }
+        } else if !self.apply_in_flight.is_empty() {
             self.park_commit(height, block, certificate);
             return Err("committed block parked for replay: apply in flight".to_string());
         }
@@ -3257,10 +3378,11 @@ impl ValidatorRuntime {
                 block.round, certificate.round
             ));
         }
-        // The block must still be a valid extension of what we finalized.
+        // The block must still be a valid extension of what we finalized (or
+        // the decided parent currently in flight at/above the pipeline gate).
         // Checked here (before any signature loop) so a commit for a forked head
         // is refused on two hash comparisons, not on quorum verification.
-        let expected_prev = self.finalized.last().map(|(_, h)| *h).unwrap_or([0u8; 32]);
+        let expected_prev = self.expected_parent_hash_for_height(height);
         if block.prev_hash != expected_prev {
             return Err("committed block does not extend our finalized head".to_string());
         }
@@ -3456,15 +3578,19 @@ impl ValidatorRuntime {
                     }
                 }
             }
-            // SECURITY: bind the block to the state it builds on. A block header commits
-            // to the state root BEFORE it is applied, and the linkage check above already
-            // forces the block to extend our own finalized head -- so the parent state IS
-            // ours and our live root is the right thing to compare against. Without this
-            // the adopt path applied blocks to a state the network never committed to,
-            // and computed a root nobody else had.
-            // (Linkage, size/gas and proposer-signature checks ran above, before the QC
-            // verify — not repeated here: the hot path verifies each once.)
-            let root_before = self.state.get_state_root().await;
+            // SECURITY: bind the block to the state it builds on. Below the
+            // pipeline gate that is our live root; at/above it, that is the
+            // worker-certified root for `committed_state_height_at(height)`.
+            let root_before = if crate::chain_spec::execution_pipeline_v1_active_at(height) {
+                let Some(root) = self.state_root_for_committed_height(height) else {
+                    return Err(format!(
+                        "committed block deferred: missing committed post-state root for height {height}"
+                    ));
+                };
+                root
+            } else {
+                self.state.get_state_root().await
+            };
             if block.state_root != root_before {
                 return Err(format!(
                     "committed block claims parent state root {} but our state is {}",
@@ -3507,6 +3633,33 @@ impl ValidatorRuntime {
                 self.ready_vdf_beacons.remove(&ep);
             }
             return Err(e);
+        }
+
+        if crate::chain_spec::execution_pipeline_v1_active_at(height)
+            && !self.apply_in_flight.is_empty()
+        {
+            // Preserve strict FIFO installation order in `self.finalized`:
+            // any older decided height in flight must install before
+            // `apply_and_advance` runs for `height`. Fail closed if the apply
+            // worker channel closes/panics while heights remain in flight so
+            // earlier heights can never be bypassed.
+            while !self.apply_in_flight.is_empty() {
+                if self.await_apply_completion().await.is_none() {
+                    if let Some(ep) = staged_vdf_epoch {
+                        self.ready_vdf_beacons.remove(&ep);
+                    }
+                    let remaining: Vec<u64> =
+                        self.apply_in_flight.iter().map(|a| a.height).collect();
+                    tracing::error!(
+                        height,
+                        ?remaining,
+                        "adopt_committed: apply worker closed while older height(s) were in flight; refusing adoption to preserve FIFO order"
+                    );
+                    return Err(format!(
+                        "committed block refused: apply worker terminated while heights {remaining:?} were in flight"
+                    ));
+                }
+            }
         }
 
         // DOWNTIME PARITY with the local path: the transition reads its slash

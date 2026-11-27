@@ -209,6 +209,28 @@ pub struct Storage {
     pub(super) safety_failed: Arc<Mutex<bool>>,
 }
 
+/// Maximum persisted block record size accepted when decoding from `sled` (32 MiB,
+/// matching `network::MAX_WIRE_BLOCK_BYTES` / `consensus_net::MAX_CONSENSUS_MSG`).
+pub(super) const MAX_BLOCK_BYTES: u64 = 32 * 1024 * 1024;
+/// Maximum small record size accepted when decoding headers, receipts, and
+/// metadata from `sled` (16 MiB).
+pub(super) const MAX_SMALL_RECORD_BYTES: u64 = crate::state_engine::MAX_SMALL_RECORD_DECODE_BYTES;
+
+/// Bounded `bincode` deserializer matching `bincode::serialize` wire format
+/// (`fixint` encoding + trailing bytes allowed) while enforcing `limit` against
+/// corrupt length prefixes.
+pub(super) fn decode_bounded<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    limit: u64,
+) -> bincode::Result<T> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(limit)
+        .deserialize(bytes)
+}
+
 /// Decode a small self-describing record with the shared per-record byte
 /// ceiling, so a corrupt length prefix cannot drive an OOM.
 pub(super) fn decode_small_record<T: serde::de::DeserializeOwned>(
@@ -218,7 +240,7 @@ pub(super) fn decode_small_record<T: serde::de::DeserializeOwned>(
     use bincode::Options;
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
-        .with_limit(crate::state_engine::MAX_SMALL_RECORD_DECODE_BYTES)
+        .with_limit(MAX_SMALL_RECORD_BYTES)
         .deserialize(bytes)
         .map_err(|e| anyhow!("{what}: record does not decode within the size limit: {e}"))
 }
@@ -390,11 +412,16 @@ impl Storage {
             snap_staging,
             safety_failed: Arc::new(Mutex::new(false)),
         };
-        let swept = this.sweep_dangling_indexes().unwrap_or(0);
-        if swept > 0 {
-            eprintln!(
-                "[storage] open: swept {swept} dangling by_height index entries (crash debris)"
-            );
+        match this.sweep_dangling_indexes() {
+            Ok(swept) if swept > 0 => {
+                eprintln!(
+                    "[storage] open: swept {swept} dangling by_height index entries (crash debris)"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("[storage] open: sweep_dangling_indexes failed: {e}");
+            }
         }
         // Derived, additive index: a failure here must not brick the store. The
         // marker stays unset, so `latest_receipts_capped` keeps using the

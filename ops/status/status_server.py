@@ -8,7 +8,9 @@ to compute 10-minute finalization rate and block-interval p99/avg, and serves:
 
   GET /                 Responsive self-contained HTML status page
   GET /api/status.json  Machine-readable cluster + per-node JSON snapshot
+  GET /api/status       Alias for /api/status.json
   GET /status.json      Alias for /api/status.json
+  GET /status           Alias for /api/status.json
   GET /health           Liveness check (200 OK while HTTP server is up)
   GET /healthz          Alias for /health
   GET /readyz           Readiness check (200 after initial poll completes)
@@ -23,7 +25,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait
 import html
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -57,7 +59,7 @@ DEFAULT_TARGETS: list[dict[str, Any]] = [
         "node": "A",
         "name": "Validator A",
         "role": "validator",
-        "rpc_url": "http://127.0.0.1:8545",
+        "rpc_url": "http://127.0.0.1:9080/rpc",
         "explorer_url": "http://127.0.0.1:9080",
         "validator_id": "48fd69d17c36d5391b7786f8091bce75e55f5b013344b60874090d53e8e8cdf7",
     },
@@ -73,7 +75,7 @@ DEFAULT_TARGETS: list[dict[str, Any]] = [
         "node": "C",
         "name": "Validator C",
         "role": "validator",
-        "rpc_url": "http://127.0.0.1:8552",
+        "rpc_url": "http://127.0.0.1:9081/rpc",
         "explorer_url": "http://127.0.0.1:9081",
         "validator_id": "9865d36eb93458ad7739e4de969e8c62b88e662b86f8ec38bd6ff3f83008162f",
     },
@@ -81,7 +83,7 @@ DEFAULT_TARGETS: list[dict[str, Any]] = [
         "node": "D",
         "name": "Validator D",
         "role": "validator",
-        "rpc_url": "http://127.0.0.1:8551",
+        "rpc_url": "http://127.0.0.1:18552",
         "explorer_url": "http://127.0.0.1:9082",
         "validator_id": "df3d10f3549f492fa829553f9f0a1fe4e6daaf7a74aa532b5411db6eca6d2ba4",
     },
@@ -383,9 +385,14 @@ def _http_get_text(url: str, timeout: float) -> tuple[int, str]:
             exc.close()
 
 
-def _rpc_call(rpc_url: str, method: str, params: list[Any] | None, timeout: float) -> tuple[Any, str | None]:
+def _rpc_call(
+    rpc_url: str,
+    method: str,
+    params: list[Any] | dict[str, Any] | None,
+    timeout: float,
+) -> tuple[Any, str | None]:
     payload = json.dumps(
-        {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}
+        {"jsonrpc": "2.0", "id": 1, "method": method, "params": params if params is not None else []}
     ).encode("utf-8")
     req = urllib.request.Request(
         rpc_url,
@@ -458,99 +465,263 @@ def probe_target(target: dict[str, Any], timeout: float) -> dict[str, Any]:
         "finals_rate_10m": None,
         "error": None,
         "_metrics_raw": None,
+        "_validator_status": None,
     }
 
+    timeout = max(0.2, float(timeout))
+    overall_budget = max(timeout * 2.5, timeout + 1.0)
+    deadline = time.monotonic() + overall_budget
     errors: list[str] = []
 
-    if rpc_url:
+    def _remaining_timeout() -> float:
+        return max(0.1, min(timeout, deadline - time.monotonic()))
+
+    def _probe_height() -> tuple[int | None, float | None, str | None]:
+        assert rpc_url is not None
         t0 = time.monotonic()
-        height_raw, err = _rpc_call(rpc_url, "eth_blockNumber", [], timeout)
+        height_raw, err = _rpc_call(rpc_url, "eth_blockNumber", [], _remaining_timeout())
         latency_ms = round((time.monotonic() - t0) * 1000.0, 2)
         height = hex_to_int(height_raw) if err is None else None
         if height is None:
             # Fallback to stell_blockNumber if eth_blockNumber failed with RPC error (not network down)
-            if err and "RPC error" in err:
+            if err and "RPC error" in err and time.monotonic() < deadline:
                 t1 = time.monotonic()
-                height_raw2, err2 = _rpc_call(rpc_url, "stell_blockNumber", [], timeout)
+                height_raw2, err2 = _rpc_call(rpc_url, "stell_blockNumber", [], _remaining_timeout())
                 latency_ms = round((time.monotonic() - t1) * 1000.0, 2)
                 height = hex_to_int(height_raw2) if err2 is None else None
                 if height is None:
-                    errors.append(err2 or f"bad blockNumber from {rpc_url}")
+                    return None, None, (err2 or f"bad blockNumber from {rpc_url}")
             else:
-                errors.append(err or f"bad eth_blockNumber from {rpc_url}")
-        if height is not None:
-            result["height"] = height
-            result["rpc_latency_ms"] = latency_ms
+                return None, None, (err or f"bad eth_blockNumber from {rpc_url}")
+        return height, latency_ms, None
 
-            syncing, _ = _rpc_call(rpc_url, "stell_syncing", [], timeout)
-            state_root, _ = _rpc_call(rpc_url, "stell_getStateRoot", [], timeout)
-            validators_raw, _ = _rpc_call(rpc_url, "stell_getValidators", [], timeout)
-            mempool_raw, _ = _rpc_call(rpc_url, "stell_mempoolSize", [], timeout)
-            chain_id, _ = _rpc_call(rpc_url, "stell_chainId", [], timeout)
-            node_id, _ = _rpc_call(rpc_url, "stell_nodeId", [], timeout)
+    def _probe_rpc_method(
+        method: str, params: list[Any] | dict[str, Any] | None = None
+    ) -> tuple[Any, str | None]:
+        assert rpc_url is not None
+        val, err = _rpc_call(rpc_url, method, params, _remaining_timeout())
+        if err is not None and method not in err:
+            err = f"{method}: {err}"
+        return val, err
 
-            result["syncing"] = syncing if isinstance(syncing, bool) else None
-            result["state_root"] = state_root if isinstance(state_root, str) else None
-            if validators_raw is not None:
-                vset = parse_validators_payload(validators_raw)
-                result["validators"] = vset["count"]
-                result["validator_set"] = vset
-            result["mempool"] = hex_to_int(mempool_raw)
-            result["chain_id"] = chain_id
-            result["node_id"] = node_id
-
-    if explorer_url:
+    def _probe_version() -> tuple[dict[str, Any] | None, str | None]:
         try:
-            code, body = _http_get_text(f"{explorer_url}/api/version", timeout)
+            code, body = _http_get_text(f"{explorer_url}/api/version", _remaining_timeout())
             if 200 <= code < 300:
                 parsed_v = json.loads(body)
+                if isinstance(parsed_v, dict):
+                    return parsed_v, None
+                return None, "explorer /api/version unexpected JSON payload"
+            return None, f"explorer /api/version HTTP {code}"
+        except (
+            urllib.error.URLError,
+            http.client.HTTPException,
+            TimeoutError,
+            OSError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            return None, f"explorer /api/version unreachable: {exc}"
+
+    def _probe_readyz() -> tuple[bool | None, str | None]:
+        try:
+            code, body = _http_get_text(f"{explorer_url}/readyz", _remaining_timeout())
+            err_msg: str | None = None
+            ready_val: bool | None = None
+            if not (200 <= code < 300):
+                err_msg = f"explorer /readyz HTTP {code}"
+            if not (300 <= code < 400) and body:
+                readyz = json.loads(body)
+                if isinstance(readyz, dict) and "ready" in readyz:
+                    ready_val = bool(readyz["ready"])
+                elif err_msg is None:
+                    err_msg = "explorer /readyz missing 'ready' field"
+            elif err_msg is None:
+                err_msg = "explorer /readyz empty response"
+            return ready_val, err_msg
+        except (
+            urllib.error.URLError,
+            http.client.HTTPException,
+            TimeoutError,
+            OSError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            return None, f"explorer /readyz unreachable: {exc}"
+
+    def _probe_metrics() -> tuple[dict[str, Any] | None, str | None]:
+        try:
+            code, body = _http_get_text(f"{explorer_url}/metrics", _remaining_timeout())
+            if 200 <= code < 300:
+                if body:
+                    return parse_prometheus_text(body), None
+                return None, "explorer /metrics empty response"
+            return None, f"explorer /metrics HTTP {code}"
+        except (
+            urllib.error.URLError,
+            http.client.HTTPException,
+            TimeoutError,
+            OSError,
+            ValueError,
+        ) as exc:
+            return None, f"explorer /metrics unreachable: {exc}"
+
+    pool = ThreadPoolExecutor(max_workers=10)
+    timed_out = False
+    try:
+        explorer_futures: dict[str, Future[Any]] = {}
+        if explorer_url:
+            explorer_futures["version"] = pool.submit(_probe_version)
+            explorer_futures["readyz"] = pool.submit(_probe_readyz)
+            explorer_futures["metrics"] = pool.submit(_probe_metrics)
+
+        height_future: Future[tuple[int | None, float | None, str | None]] | None = None
+        if rpc_url:
+            height_future = pool.submit(_probe_height)
+
+        rpc_futures: dict[str, Future[tuple[Any, str | None]]] = {}
+
+        if height_future is not None:
+            rem = max(0.0, deadline - time.monotonic())
+            done_h, _ = wait({height_future}, timeout=rem)
+            if height_future in done_h:
+                height, latency_ms, h_err = height_future.result()
+                if h_err:
+                    errors.append(h_err)
+                if height is not None:
+                    result["height"] = height
+                    result["rpc_latency_ms"] = latency_ms
+                    if time.monotonic() < deadline:
+                        for method in (
+                            "stell_syncing",
+                            "stell_getStateRoot",
+                            "stell_getValidators",
+                            "stell_mempoolSize",
+                            "stell_chainId",
+                            "stell_nodeId",
+                        ):
+                            rpc_futures[method] = pool.submit(_probe_rpc_method, method, [])
+                    else:
+                        errors.append(
+                            f"secondary RPC probes skipped (per-target budget {overall_budget:.1f}s exceeded)"
+                        )
+            else:
+                timed_out = True
+                errors.append(
+                    f"eth_blockNumber timed out (per-target budget {overall_budget:.1f}s exceeded)"
+                )
+
+        if rpc_futures:
+            rem = max(0.0, deadline - time.monotonic())
+            done_rpc, not_done_rpc = wait(rpc_futures.values(), timeout=rem)
+            if not_done_rpc:
+                timed_out = True
+            for method, fut in rpc_futures.items():
+                if fut not in done_rpc:
+                    errors.append(
+                        f"{method} timed out (per-target budget {overall_budget:.1f}s exceeded)"
+                    )
+                    continue
+                val, err = fut.result()
+                if err:
+                    errors.append(err)
+                if method == "stell_syncing":
+                    result["syncing"] = val if isinstance(val, bool) else None
+                elif method == "stell_getStateRoot":
+                    result["state_root"] = val if isinstance(val, str) else None
+                elif method == "stell_getValidators" and val is not None:
+                    vset = parse_validators_payload(val)
+                    result["validators"] = vset["count"]
+                    result["validator_set"] = vset
+                elif method == "stell_mempoolSize":
+                    result["mempool"] = hex_to_int(val)
+                elif method == "stell_chainId":
+                    result["chain_id"] = val
+                elif method == "stell_nodeId":
+                    result["node_id"] = val
+
+            vid = target.get("validator_id")
+            vset_cur = result["validator_set"]
+            if (
+                result["height"] is not None
+                and target["role"] == "validator"
+                and isinstance(vid, str)
+                and vid
+                and (vset_cur is None or vid not in vset_cur["ids"])
+            ):
+                if time.monotonic() < deadline:
+                    vstatus_future = pool.submit(
+                        _probe_rpc_method,
+                        "stell_getValidatorStatus",
+                        {"validator": vid},
+                    )
+                    rem = max(0.0, deadline - time.monotonic())
+                    done_vs, _ = wait({vstatus_future}, timeout=rem)
+                    if vstatus_future in done_vs:
+                        vstatus, vs_err = vstatus_future.result()
+                        if vs_err:
+                            errors.append(vs_err)
+                        if isinstance(vstatus, dict):
+                            result["_validator_status"] = vstatus
+                    else:
+                        timed_out = True
+                        errors.append(
+                            f"stell_getValidatorStatus timed out (per-target budget {overall_budget:.1f}s exceeded)"
+                        )
+                else:
+                    errors.append(
+                        f"stell_getValidatorStatus skipped (per-target budget {overall_budget:.1f}s exceeded)"
+                    )
+
+        if explorer_futures:
+            rem = max(0.0, deadline - time.monotonic())
+            done_exp, not_done_exp = wait(explorer_futures.values(), timeout=rem)
+            if not_done_exp:
+                timed_out = True
+
+            fut_v = explorer_futures["version"]
+            if fut_v in done_exp:
+                parsed_v, v_err = fut_v.result()
+                if v_err:
+                    errors.append(v_err)
                 if isinstance(parsed_v, dict):
                     result["version"] = parsed_v
                     if result["node_id"] is None and isinstance(parsed_v.get("node_id"), str):
                         result["node_id"] = parsed_v["node_id"]
-        except (
-            urllib.error.URLError,
-            http.client.HTTPException,
-            TimeoutError,
-            OSError,
-            ValueError,
-            json.JSONDecodeError,
-        ) as exc:
-            errors.append(f"explorer /api/version unreachable: {exc}")
+            else:
+                errors.append(
+                    f"explorer /api/version timed out (per-target budget {overall_budget:.1f}s exceeded)"
+                )
 
-        try:
-            code, body = _http_get_text(f"{explorer_url}/readyz", timeout)
-            if not (300 <= code < 400) and body:
-                readyz = json.loads(body)
-                if isinstance(readyz, dict) and "ready" in readyz:
-                    result["ready"] = bool(readyz["ready"])
-        except (
-            urllib.error.URLError,
-            http.client.HTTPException,
-            TimeoutError,
-            OSError,
-            ValueError,
-            json.JSONDecodeError,
-        ) as exc:
-            errors.append(f"explorer /readyz unreachable: {exc}")
+            fut_r = explorer_futures["readyz"]
+            if fut_r in done_exp:
+                ready_val, r_err = fut_r.result()
+                if r_err:
+                    errors.append(r_err)
+                if ready_val is not None:
+                    result["ready"] = ready_val
+            else:
+                errors.append(
+                    f"explorer /readyz timed out (per-target budget {overall_budget:.1f}s exceeded)"
+                )
 
-        try:
-            code, body = _http_get_text(f"{explorer_url}/metrics", timeout)
-            if 200 <= code < 300 and body:
-                parsed_m = parse_prometheus_text(body)
-                result["_metrics_raw"] = parsed_m
-                result["metrics_height"] = parsed_m["metrics_height"]
-                result["efficiency"] = parsed_m["efficiency"]
-                if result["ready"] is None:
-                    result["ready"] = parsed_m["ready"]
-        except (
-            urllib.error.URLError,
-            http.client.HTTPException,
-            TimeoutError,
-            OSError,
-            ValueError,
-        ) as exc:
-            errors.append(f"explorer /metrics unreachable: {exc}")
+            fut_m = explorer_futures["metrics"]
+            if fut_m in done_exp:
+                parsed_m, m_err = fut_m.result()
+                if m_err:
+                    errors.append(m_err)
+                if isinstance(parsed_m, dict):
+                    result["_metrics_raw"] = parsed_m
+                    result["metrics_height"] = parsed_m["metrics_height"]
+                    result["efficiency"] = parsed_m["efficiency"]
+                    if result["ready"] is None:
+                        result["ready"] = parsed_m["ready"]
+            else:
+                errors.append(
+                    f"explorer /metrics timed out (per-target budget {overall_budget:.1f}s exceeded)"
+                )
+    finally:
+        pool.shutdown(wait=not timed_out, cancel_futures=timed_out)
 
     height = result["height"]
     metrics_height = result["metrics_height"]
@@ -676,11 +847,44 @@ class StatusMonitor:
                         "finals_rate_10m": None,
                         "error": f"probe exception: {exc}",
                         "_metrics_raw": None,
+                        "_validator_status": None,
                     }
                 res["ts"] = ts
                 results_by_idx[idx] = res
 
         ordered_nodes = [results_by_idx[i] for i in range(len(self.targets))]
+        best_vset = self._pick_validator_set(ordered_nodes)
+        best_ids = set(best_vset["ids"]) if best_vset else set()
+        if best_ids:
+            for n in ordered_nodes:
+                vid = n.get("validator_id")
+                if (
+                    n["ok"]
+                    and n["role"] == "validator"
+                    and isinstance(vid, str)
+                    and vid
+                    and vid not in best_ids
+                    and n.get("_validator_status") is None
+                    and n.get("rpc_url")
+                ):
+                    vstatus, vstatus_err = _rpc_call(
+                        n["rpc_url"],
+                        "stell_getValidatorStatus",
+                        {"validator": vid},
+                        self.timeout_secs,
+                    )
+                    if isinstance(vstatus, dict):
+                        n["_validator_status"] = vstatus
+                    elif vstatus_err:
+                        err_msg = (
+                            vstatus_err
+                            if "stell_getValidatorStatus" in vstatus_err
+                            else f"stell_getValidatorStatus: {vstatus_err}"
+                        )
+                        n["error"] = (
+                            f"{n['error']}; {err_msg}" if n.get("error") else err_msg
+                        )
+
         with self._lock:
             snapshot = self._aggregate_locked(ts, ordered_nodes)
             self._latest_snapshot = snapshot
@@ -746,18 +950,27 @@ class StatusMonitor:
             jailed: bool | None = None
             if n["role"] == "validator":
                 vid = n.get("validator_id")
-                if not vid and isinstance(n.get("node_id"), str):
-                    vid = n["node_id"].strip().lower().removeprefix("0x")
+                if isinstance(vid, str):
+                    vid = vid.strip().lower().removeprefix("0x") or None
                 if active_set_ids and vid:
                     in_set = vid in active_set_ids
-                if in_set is False:
-                    jailed = True
-                elif n["efficiency"] is not None and n["efficiency"] == 0.0:
-                    jailed = True
-                elif in_set is True:
+                if in_set is True:
                     jailed = False
+                elif in_set is False:
+                    vstatus = n.get("_validator_status")
+                    if isinstance(vstatus, dict):
+                        if vstatus.get("jailed") is True:
+                            jailed = True
+                        elif vstatus.get("known") is False:
+                            jailed = None
+                        elif vstatus.get("jailed") is False:
+                            jailed = False
 
-            cleaned = {k: v for k, v in n.items() if k != "_metrics_raw" and k != "validator_set"}
+            cleaned = {
+                k: v
+                for k, v in n.items()
+                if k not in ("_metrics_raw", "_validator_status", "validator_set")
+            }
             cleaned["in_set"] = in_set
             cleaned["jailed"] = jailed
             cleaned["finals_rate_10m"] = node_rate
@@ -789,11 +1002,14 @@ class StatusMonitor:
 
         validator_nodes = [n for n in public_nodes if n["role"] == "validator"]
         reachable_validators = [n for n in validator_nodes if n["ok"]]
-        active_validators = [
-            n
-            for n in reachable_validators
-            if n["in_set"] is not False and n["jailed"] is not True
-        ]
+        if active_set_ids:
+            active_validators = [
+                n
+                for n in reachable_validators
+                if n["in_set"] is True and n["jailed"] is not True
+            ]
+        else:
+            active_validators = []
 
         efficiencies = [
             n["efficiency"]
@@ -983,14 +1199,12 @@ class StatusMonitor:
                         power_by_id[vid] = int(entry["power"])
                 reachable_power = 0
                 for n in active_validators:
-                    vid = n.get("validator_id") or (
-                        n["node_id"].strip().lower().removeprefix("0x")
-                        if isinstance(n.get("node_id"), str)
-                        else None
-                    )
-                    if vid and vid in power_by_id:
-                        reachable_power += power_by_id[vid]
-                if power_by_id and reachable_power > 0 and reachable_power < quorum_power:
+                    vid = n.get("validator_id")
+                    if isinstance(vid, str):
+                        vid_norm = vid.strip().lower().removeprefix("0x")
+                        if vid_norm in power_by_id:
+                            reachable_power += power_by_id[vid_norm]
+                if power_by_id and reachable_power < quorum_power:
                     power_quorum_lost = True
                     reasons.append(
                         f"reachable_power_below_quorum ({reachable_power} < {quorum_power})"
@@ -1005,6 +1219,13 @@ class StatusMonitor:
         if len(reachable_validators) == 0:
             reasons.append("no_validators_reachable")
             return "DOWN", reasons
+
+        if validator_set_info is None:
+            reasons.append("validator_set_unavailable")
+        else:
+            for n in reachable_validators:
+                if n.get("in_set") is None:
+                    reasons.append(f"validator_id_unknown ({n['node']})")
 
         if len(active_validators) < quorum_nodes or power_quorum_lost:
             reasons.append(
@@ -1296,6 +1517,8 @@ def render_html_page(snapshot: dict[str, Any] | None) -> str:
             state_txt = '<span class="warn">syncing</span>'
         elif n["ready"] is False:
             state_txt = '<span class="warn">not ready</span>'
+        elif n["role"] == "validator" and n["in_set"] is None:
+            state_txt = '<span class="warn">set unknown</span>'
         else:
             state_txt = '<span class="ok">active</span>'
 
@@ -1319,11 +1542,12 @@ def render_html_page(snapshot: dict[str, Any] | None) -> str:
             else '<span class="muted">unknown</span>'
         )
         if n["role"] == "validator":
-            set_txt = (
-                "yes"
-                if n["in_set"] is True
-                else ("NO (jailed)" if n["in_set"] is False else '<span class="muted">unknown</span>')
-            )
+            if n["in_set"] is True:
+                set_txt = "yes"
+            elif n["in_set"] is False:
+                set_txt = "NO (jailed)" if n["jailed"] is True else "NO (out of set)"
+            else:
+                set_txt = '<span class="muted">unknown</span>'
         else:
             set_txt = '<span class="muted">n/a</span>'
 
@@ -1552,6 +1776,8 @@ def render_html_page(snapshot: dict[str, Any] | None) -> str:
 class StatusHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 64
+    timeout = 10.0
 
     def __init__(self, server_address: tuple[str, int], monitor: StatusMonitor) -> None:
         self.monitor = monitor
@@ -1560,6 +1786,7 @@ class StatusHTTPServer(ThreadingHTTPServer):
 
 class StatusRequestHandler(BaseHTTPRequestHandler):
     server: StatusHTTPServer
+    timeout = 10.0
 
     def address_string(self) -> str:
         return str(self.client_address[0])
@@ -1568,20 +1795,25 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
         LOG.info("%s - %s", self.address_string(), format % args)
 
     def _send(self, status_code: int, content_type: str, body: bytes) -> None:
-        self.send_response(status_code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
+        try:
+            self.send_response(status_code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            LOG.debug("client disconnected during response to %s: %s", self.path, exc)
+            self.close_connection = True
 
     def do_HEAD(self) -> None:  # noqa: N802
         self.do_GET()
 
     def do_GET(self) -> None:  # noqa: N802
-        path = self.path.split("?", 1)[0]
+        raw_path = self.path.split("?", 1)[0]
+        path = raw_path.rstrip("/") or "/"
         snap = self.server.monitor.latest_snapshot()
 
         if path == "/":
@@ -1589,7 +1821,7 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             self._send(200, "text/html; charset=utf-8", body)
             return
 
-        if path in ("/api/status.json", "/status.json"):
+        if path in ("/api/status.json", "/status.json", "/api/status", "/status"):
             if snap is None:
                 payload = {
                     "service": "stell-status",
@@ -1691,23 +1923,28 @@ def main(argv: list[str] | None = None) -> int:
         level=os.environ.get("STELL_STATUS_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    args = build_arg_parser().parse_args(argv)
-    targets = load_targets(args.targets, args.targets_file)
-    monitor = StatusMonitor(
-        targets=targets,
-        interval_secs=args.interval,
-        timeout_secs=args.timeout,
-        history_len=args.history,
-        expected_validators=args.expected_validators,
-    )
+    try:
+        args = build_arg_parser().parse_args(argv)
+        targets = load_targets(args.targets, args.targets_file)
+        monitor = StatusMonitor(
+            targets=targets,
+            interval_secs=args.interval,
+            timeout_secs=args.timeout,
+            history_len=args.history,
+            expected_validators=args.expected_validators,
+        )
 
-    if args.once:
-        snap = monitor.poll_once()
-        print(json.dumps(snap, indent=2))
-        return 0
+        if args.once:
+            snap = monitor.poll_once()
+            print(json.dumps(snap, indent=2))
+            return 0
 
-    host, port = parse_listen(args.listen)
-    server = StatusHTTPServer((host, port), monitor)
+        host, port = parse_listen(args.listen)
+        server = StatusHTTPServer((host, port), monitor)
+    except (ValueError, json.JSONDecodeError, OSError) as exc:
+        LOG.error("configuration or startup failed: %s", exc)
+        return 1
+
     monitor.start()
 
     def _shutdown(signum: int, _frame: Any) -> None:

@@ -158,7 +158,9 @@
 //! node-local admission bond, not as an on-chain transfer.
 
 use crate::mev_kem_registry::MevKemRegistry;
-use crate::post_quantum::{verify_pq_signature, FalconKeypair, PqScheme};
+use crate::post_quantum::{
+    verify_pq_signature, FalconKeypair, PqScheme, FALCON512_PUBKEY_LEN, FALCON512_SIG_LEN,
+};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
@@ -222,6 +224,12 @@ pub const MAX_MEV_FRAME_BYTES: u64 = 4 * 1024 * 1024;
 /// ~12 s at 3 s blocks; at 240 ms it would have shrunk to ~0.96 s). This is
 /// a node-local retention bound, not a consensus rule.
 pub const ORDER_COMMITMENT_LOOKBACK: u64 = 50;
+
+/// Maximum distinct rounds retained per height in [`EpochSealManager::commitments`].
+///
+/// Caps per-height memory so a round-churning peer cannot store unbounded
+/// commitments for a single height.
+pub const MAX_COMMITMENT_ROUNDS_PER_HEIGHT: usize = 16;
 
 /// The MEV epoch a height belongs to.
 #[inline]
@@ -1114,6 +1122,123 @@ pub fn pq_transport_verify(
     Ok(())
 }
 
+/// Domain separator of the peer ML-KEM-768 key announcement Falcon signature.
+pub const KEM_KEY_ANNOUNCE_DOMAIN: &[u8; 25] = b"STELL_MEV_KEM_ANNOUNCE_V1";
+
+/// Falcon-512-authenticated announcement of a validator's ML-KEM-768
+/// encapsulation key for MEV epoch-sealing transport.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KemKeyAnnouncement {
+    pub chain_id: u64,
+    pub validator_id: [u8; 32],
+    pub ek: Vec<u8>,
+    pub activation_height: u64,
+    pub falcon_signature: Vec<u8>,
+}
+
+/// Canonical signing preimage for [`KemKeyAnnouncement`].
+pub fn kem_key_announcement_signing_message(
+    chain_id: u64,
+    validator_id: &[u8; 32],
+    ek: &[u8],
+    activation_height: u64,
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(KEM_KEY_ANNOUNCE_DOMAIN.len() + 8 + 32 + 4 + ek.len() + 8);
+    msg.extend_from_slice(KEM_KEY_ANNOUNCE_DOMAIN);
+    msg.extend_from_slice(&chain_id.to_be_bytes());
+    msg.extend_from_slice(validator_id);
+    msg.extend_from_slice(&(ek.len() as u32).to_be_bytes());
+    msg.extend_from_slice(ek);
+    msg.extend_from_slice(&activation_height.to_be_bytes());
+    msg
+}
+
+/// Seal a validator's ML-KEM-768 encapsulation key announcement with its
+/// Falcon-512 signing key, bound to `chain_id`.
+pub fn kem_key_announcement_seal(
+    falcon: &FalconKeypair,
+    chain_id: u64,
+    validator_id: [u8; 32],
+    ek: Vec<u8>,
+    activation_height: u64,
+) -> Result<KemKeyAnnouncement, String> {
+    if ek.len() != PQ_KEM_EK_LEN {
+        return Err(format!(
+            "kem key announcement ek has wrong length: {} != {PQ_KEM_EK_LEN}",
+            ek.len()
+        ));
+    }
+    crate::mev_kem_registry::validate_ek_bytes(&ek)
+        .map_err(|e| format!("kem key announcement ek is invalid: {e}"))?;
+    let msg = kem_key_announcement_signing_message(chain_id, &validator_id, &ek, activation_height);
+    let falcon_signature = falcon.sign(&msg);
+    if falcon_signature.len() != FALCON512_SIG_LEN {
+        return Err("kem key announcement Falcon-512 signature has unexpected length".to_string());
+    }
+    Ok(KemKeyAnnouncement {
+        chain_id,
+        validator_id,
+        ek,
+        activation_height,
+        falcon_signature,
+    })
+}
+
+/// Verify a [`KemKeyAnnouncement`] against `expected_chain_id` and the
+/// validator's expected Falcon-512 public key.
+///
+/// Fail-closed: cross-chain replay (`chain_id != expected_chain_id`),
+/// wrong/empty `ek` length, malformed ML-KEM-768 key encoding, empty/wrong-length
+/// `expected_falcon_pk` or `falcon_signature`, or signature verification failure
+/// are all refused.
+pub fn kem_key_announcement_verify(
+    ann: &KemKeyAnnouncement,
+    expected_chain_id: u64,
+    expected_falcon_pk: &[u8],
+) -> Result<(), String> {
+    if ann.chain_id != expected_chain_id {
+        return Err(format!(
+            "kem key announcement chain_id mismatch: got {}, expected {expected_chain_id}",
+            ann.chain_id
+        ));
+    }
+    if ann.ek.len() != PQ_KEM_EK_LEN {
+        return Err(format!(
+            "kem key announcement ek has wrong length: {} != {PQ_KEM_EK_LEN}",
+            ann.ek.len()
+        ));
+    }
+    crate::mev_kem_registry::validate_ek_bytes(&ann.ek)
+        .map_err(|e| format!("kem key announcement ek is invalid: {e}"))?;
+    if expected_falcon_pk.is_empty() || expected_falcon_pk.len() != FALCON512_PUBKEY_LEN {
+        return Err(format!(
+            "kem key announcement expected Falcon-512 pubkey has wrong length: {} != {FALCON512_PUBKEY_LEN}",
+            expected_falcon_pk.len()
+        ));
+    }
+    if ann.falcon_signature.is_empty() || ann.falcon_signature.len() != FALCON512_SIG_LEN {
+        return Err(format!(
+            "kem key announcement Falcon-512 signature has wrong length: {} != {FALCON512_SIG_LEN}",
+            ann.falcon_signature.len()
+        ));
+    }
+    let msg = kem_key_announcement_signing_message(
+        ann.chain_id,
+        &ann.validator_id,
+        &ann.ek,
+        ann.activation_height,
+    );
+    if !verify_pq_signature(
+        PqScheme::Falcon512,
+        expected_falcon_pk,
+        &msg,
+        &ann.falcon_signature,
+    ) {
+        return Err("kem key announcement Falcon-512 signature does not verify".to_string());
+    }
+    Ok(())
+}
+
 // ===========================================================================
 // PQ-KEM transport leg — RANK-1: ML-KEM-768 package encryption + Falcon auth
 // ===========================================================================
@@ -1220,8 +1345,8 @@ pub fn encrypt_share_package_pq(
     recipient_kem_ek: &[u8],
     plaintext: &[u8; 32],
 ) -> Result<EncryptedShare, String> {
-    let mut randomness = [0u8; 32];
-    OsRng.fill_bytes(&mut randomness);
+    let mut randomness = zeroize::Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(&mut *randomness);
     let (kem_ct, shared) = pq_kem_encapsulate_deterministic(recipient_kem_ek, &randomness)?;
     let key = derive_seal_key(&shared, &[0u8; 32], 0);
     let mut nonce = [0u8; 24];
@@ -2171,9 +2296,9 @@ pub fn seal_transaction(
     let public_point = decompress_point(&epoch_key.public_key)
         .ok_or_else(|| "epoch public key is not a valid curve point".to_string())?;
     // Fresh ephemeral key: the wallet never reuses an ephemeral scalar.
-    let mut eph_bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut eph_bytes);
-    let ephemeral = Scalar::from_bytes_mod_order(eph_bytes);
+    let mut eph_bytes = zeroize::Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(&mut *eph_bytes);
+    let ephemeral = Scalar::from_bytes_mod_order(*eph_bytes);
     // The Diffie-Hellman shared point: e * P_e.
     let shared = public_point * ephemeral;
     let shared_bytes = shared.compress().to_bytes();
@@ -2572,9 +2697,9 @@ pub fn prove_partial_dleq(
     if c_pt * x != d_pt {
         return Err("decryption partial does not match epoch share".to_string());
     }
-    let mut k_bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut k_bytes);
-    let k = Scalar::from_bytes_mod_order(k_bytes);
+    let mut k_bytes = zeroize::Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(&mut *k_bytes);
+    let k = Scalar::from_bytes_mod_order(*k_bytes);
     let r1 = (RISTRETTO_BASEPOINT_POINT * k).compress().to_bytes();
     let r2 = (c_pt * k).compress().to_bytes();
     let g_bytes = RISTRETTO_BASEPOINT_POINT.compress().to_bytes();
@@ -2850,25 +2975,26 @@ impl EpochKeyAnnouncement {
 
     /// Count the DISTINCT committee members whose signature verifies.
     ///
-    /// Signers MUST belong to the committee (`committee_members`, verified
-    /// against `committee_hash`, or `contributors` when `committee_members` is
-    /// empty). Arbitrary throwaway keys outside the committee are never counted.
+    /// Signers MUST belong to `committee_members` verified against
+    /// `committee_hash`. If `committee_members` is empty, fails closed by
+    /// returning `0` (never trusting unverified `contributors`). Arbitrary
+    /// throwaway keys outside the committee are never counted.
     /// When `is_pure_pq_enforced()` is true, only Falcon-512 signatures verified
     /// against registered committee PQ keys count.
     pub fn valid_signature_count(&self) -> usize {
-        let allowed: std::collections::HashSet<[u8; 32]> = if !self.committee_members.is_empty() {
-            if EpochCommittee::build(self.epoch, self.committee_members.clone()).hash
-                != self.committee_hash
-            {
-                return 0;
-            }
-            self.committee_members
-                .iter()
-                .map(|m| m.validator_id)
-                .collect()
-        } else {
-            self.contributors.iter().map(|(_, id)| *id).collect()
-        };
+        if self.committee_members.is_empty() {
+            return 0;
+        }
+        if EpochCommittee::build(self.epoch, self.committee_members.clone()).hash
+            != self.committee_hash
+        {
+            return 0;
+        }
+        let allowed: std::collections::HashSet<[u8; 32]> = self
+            .committee_members
+            .iter()
+            .map(|m| m.validator_id)
+            .collect();
         let msg = epoch_announcement_signing_message(
             self.epoch,
             &self.public_key,
@@ -3034,6 +3160,8 @@ pub const EPOCH_ANNOUNCE_PAYLOAD_MAGIC: &[u8; 4] = b"STE1";
 pub const PQ_DKG_PAYLOAD_MAGIC: &[u8; 4] = b"STPQ";
 /// Magic prefix of a Falcon-authenticated PQ share-release frame.
 pub const PQ_SHARE_RELEASE_PAYLOAD_MAGIC: &[u8; 4] = b"STRP";
+/// Magic prefix of a Falcon-authenticated ML-KEM-768 key announcement frame.
+pub const KEM_KEY_PAYLOAD_MAGIC: &[u8; 4] = b"MKM1";
 
 /// One frame of the epoch-seal gossip.
 ///
@@ -3056,6 +3184,8 @@ pub enum MevFrame {
     PqRelease(PqShareReleaseEnvelope),
     /// The epoch key announcement.
     Announcement(EpochKeyAnnouncement),
+    /// A Falcon-authenticated peer ML-KEM-768 transport key announcement.
+    KemKey(KemKeyAnnouncement),
 }
 
 impl MevFrame {
@@ -3069,6 +3199,7 @@ impl MevFrame {
             MevFrame::Release(_) => SHARE_RELEASE_PAYLOAD_MAGIC,
             MevFrame::PqRelease(_) => PQ_SHARE_RELEASE_PAYLOAD_MAGIC,
             MevFrame::Announcement(_) => EPOCH_ANNOUNCE_PAYLOAD_MAGIC,
+            MevFrame::KemKey(_) => KEM_KEY_PAYLOAD_MAGIC,
         }
     }
 
@@ -3082,6 +3213,7 @@ impl MevFrame {
             MevFrame::Release(v) => bincode::serialize(v),
             MevFrame::PqRelease(v) => bincode::serialize(v),
             MevFrame::Announcement(v) => bincode::serialize(v),
+            MevFrame::KemKey(v) => bincode::serialize(v),
         }
         .map_err(|e| format!("mev frame serialize error: {e}"))?;
         let mut out = Vec::with_capacity(4 + body.len());
@@ -3139,6 +3271,10 @@ impl MevFrame {
                 opts.deserialize(body)
                     .map_err(|e| format!("epoch announcement decode error: {e}"))?,
             ),
+            m if m == KEM_KEY_PAYLOAD_MAGIC => MevFrame::KemKey(
+                opts.deserialize(body)
+                    .map_err(|e| format!("kem key announcement decode error: {e}"))?,
+            ),
             _ => return Err("mev frame has an unknown magic prefix".to_string()),
         };
         Ok(frame)
@@ -3168,7 +3304,7 @@ pub fn decode_sealed_payload(bytes: &[u8]) -> Result<SealedEnvelope, String> {
 }
 
 /// Whether a wire frame is ANY epoch-seal frame (sealed, DKG, PQ-DKG,
-/// commitment, release or announcement).
+/// commitment, release, announcement, or KEM key announcement).
 pub fn is_mev_frame(bytes: &[u8]) -> bool {
     if bytes.len() <= 4 {
         return false;
@@ -3181,6 +3317,7 @@ pub fn is_mev_frame(bytes: &[u8]) -> bool {
         || magic == SHARE_RELEASE_PAYLOAD_MAGIC
         || magic == PQ_SHARE_RELEASE_PAYLOAD_MAGIC
         || magic == EPOCH_ANNOUNCE_PAYLOAD_MAGIC
+        || magic == KEM_KEY_PAYLOAD_MAGIC
 }
 
 // ===========================================================================
@@ -3843,9 +3980,8 @@ impl EpochSealManager {
             }
         }
         let commitment = OrderCommitment::sign(self.epoch, height, round, tx_hashes, signer);
-        self.prune_commitments(height);
         self.height_commitment = Some((height, commitment.clone()));
-        self.commitments.insert((height, round), commitment.clone());
+        self.insert_commitment_bounded(commitment.clone());
         Ok(commitment)
     }
 
@@ -3881,9 +4017,8 @@ impl EpochSealManager {
                 ));
             }
         }
-        self.prune_commitments(height);
         self.height_commitment = Some((height, candidate.clone()));
-        self.commitments.insert((height, round), candidate.clone());
+        self.insert_commitment_bounded(candidate.clone());
         Ok(candidate)
     }
 
@@ -3978,10 +4113,48 @@ impl EpochSealManager {
                 commitment.height
             ));
         }
-        self.prune_commitments(commitment.height);
-        self.commitments
-            .insert((commitment.height, commitment.round), commitment);
+        let height_rounds: Vec<u32> = self
+            .commitments
+            .keys()
+            .filter_map(|&(h, r)| (h == commitment.height).then_some(r))
+            .collect();
+        if height_rounds.len() >= MAX_COMMITMENT_ROUNDS_PER_HEIGHT
+            && height_rounds
+                .iter()
+                .min()
+                .is_some_and(|&min_round| commitment.round <= min_round)
+        {
+            return Err(format!(
+                "stale order commitment round {} for height {} below retained window",
+                commitment.round, commitment.height
+            ));
+        }
+        self.insert_commitment_bounded(commitment);
         Ok(())
+    }
+
+    /// Insert a commitment while enforcing both the height lookback and the
+    /// per-height distinct-round cap ([`MAX_COMMITMENT_ROUNDS_PER_HEIGHT`]).
+    fn insert_commitment_bounded(&mut self, commitment: OrderCommitment) {
+        self.prune_commitments(commitment.height);
+        let key = (commitment.height, commitment.round);
+        if let Some(existing) = self.commitments.get_mut(&key) {
+            *existing = commitment;
+            return;
+        }
+        let mut rounds_for_height: Vec<u32> = self
+            .commitments
+            .keys()
+            .filter_map(|&(h, r)| (h == commitment.height).then_some(r))
+            .collect();
+        rounds_for_height.sort_unstable();
+        if rounds_for_height.len() >= MAX_COMMITMENT_ROUNDS_PER_HEIGHT {
+            let excess = rounds_for_height.len() + 1 - MAX_COMMITMENT_ROUNDS_PER_HEIGHT;
+            for r in rounds_for_height.into_iter().take(excess) {
+                self.commitments.remove(&(commitment.height, r));
+            }
+        }
+        self.commitments.insert(key, commitment);
     }
 
     /// Keep the commitment map bounded.
@@ -4055,6 +4228,12 @@ impl EpochSealManager {
             return Err("this node has no committee index in this epoch".to_string());
         }
         let _ = material;
+        if height < self.partial_height {
+            return Err(format!(
+                "stale release height {} below active partial height {}",
+                height, self.partial_height
+            ));
+        }
         let point = compute_partial(&material.share, &envelope.ephemeral_pk)?;
         let partial = DecryptionPartial {
             validator_index: index,
@@ -4065,9 +4244,9 @@ impl EpochSealManager {
         Ok(partial)
     }
 
-    /// Drop the partials of a finished round (the height moved on).
+    /// Drop the partials of a finished round (the height moved forward).
     fn roll_partials_to(&mut self, height: u64) {
-        if self.partial_height != height {
+        if height > self.partial_height {
             self.partial_height = height;
             self.received.clear();
             self.released.clear();
@@ -4157,6 +4336,12 @@ impl EpochSealManager {
 
     fn ingest_release_inner(&mut self, release: ShareRelease) -> Result<usize, String> {
         self.validate_release_candidate(&release)?;
+        if release.height < self.partial_height {
+            return Err(format!(
+                "stale share release for height {} below active partial height {}",
+                release.height, self.partial_height
+            ));
+        }
         let mut accepted = 0usize;
         self.roll_partials_to(release.height);
         for (tx_hash, partial) in &release.partials {
@@ -4661,19 +4846,34 @@ mod tests {
         let signer = SigningKey::generate(&mut OsRng);
         let other = SigningKey::generate(&mut OsRng);
         let outsider = SigningKey::generate(&mut OsRng);
-        let contributors = vec![
-            (1, signer.verifying_key().to_bytes()),
-            (2, other.verifying_key().to_bytes()),
-        ];
+        let committee = EpochCommittee::build(
+            4,
+            vec![
+                CommitteeMember {
+                    validator_id: signer.verifying_key().to_bytes(),
+                    enc_pk: [0x11u8; 32],
+                },
+                CommitteeMember {
+                    validator_id: other.verifying_key().to_bytes(),
+                    enc_pk: [0x22u8; 32],
+                },
+            ],
+        );
+        let contributors = committee
+            .contributors
+            .iter()
+            .filter_map(|idx| committee.member_at(*idx).map(|m| (*idx, m.validator_id)))
+            .collect();
         let mut ann = EpochKeyAnnouncement::sign(
             4,
             [1u8; 32],
-            [2u8; 32],
+            committee.hash,
             [3u8; 32],
-            2,
+            committee.threshold,
             contributors,
             &signer,
         );
+        ann.committee_members = committee.members.clone();
         assert_eq!(ann.valid_signature_count(), 1);
         assert!(!ann.has_quorum(2));
         ann.signatures.push(ann.signatures[0].clone());
@@ -5077,5 +5277,174 @@ mod tests {
             MevFrame::decode(&evil).is_err(),
             "pathological length prefix must be refused"
         );
+    }
+
+    #[test]
+    fn empty_committee_members_announcement_returns_zero_signatures() {
+        let signer = SigningKey::generate(&mut OsRng);
+        let contributors = vec![(1, signer.verifying_key().to_bytes())];
+        let ann = EpochKeyAnnouncement::sign(
+            4,
+            [1u8; 32],
+            [2u8; 32],
+            [3u8; 32],
+            1,
+            contributors,
+            &signer,
+        );
+        assert!(ann.committee_members.is_empty());
+        assert_eq!(
+            ann.valid_signature_count(),
+            0,
+            "empty committee_members must fail closed with 0"
+        );
+        assert!(!ann.has_quorum(1));
+    }
+
+    #[test]
+    fn stale_share_release_does_not_wipe_active_height_partials() {
+        let (committee, members) = test_committee(5, 3);
+        let materials = run_dkg(&committee, &members);
+        let key = materials[0].public_key();
+        let tx_h9 = [0x11u8; 32];
+        let tx_h10 = [0x22u8; 32];
+        let env9 = seal_transaction(&key, b"tx-9", tx_h9, meta()).unwrap();
+        let env10 = seal_transaction(&key, b"tx-10", tx_h10, meta()).unwrap();
+
+        let proposer_sk = SigningKey::from_bytes(&members[0].secret);
+        let proposer_fk = FalconKeypair::generate_from_seed(0x51);
+        let peer_fk = FalconKeypair::generate_from_seed(0x52);
+
+        let mut manager = EpochSealManager::new();
+        manager.epoch = committee.epoch;
+        manager.committee = Some(committee.clone());
+        manager.material = Some(materials[0].clone());
+        manager.our_index = committee.index_of(&members[0].id);
+
+        let commit9 = OrderCommitment::sign_dual(
+            committee.epoch,
+            9,
+            0,
+            vec![tx_h9],
+            &proposer_sk,
+            &proposer_fk,
+        );
+        let commit10 = OrderCommitment::sign_dual(
+            committee.epoch,
+            10,
+            0,
+            vec![tx_h10],
+            &proposer_sk,
+            &proposer_fk,
+        );
+        manager
+            .note_commitment_verified(commit9.clone(), None, Some(&proposer_fk.public_key))
+            .expect("commit height 9");
+        manager
+            .note_commitment_verified(commit10.clone(), None, Some(&proposer_fk.public_key))
+            .expect("commit height 10");
+
+        let idx1 = committee.index_of(&members[1].id).unwrap();
+        let pt10 = compute_partial(&materials[1].share, &env10.ephemeral_pk).unwrap();
+        let rel10 = pq_share_release_seal(
+            &peer_fk,
+            members[1].id,
+            ShareRelease {
+                epoch: committee.epoch,
+                height: 10,
+                round: 0,
+                order_root: commit10.order_root,
+                partials: vec![(
+                    tx_h10,
+                    DecryptionPartial {
+                        validator_index: idx1,
+                        point: pt10,
+                    },
+                )],
+            },
+        );
+        assert_eq!(
+            manager
+                .ingest_release_authenticated(&rel10, &peer_fk.public_key)
+                .expect("active height 10 release accepted"),
+            1
+        );
+        assert_eq!(manager.partial_count(&tx_h10), 1);
+
+        // Also release our own partial at height 10.
+        manager
+            .release_partial(10, 0, &env10)
+            .expect("own partial at height 10");
+        assert_eq!(manager.partial_count(&tx_h10), 2);
+
+        // Replay an authenticated ShareRelease from height 9 (< partial_height == 10).
+        let pt9 = compute_partial(&materials[1].share, &env9.ephemeral_pk).unwrap();
+        let rel9 = pq_share_release_seal(
+            &peer_fk,
+            members[1].id,
+            ShareRelease {
+                epoch: committee.epoch,
+                height: 9,
+                round: 0,
+                order_root: commit9.order_root,
+                partials: vec![(
+                    tx_h9,
+                    DecryptionPartial {
+                        validator_index: idx1,
+                        point: pt9,
+                    },
+                )],
+            },
+        );
+        let err = manager
+            .ingest_release_authenticated(&rel9, &peer_fk.public_key)
+            .expect_err("stale height-9 ShareRelease must be refused");
+        assert!(err.contains("stale"), "unexpected error: {err}");
+        assert_eq!(
+            manager.partial_count(&tx_h10),
+            2,
+            "stale release must never wipe active height partials"
+        );
+
+        // Directly verify roll_partials_to(9) does not wipe height-10 partials.
+        manager.roll_partials_to(9);
+        assert_eq!(manager.partial_height, 10);
+        assert_eq!(manager.partial_count(&tx_h10), 2);
+    }
+
+    #[test]
+    fn commitments_bound_distinct_rounds_per_height() {
+        let (committee, members) = test_committee(6, 3);
+        let proposer_sk = SigningKey::from_bytes(&members[0].secret);
+        let proposer_fk = FalconKeypair::generate_from_seed(0x61);
+
+        let mut manager = EpochSealManager::new();
+        manager.epoch = committee.epoch;
+        manager.committee = Some(committee.clone());
+
+        let tx_h = [0x42u8; 32];
+        for round in 0..(MAX_COMMITMENT_ROUNDS_PER_HEIGHT as u32 + 8) {
+            let commit = OrderCommitment::sign_dual(
+                committee.epoch,
+                100,
+                round,
+                vec![tx_h],
+                &proposer_sk,
+                &proposer_fk,
+            );
+            manager
+                .note_commitment_verified(commit, None, Some(&proposer_fk.public_key))
+                .expect("forward rounds must be accepted");
+        }
+        let count_h100 = manager
+            .commitments
+            .keys()
+            .filter(|(h, _)| *h == 100)
+            .count();
+        assert_eq!(count_h100, MAX_COMMITMENT_ROUNDS_PER_HEIGHT);
+        assert!(manager.commitment(100, 0).is_none());
+        assert!(manager
+            .commitment(100, MAX_COMMITMENT_ROUNDS_PER_HEIGHT as u32 + 7)
+            .is_some());
     }
 }

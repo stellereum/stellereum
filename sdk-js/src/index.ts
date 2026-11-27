@@ -14,8 +14,17 @@
  */
 
 export {
+  GAS_CONTRACT_DEPLOY_BASE,
+  GAS_CONTRACT_DEPLOY_PER_BYTE,
   HttpFalconSigner,
+  OP_DEPLOY_CONTRACT,
   SubprocessFalconSigner,
+  buildContractDeployTransaction,
+  contractDeployGas,
+  encodeContractDeployOp,
+  encodeContractDeployPayload,
+  normalizeContractCode,
+  type ContractDeployIntent,
   type FalconSigner,
   type JsonCallArg,
   type SignDigestRequest,
@@ -26,6 +35,18 @@ export {
   type TxCommon,
   type TxIntent,
 } from "./signer.ts";
+
+export {
+  WasmFalconSigner,
+  createWasmImports,
+  encodeStl57Address,
+  instantiateStellereumWasm,
+  parseStellereumAddress,
+  type StellereumWasmExports,
+  type WasmEntropySource,
+  type WasmFalconKeypair,
+  type WasmFalconSignerOptions,
+} from "./wasm_signer.ts";
 
 export {
   StellereumClient,

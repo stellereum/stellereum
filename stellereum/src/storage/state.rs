@@ -127,51 +127,39 @@ impl Storage {
     /// pair builds engine state no anchor can validate. Callers must use this, never
     /// `latest_state` alone, when they need a restorable snapshot.
     pub fn latest_paired_snapshot(&self) -> Result<Option<(u64, Vec<u8>)>> {
-        let state_heights: std::collections::BTreeSet<u64> = self
-            .state
-            .iter()
-            .keys()
-            .filter_map(|k| k.ok())
-            .filter(|k| k.len() == 8)
-            .map(|k| u64::from_be_bytes(k.as_ref().try_into().unwrap()))
-            .collect();
-        let domain_heights: std::collections::BTreeSet<u64> = self
-            .domains
-            .iter()
-            .keys()
-            .filter_map(|k| k.ok())
-            .filter(|k| k.len() == 8)
-            .map(|k| u64::from_be_bytes(k.as_ref().try_into().unwrap()))
-            .collect();
-        let mut candidates: Vec<u64> = state_heights
-            .intersection(&domain_heights)
-            .copied()
-            .collect();
         if !self.pq_registry.is_empty() {
-            let pq_heights: std::collections::BTreeSet<u64> = self
-                .pq_registry
-                .iter()
-                .keys()
-                .filter_map(|k| k.ok())
-                .filter(|k| k.len() == 8)
-                .map(|k| u64::from_be_bytes(k.as_ref().try_into().unwrap()))
-                .collect();
-            let with_pq: Vec<u64> = candidates
-                .iter()
-                .copied()
-                .filter(|h| pq_heights.contains(h))
-                .collect();
-            if !with_pq.is_empty() {
-                candidates = with_pq;
+            for item in self.pq_registry.iter().keys().rev() {
+                let Ok(k) = item else {
+                    continue;
+                };
+                if k.len() != 8 {
+                    continue;
+                }
+                if self.domains.contains_key(&k)? {
+                    if let Some(bytes) = self.state.get(&k)? {
+                        let mut arr = [0u8; 8];
+                        arr.copy_from_slice(&k);
+                        return Ok(Some((u64::from_be_bytes(arr), bytes.to_vec())));
+                    }
+                }
             }
         }
-        let Some(height) = candidates.into_iter().max() else {
-            return Ok(None);
-        };
-        let Some(bytes) = self.state.get(height.to_be_bytes())? else {
-            return Ok(None);
-        };
-        Ok(Some((height, bytes.to_vec())))
+        for item in self.state.iter().keys().rev() {
+            let Ok(k) = item else {
+                continue;
+            };
+            if k.len() != 8 {
+                continue;
+            }
+            if self.domains.contains_key(&k)? {
+                if let Some(bytes) = self.state.get(&k)? {
+                    let mut arr = [0u8; 8];
+                    arr.copy_from_slice(&k);
+                    return Ok(Some((u64::from_be_bytes(arr), bytes.to_vec())));
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub fn latest_domains(&self) -> Result<Option<(u64, Vec<u8>)>> {
@@ -812,24 +800,32 @@ impl Storage {
     /// proposer reads the live root in `propose`, and `validate_proposal`,
     /// `adopt_committed` and the sync replay loop all check the header against
     /// the pre-apply root). A snapshot at height S is written AFTER block S is
-    /// finalized and applied, so it holds the post-S state -- which is exactly
-    /// the pre-state of block S+1. The expected root is therefore the
-    /// `state_root` of the block at S+1, never of the block at S: comparing
-    /// against S would reject every valid restore on a chain whose block S
-    /// changed any state.
+    /// finalized and applied, so it holds the post-S state. The expected root is
+    /// therefore the `state_root` of the block at
+    /// [`crate::chain_spec::anchor_height_for_post_state_at`]`(S)` — `S + 1` on
+    /// the legacy lag-1 chain, `S + 2` once `EXECUTION_PIPELINE_V1` is active —
+    /// never of the block at S: comparing against S would reject every valid
+    /// restore on a chain whose block S changed any state.
+    ///
+    /// Identity below the gate: the helper returns `S + 1`, so this method
+    /// opens exactly the same key and returns exactly the same root as before.
     ///
     /// The anchor comes from the already-persisted finalized chain data (the
     /// header record, which survives body pruning, falling back to a retained
     /// block body), NOT from the snapshot itself -- comparing the snapshot
     /// against anything derived from the snapshot would verify nothing.
     ///
-    /// Returns `None` when no block at S+1 is persisted (a snapshot at the
-    /// finalized tip with no successor yet, or a data directory from before
-    /// headers were written): there is nothing independent to compare against.
+    /// Returns `None` when no block at the anchor height is persisted (a
+    /// snapshot at the finalized tip with no successor yet, or a data directory
+    /// from before headers were written): there is nothing independent to
+    /// compare against.
     pub fn expected_restore_root(&self, snapshot_height: u64) -> Result<Option<[u8; 32]>> {
-        let next = snapshot_height
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("snapshot height overflows u64"))?;
+        let next = crate::chain_spec::anchor_height_for_post_state_at(snapshot_height);
+        // The helper saturates at `u64::MAX`; an anchor that is not strictly
+        // above the state height means there is no successor to anchor it.
+        if next <= snapshot_height {
+            return Err(anyhow!("snapshot height overflows u64"));
+        }
         if let Some(rec) = self.header_at(next)? {
             return Ok(Some(rec.state_root));
         }
@@ -907,7 +903,7 @@ impl Storage {
             return Err(anyhow!(
                 "restore root mismatch at height {snapshot_height}: snapshot hashes to {} but the finalized block at {} commits to {} (truncated, corrupt or wrong-height snapshot rejected)",
                 hex::encode(computed),
-                snapshot_height + 1,
+                crate::chain_spec::anchor_height_for_post_state_at(snapshot_height),
                 hex::encode(expected),
             ));
         }
@@ -2837,5 +2833,144 @@ pub async fn load_state_into(
             Ok(Some(height))
         }
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_store() -> (std::path::PathBuf, Storage) {
+        let dir = std::env::temp_dir().join(format!(
+            "stell_state_paired_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let st = Storage::open(&dir).expect("open temp storage");
+        (dir, st)
+    }
+
+    fn reference_latest_paired_snapshot(st: &Storage) -> Option<(u64, Vec<u8>)> {
+        let state_heights: std::collections::BTreeSet<u64> = st
+            .state
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .filter(|k| k.len() == 8)
+            .map(|k| u64::from_be_bytes(k.as_ref().try_into().unwrap()))
+            .collect();
+        let domain_heights: std::collections::BTreeSet<u64> = st
+            .domains
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .filter(|k| k.len() == 8)
+            .map(|k| u64::from_be_bytes(k.as_ref().try_into().unwrap()))
+            .collect();
+        let mut candidates: Vec<u64> = state_heights
+            .intersection(&domain_heights)
+            .copied()
+            .collect();
+        if !st.pq_registry.is_empty() {
+            let pq_heights: std::collections::BTreeSet<u64> = st
+                .pq_registry
+                .iter()
+                .keys()
+                .filter_map(|k| k.ok())
+                .filter(|k| k.len() == 8)
+                .map(|k| u64::from_be_bytes(k.as_ref().try_into().unwrap()))
+                .collect();
+            let with_pq: Vec<u64> = candidates
+                .iter()
+                .copied()
+                .filter(|h| pq_heights.contains(h))
+                .collect();
+            if !with_pq.is_empty() {
+                candidates = with_pq;
+            }
+        }
+        let height = candidates.into_iter().max()?;
+        let bytes = st.state.get(height.to_be_bytes()).ok().flatten()?;
+        Some((height, bytes.to_vec()))
+    }
+
+    #[test]
+    fn latest_paired_snapshot_matches_reference_across_empty_mismatched_and_pq_trees() {
+        // 1. Empty trees.
+        let (dir, st) = temp_store();
+        assert_eq!(
+            st.latest_paired_snapshot().unwrap(),
+            reference_latest_paired_snapshot(&st)
+        );
+        assert!(st.latest_paired_snapshot().unwrap().is_none());
+
+        // 2. Unpaired state-only & domains-only heights, plus non-8-byte stray keys.
+        st.state.insert(b"bad", b"x").unwrap();
+        st.domains.insert(b"123456789", b"y").unwrap();
+        st.put_state(100, b"s100").unwrap();
+        st.put_domains(200, b"d200").unwrap();
+        assert_eq!(
+            st.latest_paired_snapshot().unwrap(),
+            reference_latest_paired_snapshot(&st)
+        );
+        assert!(st.latest_paired_snapshot().unwrap().is_none());
+
+        // 3. Multi-height with unpaired tails on both sides.
+        st.put_state(0, b"s0").unwrap();
+        st.put_domains(0, b"d0").unwrap();
+        st.put_state(50, b"s50").unwrap();
+        st.put_domains(50, b"d50").unwrap();
+        st.put_state(300, b"s300").unwrap();
+        st.put_domains(300, b"d300").unwrap();
+        st.put_state(400, b"s400").unwrap();
+        st.put_domains(500, b"d500").unwrap();
+        assert_eq!(
+            st.latest_paired_snapshot().unwrap(),
+            reference_latest_paired_snapshot(&st)
+        );
+        assert_eq!(
+            st.latest_paired_snapshot().unwrap(),
+            Some((300, b"s300".to_vec()))
+        );
+
+        // 4. Non-empty pq_registry with NO overlap with paired (state, domains) -> falls back to 300.
+        st.pq_registry.insert(b"meta", b"ignored").unwrap();
+        st.put_pq_registry(999, b"pq999").unwrap();
+        st.put_pq_registry(400, b"pq400").unwrap();
+        st.put_pq_registry(500, b"pq500").unwrap();
+        assert_eq!(
+            st.latest_paired_snapshot().unwrap(),
+            reference_latest_paired_snapshot(&st)
+        );
+        assert_eq!(
+            st.latest_paired_snapshot().unwrap(),
+            Some((300, b"s300".to_vec()))
+        );
+
+        // 5. Non-empty pq_registry overlapping a lower paired height -> prefers highest triple-paired (50).
+        st.put_pq_registry(50, b"pq50").unwrap();
+        st.put_pq_registry(0, b"pq0").unwrap();
+        assert_eq!(
+            st.latest_paired_snapshot().unwrap(),
+            reference_latest_paired_snapshot(&st)
+        );
+        assert_eq!(
+            st.latest_paired_snapshot().unwrap(),
+            Some((50, b"s50".to_vec()))
+        );
+
+        // 6. pq_registry paired at tip 300 -> picks 300.
+        st.put_pq_registry(300, b"pq300").unwrap();
+        assert_eq!(
+            st.latest_paired_snapshot().unwrap(),
+            reference_latest_paired_snapshot(&st)
+        );
+        assert_eq!(
+            st.latest_paired_snapshot().unwrap(),
+            Some((300, b"s300".to_vec()))
+        );
+
+        drop(st);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

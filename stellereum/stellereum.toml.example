@@ -14,9 +14,11 @@
 # Consensus loop tick quantum in ms (valid range: 10..=1000).
 tick_ms = 50
 # Minimum interval between finalized blocks in ms (0 disables flood floor).
-min_block_ms = 50
-# Base round timeout in ms (must be >= min_block_ms).
-round_timeout_ms = 3000
+min_block_ms = 400
+# DEPRECATED / CONSENSUS-FROZEN: FROZEN_ROUND_TIMEOUT_BASE_MS = 3000 is consensus-frozen
+# and ignores overrides. Setting `round_timeout_ms` or `STELL_ROUND_TIMEOUT_MS` emits a
+# warning in `stellereum config check`.
+# round_timeout_ms = 3000
 round_zero_timeout_ms = 650
 down_proposer_timeout_ms = 800
 straggler_grace_ms = 0
@@ -33,7 +35,7 @@ chain_id = 5757
 observer = false
 workchain_observer = false
 new_chain = false
-shards = "0"
+shards = [0]
 experimental_shards = false
 pure_pq = true
 auto_upgrade = false
@@ -44,7 +46,7 @@ gov_allow_multinode_writes = false
 [storage]
 data_dir = "./data"
 # When archive = false, keep_blocks MUST be > 0.
-archive = true
+archive = false
 keep_blocks = 50_000
 snapshot_interval = 1000
 sled_cache_bytes = 1_073_741_824

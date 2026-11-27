@@ -548,7 +548,7 @@ pub(crate) fn parse_wallet_address(raw: &str) -> anyhow::Result<[u8; 32]> {
 /// Build the wallet signing key the `sign` commands use.
 ///
 /// Falcon-512 is the ONLY scheme: `--falcon-key-file` (a stored key,
-/// preferred) or `--falcon-seed` (deterministic, dev/test reproducibility).
+/// preferred), `--falcon-seed-file`, `--falcon-seed`, or `STELL_FALCON_SEED`.
 /// The classical `ed25519` and `hybrid` schemes are REMOVED and refused by
 /// name; `--from-key` (an Ed25519 seed) is refused too, never silently
 /// ignored.
@@ -557,12 +557,13 @@ pub(crate) fn resolve_wallet_signing_key(
     from_key: Option<String>,
     falcon_key_file: Option<PathBuf>,
     falcon_seed: Option<String>,
+    falcon_seed_file: Option<PathBuf>,
 ) -> anyhow::Result<stellereum::wallet_signing::WalletSigningKey> {
     use stellereum::wallet_signing::WalletSigningKey;
     if from_key.is_some() {
         anyhow::bail!(
             "--from-key (classical Ed25519 seed) is REMOVED: pass Falcon-512 material \
-             with --falcon-key-file or --falcon-seed"
+             with --falcon-key-file, --falcon-seed-file, or --falcon-seed"
         );
     }
     let load_falcon = || -> anyhow::Result<stellereum::post_quantum::FalconKeypair> {
@@ -570,13 +571,8 @@ pub(crate) fn resolve_wallet_signing_key(
             return stellereum::node_keys::load_falcon_key(path)
                 .map_err(|e| anyhow::anyhow!("cannot load falcon key {}: {e}", path.display()));
         }
-        if let Some(seed_hex) = falcon_seed.as_ref() {
-            let seed = parse_wallet_seed(seed_hex, "falcon seed")?;
-            return Ok(stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed));
-        }
-        anyhow::bail!(
-            "scheme '{scheme}' needs a Falcon-512 key: pass --falcon-key-file or --falcon-seed"
-        )
+        let seed = resolve_falcon_seed(falcon_seed, falcon_seed_file)?;
+        Ok(stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed))
     };
     match scheme {
         "falcon" => Ok(WalletSigningKey::Falcon {
@@ -753,6 +749,59 @@ pub(crate) fn attest_for(
     })
 }
 
+/// Maximum JSON-RPC response size accepted by CLI commands (16 MiB).
+pub(crate) const MAX_CLI_RPC_BYTES: usize = 16 * 1024 * 1024;
+
+/// Bounded HTTP agent for CLI JSON-RPC requests: 15s timeout, no redirects,
+/// and no ambient `HTTP_PROXY`/`HTTPS_PROXY` pickup. Plain `http://` remains
+/// allowed so localhost / 127.0.0.1 node RPC and tests work unchanged.
+pub(crate) fn cli_http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(15))
+        .redirects(0)
+        .try_proxy_from_env(false)
+        .build()
+}
+
+fn cli_read_json_response_with_cap(
+    resp: ureq::Response,
+    rpc: &str,
+    max_bytes: usize,
+) -> anyhow::Result<serde_json::Value> {
+    use std::io::Read as _;
+    let status = resp.status();
+    if (300..400).contains(&status) {
+        anyhow::bail!("refusing HTTP redirect (status {status}) from {rpc}");
+    }
+    if !(200..300).contains(&status) {
+        anyhow::bail!("unexpected HTTP status {status} from {rpc}");
+    }
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut buf)?;
+    if buf.len() > max_bytes {
+        anyhow::bail!("RPC response from {rpc} exceeded maximum allowed size of {max_bytes} bytes");
+    }
+    Ok(serde_json::from_slice(&buf)?)
+}
+
+/// Read a JSON response body from `resp`, refusing HTTP redirects / unexpected
+/// non-2xx statuses and capping the read at [`MAX_CLI_RPC_BYTES`].
+pub(crate) fn cli_read_json_response(
+    resp: ureq::Response,
+    rpc: &str,
+) -> anyhow::Result<serde_json::Value> {
+    cli_read_json_response_with_cap(resp, rpc, MAX_CLI_RPC_BYTES)
+}
+
+/// POST a JSON-RPC request body to `rpc` using [`cli_http_agent`] and parse the
+/// bounded JSON response.
+pub(crate) fn cli_post_json(rpc: &str, body: &str) -> anyhow::Result<serde_json::Value> {
+    let resp = cli_http_agent().post(rpc).send_string(body)?;
+    cli_read_json_response(resp, rpc)
+}
+
 /// Query a node for an account's nonce, so consecutive CLI submissions do not
 /// replay each other. The address is the PUBLIC key - querying with the seed
 /// silently returns a fresh account every time.
@@ -763,7 +812,7 @@ pub(crate) fn rpc_account_nonce(rpc: &str, account: &[u8; 32]) -> anyhow::Result
         "params": { "address": hex::encode(account) }
     })
     .to_string();
-    let resp: serde_json::Value = ureq::post(rpc).send_string(&body)?.into_json()?;
+    let resp = cli_post_json(rpc, &body)?;
     if let Some(e) = resp.get("error") {
         anyhow::bail!("RPC error: {e}");
     }
@@ -793,7 +842,7 @@ pub(crate) fn rpc_submit_tx(
         "jsonrpc": "2.0", "id": 1, "method": method, "params": params
     })
     .to_string();
-    let resp: serde_json::Value = ureq::post(rpc).send_string(&body)?.into_json()?;
+    let resp = cli_post_json(rpc, &body)?;
     if let Some(e) = resp.get("error") {
         anyhow::bail!("rejected by node: {e}");
     }
@@ -864,8 +913,8 @@ pub(crate) fn resolve_chain_id(rpc: &str, explicit: Option<u64>) -> anyhow::Resu
         Ok(None)
     };
 
-    let resp: serde_json::Value = match ureq::post(rpc).send_string(&body) {
-        Ok(resp) => match resp.into_json() {
+    let resp: serde_json::Value = match cli_http_agent().post(rpc).send_string(&body) {
+        Ok(resp) => match cli_read_json_response(resp, rpc) {
             Ok(json) => json,
             Err(e) => return failure(format!("invalid JSON response: {e}")),
         },
@@ -910,6 +959,22 @@ pub(crate) fn resolve_falcon_keypair(
     anyhow::bail!("missing {what} key: pass key file or 32-byte hex seed");
 }
 
+/// Resolve a Falcon-512 keypair from `--falcon-key-file`, `--falcon-seed-file`,
+/// `--falcon-seed`, or `STELL_FALCON_SEED`.
+pub(crate) fn resolve_falcon_keypair_with_seed_file(
+    key_file: Option<PathBuf>,
+    seed_hex: Option<String>,
+    seed_file: Option<PathBuf>,
+    what: &str,
+) -> anyhow::Result<stellereum::post_quantum::FalconKeypair> {
+    if let Some(path) = key_file {
+        return stellereum::node_keys::load_falcon_key(&path)
+            .map_err(|e| anyhow::anyhow!("cannot load {what} key {}: {e}", path.display()));
+    }
+    let seed = resolve_falcon_seed(seed_hex, seed_file)?;
+    Ok(stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed))
+}
+
 /// Resolve an explicit `--chain-id` or query `stell_chainId` fail-closed.
 /// Used by W3 PQ validator lifecycle commands where PoP signatures always bind
 /// `chain_id`.
@@ -921,10 +986,11 @@ pub(crate) fn resolve_required_chain_id(rpc: &str, explicit: Option<u64>) -> any
         "jsonrpc": "2.0", "id": 1, "method": "stell_chainId", "params": []
     })
     .to_string();
-    let resp: serde_json::Value = ureq::post(rpc)
+    let resp = cli_http_agent()
+        .post(rpc)
         .send_string(&body)
-        .map_err(|e| anyhow::anyhow!("cannot resolve chain_id from {rpc}: {e}; pass --chain-id"))?
-        .into_json()
+        .map_err(|e| anyhow::anyhow!("cannot resolve chain_id from {rpc}: {e}; pass --chain-id"))?;
+    let resp = cli_read_json_response(resp, rpc)
         .map_err(|e| anyhow::anyhow!("invalid stell_chainId JSON from {rpc}: {e}"))?;
     if let Some(e) = resp.get("error") {
         anyhow::bail!("stell_chainId error from {rpc}: {e}");
@@ -1376,6 +1442,270 @@ pub(crate) fn build_claim_rewards_tx_with_chain(
     build_masterchain_op_tx_with_chain(signer_key, op, nonce, chain_id)
 }
 
+/// Build a Falcon-512 PQ1 `OpCode::SysCallDeployContract` transaction.
+pub(crate) fn build_contract_deploy_tx(
+    deployer: &stellereum::post_quantum::FalconKeypair,
+    code: Vec<u8>,
+    nonce: u64,
+    gas_limit: Option<u64>,
+    chain_id: Option<u64>,
+) -> anyhow::Result<Transaction> {
+    if code.is_empty() {
+        anyhow::bail!("contract WASM bytecode cannot be empty");
+    }
+    if code.len() > stellereum::contract::MAX_CONTRACT_CODE_SIZE {
+        anyhow::bail!(
+            "contract WASM bytecode ({} bytes) exceeds maximum {} bytes",
+            code.len(),
+            stellereum::contract::MAX_CONTRACT_CODE_SIZE
+        );
+    }
+    let from = falcon_pq_address(deployer);
+    let opcode_gas = stellereum::svm::contract_deploy_gas(code.len());
+    let default_gas =
+        cli_tx_gas(opcode_gas).saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    let gas = default_gas.max(gas_limit.unwrap_or(0));
+    let master = stellereum::sharding::MASTERCHAIN_SHARD;
+    let payload = vec![stellereum::svm::OpCode::SysCallDeployContract { code }];
+    Ok(match chain_id {
+        Some(cid) => sign_pq_explicit_payload_with_chain(
+            deployer, from, 0, gas, nonce, master, master, payload, cid,
+        ),
+        None => sign_pq_explicit_payload(deployer, from, 0, gas, nonce, master, master, payload),
+    })
+}
+
+/// Parse `--method` and optional `--args` / `--calldata` into either
+/// `OpCode::SysCallCallContract` (single `i64`) or `OpCode::SysCallCallContractArgs`
+/// (0 args, multi-arg, STELL-ABI v1 `AbiValue`-encoded calldata, or raw hex calldata).
+pub(crate) fn parse_contract_call_opcode_with_calldata(
+    contract: [u8; 32],
+    method: &str,
+    args: Option<&str>,
+    calldata_hex: Option<&str>,
+) -> anyhow::Result<stellereum::svm::OpCode> {
+    if let Some(raw_cd) = calldata_hex {
+        if args.is_some_and(|s| !s.trim().is_empty()) {
+            anyhow::bail!("--args and --calldata cannot be combined");
+        }
+        if method.is_empty() {
+            anyhow::bail!("contract method name cannot be empty");
+        }
+        if method.len() > stellereum::svm::MAX_CONTRACT_METHOD_LEN {
+            anyhow::bail!(
+                "contract method name ({} bytes) exceeds maximum {} bytes",
+                method.len(),
+                stellereum::svm::MAX_CONTRACT_METHOD_LEN
+            );
+        }
+        let trimmed = raw_cd.trim();
+        let stripped = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+        let calldata =
+            hex::decode(stripped).map_err(|e| anyhow::anyhow!("invalid --calldata hex: {e}"))?;
+        if calldata.len() > stellereum::svm::MAX_CONTRACT_CALLDATA_BYTES {
+            anyhow::bail!(
+                "raw calldata ({} bytes) exceeds maximum {} bytes",
+                calldata.len(),
+                stellereum::svm::MAX_CONTRACT_CALLDATA_BYTES
+            );
+        }
+        return Ok(stellereum::svm::OpCode::SysCallCallContractArgs {
+            contract,
+            method: method.as_bytes().to_vec(),
+            args: Vec::new(),
+            calldata,
+        });
+    }
+    parse_contract_call_opcode(contract, method, args)
+}
+
+/// Parse `--method` and optional `--args` into either `OpCode::SysCallCallContract`
+/// (single `i64`) or `OpCode::SysCallCallContractArgs` (0 args, multi-arg, or
+/// STELL-ABI v1 `AbiValue`-encoded calldata).
+pub(crate) fn parse_contract_call_opcode(
+    contract: [u8; 32],
+    method: &str,
+    args: Option<&str>,
+) -> anyhow::Result<stellereum::svm::OpCode> {
+    if method.is_empty() {
+        anyhow::bail!("contract method name cannot be empty");
+    }
+    if method.len() > stellereum::svm::MAX_CONTRACT_METHOD_LEN {
+        anyhow::bail!(
+            "contract method name ({} bytes) exceeds maximum {} bytes",
+            method.len(),
+            stellereum::svm::MAX_CONTRACT_METHOD_LEN
+        );
+    }
+    let method_bytes = method.as_bytes().to_vec();
+    let Some(raw) = args.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(stellereum::svm::OpCode::SysCallCallContractArgs {
+            contract,
+            method: method_bytes,
+            args: Vec::new(),
+            calldata: Vec::new(),
+        });
+    };
+    if let Ok(single_arg) = raw.parse::<i64>() {
+        return Ok(stellereum::svm::OpCode::SysCallCallContract {
+            contract,
+            method: method_bytes,
+            arg: single_arg,
+        });
+    }
+    let json_val: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| anyhow::anyhow!("invalid --args (expected i64 or JSON): {e}"))?;
+    let abi_values = match json_val {
+        serde_json::Value::Null => {
+            return Ok(stellereum::svm::OpCode::SysCallCallContractArgs {
+                contract,
+                method: method_bytes,
+                args: Vec::new(),
+                calldata: Vec::new(),
+            });
+        }
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in &items {
+                out.push(
+                    stellereum::contract_abi::AbiValue::from_json_value(item)
+                        .map_err(|e| anyhow::anyhow!("invalid contract argument: {e}"))?,
+                );
+            }
+            out
+        }
+        other => vec![stellereum::contract_abi::AbiValue::from_json_value(&other)
+            .map_err(|e| anyhow::anyhow!("invalid contract argument: {e}"))?],
+    };
+    if abi_values.len() > stellereum::contract_abi::MAX_ABI_ARGS {
+        anyhow::bail!(
+            "too many contract call arguments: got {}, maximum is {}",
+            abi_values.len(),
+            stellereum::contract_abi::MAX_ABI_ARGS
+        );
+    }
+    let mut scalars = Vec::with_capacity(abi_values.len());
+    let mut calldata = Vec::with_capacity(4 + abi_values.len() * 9);
+    calldata.extend_from_slice(&(abi_values.len() as u32).to_le_bytes());
+    for val in &abi_values {
+        scalars.push(val.as_i64().unwrap_or(0));
+        let encoded = val
+            .encode()
+            .map_err(|e| anyhow::anyhow!("failed to encode contract argument: {e}"))?;
+        calldata.extend_from_slice(&encoded);
+    }
+    if calldata.len() > stellereum::svm::MAX_CONTRACT_CALLDATA_BYTES {
+        anyhow::bail!(
+            "encoded calldata ({} bytes) exceeds maximum {} bytes",
+            calldata.len(),
+            stellereum::svm::MAX_CONTRACT_CALLDATA_BYTES
+        );
+    }
+    Ok(stellereum::svm::OpCode::SysCallCallContractArgs {
+        contract,
+        method: method_bytes,
+        args: scalars,
+        calldata,
+    })
+}
+
+/// Build a Falcon-512 PQ1 contract call transaction.
+pub(crate) fn build_contract_call_tx(
+    caller: &stellereum::post_quantum::FalconKeypair,
+    contract: [u8; 32],
+    op: stellereum::svm::OpCode,
+    value: u64,
+    nonce: u64,
+    gas_limit: Option<u64>,
+    chain_id: Option<u64>,
+) -> Transaction {
+    let opcode_gas = stellereum::svm::opcode_gas(&op);
+    let default_gas =
+        cli_tx_gas(opcode_gas).saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
+    let gas = default_gas.max(gas_limit.unwrap_or(0));
+    let master = stellereum::sharding::MASTERCHAIN_SHARD;
+    let payload = vec![op];
+    match chain_id {
+        Some(cid) => sign_pq_explicit_payload_with_chain(
+            caller, contract, value, gas, nonce, master, master, payload, cid,
+        ),
+        None => {
+            sign_pq_explicit_payload(caller, contract, value, gas, nonce, master, master, payload)
+        }
+    }
+}
+
+/// True when a `host:port` listen address resolves strictly to loopback.
+pub(crate) fn is_loopback_listen_addr(listen: &str) -> bool {
+    let trimmed = listen.trim();
+    if let Ok(sock) = trimmed.parse::<std::net::SocketAddr>() {
+        return sock.ip().is_loopback();
+    }
+    if let Some((host, _port)) = trimmed.rsplit_once(':') {
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        if host.eq_ignore_ascii_case("localhost") {
+            return true;
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return ip.is_loopback();
+        }
+    }
+    trimmed.eq_ignore_ascii_case("localhost")
+}
+
+/// Enforce fail-closed remote-signer startup policy:
+/// 1. Refuse non-loopback binds over plaintext HTTP unless `--allow-insecure-http`.
+/// 2. Require a non-empty bearer token via `--token-file`, `--token`, or `STELL_REMOTE_SIGNER_TOKEN`.
+pub(crate) fn validate_remote_signer_serve_policy(
+    listen: &str,
+    token: Option<String>,
+    token_file: Option<PathBuf>,
+    allow_insecure_http: bool,
+) -> anyhow::Result<zeroize::Zeroizing<String>> {
+    use zeroize::{Zeroize, Zeroizing};
+    if !is_loopback_listen_addr(listen) && !allow_insecure_http {
+        anyhow::bail!(
+            "refusing to bind remote-signer on non-loopback address '{listen}' without TLS: \
+             bind loopback (127.0.0.1 / [::1]) behind a TLS/mTLS terminator or pass \
+             --allow-insecure-http explicitly"
+        );
+    }
+    if let Some(path) = token_file {
+        let mut raw = Zeroizing::new(std::fs::read_to_string(&path).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot read remote-signer token file {}: {e}",
+                path.display()
+            )
+        })?);
+        let trimmed = Zeroizing::new(raw.trim().to_string());
+        raw.zeroize();
+        if trimmed.is_empty() {
+            anyhow::bail!("remote-signer token file {} is empty", path.display());
+        }
+        return Ok(trimmed);
+    }
+    if let Some(mut raw) = token {
+        let trimmed = Zeroizing::new(raw.trim().to_string());
+        raw.zeroize();
+        if trimmed.is_empty() {
+            anyhow::bail!("remote-signer --token cannot be empty");
+        }
+        return Ok(trimmed);
+    }
+    if let Ok(mut env_val) = std::env::var(stellereum::remote_signer::REMOTE_SIGNER_TOKEN_ENV) {
+        let trimmed = Zeroizing::new(env_val.trim().to_string());
+        env_val.zeroize();
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+    }
+    anyhow::bail!(
+        "refusing to start remote-signer without a bearer token: pass --token-file <PATH>, \
+         --token <TOKEN>, or set {}",
+        stellereum::remote_signer::REMOTE_SIGNER_TOKEN_ENV
+    );
+}
+
 #[cfg(test)]
 mod unjail_builder_tests {
     use super::*;
@@ -1602,5 +1932,83 @@ mod unjail_builder_tests {
             std::env::set_var("STELL_FALCON_SEED", v);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_http_agent_accepts_loopback_json_and_refuses_redirects_and_oversize_bodies() {
+        use std::io::{Read as _, Write as _};
+
+        // 1. Loopback HTTP 200 OK JSON succeeds.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        let h_ok = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req_buf = [0u8; 1024];
+                let _ = stream.read(&mut req_buf);
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":42}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        let ok_json = cli_post_json(&format!("http://{addr}"), "{}").expect("loopback 200 OK");
+        assert_eq!(ok_json["result"], 42);
+        h_ok.join().expect("ok server thread");
+
+        // 2. HTTP 302 redirect is refused without following.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        let h_redir = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req_buf = [0u8; 1024];
+                let _ = stream.read(&mut req_buf);
+                let resp = "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        let err_redir =
+            cli_post_json(&format!("http://{addr}"), "{}").expect_err("redirect must be refused");
+        assert!(
+            err_redir.to_string().contains("redirect"),
+            "unexpected redirect error: {err_redir}"
+        );
+        h_redir.join().expect("redirect server thread");
+
+        // 3. Oversized JSON response is refused at the bounded reader cap.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        let h_big = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req_buf = [0u8; 1024];
+                let _ = stream.read(&mut req_buf);
+                let body = format!(r#"{{"pad":"{}"}}"#, "a".repeat(64));
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        let url = format!("http://{addr}");
+        let raw_resp = cli_http_agent()
+            .post(&url)
+            .send_string("{}")
+            .expect("200 response");
+        let err_big = cli_read_json_response_with_cap(raw_resp, &url, 32)
+            .expect_err("oversize body must be refused");
+        assert!(
+            err_big
+                .to_string()
+                .contains("exceeded maximum allowed size"),
+            "unexpected cap error: {err_big}"
+        );
+        h_big.join().expect("oversize server thread");
     }
 }

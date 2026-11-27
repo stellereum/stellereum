@@ -131,6 +131,8 @@ impl std::fmt::Debug for RpcClient {
 }
 
 impl RpcClient {
+    const REQUEST_ID: u64 = 1;
+
     /// Build a client with a 15-second per-request timeout.
     pub fn new(url: impl Into<String>) -> Self {
         Self::with_timeout(url, Duration::from_secs(15))
@@ -162,7 +164,7 @@ impl RpcClient {
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
         let body = json!({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": Self::REQUEST_ID,
             "method": method,
             "params": params,
         });
@@ -204,7 +206,18 @@ impl RpcClient {
     }
 
     fn parse_response(method: &str, v: Value) -> Result<Value> {
-        if let Some(err) = v.get("error") {
+        Self::parse_response_with_id(method, Self::REQUEST_ID, v)
+    }
+
+    fn parse_response_with_id(method: &str, expected_id: u64, v: Value) -> Result<Value> {
+        let got_id = v.get("id").and_then(Value::as_u64);
+        if got_id != Some(expected_id) {
+            return Err(SdkError::Decode(format!(
+                "{method}: response id mismatch (expected {expected_id}, got {:?})",
+                v.get("id")
+            )));
+        }
+        if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
             let body: RpcErrorBody = serde_json::from_value(err.clone())
                 .map_err(|e| SdkError::Decode(format!("{method}: bad error object: {e}")))?;
             return Err(map_rpc_error(method, body));
@@ -520,5 +533,55 @@ mod tests {
                 got: 9
             }
         );
+    }
+
+    #[test]
+    fn parse_response_rejects_mismatched_missing_or_wrong_type_id() {
+        for bad in [
+            json!({ "jsonrpc": "2.0", "id": 2, "result": 5757 }),
+            json!({ "jsonrpc": "2.0", "id": null, "result": 5757 }),
+            json!({ "jsonrpc": "2.0", "id": "1", "result": 5757 }),
+            json!({ "jsonrpc": "2.0", "result": 5757 }),
+            json!({ "jsonrpc": "2.0", "id": 99, "error": { "code": -32000, "message": "boom" } }),
+        ] {
+            let err = RpcClient::parse_response("stell_chainId", bad.clone()).unwrap_err();
+            assert!(
+                matches!(err, SdkError::Decode(_)),
+                "expected Decode error for {bad}, got {err:?}"
+            );
+        }
+
+        let ok = RpcClient::parse_response(
+            "stell_chainId",
+            json!({ "jsonrpc": "2.0", "id": 1, "result": 5757 }),
+        )
+        .unwrap();
+        assert_eq!(ok, json!(5757));
+    }
+
+    #[test]
+    fn call_rejects_mismatched_response_id_over_http() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"jsonrpc":"2.0","id":2,"result":5757}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let client = RpcClient::new(format!("http://{addr}"));
+        let err = client.chain_id().unwrap_err();
+        assert!(matches!(err, SdkError::Decode(_)), "got {err:?}");
     }
 }

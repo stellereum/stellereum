@@ -7,13 +7,13 @@ entries, and `docs/feature_gates.yaml` manifest are green and all four
 validators stage and activate the same binary strictly before the chosen
 activation height `H`.
 
-## 1. Overview of Batch 1 Candidates (A1–A7)
+## 1. Overview of Batch 1 Candidates (A1–A9)
 
 Every change in this batch alters consensus-visible block validity, execution
-gas/fuel, contract-visible state, settlement verdicts, or deterministic validator
-jailing. Changing any of them without a shared activation height `H` would cause
-nodes to disagree on historical blocks or diverge on live `state_root` /
-validator-set commitments.
+gas/fuel, contract-visible state, settlement verdicts, deterministic validator
+jailing, or committee sortition. Changing any of them without a shared
+activation height `H` would cause nodes to disagree on historical blocks or
+diverge on live `state_root` / validator-set / µQC commitments.
 
 | # | Gate / Decision | Constant / Symbol | Compiled Default | Chain Scope | Summary |
 |---|---|---|---|---|---|
@@ -21,9 +21,11 @@ validator-set commitments.
 | A2 | Falcon host fuel v2 + single `(start)` gas charging | `FALCON_HOST_FUEL_V2_ACTIVATION_HEIGHT` | `u64::MAX` | `{0}` and `{0,1}` | Raise `host.falcon512_verify` base fuel from `FUEL_FALCON512_VERIFY` (`2_000`) to `FUEL_FALCON512_VERIFY_V2` (`150_000`), validate deploy modules once, and charge `(start)` fuel to `state.gas_remaining` |
 | A3 | Contract `host.block_hash` | `CONTRACT_BLOCK_HASH_ACTIVATION_HEIGHT` | `u64::MAX` | `{0}` and `{0,1}` | Expose `block.prev_hash` (parent block hash) via `host.block_hash` on block execution paths instead of `[0u8; 32]` |
 | A4 | Bridge withdrawal target-address cap | `BRIDGE_TARGET_ADDRESS_CAP_HEIGHT` | `u64::MAX` | `{0}` and `{0,1}` | Cap `BridgeIntent::Withdraw.target_address` at `MAX_BRIDGE_TARGET_ADDRESS_BYTES` (`128` UTF-8 bytes) during `validate_at_height` and `plan_at_height` settlement |
-| A5 | Cross-shard bounce escrow | `XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT` | `u64::MAX` | `{0,1}` only (`{0}` stays `u64::MAX`) | Require committed XSHARD-01 escrow leaf (`status[i] && L(T)`) for produced/outbound/bounce paths, §9 2PC precedence, `runtime/cluster.rs` parity, and deterministic history cleanse |
-| A6 | Downtime miss budget decision | `DOWNTIME_MISS_THRESHOLD` (`42`) / `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` | `42` (frozen) | `{0}` and `{0,1}` | Decision record: keep `42` if C/A/D move to 2 vCPU, or gate efficiency-based jailing / `150`-miss interim behind `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` if 1 vCPU remains |
+| A5 | Cross-shard bounce escrow & 2PC `Prepared` bounds | `XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT` | `u64::MAX` | `{0,1}` only (`{0}` stays `u64::MAX`) | Require committed XSHARD-01 escrow leaf (`status[i] && L(T)`) for produced/outbound/bounce paths, §9 2PC precedence, `runtime/cluster.rs` parity, deterministic history cleanse, and `XPC-PREPARED-UNBOUNDED` (`MAX_ACTIVE_PREPARED_PER_SENDER = 4`, same-nonce `Prepared` dedup, `XPC_PREPARE_TTL_HEIGHTS = 4096`) |
+| A6 | Downtime miss budget decision | `DOWNTIME_MISS_THRESHOLD` (`42`) / `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` | `42` (frozen) | `{0}` and `{0,1}` | Decision record (resolved in **A8**): keep `42` if C/A/D move to 2 vCPU, or gate threshold increase behind `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` (`DOWNTIME_MISS_THRESHOLD_V2 = 200` in Wave 9B) |
 | A7 | Actor mailbox hardening | `ACTOR_MAILBOX_HARDENING_HEIGHT` | `u64::MAX` | `{0}` and `{0,1}` | Reject asset-debiting/state-mutating opcodes in non-self `ActorSendBody` deliveries (opcode allowlist + `ctx.balance = msg.value`), and bound/bill `host.send_message` `ActorSendBody.gas_budget <= MAX_CONTRACT_ACTOR_GAS_BUDGET` (`1_000_000`) + `GAS_ACTOR_DELIVER` |
+| A8 | Jail budget v2 (`jail-budget-v2`) | `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` | `u64::MAX` | `{0}` and `{0,1}` | Raise consecutive downtime miss threshold from `DOWNTIME_MISS_THRESHOLD` (`42`, `16.8 s` at `STELL_MIN_BLOCK_MS = 400 ms`) to `DOWNTIME_MISS_THRESHOLD_V2` (`200`, `80.0 s` at `400 ms`) for single-vCPU / WAN outage tolerance |
+| A9 | Unbiased sortition ticket selection (`sortition-unbiased`, `W6-A7-7`) | `SORTITION_UNBIASED_ACTIVATION_HEIGHT` | `u64::MAX` | `{0}` and `{0,1}` | Switch weighted sortition ticket draw in `consensus/sortition.rs` and `consensus/types.rs` from modulo reduction (`rand_val % total_power`) to deterministic rejection-sampling unbiased ticket selection |
 
 All height-gated constants follow strict `>= H` activation semantics with the
 `u64::MAX` sentinel meaning "never active" (even at `height == u64::MAX`).
@@ -187,7 +189,10 @@ by CI.
   (`XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT`,
   `xshard_bounce_escrow_required_active_at(h)`),
   `stellereum/src/runtime/{apply,anchors,consensus_step,mev_sync,cluster}.rs`,
-  `stellereum/src/state_engine/xshard.rs`. Full analysis:
+  `stellereum/src/state_engine/xshard.rs`,
+  `stellereum/src/xshard2pc.rs` (`MAX_ACTIVE_PREPARED_PER_SENDER = 4`,
+  `XPC_PREPARE_TTL_HEIGHTS = 4_096`, `target_prepare_slot_available`,
+  `is_retired` / `is_retired_at`). Full analysis:
   `stellereum/docs/specs/XSHARD_BOUNCE_ESCROW.md`.
 - **Chain scope**: **Live single-shard `{0}` keeps `u64::MAX` (`INERT`)**. This
   gate is armed only on a coordinated `{0,1}` multi-shard chain with
@@ -196,6 +201,9 @@ by CI.
   - Legacy unconditional `produced_cross_shard` recording and 64-height timeout
     bounce remain byte-identical. Pinned by
     `stellereum/tests/activation_gate_xshard_bounce_escrow_tests.rs`.
+  - Under `XPC_ACTIVATION`, `Prepared` 2PC records do not expire via
+    `XPC_PREPARE_TTL_HEIGHTS` (`is_retired` returns `false` for `Prepared`) and
+    pre-gate `target_prepare` admission semantics remain byte-identical.
 - **Post-activation (`height >= H`)**:
   - `produced_cross_shard` records a transaction only if `status[i] == true`
     **and** its committed XSHARD-01 escrow leaf `L(T)` exists.
@@ -204,6 +212,20 @@ by CI.
     owning a §9 2PC record (`PREPARE`/`COMMIT`/`ABORT`).
   - Every gated block deterministically prunes produced entries lacking
     `legacy_escrow_leaf_committed` before inserting new entries.
+  - **`XPC-PREPARED-UNBOUNDED` guard (also activates under `XPC_ACTIVATION` +
+    `XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT`)**:
+    - **Per-sender active `Prepared` cap (`MAX_ACTIVE_PREPARED_PER_SENDER = 4`)**:
+      `target_prepare_slot_available` limits each `(source_shard, from)` sender
+      to at most `4` concurrent active `Prepared` 2PC records on a target shard.
+    - **Same-nonce `Prepared` deduplication**: `target_prepare_slot_available`
+      permits at most one active `Prepared` record per
+      `(source_shard, from, source_nonce)`, blocking multi-`tx_hash` same-nonce
+      spam against a single affordability proof.
+    - **Deterministic `Prepared` expiry (`XPC_PREPARE_TTL_HEIGHTS = 4096`)**:
+      `is_retired` / `is_retired_at` deterministically retires unresolved
+      `Prepared` 2PC records at `prepared_height + XPC_PREPARE_TTL_HEIGHTS`
+      (`4096` heights) once `xshard_bounce_escrow_required_active_at(height)` is
+      active.
 - **Closure of `runtime/cluster.rs` parity blocker**:
   - `docs/ACTIVATION_GATES.md` §3.5 blocker 1 and `XSHARD_BOUNCE_ESCROW.md` §5.4
     identified that `runtime/cluster.rs::ChainState::apply_block` still recorded
@@ -260,7 +282,9 @@ by CI.
 - **Consensus invariant**: Any change away from `42` (Option 2 or Option 3)
   **must** be height-gated via `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` registered in
   `current_activation_schedule()` and `feature_gates.rs`. Mixed thresholds across
-  validators cause deterministic validator-set divergence.
+  validators cause deterministic validator-set divergence. See **A8** below for
+  the Wave 9B `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` specification
+  (`DOWNTIME_MISS_THRESHOLD = 42` -> `DOWNTIME_MISS_THRESHOLD_V2 = 200`).
 
 ### A7 — `ACTOR_MAILBOX_HARDENING_HEIGHT`
 
@@ -323,6 +347,85 @@ by CI.
   3. Inert pin update + `docs/feature_gates.yaml` regeneration via
      `stellereum gates --yaml`.
 
+### A8 — `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` (`jail-budget-v2`)
+
+- **Code surface**: `stellereum/src/chain_spec.rs`
+  (`JAIL_BUDGET_V2_ACTIVATION_HEIGHT`, `jail_budget_v2_activation_height()`,
+  `jail_budget_v2_active_at(h)`), `stellereum/src/staking.rs`
+  (`DOWNTIME_MISS_THRESHOLD = 42`, `DOWNTIME_MISS_THRESHOLD_V2 = 200`),
+  `stellereum/src/node/policy.rs`,
+  `stellereum/src/node/consensus_driver/tick.rs`,
+  `stellereum/src/feature_gates.rs` (`id: "jail-budget-v2"`).
+- **Threat / Operational motivation**:
+  - `DOWNTIME_MISS_THRESHOLD = 42` yields an outage tolerance of only
+    `42 × 400 ms = 16.8 s` at the live `STELL_MIN_BLOCK_MS = 400 ms` cluster
+    tempo (`scripts/cluster-nodes.conf`).
+  - On single-vCPU / WAN validator hosts (`nodeC`, `nodeA`, `nodeD`), routine
+    CPU/IO contention, WAN jitter, or binary-swap restarts can exceed `16.8 s`
+    and trigger a `JAIL_RELEASE_DELAY_HEIGHTS = 4_000` jail (~26.7 min).
+- **Pre-activation (`height < H`, or `u64::MAX`)**:
+  - Consensus and node-policy downtime jailing retain
+    `DOWNTIME_MISS_THRESHOLD = 42` (`16.8 s` at `STELL_MIN_BLOCK_MS = 400 ms`)
+    so historical blocks and validator-set transitions replay byte-identically.
+- **Post-activation (`height >= H`)**:
+  - Consensus and node-policy downtime miss tracking switches from
+    `DOWNTIME_MISS_THRESHOLD = 42` to `DOWNTIME_MISS_THRESHOLD_V2 = 200`,
+    raising consecutive-miss outage tolerance from **`16.8 s` to `80.0 s`** at
+    `STELL_MIN_BLOCK_MS = 400 ms` on single-vCPU / WAN nodes.
+  - Because `jail_budget_v2_active_at(height)` is a pure function of block
+    height, all validators switch simultaneously at `height >= H` without
+    validator-set divergence.
+- **Prerequisites before arming**:
+  1. `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` registered in
+     `chain_spec::current_activation_schedule()` and `feature_gates.rs`
+     (`id: "jail-budget-v2"`).
+  2. Differential / boundary tests confirming `42` misses trigger jailing at
+     `height < H` while `42..199` misses do not jail and `200` misses jail at
+     `height >= H` with identical validator-set / `state_root` commitments
+     across nodes, accompanied by an audit note per `AGENTS.md §7`.
+  3. Inert pin update + `docs/feature_gates.yaml` regeneration via
+     `stellereum gates --yaml`.
+
+### A9 — `SORTITION_UNBIASED_ACTIVATION_HEIGHT` (`sortition-unbiased`)
+
+- **Code surface**: `stellereum/src/chain_spec.rs`
+  (`SORTITION_UNBIASED_ACTIVATION_HEIGHT`,
+  `sortition_unbiased_activation_height()`,
+  `sortition_unbiased_active_at(h)`),
+  `stellereum/src/consensus/sortition.rs` (`W6-A7-7` rejection-sampling
+  unbiased ticket selection), `stellereum/src/consensus/types.rs`
+  (height-aware committee derivation and µQC verification),
+  `stellereum/src/feature_gates.rs` (`id: "sortition-unbiased"`).
+- **Threat / Audit finding (`W6-A7-7`)**:
+  - Legacy `select_committee_from_seed` reduced a 64-bit BLAKE3 output via
+    `rand_val % total_power`. Whenever `total_power` does not evenly divide
+    `2^64`, modulo reduction introduces non-uniform ticket selection bias
+    favoring lower-indexed stake ranges.
+- **Pre-activation (`height < H`, or `u64::MAX`)**:
+  - `consensus/sortition.rs` and `consensus/types.rs` retain the legacy
+    `rand_val % total_power` draw for byte-identical replay of historical
+    sortition committees and µQC certificates.
+- **Post-activation (`height >= H`)**:
+  - Sortition ticket selection in `sortition.rs` and height-aware callers in
+    `consensus/types.rs` switch to `W6-A7-7` deterministic rejection sampling
+    (discarding `u64` draws that fall in the modulo remainder tail and
+    re-hashing deterministically until `rand_val < limit`, where `limit` is the
+    largest multiple of `total_power` representable in `u64`), producing an
+    exact uniform ticket in `[0, total_power)`.
+  - Committee derivation and µQC verification both evaluate
+    `sortition_unbiased_active_at(height)` so every node derives the identical
+    committee at every `(height, round)`.
+- **Prerequisites before arming**:
+  1. `SORTITION_UNBIASED_ACTIVATION_HEIGHT` registered in
+     `chain_spec::current_activation_schedule()` and `feature_gates.rs`
+     (`id: "sortition-unbiased"`).
+  2. Unit and cross-node E2E tests proving legacy modulo parity at `height < H`,
+     unbiased rejection-sampling ticket selection at `height >= H`, and
+     identical committee / µQC verification across the `H - 1 -> H` boundary
+     and node restarts.
+  3. Inert pin update + `docs/feature_gates.yaml` regeneration via
+     `stellereum gates --yaml`.
+
 ---
 
 ## 3. Rollout Order and Invariants
@@ -330,13 +433,16 @@ by CI.
 For the exact operator procedure, pre-flight commands, canary checks, and
 post-`H` verification, follow `ops/activation_rollout_runbook.md`.
 
-1. Land all Wave 3 gate wiring (`chain_spec.rs`, `current_activation_schedule()`,
-   `feature_gates.rs`, `runtime/cluster.rs` parity) with every new gate at
-   `u64::MAX` and `activation_gate_*` / `w3_*` tests green.
-2. Freeze the chosen activation height `H` (and A6 decision) in `chain_spec.rs`,
-   update `feature_gates.rs` proving test names, update inert pin tests, and
-   regenerate `docs/feature_gates.yaml` via `stellereum gates --yaml` (on `{0}`,
-   keep `XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT = u64::MAX`).
+1. Land all Wave 3 / Wave 9B gate wiring (`chain_spec.rs`,
+   `current_activation_schedule()`, `feature_gates.rs`, `runtime/cluster.rs`
+   parity, `xshard2pc.rs`, `staking.rs`, `consensus/sortition.rs`,
+   `consensus/types.rs`) with every new gate at `u64::MAX` and
+   `activation_gate_*` / `w3_*` / Wave 9B gate tests green.
+2. Freeze the chosen activation height `H` (and A6/A8 decision) in
+   `chain_spec.rs`, update `feature_gates.rs` proving test names, update inert
+   pin tests, and regenerate `docs/feature_gates.yaml` via
+   `stellereum gates --yaml` (on `{0}`, keep
+   `XSHARD_BOUNCE_ESCROW_REQUIRED_HEIGHT = u64::MAX`).
 3. Stage (`rolling-deploy.sh stage`) and canary-activate
    (`rolling-deploy.sh activate --canary`) before `H`, then roll out one node
    at a time (`C -> A -> D -> B` or `B -> D -> A -> C`) with **4/4** verified
@@ -350,8 +456,9 @@ post-`H` verification, follow `ops/activation_rollout_runbook.md`.
 
 - **Unchanged core**: No change to block hash inputs, QC wire bytes, signature
   domains, quorum math, or `apply()` semantics for non-gated transactions (and
-  no change to staking math unless A6 Option 2/3 explicitly activates
-  `JAIL_BUDGET_V2_ACTIVATION_HEIGHT`).
+  no change to staking math unless A8 `JAIL_BUDGET_V2_ACTIVATION_HEIGHT` is
+  armed, nor to sortition committee selection below A9
+  `SORTITION_UNBIASED_ACTIVATION_HEIGHT`).
 - **Fail-closed upgrade discipline**: A node that fails verification or misses
   the upgrade window before `H` must not participate with a mismatched binary;
   roll back to `stellereum.prev` before `H` or halt and snapshot-sync after `H`.

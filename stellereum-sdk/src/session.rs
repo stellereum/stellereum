@@ -14,7 +14,9 @@
 //! (`zkml.rs:554-573`); `gas_spent` is deliberately excluded.
 
 use crate::error::{Result, SdkError};
-use crate::key::{derive_pq_address, verify_pq_signature, FalconKeypair, FALCON512_SIG_LEN};
+use crate::key::{
+    derive_pq_address, verify_pq_signature, FalconKeypair, FALCON512_PUBKEY_LEN, FALCON512_SIG_LEN,
+};
 
 /// Domain separator for grant signatures (`stellereum/src/zkml.rs:180`).
 pub const SESSION_KEY_DOMAIN: &[u8] = b"STELL_SESSKEY_V1";
@@ -147,7 +149,27 @@ impl SessionGrant {
 
     /// Bincode bytes exactly as the node serializes the grant
     /// (`zkml.rs:347-363`). `PqScheme` is written as its one-byte id.
-    pub fn encode(&self) -> Vec<u8> {
+    ///
+    /// Enforces Falcon-512 public key (897B) and signature (666B) lengths.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        if self.master_signature.len() != FALCON512_SIG_LEN {
+            return Err(SdkError::InvalidArgument(format!(
+                "grant master_signature must be {FALCON512_SIG_LEN} bytes, got {}",
+                self.master_signature.len()
+            )));
+        }
+        if self.master_pubkey.len() != FALCON512_PUBKEY_LEN {
+            return Err(SdkError::InvalidArgument(format!(
+                "grant master_pubkey must be {FALCON512_PUBKEY_LEN} bytes, got {}",
+                self.master_pubkey.len()
+            )));
+        }
+        if self.session_pubkey_bytes.len() != FALCON512_PUBKEY_LEN {
+            return Err(SdkError::InvalidArgument(format!(
+                "grant session_pubkey_bytes must be {FALCON512_PUBKEY_LEN} bytes, got {}",
+                self.session_pubkey_bytes.len()
+            )));
+        }
         let mut out = Vec::new();
         out.extend_from_slice(&self.master_address);
         out.extend_from_slice(&self.session_pubkey);
@@ -167,10 +189,12 @@ impl SessionGrant {
         out.push(1);
         out.extend_from_slice(&(self.session_pubkey_bytes.len() as u64).to_le_bytes());
         out.extend_from_slice(&self.session_pubkey_bytes);
-        out
+        Ok(out)
     }
 
     /// Decode the node's bincode grant bytes (used by the CLI and tests).
+    ///
+    /// Enforces Falcon-512 public key (897B) and signature (666B) lengths.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut c = Cursor { b: bytes, i: 0 };
         let master_address = c.array32()?;
@@ -181,7 +205,7 @@ impl SessionGrant {
         let scope = c.u64()?;
         let max_value_per_tx = c.u64()?;
         let chain_id = c.u64()?;
-        let master_signature = c.vec()?;
+        let master_signature = c.exact_vec(FALCON512_SIG_LEN, "master_signature")?;
         let master_scheme = c.u8()?;
         let session_scheme = c.u8()?;
         if master_scheme != crate::key::PQ_SCHEME_FALCON512
@@ -192,10 +216,10 @@ impl SessionGrant {
             ));
         }
         let master_pubkey = c
-            .option_vec()?
+            .option_exact_vec(FALCON512_PUBKEY_LEN, "master_pubkey")?
             .ok_or_else(|| SdkError::Decode("grant is missing the master public key".into()))?;
         let session_pubkey_bytes = c
-            .option_vec()?
+            .option_exact_vec(FALCON512_PUBKEY_LEN, "session_pubkey_bytes")?
             .ok_or_else(|| SdkError::Decode("grant is missing the session public key".into()))?;
         if c.i != bytes.len() {
             return Err(SdkError::Decode("trailing bytes after grant".into()));
@@ -248,15 +272,20 @@ impl<'a> Cursor<'a> {
     fn array32(&mut self) -> Result<[u8; 32]> {
         Ok(self.take(32)?.try_into().expect("32-byte slice"))
     }
-    fn vec(&mut self) -> Result<Vec<u8>> {
+    fn exact_vec(&mut self, expected: usize, field: &str) -> Result<Vec<u8>> {
         let n = self.u64()?;
         let n = usize::try_from(n).map_err(|_| SdkError::Decode("length overflow".into()))?;
+        if n != expected {
+            return Err(SdkError::Decode(format!(
+                "grant {field} must be {expected} bytes, got {n}"
+            )));
+        }
         Ok(self.take(n)?.to_vec())
     }
-    fn option_vec(&mut self) -> Result<Option<Vec<u8>>> {
+    fn option_exact_vec(&mut self, expected: usize, field: &str) -> Result<Option<Vec<u8>>> {
         match self.u8()? {
             0 => Ok(None),
-            1 => Ok(Some(self.vec()?)),
+            1 => Ok(Some(self.exact_vec(expected, field)?)),
             v => Err(SdkError::Decode(format!("bad Option tag {v}"))),
         }
     }
@@ -281,8 +310,79 @@ mod tests {
         )
         .unwrap();
         assert!(grant.verify_master());
-        assert_eq!(SessionGrant::decode(&grant.encode()).unwrap(), grant);
+        assert_eq!(
+            SessionGrant::decode(&grant.encode().unwrap()).unwrap(),
+            grant
+        );
         assert_eq!(grant.remaining_gas(), 10_000_000);
+    }
+
+    #[test]
+    fn encode_and_decode_enforce_falcon512_lengths() {
+        let master = FalconKeypair::generate().unwrap();
+        let session = FalconKeypair::generate().unwrap();
+        let base = SessionGrant::new(
+            &master,
+            session.public_key(),
+            4_000_000_000,
+            10_000_000,
+            SCOPE_ALL,
+            1_000_000,
+            5757,
+        )
+        .unwrap();
+
+        let mut bad_sig = base.clone();
+        bad_sig.master_signature = vec![0x29; FALCON512_SIG_LEN - 1];
+        assert!(matches!(
+            bad_sig.encode(),
+            Err(SdkError::InvalidArgument(_))
+        ));
+
+        let mut bad_master_pk = base.clone();
+        bad_master_pk.master_pubkey = vec![0x09; FALCON512_PUBKEY_LEN + 1];
+        assert!(matches!(
+            bad_master_pk.encode(),
+            Err(SdkError::InvalidArgument(_))
+        ));
+
+        let mut bad_session_pk = base.clone();
+        bad_session_pk.session_pubkey_bytes = vec![0x09; 32];
+        assert!(matches!(
+            bad_session_pk.encode(),
+            Err(SdkError::InvalidArgument(_))
+        ));
+
+        // Craft raw bytes with non-canonical lengths for each field and confirm decode refuses.
+        let mut raw_bad_sig = Vec::new();
+        raw_bad_sig.extend_from_slice(&[0u8; 32 + 32 + 6 * 8]);
+        raw_bad_sig.extend_from_slice(&((FALCON512_SIG_LEN - 1) as u64).to_le_bytes());
+        raw_bad_sig.extend_from_slice(&vec![0x29; FALCON512_SIG_LEN - 1]);
+        assert!(matches!(
+            SessionGrant::decode(&raw_bad_sig),
+            Err(SdkError::Decode(_))
+        ));
+
+        let valid_bytes = base.encode().unwrap();
+        // Offset of master_pubkey length prefix:
+        // 32 + 32 + 6*8 + 8 + 666 + 1 + 1 + 1 = 789
+        let master_pk_len_off = 32 + 32 + 6 * 8 + 8 + FALCON512_SIG_LEN + 3;
+        let mut raw_bad_master_pk = valid_bytes.clone();
+        raw_bad_master_pk[master_pk_len_off..master_pk_len_off + 8]
+            .copy_from_slice(&((FALCON512_PUBKEY_LEN - 1) as u64).to_le_bytes());
+        assert!(matches!(
+            SessionGrant::decode(&raw_bad_master_pk),
+            Err(SdkError::Decode(_))
+        ));
+
+        let session_pk_len_off = master_pk_len_off + 8 + FALCON512_PUBKEY_LEN + 1;
+        let mut raw_bad_session_pk = valid_bytes;
+        raw_bad_session_pk[session_pk_len_off..session_pk_len_off + 8]
+            .copy_from_slice(&(32u64).to_le_bytes());
+        assert!(matches!(
+            SessionGrant::decode(&raw_bad_session_pk),
+            Err(SdkError::Decode(_))
+        ));
     }
 
     #[test]

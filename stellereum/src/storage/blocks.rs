@@ -1,4 +1,7 @@
-use super::{decode_small_record, BlockHash, Storage};
+use super::{
+    decode_bounded, decode_small_record, BlockHash, Storage, MAX_BLOCK_BYTES,
+    MAX_SMALL_RECORD_BYTES,
+};
 use crate::sharding::Block;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -31,7 +34,10 @@ pub struct BlockHeaderRecord {
 
 impl BlockHeaderRecord {
     pub fn of(b: &Block) -> Self {
-        let gas_used: u64 = b.transactions.iter().map(|t| t.gas_limit).sum();
+        let gas_used: u64 = b
+            .transactions
+            .iter()
+            .fold(0u64, |acc, t| acc.saturating_add(t.gas_limit));
         Self {
             height: b.height,
             prev_hash: b.prev_hash,
@@ -59,7 +65,10 @@ pub struct BlockHeaderRecordV2 {
 
 impl BlockHeaderRecordV2 {
     pub fn of(b: &Block) -> Self {
-        let gas_used: u64 = b.transactions.iter().map(|t| t.gas_limit).sum();
+        let gas_used: u64 = b
+            .transactions
+            .iter()
+            .fold(0u64, |acc, t| acc.saturating_add(t.gas_limit));
         Self {
             header: b.header(),
             tx_count: b.transactions.len() as u32,
@@ -125,10 +134,10 @@ pub(super) struct LegacyStoredReceipt {
 }
 
 pub fn decode_receipt(bytes: &[u8]) -> Result<StoredReceipt> {
-    if let Ok(r) = bincode::deserialize::<StoredReceipt>(bytes) {
+    if let Ok(r) = decode_bounded::<StoredReceipt>(bytes, MAX_SMALL_RECORD_BYTES) {
         return Ok(r);
     }
-    if let Ok(l) = bincode::deserialize::<LegacyStoredReceiptWithFee>(bytes) {
+    if let Ok(l) = decode_bounded::<LegacyStoredReceiptWithFee>(bytes, MAX_SMALL_RECORD_BYTES) {
         return Ok(StoredReceipt {
             tx_hash: l.tx_hash,
             height: l.height,
@@ -140,7 +149,7 @@ pub fn decode_receipt(bytes: &[u8]) -> Result<StoredReceipt> {
             events: Vec::new(),
         });
     }
-    let l: LegacyStoredReceipt = bincode::deserialize(bytes)?;
+    let l: LegacyStoredReceipt = decode_bounded(bytes, MAX_SMALL_RECORD_BYTES)?;
     Ok(StoredReceipt {
         tx_hash: l.tx_hash,
         height: l.height,
@@ -506,7 +515,14 @@ impl Storage {
         self.put_header(&BlockHeaderRecord::of(block))?;
         self.put_header_v2(&BlockHeaderRecordV2::of(block))?;
         if block.height > 0 {
-            self.put_finalized_post_root(block.height - 1, block.state_root)?;
+            // Identity below `EXECUTION_PIPELINE_V1`: the helper returns
+            // `block.height - 1` while the gate is inert, so the persisted key
+            // and value are byte-identical to the lag-1 chain. At/above the
+            // gate the block commits the post-state of `height - 2`.
+            self.put_finalized_post_root(
+                crate::chain_spec::committed_state_height_at(block.height),
+                block.state_root,
+            )?;
         }
         let mut hk = Vec::with_capacity(40);
         hk.extend_from_slice(&block.height.to_be_bytes());
@@ -522,7 +538,7 @@ impl Storage {
             // NOT: there a truncated body must fail closed, not be
             // reinterpreted as a different block (audit W6.4b).
             Some(v) => Ok(Some(crate::sharding::with_legacy_block_tolerance(|| {
-                bincode::deserialize::<Block>(&v)
+                decode_bounded::<Block>(&v, MAX_BLOCK_BYTES)
             })?)),
             None => Ok(None),
         }
@@ -596,7 +612,9 @@ impl Storage {
         // Prefer the single-key blob (one sled insert = one ACID unit): when
         // present it is always a complete pointer, never a half-write.
         if let Some(blob) = self.get_meta("finalized_blob")? {
-            if let Ok((height, hash)) = bincode::deserialize::<(u64, BlockHash)>(&blob) {
+            if let Ok((height, hash)) =
+                decode_bounded::<(u64, BlockHash)>(&blob, MAX_SMALL_RECORD_BYTES)
+            {
                 return Ok(Some((height, hash)));
             }
             // Corrupt blob (torn write is impossible for a single key, but a
@@ -627,7 +645,7 @@ impl Storage {
 
     pub fn header_at(&self, height: u64) -> Result<Option<BlockHeaderRecord>> {
         match self.headers.get(height.to_be_bytes())? {
-            Some(v) => Ok(Some(bincode::deserialize(&v)?)),
+            Some(v) => Ok(Some(decode_bounded(&v, MAX_SMALL_RECORD_BYTES)?)),
             None => Ok(None),
         }
     }
@@ -635,7 +653,7 @@ impl Storage {
     /// The highest header retained, if any.
     pub fn latest_header(&self) -> Result<Option<BlockHeaderRecord>> {
         match self.headers.last()? {
-            Some((_, v)) => Ok(Some(bincode::deserialize(&v)?)),
+            Some((_, v)) => Ok(Some(decode_bounded(&v, MAX_SMALL_RECORD_BYTES)?)),
             None => Ok(None),
         }
     }
@@ -650,7 +668,7 @@ impl Storage {
 
     pub fn header_v2_at(&self, height: u64) -> Result<Option<BlockHeaderRecordV2>> {
         if let Some(v) = self.headers_v2.get(height.to_be_bytes())? {
-            let rec: BlockHeaderRecordV2 = bincode::deserialize(&v)?;
+            let rec: BlockHeaderRecordV2 = decode_bounded(&v, MAX_SMALL_RECORD_BYTES)?;
             if rec.header.height != height {
                 return Err(anyhow!(
                     "header_v2 height mismatch at key {height}: record reports {}",
@@ -694,7 +712,7 @@ impl Storage {
     /// The highest v2 header retained, if any.
     pub fn latest_header_v2(&self) -> Result<Option<BlockHeaderRecordV2>> {
         if let Some((_, v)) = self.headers_v2.last()? {
-            let rec: BlockHeaderRecordV2 = bincode::deserialize(&v)?;
+            let rec: BlockHeaderRecordV2 = decode_bounded(&v, MAX_SMALL_RECORD_BYTES)?;
             if crate::sharding::header_commit_active_at(rec.header.height)
                 && rec.header.compute_hash() != rec.block_hash
             {
@@ -720,9 +738,11 @@ impl Storage {
         k
     }
 
-    /// Record the finalized post-state root for `height` in `"meta"` so
-    /// [`Self::verify_restored_root`] can still verify a snapshot at the tip
-    /// when no successor block at `height + 1` exists yet (`SNAP-TIP-SKIP`).
+    /// Record the finalized post-state root for the state height `height` in
+    /// `"meta"` so [`Self::verify_restored_root`] can still verify a snapshot
+    /// at the tip when no successor block at
+    /// [`crate::chain_spec::anchor_height_for_post_state_at`]`(height)` exists
+    /// yet (`SNAP-TIP-SKIP`).
     pub fn put_finalized_post_root(&self, height: u64, root: [u8; 32]) -> Result<()> {
         self.meta
             .insert(Self::finalized_post_root_key(height), &root[..])?;
@@ -772,7 +792,8 @@ impl Storage {
         let Some(bytes) = self.meta.get(Self::VALIDATOR_SET_HISTORY_META_KEY)? else {
             return Ok(None);
         };
-        let mut entries: Vec<(u64, crate::consensus::ValidatorSet)> = bincode::deserialize(&bytes)?;
+        let mut entries: Vec<(u64, crate::consensus::ValidatorSet)> =
+            decode_bounded(&bytes, MAX_SMALL_RECORD_BYTES)?;
         entries.sort_by_key(|(h, _)| *h);
         Ok(Some(entries))
     }
@@ -1054,7 +1075,7 @@ impl Storage {
             .get(height.to_be_bytes())
             .ok()
             .flatten()
-            .and_then(|v| bincode::deserialize::<BlockHeaderRecord>(&v).ok())
+            .and_then(|v| decode_bounded::<BlockHeaderRecord>(&v, MAX_SMALL_RECORD_BYTES).ok())
             .map(|h| h.timestamp)
             .unwrap_or(0);
         let shard_id = self
@@ -1062,7 +1083,7 @@ impl Storage {
             .get(height.to_be_bytes())
             .ok()
             .flatten()
-            .and_then(|v| bincode::deserialize::<BlockHeaderRecordV2>(&v).ok())
+            .and_then(|v| decode_bounded::<BlockHeaderRecordV2>(&v, MAX_SMALL_RECORD_BYTES).ok())
             .map(|h| h.header.shard_id)
             .unwrap_or(0);
         (timestamp, shard_id)

@@ -28,7 +28,9 @@ use sha2::{Digest as _, Sha256};
 use crate::envelope::{EnvelopeMode, PqEnvelope};
 use crate::error::{Result, SdkError};
 use crate::governance::{GovAction, VoteChoice};
-use crate::key::{derive_pq_address, FalconKeypair, DEFAULT_SALT, FALCON512_SIG_LEN};
+use crate::key::{
+    derive_pq_address, FalconKeypair, DEFAULT_SALT, FALCON512_PUBKEY_LEN, FALCON512_SIG_LEN,
+};
 use crate::opcode::{encode_payload, payload_gas, Op, GAS_BASIC_TRANSFER};
 use crate::protocol::ProtocolIdentity;
 use crate::session::SessionGrant;
@@ -57,9 +59,123 @@ pub const SESSION_FALCON_SIG_TAG: &[u8; 3] = b"SF1";
 /// Transaction-hash domain for PQ envelopes
 /// (`stellereum/src/sharding/transaction.rs:885`).
 pub const PQ_ENVELOPE_HASH_TAG: &[u8; 6] = b"PQ_ENV";
+/// Trailing sponsor envelope tag (`stellereum/src/sharding/envelope.rs:613`).
+pub const SPONSOR_SIG_TAG: &[u8; 3] = b"SP1";
+/// Commitment tag bound into the user's signed message AND the tx hash for
+/// sponsored transactions (`stellereum/src/sharding/envelope.rs:617`).
+pub const SPONSOR_COMMITMENT_TAG: &[u8; 8] = b"SPONSOR_";
+/// Domain separator for the sponsor's fee authorization signature
+/// (`stellereum/src/sharding/envelope.rs:620`).
+pub const SPONSOR_FEE_DOMAIN: &[u8; 14] = b"SPONSOR_FEE_V1";
+/// Hard cap on decoded sponsor auth bytes (`stellereum/src/sharding/envelope.rs:625`).
+pub const SPONSOR_AUTH_MAX_BYTES: usize = 4096;
+/// Hard cap on allowlisted targets per sponsor grant
+/// (`stellereum/src/sharding/envelope.rs:628`).
+pub const SPONSOR_MAX_TARGETS: usize = 64;
 
 /// Masterchain shard id (`stellereum/src/sharding/topology.rs:7-8`).
 pub const MASTERCHAIN_SHARD: u32 = 0;
+
+/// Post-quantum signature scheme tag matching `stellereum::post_quantum::PqScheme`.
+///
+/// Variant order MUST remain `Falcon512` then `MlDsa44` so `bincode`'s derived
+/// `u32` variant indices match the node's `SponsorAuthorization` wire layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[repr(u8)]
+pub enum PqScheme {
+    /// Post-quantum Falcon-512 (897-byte public key, 666-byte signature).
+    Falcon512 = 2,
+    /// Disabled ML-DSA-44 tag (always rejected fail-closed).
+    MlDsa44 = 3,
+}
+
+/// A sponsor's fee authorization for one transaction (`SP1` envelope,
+/// `stellereum/src/sharding/envelope.rs:708-739`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SponsorAuthorization {
+    pub sponsor: [u8; 32],
+    pub max_fee_per_tx: u64,
+    pub valid_until: u64,
+    #[serde(default)]
+    pub allowed_targets: Vec<[u8; 32]>,
+    pub chain_id: u64,
+    pub sponsor_sig: Vec<u8>,
+    #[serde(default)]
+    pub sponsor_scheme: Option<PqScheme>,
+    #[serde(default)]
+    pub sponsor_pubkey: Option<Vec<u8>>,
+    #[serde(default)]
+    pub sponsor_salt: Option<[u8; 16]>,
+}
+
+impl SponsorAuthorization {
+    /// Serialize with `bincode`, enforcing `SPONSOR_MAX_TARGETS` and `SPONSOR_AUTH_MAX_BYTES`.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        if self.allowed_targets.len() > SPONSOR_MAX_TARGETS {
+            return Err(SdkError::InvalidArgument(format!(
+                "sponsor allowed_targets has {} entries, max {SPONSOR_MAX_TARGETS}",
+                self.allowed_targets.len()
+            )));
+        }
+        let bytes = bincode::serialize(self)
+            .map_err(|e| SdkError::InvalidArgument(format!("sponsor auth serialize: {e}")))?;
+        if bytes.is_empty() || bytes.len() > SPONSOR_AUTH_MAX_BYTES {
+            return Err(SdkError::InvalidArgument(format!(
+                "sponsor auth is {} bytes, max {SPONSOR_AUTH_MAX_BYTES}",
+                bytes.len()
+            )));
+        }
+        Ok(bytes)
+    }
+}
+
+/// Split the trailing `SP1` sponsor suffix off a signature blob, matching
+/// `Transaction::split_sponsor_envelope` (`stellereum/src/sharding/transaction.rs:1614-1652`).
+///
+/// Returns `(inner_len, auth, malformed)`.
+pub fn split_sponsor_envelope(blob: &[u8]) -> (usize, Option<SponsorAuthorization>, bool) {
+    let tag_len = SPONSOR_SIG_TAG.len();
+    if blob.len() < tag_len + 4 + 1 || blob[blob.len() - tag_len..] != SPONSOR_SIG_TAG[..] {
+        return (blob.len(), None, false);
+    }
+    let len_off = blob.len() - tag_len - 4;
+    let auth_len = u32::from_be_bytes([
+        blob[len_off],
+        blob[len_off + 1],
+        blob[len_off + 2],
+        blob[len_off + 3],
+    ]) as usize;
+    if auth_len == 0 || auth_len > SPONSOR_AUTH_MAX_BYTES || len_off < auth_len {
+        return (blob.len(), None, true);
+    }
+    let inner_len = len_off - auth_len;
+    if inner_len < 64 {
+        return (blob.len(), None, true);
+    }
+    let auth_bytes = &blob[inner_len..len_off];
+    match bincode::deserialize::<SponsorAuthorization>(auth_bytes) {
+        Ok(auth) => {
+            if (auth.sponsor_sig.len() != FALCON512_SIG_LEN && auth.sponsor_sig.len() != 64)
+                || auth.allowed_targets.len() > SPONSOR_MAX_TARGETS
+            {
+                return (blob.len(), None, true);
+            }
+            (inner_len, Some(auth), false)
+        }
+        Err(_) => (blob.len(), None, true),
+    }
+}
+
+/// Exact preimage signed by the sponsor (`Transaction::sponsor_message`).
+pub fn sponsor_message(tx: &Transaction, auth: &SponsorAuthorization) -> Vec<u8> {
+    tx.sponsor_message(auth)
+}
+
+/// Exact preimage signed by the user for a sponsored transaction
+/// (`base_signing_message` + `SPONSOR_` commitment).
+pub fn sponsored_signing_message(tx: &Transaction, auth: &SponsorAuthorization) -> Vec<u8> {
+    tx.sponsored_signing_message(auth)
+}
 
 /// A canonical Stellereum transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,22 +295,120 @@ impl Transaction {
         out
     }
 
+    /// Split the trailing `SP1` sponsor suffix off a signature blob.
+    pub fn split_sponsor_envelope(blob: &[u8]) -> (usize, Option<SponsorAuthorization>, bool) {
+        split_sponsor_envelope(blob)
+    }
+
+    /// Strip the optional trailing `SP1` sponsor suffix and return the inner
+    /// signature slice (or the full signature when no well-formed suffix is
+    /// present).
+    pub fn sponsor_inner_sig(&self) -> &[u8] {
+        let (inner_len, _, _) = split_sponsor_envelope(&self.signature);
+        &self.signature[..inner_len]
+    }
+
+    /// True when the trailing `SP1` sponsor tag is present, regardless of
+    /// whether the suffix parses.
+    pub fn has_sponsor_envelope(&self) -> bool {
+        let b = &self.signature;
+        b.len() > SPONSOR_SIG_TAG.len() + 4
+            && b[b.len() - SPONSOR_SIG_TAG.len()..] == SPONSOR_SIG_TAG[..]
+    }
+
+    /// True when the `SP1` suffix is present but malformed (must fail closed).
+    pub fn sponsor_malformed(&self) -> bool {
+        split_sponsor_envelope(&self.signature).2
+    }
+
+    /// Parsed sponsor authorization when a well-formed `SP1` suffix is present.
+    pub fn sponsor_auth(&self) -> Option<SponsorAuthorization> {
+        split_sponsor_envelope(&self.signature).1
+    }
+
+    /// True when a well-formed `SP1` sponsor suffix is present.
+    pub fn is_sponsored(&self) -> bool {
+        self.sponsor_auth().is_some()
+    }
+
+    /// The exact preimage the sponsor signs (`Transaction::sponsor_message`).
+    pub fn sponsor_message(&self, auth: &SponsorAuthorization) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(256);
+        msg.extend_from_slice(SPONSOR_FEE_DOMAIN);
+        msg.extend_from_slice(&auth.sponsor);
+        msg.extend_from_slice(&self.from);
+        msg.extend_from_slice(&self.to);
+        msg.extend_from_slice(&self.amount.to_be_bytes());
+        msg.extend_from_slice(&self.gas_limit.to_be_bytes());
+        msg.extend_from_slice(&self.nonce.to_be_bytes());
+        msg.extend_from_slice(&self.source_shard.to_be_bytes());
+        msg.extend_from_slice(&self.target_shard.to_be_bytes());
+        let payload = self.payload_bytes_normalized();
+        msg.extend_from_slice(PAYLOAD_COMMITMENT_TAG);
+        msg.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        msg.extend_from_slice(payload);
+        msg.extend_from_slice(&self.priority_fee_per_gas.to_be_bytes());
+        msg.extend_from_slice(&auth.max_fee_per_tx.to_be_bytes());
+        msg.extend_from_slice(&auth.valid_until.to_be_bytes());
+        msg.extend_from_slice(b"ALLOWLIST");
+        msg.extend_from_slice(&(auth.allowed_targets.len() as u32).to_be_bytes());
+        for t in &auth.allowed_targets {
+            msg.extend_from_slice(t);
+        }
+        msg.extend_from_slice(&auth.chain_id.to_be_bytes());
+        msg
+    }
+
+    /// The exact preimage the user signs for a sponsored transaction:
+    /// `base_signing_message` + `SPONSOR_` commitment.
+    pub fn sponsored_signing_message(&self, auth: &SponsorAuthorization) -> Vec<u8> {
+        let mut msg = self.base_signing_message();
+        msg.extend_from_slice(&sponsor_commitment(auth));
+        msg
+    }
+
+    /// Verify only the sponsor's Falcon-512 signature over `sponsor_message`.
+    pub fn verify_sponsor_sig(&self, auth: &SponsorAuthorization) -> bool {
+        if auth.sponsor_sig.len() != FALCON512_SIG_LEN {
+            return false;
+        }
+        if auth.sponsor_scheme != Some(PqScheme::Falcon512) {
+            return false;
+        }
+        let Some(ref pk) = auth.sponsor_pubkey else {
+            return false;
+        };
+        if pk.len() != FALCON512_PUBKEY_LEN {
+            return false;
+        }
+        let salt = auth.sponsor_salt.unwrap_or(DEFAULT_SALT);
+        let Ok(derived) = derive_pq_address(pk, &salt) else {
+            return false;
+        };
+        if derived != auth.sponsor {
+            return false;
+        }
+        crate::key::verify_pq_signature(pk, &self.sponsor_message(auth), &auth.sponsor_sig)
+    }
+
     /// The exact preimage the credential signs.
     ///
-    /// This is the node's `Transaction::signing_message()`
-    /// (`transaction.rs:1319-1376`) for PQ and session envelopes: base
-    /// fields, `PAYLOAD` commitment, optional `PRIORITY` commitment, then
-    /// either the `SESSION` commitment (SF1) or the `CHAIN_ID` commitment
-    /// (PQ1). A PQ envelope's chain id is also carried in the envelope, but
-    /// it is committed into the message (and therefore into the signature)
-    /// by the same tag.
+    /// Matches the node's `Transaction::signing_message()`
+    /// (`transaction.rs:1438-1475`) for PQ1, SF1, and SP1-sponsored envelopes.
     pub fn signing_message(&self) -> Vec<u8> {
         let mut msg = self.base_signing_message();
-        if let Some(grant) = self.session_grant() {
+        let (inner_len, sponsor_auth, _) = split_sponsor_envelope(&self.signature);
+        let inner = &self.signature[..inner_len];
+        if let Some(grant) = session_grant_from_inner(inner) {
             msg.extend_from_slice(&session_commitment(&grant));
-        } else if let Some(cid) = self.bound_chain_id() {
-            msg.extend_from_slice(CHAIN_ID_COMMITMENT_TAG);
-            msg.extend_from_slice(&cid.to_be_bytes());
+        } else if sponsor_auth.is_none() {
+            if let Some(cid) = pq_envelope_from_inner(inner).and_then(|e| e.chain_id) {
+                msg.extend_from_slice(CHAIN_ID_COMMITMENT_TAG);
+                msg.extend_from_slice(&cid.to_be_bytes());
+            }
+        }
+        if let Some(ref auth) = sponsor_auth {
+            msg.extend_from_slice(&sponsor_commitment(auth));
         }
         msg
     }
@@ -215,6 +429,14 @@ impl Transaction {
         msg
     }
 
+    fn payload_bytes_normalized(&self) -> &[u8] {
+        if self.payload.is_empty() {
+            &[0u8; 8]
+        } else {
+            &self.payload
+        }
+    }
+
     fn base_signing_message(&self) -> Vec<u8> {
         let mut msg = Vec::with_capacity(128);
         msg.extend_from_slice(&self.from);
@@ -224,9 +446,10 @@ impl Transaction {
         msg.extend_from_slice(&self.nonce.to_be_bytes());
         msg.extend_from_slice(&self.source_shard.to_be_bytes());
         msg.extend_from_slice(&self.target_shard.to_be_bytes());
+        let payload = self.payload_bytes_normalized();
         msg.extend_from_slice(PAYLOAD_COMMITMENT_TAG);
-        msg.extend_from_slice(&(self.payload.len() as u32).to_be_bytes());
-        msg.extend_from_slice(&self.payload);
+        msg.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        msg.extend_from_slice(payload);
         if self.priority_fee_per_gas != 0 {
             msg.extend_from_slice(PRIORITY_FEE_COMMITMENT_TAG);
             msg.extend_from_slice(&self.priority_fee_per_gas.to_be_bytes());
@@ -234,41 +457,30 @@ impl Transaction {
         msg
     }
 
-    /// Parse the `PQ1` envelope, if this is a PQ transaction.
+    /// Parse the `PQ1` envelope, if this is a PQ transaction (stripping any
+    /// trailing `SP1` sponsor suffix).
     pub fn pq_envelope(&self) -> Option<PqEnvelope> {
-        if !self
-            .signature
-            .starts_with(crate::envelope::PQ_ENVELOPE_MAGIC)
-        {
-            return None;
-        }
-        PqEnvelope::decode(&self.signature).ok()
+        pq_envelope_from_inner(self.sponsor_inner_sig())
     }
 
-    /// Parse the `SF1` session grant, if this is a session transaction.
+    /// Parse the `SF1` session grant, if this is a session transaction
+    /// (stripping any trailing `SP1` sponsor suffix).
     pub fn session_grant(&self) -> Option<SessionGrant> {
-        let sig_len = FALCON512_SIG_LEN;
-        let tag_len = SESSION_FALCON_SIG_TAG.len();
-        if self.signature.len() <= sig_len + tag_len {
-            return None;
-        }
-        if &self.signature[sig_len..sig_len + tag_len] != SESSION_FALCON_SIG_TAG {
-            return None;
-        }
-        SessionGrant::decode(&self.signature[sig_len + tag_len..]).ok()
+        session_grant_from_inner(self.sponsor_inner_sig())
     }
 
-    /// The credential's chain id: the envelope's for PQ1, the grant's for
-    /// `SF1`, `None` for an unbound envelope.
+    /// The credential's chain id: `auth.chain_id` for `SP1`, `grant.chain_id`
+    /// for `SF1`, `envelope.chain_id` for `PQ1`, or `None` for unbound.
     pub fn chain_id(&self) -> Option<u64> {
-        if let Some(g) = self.session_grant() {
+        let (inner_len, sponsor_auth, _) = split_sponsor_envelope(&self.signature);
+        if let Some(auth) = sponsor_auth {
+            return Some(auth.chain_id);
+        }
+        let inner = &self.signature[..inner_len];
+        if let Some(g) = session_grant_from_inner(inner) {
             return Some(g.chain_id);
         }
-        self.pq_envelope().and_then(|e| e.chain_id)
-    }
-
-    fn bound_chain_id(&self) -> Option<u64> {
-        self.chain_id()
+        pq_envelope_from_inner(inner).and_then(|e| e.chain_id)
     }
 
     /// True for an explicit PQ1 activation transaction (the node only charges
@@ -278,7 +490,7 @@ impl Transaction {
     }
 
     /// Canonical SHA-256 transaction hash, byte-identical to
-    /// `Transaction::compute_tx_hash` (`transaction.rs:813-890`).
+    /// `Transaction::compute_tx_hash` (`transaction.rs:847-936`).
     pub fn compute_tx_hash(&self) -> [u8; 32] {
         let mut h = Sha256::new();
         h.update(self.from);
@@ -288,21 +500,25 @@ impl Transaction {
         h.update(self.nonce.to_be_bytes());
         h.update(self.source_shard.to_be_bytes());
         h.update(self.target_shard.to_be_bytes());
+        let payload = self.payload_bytes_normalized();
         h.update(PAYLOAD_COMMITMENT_TAG);
-        h.update((self.payload.len() as u32).to_be_bytes());
-        h.update(&self.payload);
+        h.update((payload.len() as u32).to_be_bytes());
+        h.update(payload);
         if self.priority_fee_per_gas != 0 {
             h.update(PRIORITY_FEE_COMMITMENT_TAG);
             h.update(self.priority_fee_per_gas.to_be_bytes());
         }
-        if let Some(grant) = self.session_grant() {
+        let (inner_len, sponsor_auth, _) = split_sponsor_envelope(&self.signature);
+        let inner_sig = &self.signature[..inner_len];
+        if let Some(grant) = session_grant_from_inner(inner_sig) {
             h.update(session_commitment(&grant));
         }
-        // `is_pq()` is true iff the inner signature starts with "PQ1".
-        if self
-            .signature
-            .starts_with(crate::envelope::PQ_ENVELOPE_MAGIC)
-        {
+        if let Some(ref auth) = sponsor_auth {
+            h.update(sponsor_commitment(auth));
+        }
+        // `is_pq_inner()` is true iff the inner signature starts with "PQ1",
+        // and the node hashes the full `self.signature` (including any `SP1` suffix).
+        if inner_sig.starts_with(crate::envelope::PQ_ENVELOPE_MAGIC) {
             h.update(PQ_ENVELOPE_HASH_TAG);
             h.update(&self.signature);
         }
@@ -310,13 +526,58 @@ impl Transaction {
     }
 }
 
+fn pq_envelope_from_inner(inner: &[u8]) -> Option<PqEnvelope> {
+    if !inner.starts_with(crate::envelope::PQ_ENVELOPE_MAGIC) {
+        return None;
+    }
+    PqEnvelope::decode(inner).ok()
+}
+
+fn session_grant_from_inner(inner: &[u8]) -> Option<SessionGrant> {
+    let sig_len = FALCON512_SIG_LEN;
+    let tag_len = SESSION_FALCON_SIG_TAG.len();
+    if inner.len() <= sig_len + tag_len {
+        return None;
+    }
+    if &inner[sig_len..sig_len + tag_len] != SESSION_FALCON_SIG_TAG {
+        return None;
+    }
+    SessionGrant::decode(&inner[sig_len + tag_len..]).ok()
+}
+
 fn session_commitment(grant: &SessionGrant) -> Vec<u8> {
-    let bytes = grant.encode();
-    let mut out = Vec::with_capacity(SESSION_COMMITMENT_TAG.len() + 4 + bytes.len());
+    let mut out = Vec::new();
     out.extend_from_slice(SESSION_COMMITMENT_TAG);
-    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-    out.extend_from_slice(&bytes);
+    match grant.encode() {
+        Ok(bytes) => {
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        Err(_) => out.extend_from_slice(&u32::MAX.to_be_bytes()),
+    }
     out
+}
+
+fn sponsor_commitment(auth: &SponsorAuthorization) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(SPONSOR_COMMITMENT_TAG);
+    match bincode::serialize(auth) {
+        Ok(bytes) => {
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        Err(_) => out.extend_from_slice(&u32::MAX.to_be_bytes()),
+    }
+    out
+}
+
+fn encode_sponsor_suffix(auth: &SponsorAuthorization) -> Result<Vec<u8>> {
+    let body = auth.encode()?;
+    let mut out = Vec::with_capacity(body.len() + 4 + SPONSOR_SIG_TAG.len());
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(SPONSOR_SIG_TAG);
+    Ok(out)
 }
 
 /// Split the optional trailing `PRIORITY` envelope off a signature blob,
@@ -458,6 +719,19 @@ impl TxBuilder {
         b
     }
 
+    /// Deploy a WASM smart contract (`OpCode::SysCallDeployContract`).
+    /// Self-addressed (`to == from`) with `amount == 0`.
+    pub fn contract_deploy(code: Vec<u8>) -> Self {
+        Self::payload_builder(vec![Op::DeployContract { code }], 0)
+    }
+
+    /// Deploy a WASM smart contract with an inline JSON ABI manifest
+    /// (`OpCode::SysCallDeployContractWithAbi`, discriminant 65).
+    /// Self-addressed (`to == from`) with `amount == 0`.
+    pub fn contract_deploy_with_abi(code: Vec<u8>, abi_json: Vec<u8>) -> Self {
+        Self::payload_builder(vec![Op::DeployContractWithAbi { code, abi_json }], 0)
+    }
+
     /// Call a WASM contract method with typed ABI arguments. `value` is the
     /// native amount sent with the call (rides in `Transaction.amount`).
     pub fn contract_call(
@@ -472,9 +746,47 @@ impl TxBuilder {
         Ok(b)
     }
 
+    /// Call a WASM contract method with raw `host.calldata` bytes (for `*_pq`
+    /// entrypoints that decode binary layouts directly). `value` is the native
+    /// amount sent with the call (rides in `Transaction.amount`).
+    pub fn contract_call_raw(
+        contract: [u8; 32],
+        method: &str,
+        args: &[i64],
+        calldata: Vec<u8>,
+        value: u64,
+    ) -> Result<Self> {
+        let op = Op::call_raw(contract, method, args, calldata)?;
+        let mut b = Self::payload_builder(vec![op], value);
+        b.to = Some(contract);
+        Ok(b)
+    }
+
     /// Bond (or top up) a validator. The amount leaves the sender.
     pub fn stake(validator: [u8; 32], amount: u64) -> Self {
         Self::payload_builder(vec![Op::Stake { validator, amount }], amount)
+    }
+
+    /// Bond (or top up) a validator with an explicit commission rate in basis
+    /// points (`<= 10_000`). The amount leaves the sender.
+    pub fn stake_with_commission(
+        validator: [u8; 32],
+        amount: u64,
+        commission_bps: u64,
+    ) -> Result<Self> {
+        if commission_bps > 10_000 {
+            return Err(SdkError::InvalidArgument(format!(
+                "commission_bps {commission_bps} exceeds 10_000"
+            )));
+        }
+        Ok(Self::payload_builder(
+            vec![Op::StakeWithCommission {
+                validator,
+                amount,
+                commission_bps,
+            }],
+            amount,
+        ))
     }
 
     /// Re-admit a jailed validator. `top_up` emits the CLI's `SysCallStake`
@@ -728,6 +1040,19 @@ impl TxBuilder {
         Ok(signed)
     }
 
+    /// Required session-grant scope bits for this builder's payload, matching
+    /// `Transaction::required_scope` (`stellereum/src/sharding/transaction.rs:1531`).
+    pub fn required_scope(&self) -> u64 {
+        if self.ops.is_empty() {
+            crate::session::SCOPE_TRANSFER
+        } else {
+            // Note: `Op` in `opcode.rs` does not currently define an actor-send
+            // variant (`SysCallActorSend`); if one is added, it must require
+            // `crate::session::SCOPE_SVM_PAYLOAD | crate::session::SCOPE_ACTOR_SEND`.
+            crate::session::SCOPE_SVM_PAYLOAD
+        }
+    }
+
     /// Sign with a delegated Falcon-512 session key (`SF1` envelope).
     ///
     /// `tx.from` is the grant's master address; the nonce, balance and fee
@@ -749,15 +1074,10 @@ impl TxBuilder {
                 "session key does not match the grant's session_pubkey_bytes".into(),
             ));
         }
-        if let Ok(addr) = derive_pq_address(session_key.public_key(), &DEFAULT_SALT) {
-            if addr != grant.session_pubkey {
-                return Err(SdkError::InvalidArgument(
-                    "session key address does not match the grant's session_pubkey".into(),
-                ));
-            }
-        } else {
-            return Err(SdkError::InvalidKey(
-                "session key is not a 897-byte Falcon-512 public key".into(),
+        let derived_session = derive_pq_address(&grant.session_pubkey_bytes, &DEFAULT_SALT)?;
+        if derived_session != grant.session_pubkey {
+            return Err(SdkError::InvalidArgument(
+                "session key address does not match the grant's session_pubkey".into(),
             ));
         }
         if let Some(cid) = self.chain_id {
@@ -768,11 +1088,7 @@ impl TxBuilder {
                 )));
             }
         }
-        let required = if self.ops.is_empty() {
-            crate::session::SCOPE_TRANSFER
-        } else {
-            crate::session::SCOPE_SVM_PAYLOAD
-        };
+        let required = self.required_scope();
         if !grant.grants_scope(required) {
             return Err(SdkError::InvalidArgument(format!(
                 "grant scope 0x{:x} does not cover required scope 0x{required:x}",
@@ -785,19 +1101,129 @@ impl TxBuilder {
                 self.amount, grant.max_value_per_tx
             )));
         }
+        let grant_bytes = grant.encode()?;
         let from = grant.master_address;
         let to = self.to.unwrap_or(from);
         let mut tx = self.unsigned(from, to);
         let msg = tx.signing_message_with_session(grant);
         let sig = session_key.sign(&msg)?;
-        let mut signature = Vec::with_capacity(sig.len() + 3 + grant.encode().len());
+        let mut signature =
+            Vec::with_capacity(sig.len() + SESSION_FALCON_SIG_TAG.len() + grant_bytes.len());
         signature.extend_from_slice(&sig);
         signature.extend_from_slice(SESSION_FALCON_SIG_TAG);
-        signature.extend_from_slice(&grant.encode());
+        signature.extend_from_slice(&grant_bytes);
         tx.signature = signature;
         let signed = SignedTx { tx };
         signed
             .verify_session(session_key)
+            .map_err(|e| SdkError::VerificationFailed(e.to_string()))?;
+        Ok(signed)
+    }
+
+    /// Sign a FULL-PQ Paymaster v2 sponsored transaction (`PQ1` user inner +
+    /// `SP1` Falcon-512 sponsor suffix), matching
+    /// `Transaction::sign_with_sponsor_falcon512`.
+    ///
+    /// The sponsor signs `sponsor_message` first, then the user signs
+    /// `sponsored_signing_message` (which commits to the full `SponsorAuthorization`
+    /// including `sponsor_sig`).
+    pub fn sign_with_sponsor(
+        self,
+        user_key: &FalconKeypair,
+        sponsor_key: &FalconKeypair,
+        max_fee_per_tx: u64,
+        valid_until: u64,
+        allowed_targets: Vec<[u8; 32]>,
+    ) -> Result<SignedTx> {
+        self.validate_identity()?;
+        let chain_id = self.chain_id.ok_or_else(|| {
+            SdkError::InvalidArgument("sponsored transactions require a chain_id".into())
+        })?;
+        if allowed_targets.len() > SPONSOR_MAX_TARGETS {
+            return Err(SdkError::InvalidArgument(format!(
+                "allowed_targets has {} entries, max {SPONSOR_MAX_TARGETS}",
+                allowed_targets.len()
+            )));
+        }
+        let from = user_key.address();
+        let to = self.to.unwrap_or(from);
+        let mut tx = self.unsigned(from, to);
+        let mut auth = SponsorAuthorization {
+            sponsor: sponsor_key.address(),
+            max_fee_per_tx,
+            valid_until,
+            allowed_targets,
+            chain_id,
+            sponsor_sig: Vec::new(),
+            sponsor_scheme: Some(PqScheme::Falcon512),
+            sponsor_pubkey: Some(sponsor_key.public_key().to_vec()),
+            sponsor_salt: Some(DEFAULT_SALT),
+        };
+        let sponsor_msg = tx.sponsor_message(&auth);
+        auth.sponsor_sig = sponsor_key.sign(&sponsor_msg)?;
+        let user_msg = tx.sponsored_signing_message(&auth);
+        let user_sig = user_key.sign(&user_msg)?;
+        let envelope = match self.mode {
+            EnvelopeMode::Explicit => {
+                PqEnvelope::explicit(user_key.public_key().to_vec(), user_sig)
+            }
+            EnvelopeMode::Implicit => PqEnvelope::implicit(user_sig),
+        };
+        let mut blob = envelope.encode()?;
+        blob.extend_from_slice(&encode_sponsor_suffix(&auth)?);
+        tx.signature = blob;
+        let signed = SignedTx { tx };
+        signed
+            .verify_with_key(user_key)
+            .map_err(|e| SdkError::VerificationFailed(e.to_string()))?;
+        Ok(signed)
+    }
+
+    /// Sign the user half of a sponsored transaction given a pre-signed
+    /// [`SponsorAuthorization`] from the paymaster.
+    pub fn sign_with_sponsor_auth(
+        self,
+        user_key: &FalconKeypair,
+        auth: &SponsorAuthorization,
+    ) -> Result<SignedTx> {
+        self.validate_identity()?;
+        let chain_id = self.chain_id.ok_or_else(|| {
+            SdkError::InvalidArgument("sponsored transactions require a chain_id".into())
+        })?;
+        if chain_id != auth.chain_id {
+            return Err(SdkError::InvalidArgument(format!(
+                "builder chain_id {chain_id} != sponsor auth chain_id {}",
+                auth.chain_id
+            )));
+        }
+        if auth.allowed_targets.len() > SPONSOR_MAX_TARGETS {
+            return Err(SdkError::InvalidArgument(format!(
+                "allowed_targets has {} entries, max {SPONSOR_MAX_TARGETS}",
+                auth.allowed_targets.len()
+            )));
+        }
+        let from = user_key.address();
+        let to = self.to.unwrap_or(from);
+        let mut tx = self.unsigned(from, to);
+        if !tx.verify_sponsor_sig(auth) {
+            return Err(SdkError::VerificationFailed(
+                "sponsor authorization signature does not verify for this transaction".into(),
+            ));
+        }
+        let user_msg = tx.sponsored_signing_message(auth);
+        let user_sig = user_key.sign(&user_msg)?;
+        let envelope = match self.mode {
+            EnvelopeMode::Explicit => {
+                PqEnvelope::explicit(user_key.public_key().to_vec(), user_sig)
+            }
+            EnvelopeMode::Implicit => PqEnvelope::implicit(user_sig),
+        };
+        let mut blob = envelope.encode()?;
+        blob.extend_from_slice(&encode_sponsor_suffix(auth)?);
+        tx.signature = blob;
+        let signed = SignedTx { tx };
+        signed
+            .verify_with_key(user_key)
             .map_err(|e| SdkError::VerificationFailed(e.to_string()))?;
         Ok(signed)
     }
@@ -810,6 +1236,15 @@ pub struct SignedTx {
 }
 
 impl SignedTx {
+    /// Decode a wire transaction and verify its explicit `PQ1` (and optional
+    /// `SP1`) signature(s).
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let tx = Transaction::decode(bytes)?;
+        let signed = Self { tx };
+        signed.verify()?;
+        Ok(signed)
+    }
+
     /// Borrow the canonical transaction.
     pub fn transaction(&self) -> &Transaction {
         &self.tx
@@ -827,6 +1262,11 @@ impl SignedTx {
 
     /// Canonical transaction hash.
     pub fn tx_hash(&self) -> [u8; 32] {
+        self.tx.compute_tx_hash()
+    }
+
+    /// Canonical transaction hash (alias for `tx_hash`).
+    pub fn compute_tx_hash(&self) -> [u8; 32] {
         self.tx.compute_tx_hash()
     }
 
@@ -881,18 +1321,115 @@ impl SignedTx {
         self.tx.is_pq_activation()
     }
 
+    /// Decoded `PQ1` envelope, if present (stripping any trailing `SP1` suffix).
+    pub fn pq_envelope(&self) -> Option<PqEnvelope> {
+        self.tx.pq_envelope()
+    }
+
+    /// Decoded `SF1` session grant, if present (stripping any trailing `SP1` suffix).
+    pub fn session_grant(&self) -> Option<SessionGrant> {
+        self.tx.session_grant()
+    }
+
+    /// Decoded `SP1` sponsor authorization, if present and well-formed.
+    pub fn sponsor_authorization(&self) -> Option<SponsorAuthorization> {
+        self.tx.sponsor_auth()
+    }
+
+    /// True when a well-formed `SP1` sponsor suffix is present.
+    pub fn is_sponsored(&self) -> bool {
+        self.tx.is_sponsored()
+    }
+
+    /// Exact credential signing message (`Transaction::signing_message`).
+    pub fn signing_message(&self) -> Vec<u8> {
+        self.tx.signing_message()
+    }
+
     /// The raw SVM payload bytes.
     pub fn payload_bytes(&self) -> &[u8] {
         &self.tx.payload
     }
 
+    /// Attach or replace a sponsor authorization on a `PQ1` transaction by
+    /// signing the sponsor side first and re-signing the user's `PQ1` envelope
+    /// over `sponsored_signing_message`.
+    pub fn cosign_with_sponsor(
+        self,
+        user_key: &FalconKeypair,
+        sponsor_key: &FalconKeypair,
+        max_fee_per_tx: u64,
+        valid_until: u64,
+        allowed_targets: Vec<[u8; 32]>,
+    ) -> Result<SignedTx> {
+        if user_key.address() != self.tx.from {
+            return Err(SdkError::InvalidArgument(
+                "user_key address does not match tx.from".into(),
+            ));
+        }
+        let chain_id = self.chain_id().ok_or_else(|| {
+            SdkError::InvalidArgument("sponsored transactions require a chain_id".into())
+        })?;
+        if allowed_targets.len() > SPONSOR_MAX_TARGETS {
+            return Err(SdkError::InvalidArgument(format!(
+                "allowed_targets has {} entries, max {SPONSOR_MAX_TARGETS}",
+                allowed_targets.len()
+            )));
+        }
+        let mode = match self.tx.pq_envelope() {
+            Some(env) => env.mode,
+            None => {
+                return Err(SdkError::InvalidArgument(
+                    "sponsor cosigning requires a PQ1 inner envelope".into(),
+                ));
+            }
+        };
+        let mut tx = self.tx;
+        tx.signature.clear();
+        let mut auth = SponsorAuthorization {
+            sponsor: sponsor_key.address(),
+            max_fee_per_tx,
+            valid_until,
+            allowed_targets,
+            chain_id,
+            sponsor_sig: Vec::new(),
+            sponsor_scheme: Some(PqScheme::Falcon512),
+            sponsor_pubkey: Some(sponsor_key.public_key().to_vec()),
+            sponsor_salt: Some(DEFAULT_SALT),
+        };
+        let sponsor_msg = tx.sponsor_message(&auth);
+        auth.sponsor_sig = sponsor_key.sign(&sponsor_msg)?;
+        let user_msg = tx.sponsored_signing_message(&auth);
+        let user_sig = user_key.sign(&user_msg)?;
+        let envelope = match mode {
+            EnvelopeMode::Explicit => {
+                PqEnvelope::explicit(user_key.public_key().to_vec(), user_sig)
+            }
+            EnvelopeMode::Implicit => PqEnvelope::implicit(user_sig),
+        };
+        let mut blob = envelope.encode()?;
+        blob.extend_from_slice(&encode_sponsor_suffix(&auth)?);
+        tx.signature = blob;
+        let signed = SignedTx { tx };
+        signed
+            .verify_with_key(user_key)
+            .map_err(|e| SdkError::VerificationFailed(e.to_string()))?;
+        Ok(signed)
+    }
+
     /// Verify an explicit `PQ1` transaction locally, exactly like node
-    /// admission: envelope decodes, address derives from the carried key,
-    /// chain id matches, signature verifies over the signing message.
+    /// admission: rejects malformed `SP1` suffixes, decodes `PQ1`, checks the
+    /// derived sender address, verifies the user's signature, and (when
+    /// sponsored) verifies the sponsor's Falcon-512 signature as well.
     pub fn verify(&self) -> Result<()> {
-        let env = self
-            .tx
-            .pq_envelope()
+        let (inner_len, sponsor_auth, sponsor_malformed) =
+            split_sponsor_envelope(&self.tx.signature);
+        if sponsor_malformed {
+            return Err(SdkError::VerificationFailed(
+                "malformed SP1 sponsor envelope".into(),
+            ));
+        }
+        let env = pq_envelope_from_inner(&self.tx.signature[..inner_len])
             .ok_or_else(|| SdkError::VerificationFailed("not a PQ1 envelope".into()))?;
         if !env.is_explicit() {
             return Err(SdkError::VerificationFailed(
@@ -909,17 +1446,27 @@ impl SignedTx {
                 "envelope pubkey does not derive to tx.from".into(),
             ));
         }
-        let msg = match env.chain_id {
-            Some(cid) => self.tx.signing_message_for_chain(cid),
-            None => self.tx.signing_message(),
-        };
-        if crate::key::verify_pq_signature(pk, &msg, &env.signature) {
-            Ok(())
+        let msg = if let Some(ref auth) = sponsor_auth {
+            self.tx.sponsored_signing_message(auth)
         } else {
-            Err(SdkError::VerificationFailed(
+            match env.chain_id {
+                Some(cid) => self.tx.signing_message_for_chain(cid),
+                None => self.tx.signing_message(),
+            }
+        };
+        if !crate::key::verify_pq_signature(pk, &msg, &env.signature) {
+            return Err(SdkError::VerificationFailed(
                 "Falcon-512 signature does not verify".into(),
-            ))
+            ));
         }
+        if let Some(ref auth) = sponsor_auth {
+            if !self.tx.verify_sponsor_sig(auth) {
+                return Err(SdkError::VerificationFailed(
+                    "sponsor Falcon-512 signature does not verify".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Verify with the original key (needed for implicit envelopes).
@@ -929,9 +1476,14 @@ impl SignedTx {
                 "key address != tx.from".into(),
             ));
         }
-        let env = self
-            .tx
-            .pq_envelope()
+        let (inner_len, sponsor_auth, sponsor_malformed) =
+            split_sponsor_envelope(&self.tx.signature);
+        if sponsor_malformed {
+            return Err(SdkError::VerificationFailed(
+                "malformed SP1 sponsor envelope".into(),
+            ));
+        }
+        let env = pq_envelope_from_inner(&self.tx.signature[..inner_len])
             .ok_or_else(|| SdkError::VerificationFailed("not a PQ1 envelope".into()))?;
         if env.is_explicit() {
             if let Some(pk) = &env.pubkey {
@@ -942,21 +1494,36 @@ impl SignedTx {
                 }
             }
         }
-        let msg = match env.chain_id {
-            Some(cid) => self.tx.signing_message_for_chain(cid),
-            None => self.tx.signing_message(),
-        };
-        if crate::key::verify_pq_signature(key.public_key(), &msg, &env.signature) {
-            Ok(())
+        let msg = if let Some(ref auth) = sponsor_auth {
+            self.tx.sponsored_signing_message(auth)
         } else {
-            Err(SdkError::VerificationFailed(
+            match env.chain_id {
+                Some(cid) => self.tx.signing_message_for_chain(cid),
+                None => self.tx.signing_message(),
+            }
+        };
+        if !crate::key::verify_pq_signature(key.public_key(), &msg, &env.signature) {
+            return Err(SdkError::VerificationFailed(
                 "Falcon-512 signature does not verify".into(),
-            ))
+            ));
         }
+        if let Some(ref auth) = sponsor_auth {
+            if !self.tx.verify_sponsor_sig(auth) {
+                return Err(SdkError::VerificationFailed(
+                    "sponsor Falcon-512 signature does not verify".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Verify an `SF1` transaction against the session key.
     pub fn verify_session(&self, session_key: &FalconKeypair) -> Result<()> {
+        if self.tx.sponsor_malformed() || self.tx.is_sponsored() {
+            return Err(SdkError::VerificationFailed(
+                "SF1 session transactions cannot carry an SP1 sponsor envelope".into(),
+            ));
+        }
         let grant = self
             .tx
             .session_grant()
@@ -964,6 +1531,13 @@ impl SignedTx {
         if !grant.verify_master() {
             return Err(SdkError::VerificationFailed(
                 "grant master signature does not verify".into(),
+            ));
+        }
+        let derived_session = derive_pq_address(&grant.session_pubkey_bytes, &DEFAULT_SALT)
+            .map_err(|e| SdkError::VerificationFailed(e.to_string()))?;
+        if derived_session != grant.session_pubkey {
+            return Err(SdkError::VerificationFailed(
+                "grant session_pubkey_bytes does not derive to grant session_pubkey".into(),
             ));
         }
         if grant.session_pubkey_bytes != session_key.public_key() {
@@ -976,7 +1550,7 @@ impl SignedTx {
                 "grant master_address != tx.from".into(),
             ));
         }
-        let sig = &self.tx.signature[..FALCON512_SIG_LEN];
+        let sig = &self.tx.sponsor_inner_sig()[..FALCON512_SIG_LEN];
         let msg = self.tx.signing_message_with_session(&grant);
         if crate::key::verify_pq_signature(session_key.public_key(), &msg, sig) {
             Ok(())
@@ -1189,5 +1763,290 @@ mod tests {
         signed.verify().unwrap();
         assert_eq!(signed.chain_id(), Some(2));
         assert_eq!(signed.priority_fee_per_gas(), 11);
+    }
+
+    #[test]
+    fn contract_deploy_builds_and_signs_cleanly() {
+        let key = FalconKeypair::generate().unwrap();
+        let small_code = b"\0asm\x01\0\0\0".to_vec();
+        let signed = TxBuilder::contract_deploy(small_code.clone())
+            .nonce(2)
+            .sign(&key)
+            .unwrap();
+        signed.verify().unwrap();
+        assert_eq!(signed.from(), signed.to());
+        assert_eq!(signed.amount(), 0);
+        assert_eq!(signed.nonce(), 2);
+        assert_eq!(
+            signed.gas_limit(),
+            FROZEN_MIN_GAS_FLOOR + PQ_ACTIVATION_SURCHARGE_GAS
+        );
+        assert_eq!(
+            signed.payload_bytes(),
+            encode_payload(&[Op::DeployContract { code: small_code }])
+        );
+
+        // Large bytecode scales deploy gas above TX_INTRINSIC_GAS (FROZEN_MIN_GAS_FLOOR).
+        let big_code = vec![0x00u8; 200_000];
+        let big_builder = TxBuilder::contract_deploy(big_code);
+        assert_eq!(
+            big_builder.effective_gas_limit(),
+            crate::opcode::contract_deploy_gas(200_000) + PQ_ACTIVATION_SURCHARGE_GAS
+        );
+        assert!(big_builder.effective_gas_limit() > FROZEN_MIN_GAS_FLOOR);
+    }
+
+    #[test]
+    fn contract_deploy_with_abi_builds_and_signs_cleanly() {
+        let key = FalconKeypair::generate().unwrap();
+        let small_code = b"\0asm\x01\0\0\0".to_vec();
+        let small_abi =
+            br#"{"methods":[{"name":"get","params":[],"returns":"i64","mutates_state":false}],"events":[]}"#
+                .to_vec();
+        let signed = TxBuilder::contract_deploy_with_abi(small_code.clone(), small_abi.clone())
+            .nonce(7)
+            .sign(&key)
+            .unwrap();
+        signed.verify().unwrap();
+        assert_eq!(signed.from(), signed.to());
+        assert_eq!(signed.amount(), 0);
+        assert_eq!(signed.nonce(), 7);
+        assert_eq!(
+            signed.gas_limit(),
+            FROZEN_MIN_GAS_FLOOR + PQ_ACTIVATION_SURCHARGE_GAS
+        );
+        assert_eq!(
+            signed.payload_bytes(),
+            encode_payload(&[Op::DeployContractWithAbi {
+                code: small_code,
+                abi_json: small_abi,
+            }])
+        );
+
+        // Large bytecode + ABI scales deploy gas above FROZEN_MIN_GAS_FLOOR.
+        let big_code = vec![0x00u8; 150_000];
+        let big_abi = vec![b' '; 20_000];
+        let big_builder = TxBuilder::contract_deploy_with_abi(big_code, big_abi);
+        assert_eq!(
+            big_builder.effective_gas_limit(),
+            crate::opcode::contract_deploy_with_abi_gas(150_000, 20_000)
+                + PQ_ACTIVATION_SURCHARGE_GAS
+        );
+        assert!(big_builder.effective_gas_limit() > FROZEN_MIN_GAS_FLOOR);
+    }
+
+    #[test]
+    fn stake_with_commission_builds_signs_and_rejects_oversize_bps() {
+        let key = FalconKeypair::generate().unwrap();
+        let validator = [0x55u8; 32];
+        let signed = TxBuilder::stake_with_commission(validator, 5_000, 750)
+            .unwrap()
+            .nonce(3)
+            .sign(&key)
+            .unwrap();
+        signed.verify().unwrap();
+        assert_eq!(signed.from(), signed.to());
+        assert_eq!(signed.amount(), 5_000);
+        assert_eq!(signed.nonce(), 3);
+        assert_eq!(
+            signed.payload_bytes(),
+            encode_payload(&[Op::StakeWithCommission {
+                validator,
+                amount: 5_000,
+                commission_bps: 750,
+            }])
+        );
+
+        assert!(TxBuilder::stake_with_commission(validator, 5_000, 10_000).is_ok());
+        assert!(matches!(
+            TxBuilder::stake_with_commission(validator, 5_000, 10_001),
+            Err(SdkError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn empty_payload_normalization_matches_encoded_empty_vec() {
+        let key = FalconKeypair::generate().unwrap();
+        let hand_built = Transaction {
+            from: key.address(),
+            to: [0x22u8; 32],
+            amount: 100,
+            gas_limit: 325_000,
+            nonce: 1,
+            source_shard: MASTERCHAIN_SHARD,
+            target_shard: MASTERCHAIN_SHARD,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: 50,
+        };
+        let mut builder_tx = hand_built.clone();
+        builder_tx.payload = encode_payload(&[]);
+
+        assert_eq!(hand_built.encode(), builder_tx.encode());
+        assert_eq!(
+            hand_built.base_signing_message(),
+            builder_tx.base_signing_message()
+        );
+        assert_eq!(hand_built.signing_message(), builder_tx.signing_message());
+        assert_eq!(
+            hand_built.signing_message_for_chain(DEFAULT_CHAIN_ID),
+            builder_tx.signing_message_for_chain(DEFAULT_CHAIN_ID)
+        );
+        assert_eq!(hand_built.compute_tx_hash(), builder_tx.compute_tx_hash());
+
+        let auth = SponsorAuthorization {
+            sponsor: [0x33u8; 32],
+            max_fee_per_tx: 500_000,
+            valid_until: 4_000_000_000,
+            allowed_targets: vec![[0x22u8; 32]],
+            chain_id: DEFAULT_CHAIN_ID,
+            sponsor_sig: vec![0x29; FALCON512_SIG_LEN],
+            sponsor_scheme: Some(PqScheme::Falcon512),
+            sponsor_pubkey: Some(vec![0x09; FALCON512_PUBKEY_LEN]),
+            sponsor_salt: Some(DEFAULT_SALT),
+        };
+        assert_eq!(
+            hand_built.sponsor_message(&auth),
+            builder_tx.sponsor_message(&auth)
+        );
+    }
+
+    #[test]
+    fn sponsor_sign_verify_roundtrip_and_tamper_rejected() {
+        let user = FalconKeypair::generate().unwrap();
+        let sponsor = FalconKeypair::generate().unwrap();
+        let to = [0x44u8; 32];
+
+        let signed = TxBuilder::transfer(to, 1_234)
+            .nonce(7)
+            .priority_fee_per_gas(99)
+            .sign_with_sponsor(&user, &sponsor, 500_000, 4_000_000_000, vec![to])
+            .unwrap();
+
+        signed.verify().unwrap();
+        assert!(signed.is_sponsored());
+        assert!(signed.is_pq_activation());
+        assert_eq!(signed.chain_id(), Some(DEFAULT_CHAIN_ID));
+        assert!(signed.pq_envelope().is_some());
+        assert!(signed.session_grant().is_none());
+        let auth = signed.sponsor_authorization().unwrap();
+        assert_eq!(auth.sponsor, sponsor.address());
+        assert_eq!(auth.allowed_targets, vec![to]);
+
+        // Wire roundtrip + decode + verify.
+        let decoded = SignedTx::decode(&signed.to_bytes()).unwrap();
+        assert_eq!(decoded, signed);
+        assert_eq!(decoded.compute_tx_hash(), signed.tx_hash());
+        assert_eq!(decoded.signing_message(), signed.signing_message());
+
+        // `cosign_with_sponsor` on a plain PQ1 transaction produces a valid sponsored tx.
+        let plain = TxBuilder::transfer(to, 1_234).nonce(8).sign(&user).unwrap();
+        let cosigned = plain
+            .cosign_with_sponsor(&user, &sponsor, 500_000, 4_000_000_000, vec![to])
+            .unwrap();
+        cosigned.verify().unwrap();
+        assert!(cosigned.is_sponsored());
+        assert_eq!(
+            cosigned.sponsor_authorization().unwrap().sponsor,
+            sponsor.address()
+        );
+
+        // Tamper with user PQ1 byte -> verify fails.
+        let mut bad_user = signed.transaction().clone();
+        bad_user.signature[20] ^= 0xff;
+        assert!(SignedTx { tx: bad_user }.verify().is_err());
+
+        // Tamper with SP1 suffix -> malformed -> verify fails.
+        let mut bad_sp1 = signed.transaction().clone();
+        let last = bad_sp1.signature.len() - 4;
+        bad_sp1.signature[last] ^= 0x01;
+        assert!(bad_sp1.sponsor_malformed());
+        assert!(SignedTx { tx: bad_sp1 }.verify().is_err());
+
+        // Unbound builder cannot sponsor.
+        assert!(matches!(
+            TxBuilder::transfer(to, 1).unbound().sign_with_sponsor(
+                &user,
+                &sponsor,
+                500_000,
+                4_000_000_000,
+                vec![]
+            ),
+            Err(SdkError::InvalidArgument(_))
+        ));
+
+        // Too many allowed_targets rejected.
+        assert!(matches!(
+            TxBuilder::transfer(to, 1).sign_with_sponsor(
+                &user,
+                &sponsor,
+                500_000,
+                4_000_000_000,
+                vec![[0x11u8; 32]; SPONSOR_MAX_TARGETS + 1]
+            ),
+            Err(SdkError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn verify_session_enforces_key_binding_and_refuses_sponsor_suffix() {
+        let master = FalconKeypair::generate().unwrap();
+        let session = FalconKeypair::generate().unwrap();
+        let sponsor = FalconKeypair::generate().unwrap();
+        let grant = SessionGrant::new(
+            &master,
+            session.public_key(),
+            4_000_000_000,
+            10_000_000,
+            crate::session::SCOPE_ALL,
+            1_000_000,
+            DEFAULT_CHAIN_ID,
+        )
+        .unwrap();
+        let signed = TxBuilder::transfer([0x22u8; 32], 50)
+            .nonce(1)
+            .sign_with_session(&session, &grant)
+            .unwrap();
+        signed.verify_session(&session).unwrap();
+
+        // Attaching an SP1 suffix to an SF1 tx must be rejected by verify_session.
+        let mut sponsored_sf1 = signed.transaction().clone();
+        let mut auth = SponsorAuthorization {
+            sponsor: sponsor.address(),
+            max_fee_per_tx: 500_000,
+            valid_until: 4_000_000_000,
+            allowed_targets: Vec::new(),
+            chain_id: DEFAULT_CHAIN_ID,
+            sponsor_sig: Vec::new(),
+            sponsor_scheme: Some(PqScheme::Falcon512),
+            sponsor_pubkey: Some(sponsor.public_key().to_vec()),
+            sponsor_salt: Some(DEFAULT_SALT),
+        };
+        auth.sponsor_sig = sponsor.sign(&sponsored_sf1.sponsor_message(&auth)).unwrap();
+        sponsored_sf1
+            .signature
+            .extend_from_slice(&encode_sponsor_suffix(&auth).unwrap());
+        assert!(SignedTx { tx: sponsored_sf1 }
+            .verify_session(&session)
+            .is_err());
+
+        // Grant with mismatched session_pubkey vs session_pubkey_bytes is rejected.
+        let mut bad_grant = grant;
+        bad_grant.session_pubkey = [0xAAu8; 32];
+        // Re-sign master signature over the tampered session_pubkey so verify_master passes.
+        let msg = SessionGrant::grant_message(
+            &bad_grant.master_address,
+            &bad_grant.session_pubkey,
+            bad_grant.valid_until,
+            bad_grant.max_gas_spend,
+            bad_grant.scope,
+            bad_grant.max_value_per_tx,
+            bad_grant.chain_id,
+        );
+        bad_grant.master_signature = master.sign(&msg).unwrap();
+        assert!(TxBuilder::transfer([0x22u8; 32], 50)
+            .nonce(2)
+            .sign_with_session(&session, &bad_grant)
+            .is_err());
     }
 }

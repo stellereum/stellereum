@@ -417,41 +417,62 @@ async fn step_finalize_and_apply(
     // inline apply. `propose` for the next height, the proposal root
     // check and the commit broadcast all wait for it (stage-1 gate,
     // `apply_in_flight` checks in the runtime).
+    if st.rt.parallel_exec {
+        st.rt.state.set_parallel_exec(true);
+    }
     let phase_t = std::time::Instant::now();
-    let decided_out = st.rt.try_finalize_submit().await;
-    stellereum::metrics::global().observe_phase("finalize_submit", phase_t.elapsed().as_secs_f64());
-    if let Some(decided) = decided_out {
-        let decided_height = st.rt.hc.height;
-        info!(
-            "[consensus] DECIDED block #{} {} (execution queued on the sequenced worker)",
-            height,
-            hex::encode(&decided[..6]),
-        );
-        // P0-SAFETY-BOOT-ONE-BLOCK: write-ahead the QC-carrying decided
-        // block and finalized tip pointer BEFORE `try_poll_apply` ->
-        // `install_apply_outcome` -> `safety.advance_height` fsyncs
-        // `safety_record_v1`. Sled's `db.flush()` inside `advance_height`
-        // then makes both durable together, closing the hard-SIGKILL
-        // 1-block gap on the live finalize path.
+    let decided_out = if let Some((decided_height, decided_bh, decided_block)) =
+        st.rt.prepare_decided_block().await
+    {
+        // P0-SAFETY-BOOT-ONE-BLOCK / W6-A2-4: write-ahead the QC-carrying
+        // decided block and finalized tip pointer BEFORE `submit_prepared_block`
+        // -> `safety.advance_height` fsyncs `safety_record_v1` (at/above
+        // `EXECUTION_PIPELINE_V1`) or `try_poll_apply` -> `safety.advance_height`
+        // fsyncs it (below the gate). Sled's `db.flush()` inside `advance_height`
+        // then makes both durable together, closing the hard-SIGKILL 1-block gap
+        // on the live finalize path.
         if let Some(ap) = &cfg.persistence {
-            if let Some(decided_block) = st.rt.blocks.get(&decided).cloned() {
-                if let Err(e) =
-                    write_ahead_finalized_block(ap, decided_height, decided, decided_block, false)
-                        .await
-                {
-                    tracing::error!(
-                        height = decided_height,
-                        error = %e,
-                        "[storage] write-ahead put_block/set_finalized failed before safety advance"
-                    );
-                    eprintln!(
-                        "[storage] write-ahead put_block/set_finalized failed at #{decided_height}: {e}"
-                    );
-                }
+            if let Err(e) = write_ahead_finalized_block(
+                ap,
+                decided_height,
+                decided_bh,
+                decided_block.clone(),
+                false,
+            )
+            .await
+            {
+                tracing::error!(
+                    height = decided_height,
+                    error = %e,
+                    "[storage] write-ahead put_block/set_finalized failed before safety advance"
+                );
+                eprintln!(
+                    "[storage] write-ahead put_block/set_finalized failed at #{decided_height}: {e}"
+                );
             }
         }
+        st.rt
+            .submit_prepared_block(decided_height, decided_bh, decided_block)
+            .await
+    } else {
+        None
+    };
+    stellereum::metrics::global().observe_phase("finalize_submit", phase_t.elapsed().as_secs_f64());
+    if let Some(decided) = decided_out {
+        let decided_height = st
+            .rt
+            .last_decision
+            .as_ref()
+            .filter(|(_, b, _)| b.compute_hash() == decided)
+            .map(|(dh, _, _)| *dh)
+            .unwrap_or(st.rt.hc.height);
+        info!(
+            "[consensus] DECIDED block #{} {} (execution queued on the sequenced worker)",
+            decided_height,
+            hex::encode(&decided[..6]),
+        );
         // EARLY `_hq_` QC SIDECAR (liveness, incident #21508): the QC is
-        // already in hand (`try_finalize_submit` stashed it), so publish it
+        // already in hand (`prepare_decided_block` stashed it), so publish it
         // NOW — before the body persist / apply completion path — instead
         // of waiting for the header publish that rides after the apply.
         //
@@ -481,11 +502,48 @@ async fn step_finalize_and_apply(
                 });
             }
         }
+        // At/above EXECUTION_PIPELINE_V1, `submit_prepared_block` advances `hc`
+        // to `decided_height + 1` immediately on decide; reset per-height vote
+        // caches, cast votes, checkpoint, and round timers here so `decided_height + 1`
+        // starts clean.
+        if stellereum::chain_spec::execution_pipeline_v1_active_at(decided_height)
+            && st.rt.hc.height > decided_height
+        {
+            st.last_prevoted = None;
+            st.last_precommitted = None;
+            st.cast_prevote = None;
+            st.cast_precommit = None;
+            if let Some(ap) = &cfg.persistence {
+                ap.enqueue_consensus(stellereum::storage::ConsensusCheckpoint {
+                    height: decided_height + 1,
+                    round: 0,
+                    locked_hash: None,
+                    locked_round: 0,
+                    finalized_height: decided_height,
+                    finalized_hash: decided,
+                });
+            }
+            let elapsed_round = st.round_started.elapsed();
+            st.round_started = std::time::Instant::now();
+            st.last_block_at = std::time::Instant::now()
+                .checked_sub(elapsed_round.min(cfg.min_block_time))
+                .unwrap_or_else(std::time::Instant::now);
+        }
     }
-    let phase_t = std::time::Instant::now();
-    let polled = st.rt.try_poll_apply().await;
-    stellereum::metrics::global().observe_phase("poll_apply", phase_t.elapsed().as_secs_f64());
-    if let Some(completed) = polled {
+    let mut any_polled = false;
+    let max_polls = if stellereum::chain_spec::execution_pipeline_v1_active_at(step.height) {
+        stellereum::runtime::MAX_APPLY_IN_FLIGHT_DEPTH
+    } else {
+        1
+    };
+    for _ in 0..max_polls {
+        let phase_t = std::time::Instant::now();
+        let polled = st.rt.try_poll_apply().await;
+        stellereum::metrics::global().observe_phase("poll_apply", phase_t.elapsed().as_secs_f64());
+        let Some(completed) = polled else {
+            break;
+        };
+        any_polled = true;
         if let Some(now_cpu) = process_cpu_seconds() {
             if let Some(prev_cpu) = st.cpu_at_last_block {
                 if now_cpu >= prev_cpu {
@@ -619,16 +677,14 @@ async fn step_finalize_and_apply(
             // pass; the pass itself is throttled (100 heights) and capped
             // inside maybe_prune_retained, and the guard keeps passes from
             // piling up.
+            if let Some(reset_guard) =
+                AtomicFlagResetGuard::try_acquire(std::sync::Arc::clone(&cfg.prune_lane_guard))
             {
                 let a = cfg.adapter.clone();
                 let shard_id = cfg.block_shard;
-                let g = cfg.prune_lane_guard.clone();
                 cfg.prune_lane.submit(async move {
-                    if g.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        return;
-                    }
+                    let _reset_guard = reset_guard;
                     a.maybe_prune_retained(shard_id, h).await;
-                    g.store(false, std::sync::atomic::Ordering::Relaxed);
                 });
             }
         } else {
@@ -661,6 +717,12 @@ async fn step_finalize_and_apply(
                 // every outcome; the DHT publication below (head pointer,
                 // body, header) is unchanged and remains the slow path.
                 spawn_committed_push(&cfg.net, height, block, certificate);
+            } else if stellereum::chain_spec::execution_pipeline_v1_active_at(height) {
+                if let Some(block) = st.rt.blocks.get(&bh).cloned() {
+                    if let Some(certificate) = block.precommit_qc.clone() {
+                        spawn_committed_push(&cfg.net, height, block, certificate);
+                    }
+                }
             }
         }
         // Publish the finalized block to the RPC/explorer height + feed, and
@@ -786,15 +848,18 @@ async fn step_finalize_and_apply(
                 ap.enqueue_validator_set_history(st.rt.export_validator_set_history());
                 ap.request_flush();
             }
-            // Clear the lock for the next height in the checkpoint.
-            ap.enqueue_consensus(stellereum::storage::ConsensusCheckpoint {
-                height: height + 1,
-                round: 0,
-                locked_hash: None,
-                locked_round: 0,
-                finalized_height: height,
-                finalized_hash: bh,
-            });
+            // Clear the lock for the next height in the checkpoint, only when
+            // `hc` is still at `height + 1` without a newer live lock.
+            if st.rt.hc.height == height + 1 && st.rt.hc.locked.is_none() {
+                ap.enqueue_consensus(stellereum::storage::ConsensusCheckpoint {
+                    height: height + 1,
+                    round: 0,
+                    locked_hash: None,
+                    locked_round: 0,
+                    finalized_height: height,
+                    finalized_hash: bh,
+                });
+            }
             // Check if an on-chain governed software upgrade is scheduled for this height.
             let upgrade_plan = st
                 .rt
@@ -1046,12 +1111,14 @@ async fn step_finalize_and_apply(
                 st.last_snapshot_height,
                 snap_int,
             );
-            if stellereum::snapshot_cadence::should_submit_snapshot(
-                height,
-                st.last_snapshot_height,
-                snap_int,
-                state_changed,
-            ) {
+            if !st.rt.has_pending_apply()
+                && stellereum::snapshot_cadence::should_submit_snapshot(
+                    height,
+                    st.last_snapshot_height,
+                    snap_int,
+                    state_changed,
+                )
+            {
                 // Submit-time cross-shard binding: the worker bundle holds
                 // accounts/domains/aux at post-`height` (root-gated), but
                 // the replay set is captured HERE, on the tick, at the
@@ -1168,8 +1235,17 @@ async fn step_finalize_and_apply(
                 let tip_header = st
                     .rt
                     .finalized
-                    .last()
-                    .and_then(|(_, h)| st.rt.blocks.get(h).cloned());
+                    .iter()
+                    .rev()
+                    .find(|(h, _)| *h == bundle.height)
+                    .and_then(|(_, hash)| st.rt.blocks.get(hash).cloned())
+                    .or_else(|| {
+                        ap.storage()
+                            .hashes_at_height(bundle.height)
+                            .ok()
+                            .and_then(|hashes| hashes.into_iter().next())
+                            .and_then(|hash| ap.storage().get_block(&hash).ok().flatten())
+                    });
                 let ap2 = ap.clone();
                 let adapter2 = cfg.adapter.clone();
                 let shard_id = cfg.block_shard;
@@ -1379,13 +1455,38 @@ async fn step_finalize_and_apply(
                 }
             }
         }
-        st.last_prevoted = None;
-        st.last_precommitted = None;
-        let elapsed_round = st.round_started.elapsed();
-        st.round_started = std::time::Instant::now();
-        st.last_block_at = std::time::Instant::now()
-            .checked_sub(elapsed_round.min(cfg.min_block_time))
-            .unwrap_or_else(std::time::Instant::now);
+    }
+    if any_polled {
+        if st.last_prevoted.is_some_and(|(vh, _)| vh < st.rt.hc.height) {
+            st.last_prevoted = None;
+        }
+        if st
+            .last_precommitted
+            .is_some_and(|(vh, _)| vh < st.rt.hc.height)
+        {
+            st.last_precommitted = None;
+        }
+        if st
+            .cast_prevote
+            .as_ref()
+            .is_some_and(|v| v.height < st.rt.hc.height)
+        {
+            st.cast_prevote = None;
+        }
+        if st
+            .cast_precommit
+            .as_ref()
+            .is_some_and(|v| v.height < st.rt.hc.height)
+        {
+            st.cast_precommit = None;
+        }
+        if !stellereum::chain_spec::execution_pipeline_v1_active_at(step.height) {
+            let elapsed_round = st.round_started.elapsed();
+            st.round_started = std::time::Instant::now();
+            st.last_block_at = std::time::Instant::now()
+                .checked_sub(elapsed_round.min(cfg.min_block_time))
+                .unwrap_or_else(std::time::Instant::now);
+        }
         // PARK-AND-REPLAY (see the note at `try_poll_apply` above). Runs
         // after this height's publish/record/persist work so the commit
         // re-injection cannot rewrite the H bookkeeping, and before the

@@ -455,7 +455,8 @@ async fn local_broadcast_is_pending_never_confirmed() {
         1,
         true,
         stellereum::zkml::DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_transfer_tx_bound");
 
     let (hash, finality) = client.broadcast_tx(&tx).await.expect("broadcast");
     assert_eq!(hash, tx.compute_tx_hash());
@@ -546,7 +547,8 @@ async fn token_transfer_tx_shape_and_local_execution() {
         0,
         1,
         stellereum::zkml::DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_token_transfer_tx");
     assert_eq!(tx.amount, 0);
     assert!(tx.gas_limit >= stellereum::svm::GAS_BASIC_TRANSFER);
     assert!(matches!(
@@ -602,7 +604,8 @@ async fn token_approve_then_transfer_from_local() {
         0,
         1,
         stellereum::zkml::DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_token_approve_tx");
     assert!(matches!(
         &approve.payload[..],
         [stellereum::svm::OpCode::SysCallTokenApprove { .. }]
@@ -710,7 +713,8 @@ async fn token_create_tx_shape_and_local_execution() {
         0,
         1,
         stellereum::zkml::DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_token_create_tx");
     assert_eq!(tx.amount, 0);
     assert!(tx.gas_limit >= stellereum::svm::GAS_BASIC_TRANSFER);
     assert!(matches!(

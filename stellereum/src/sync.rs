@@ -587,8 +587,11 @@ pub fn verify_finality_for_header_v2_with_schedule(
 ///
 /// * `state_root` — the post-state of the boundary block, committed by the
 ///   verified successor header. A snapshot must hash to it.
-/// * `boundary_hash` — the block hash at the boundary height
-///   (`next_height - 1`) ON THE VERIFIED CHAIN. It is the chain's finalized
+/// * `boundary_hash` — the block hash at the boundary height ON THE VERIFIED
+///   CHAIN. The boundary is the state height whose post-state the walked
+///   anchor header commits ([`anchor_height_for_post_state_at`]):
+///   `next_height - 1` on the legacy lag-1 chain, `next_height - 2` once
+///   `EXECUTION_PIPELINE_V1` is active. It is the chain's finalized
 ///   head at that height AND the sortition entropy for the height the node
 ///   resumes at (see [`crate::consensus::HeightConsensus::set_parent_hash`]).
 ///
@@ -714,9 +717,12 @@ where
     }
 
     let mut trusted_root: Option<[u8; 32]> = None;
-    // The verified block hash at `next_height - 1`: the boundary block, whose
-    // hash the successor header links to. Tracked from the walk itself, so it
-    // is a value the QUORUM vouched for — never a peer-supplied `prev_hash`.
+    // The verified block hash at the boundary: the state height whose
+    // post-state `next_height`'s header commits. The helper resolves it to
+    // `next_height - 1` below `EXECUTION_PIPELINE_V1` (byte-identical to the
+    // old `height + 1 == next_height` check) and `next_height - 2` above it.
+    // Tracked from the walk itself, so it is a value the QUORUM vouched for —
+    // never a peer-supplied `prev_hash`.
     let mut boundary_hash: Option<[u8; 32]> = None;
     for height in (anchor_height + 1)..=next_height {
         let link = fetch_header(height).await.ok_or_else(|| {
@@ -750,10 +756,10 @@ where
         })?;
         link.verify_with_schedule(&vs, resolve_schedule(height))
             .map_err(|e| format!("snapshot anchor: {e}"))?;
-        // The block at `next_height - 1` is the boundary: it is the height
-        // the snapshot restores to, and its hash is the finalized head the
-        // node resumes from.
-        if height + 1 == next_height {
+        // The height whose post-state the anchor commits is the boundary: it
+        // is the height the snapshot restores to, and its hash is the
+        // finalized head the node resumes from.
+        if crate::chain_spec::anchor_height_for_post_state_at(height) == next_height {
             boundary_hash = Some(link.block_hash);
         }
         parent_hash = link.block_hash;
@@ -769,7 +775,9 @@ where
     // walk covers only the tip (our anchor IS the boundary), the boundary is
     // our own finalized head.
     let boundary_hash = boundary_hash.unwrap_or(match our_finalized {
-        Some((h, hash)) if h + 1 == next_height => hash,
+        Some((h, hash)) if crate::chain_spec::anchor_height_for_post_state_at(h) == next_height => {
+            hash
+        }
         _ => genesis_root,
     });
     Ok(SnapshotAnchor {
@@ -976,7 +984,11 @@ where
         .max(1);
     let mut parent_hash: Option<[u8; 32]> = None;
     let mut trusted_root: Option<[u8; 32]> = None;
-    // The verified block hash at the BOUNDARY height (`next_height - 1`).
+    // The verified block hash at the BOUNDARY height: the state height whose
+    // post-state `next_height`'s header commits
+    // (`anchor_height_for_post_state_at`: `next_height - 1` below the
+    // execution-pipeline gate, `next_height - 2` above it). Below the gate the
+    // helper returns `height + 1`, so this is byte-identical to the old check.
     let mut boundary_hash: Option<[u8; 32]> = None;
     for height in lo..=next_height {
         let link = fetch_header(height).await.ok_or_else(|| {
@@ -1017,7 +1029,7 @@ where
             .map_err(|e| format!("snapshot anchor (tail): {e}"))?;
         // The boundary block (the height the snapshot restores to): its hash
         // is QC-verified above, so it is a value the quorum vouched for.
-        if height + 1 == next_height {
+        if crate::chain_spec::anchor_height_for_post_state_at(height) == next_height {
             boundary_hash = Some(link.block_hash);
         }
         parent_hash = Some(link.block_hash);

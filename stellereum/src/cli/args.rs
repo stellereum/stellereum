@@ -362,6 +362,129 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         sub: StoreCommands,
     },
+    /// Standalone PQ remote signer daemon (v2 Falcon-512 HTTP API)
+    RemoteSigner {
+        #[command(subcommand)]
+        sub: RemoteSignerCommands,
+    },
+    /// Deploy and invoke WASM smart contracts
+    Contract {
+        #[command(subcommand)]
+        sub: ContractCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum RemoteSignerCommands {
+    /// Serve the v2 Falcon-512 anti-equivocation remote signer HTTP API
+    Serve {
+        /// TCP socket address to bind (default: 127.0.0.1:8443)
+        #[arg(long, default_value = "127.0.0.1:8443")]
+        listen: String,
+        /// Path to Falcon-512 signing key file (defaults to $STELL_FALCON_KEY_FILE or ./keys/falcon.key)
+        #[arg(long)]
+        falcon_key_file: Option<PathBuf>,
+        /// Durable data directory for the signer's safety record store
+        #[arg(long, default_value = "./remote-signer-data")]
+        data_dir: PathBuf,
+        /// Bearer token required on all HTTP requests (or set STELL_REMOTE_SIGNER_TOKEN / --token-file)
+        #[arg(long)]
+        token: Option<String>,
+        /// Path to a file containing the bearer token
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        /// Allow plaintext HTTP on non-loopback interfaces (unsafe unless behind a TLS/mTLS terminator)
+        #[arg(long, default_value_t = false)]
+        allow_insecure_http: bool,
+        /// Optional 32-byte genesis state root / hash in hex (0x prefix optional) bound into the safety chain id
+        #[arg(long)]
+        genesis_hash: Option<String>,
+        /// Shard ID bound into the durable safety record identity (0 = Masterchain, 1 = Base Workchain)
+        #[arg(long, default_value_t = 0)]
+        shard: u32,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ContractCommands {
+    /// Deploy a compiled WASM smart contract (SysCallDeployContract)
+    Deploy {
+        /// Path to the compiled .wasm contract binary
+        #[arg(long)]
+        wasm_file: PathBuf,
+        /// Deployer Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        falcon_seed: Option<String>,
+        /// Path to a file containing the 32-byte Falcon-512 hex seed
+        #[arg(long)]
+        falcon_seed_file: Option<PathBuf>,
+        /// Deployer Falcon-512 key file
+        #[arg(long)]
+        falcon_key_file: Option<PathBuf>,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit sender nonce
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Chain id bound into the PQ1 envelope
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Optional gas limit override in nano-STELL
+        #[arg(long)]
+        gas_limit: Option<u64>,
+        /// Only print the signed transaction instead of submitting
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Write-API token, when configured on the node
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Call a method on a deployed WASM smart contract
+    Call {
+        /// Target 32-byte contract address in hex
+        #[arg(long)]
+        contract: String,
+        /// Exported contract method name
+        #[arg(long)]
+        method: String,
+        /// Optional method arguments (i64 integer or JSON array of AbiValue-compatible values)
+        #[arg(long, conflicts_with = "calldata")]
+        args: Option<String>,
+        /// Optional raw hex calldata bytes for `*_pq` contract entrypoints (0x prefix optional)
+        #[arg(long, conflicts_with = "args")]
+        calldata: Option<String>,
+        /// Caller Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        falcon_seed: Option<String>,
+        /// Path to a file containing the 32-byte Falcon-512 hex seed
+        #[arg(long)]
+        falcon_seed_file: Option<PathBuf>,
+        /// Caller Falcon-512 key file
+        #[arg(long)]
+        falcon_key_file: Option<PathBuf>,
+        /// Native STELL value attached in nano-STELL (default: 0)
+        #[arg(long, default_value_t = 0)]
+        value: u64,
+        /// JSON-RPC endpoint
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit sender nonce
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Chain id bound into the PQ1 envelope
+        #[arg(long)]
+        chain_id: Option<u64>,
+        /// Optional gas limit override in nano-STELL
+        #[arg(long)]
+        gas_limit: Option<u64>,
+        /// Only print the signed transaction instead of submitting
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Write-API token, when configured on the node
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -466,6 +589,9 @@ pub(crate) enum GovCommands {
         /// Falcon-512 seed in hex (32 bytes) of the proposer
         #[arg(long)]
         falcon_seed: Option<String>,
+        /// Path to a file containing the 32-byte Falcon-512 hex seed of the proposer
+        #[arg(long)]
+        falcon_seed_file: Option<PathBuf>,
         /// Proposal title
         #[arg(long)]
         title: String,
@@ -505,6 +631,9 @@ pub(crate) enum GovCommands {
         /// Falcon-512 seed in hex (32 bytes) of the voter
         #[arg(long)]
         falcon_seed: Option<String>,
+        /// Path to a file containing the 32-byte Falcon-512 hex seed of the voter
+        #[arg(long)]
+        falcon_seed_file: Option<PathBuf>,
         /// Proposal ID to vote on
         #[arg(long)]
         id: u64,
@@ -844,6 +973,9 @@ pub(crate) enum ValidatorCommands {
         /// Delegator Falcon-512 seed in hex (32 bytes)
         #[arg(long)]
         falcon_seed: Option<String>,
+        /// Path to a file containing the delegator 32-byte Falcon-512 hex seed
+        #[arg(long)]
+        falcon_seed_file: Option<PathBuf>,
         /// Target 32-byte validator_id in hex
         #[arg(long)]
         validator_id: String,
@@ -874,6 +1006,9 @@ pub(crate) enum ValidatorCommands {
         /// Delegator Falcon-512 seed in hex (32 bytes)
         #[arg(long)]
         falcon_seed: Option<String>,
+        /// Path to a file containing the delegator 32-byte Falcon-512 hex seed
+        #[arg(long)]
+        falcon_seed_file: Option<PathBuf>,
         /// Target 32-byte validator_id in hex
         #[arg(long)]
         validator_id: String,
@@ -904,6 +1039,9 @@ pub(crate) enum ValidatorCommands {
         /// Delegator Falcon-512 seed in hex (32 bytes)
         #[arg(long)]
         falcon_seed: Option<String>,
+        /// Path to a file containing the delegator 32-byte Falcon-512 hex seed
+        #[arg(long)]
+        falcon_seed_file: Option<PathBuf>,
         /// Target 32-byte validator_id in hex
         #[arg(long)]
         validator_id: String,
@@ -995,29 +1133,46 @@ pub(crate) enum ValidatorCommands {
 }
 #[derive(Subcommand)]
 pub(crate) enum WalletCommands {
-    /// Generate a fresh Stellereum keypair, viewing key, and stealth address
+    /// Generate a fresh Falcon-512 post-quantum wallet seed and spendable address
     Generate,
-    /// Inspect account balance and nonce
+    /// Inspect account balance and nonce from a node over JSON-RPC
     Balance {
         /// 32-byte account address in hex format
         #[arg(short, long)]
         address: String,
+        /// JSON-RPC endpoint to query
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
     },
-    /// Print the account address (public key) for a private key.
+    /// Print the spendable Falcon-512 account address for a 32-byte seed or key file.
     ///
-    /// The account address is the public key, not the private key, so deriving
-    /// it by hand is a reliable way to fund the wrong account and then wonder
-    /// why every transaction is rejected for insufficient balance.
+    /// Derives the Falcon-512 PQ address via `FalconKeypair::generate_from_seed_bytes`
+    /// matching `wallet send` and `wallet send-pq`.
     Address {
-        /// 32-byte Ed25519 private key (seed) in hex
+        /// 32-byte Falcon-512 seed in hex (legacy alias for --falcon-seed)
         #[arg(long)]
-        from_key: String,
+        from_key: Option<String>,
+        /// Falcon-512 seed in hex (32 bytes)
+        #[arg(long)]
+        falcon_seed: Option<String>,
+        /// Path to a file containing the 32-byte Falcon-512 hex seed
+        #[arg(long, alias = "from-key-file")]
+        falcon_seed_file: Option<PathBuf>,
+        /// Falcon-512 key file (as written by `keys init`)
+        #[arg(long)]
+        falcon_key_file: Option<PathBuf>,
     },
-    /// Send standard STELL transfer
+    /// Send standard STELL transfer (Falcon-512, PQ1 explicit envelope)
     Send {
-        /// Sender Ed25519 private key in hex
+        /// Sender 32-byte Falcon-512 seed in hex (optional when --falcon-seed-file, --falcon-seed, or STELL_FALCON_SEED is given)
         #[arg(long)]
-        from_key: String,
+        from_key: Option<String>,
+        /// Falcon-512 seed in hex (32 bytes; alias for --from-key)
+        #[arg(long)]
+        falcon_seed: Option<String>,
+        /// Path to a file containing the 32-byte Falcon-512 hex seed (preferred over --from-key/--falcon-seed)
+        #[arg(long)]
+        falcon_seed_file: Option<PathBuf>,
         /// Recipient 32-byte address in hex
         #[arg(long)]
         to: String,
@@ -1049,9 +1204,7 @@ pub(crate) enum WalletCommands {
     },
     /// Send a post-quantum STELL transfer (Falcon-512, PQ1 explicit envelope).
     ///
-    /// The ONLY transfer command that verifies when `STELL_PURE_PQ=1` (live +
-    /// local-cluster): plain `wallet send` builds legacy ed25519 txs, which
-    /// pure-PQ nodes refuse with `invalid transaction signature`.
+    /// Signs a Falcon-512 PQ1 transfer identically to `wallet send`.
     /// The Falcon-512 keypair is derived from `--falcon-seed-file`,
     /// `STELL_FALCON_SEED`, or `--falcon-seed` with the SAME raw derivation
     /// `Faucet::new` uses (`generate_from_seed_bytes`, no wallet KDF), so
@@ -1116,6 +1269,9 @@ pub(crate) enum WalletCommands {
         /// Falcon-512 seed in hex (32 bytes) of the signing key (cold withdrawal or pre-W3 validator key)
         #[arg(long)]
         falcon_seed: Option<String>,
+        /// Path to a file containing the 32-byte Falcon-512 hex seed of the signing key
+        #[arg(long)]
+        falcon_seed_file: Option<PathBuf>,
         /// Falcon-512 key file of the signing key
         #[arg(long)]
         falcon_key_file: Option<PathBuf>,
@@ -1151,7 +1307,7 @@ pub(crate) enum WalletCommands {
     },
     /// Delegate Session Key for autonomous AI trading bots
     DelegateSession {
-        /// Master Ed25519 private key in hex
+        /// Master Falcon-512 seed in hex (32 bytes)
         #[arg(long)]
         master_key: String,
         /// Bot session public key in hex
@@ -1201,13 +1357,16 @@ pub(crate) enum WalletCommands {
         #[arg(long, default_value = "falcon")]
         scheme: String,
         /// Falcon-512 key file (as written by `keys init`). Required unless
-        /// `--falcon-seed` is given.
+        /// `--falcon-seed`, `--falcon-seed-file`, or `STELL_FALCON_SEED` is given.
         #[arg(long)]
         falcon_key_file: Option<PathBuf>,
         /// Falcon-512 seed in hex (32 bytes, deterministic — for dev/test
         /// reproducibility; a stored key file is preferred for real wallets).
         #[arg(long)]
         falcon_seed: Option<String>,
+        /// Path to a file containing the 32-byte Falcon-512 hex seed.
+        #[arg(long)]
+        falcon_seed_file: Option<PathBuf>,
         /// Message to sign (UTF-8). Exactly one of `--message` / `--message-hex`.
         #[arg(long)]
         message: Option<String>,
@@ -1250,12 +1409,16 @@ pub(crate) enum WalletCommands {
         /// and `hybrid` are REMOVED and refused by name).
         #[arg(long, default_value = "falcon")]
         scheme: String,
-        /// Falcon-512 key file. Required unless `--falcon-seed` is given.
+        /// Falcon-512 key file. Required unless `--falcon-seed`,
+        /// `--falcon-seed-file`, or `STELL_FALCON_SEED` is given.
         #[arg(long)]
         falcon_key_file: Option<PathBuf>,
         /// Falcon-512 seed in hex (32 bytes, deterministic).
         #[arg(long)]
         falcon_seed: Option<String>,
+        /// Path to a file containing the 32-byte Falcon-512 hex seed.
+        #[arg(long)]
+        falcon_seed_file: Option<PathBuf>,
         /// Contract address (32-byte hex).
         #[arg(long)]
         contract: String,
@@ -1406,7 +1569,7 @@ pub(crate) enum OrderbookCommands {
     /// it to a node's mempool. The order exists only when a proposer includes
     /// the transaction in a block - this command never touches a local book.
     Place {
-        /// Trader Ed25519 private key in hex
+        /// Trader Falcon-512 seed in hex (32 bytes)
         #[arg(long)]
         trader_key: String,
         /// Trading pair ID (1 = STELL/USDT, 2 = STELL/TON)
@@ -1445,7 +1608,7 @@ pub(crate) enum OrderbookCommands {
     },
     /// Cancel an active order (the opcode itself costs 100 nano-STELL of gas)
     Cancel {
-        /// Trader Ed25519 private key in hex (only the owner may cancel)
+        /// Trader Falcon-512 seed in hex (32 bytes; only the owner may cancel)
         #[arg(long)]
         trader_key: String,
         /// Order ID to cancel
@@ -1478,7 +1641,7 @@ pub(crate) enum OracleCommands {
     /// node. The price only becomes state when a proposer includes the
     /// transaction in a block - this command never writes state itself.
     Feed {
-        /// Publisher Ed25519 private key in hex (signs the feed itself)
+        /// Publisher Falcon-512 seed in hex (32 bytes; signs the feed itself)
         #[arg(long)]
         key: String,
         /// Asset symbol (e.g. TON, GRAM, USDT)

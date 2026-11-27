@@ -156,12 +156,13 @@ impl LocalCrossShardKv {
         if msg_ids.is_empty() {
             return 0;
         }
+        let drop_set: std::collections::HashSet<[u8; 32]> = msg_ids.iter().copied().collect();
         let mut map = self.inbound.lock().await;
         let Some(queue) = map.get_mut(&target_shard) else {
             return 0;
         };
         let before = queue.len();
-        queue.retain(|m| !msg_ids.contains(&m.msg_id));
+        queue.retain(|m| !drop_set.contains(&m.msg_id));
         before - queue.len()
     }
 }
@@ -248,6 +249,12 @@ impl InMemoryCrossShardPubSub {
     pub fn shared() -> Arc<Self> {
         Arc::new(Self::default())
     }
+
+    #[cfg(test)]
+    fn subscriber_count(&self, topic: &str) -> usize {
+        let map = self.topics.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(topic).map_or(0, Vec::len)
+    }
 }
 
 impl CrossShardPubSub for InMemoryCrossShardPubSub {
@@ -259,8 +266,17 @@ impl CrossShardPubSub for InMemoryCrossShardPubSub {
         Box::pin(async move {
             let envelope = serde_json::json!({ "topic": topic, "data": data }).to_string();
             let senders = {
-                let map = self.topics.lock().unwrap_or_else(|e| e.into_inner());
-                map.get(topic).cloned().unwrap_or_default()
+                let mut map = self.topics.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(list) = map.get_mut(topic) {
+                    list.retain(|tx| !tx.is_closed());
+                    let cloned = list.clone();
+                    if list.is_empty() {
+                        map.remove(topic);
+                    }
+                    cloned
+                } else {
+                    Vec::new()
+                }
             };
             for tx in senders {
                 let _ = tx.send(envelope.clone());
@@ -277,7 +293,9 @@ impl CrossShardPubSub for InMemoryCrossShardPubSub {
         Box::pin(async move {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let mut map = self.topics.lock().unwrap_or_else(|e| e.into_inner());
-            map.entry(topic.to_string()).or_default().push(tx);
+            let list = map.entry(topic.to_string()).or_default();
+            list.retain(|existing| !existing.is_closed());
+            list.push(tx);
             Ok(rx)
         })
     }
@@ -304,17 +322,34 @@ impl LocalTopicBus {
         Arc::clone(BUS.get_or_init(|| Arc::new(LocalTopicBus::default())))
     }
 
+    #[cfg(test)]
+    fn subscriber_count(&self, topic: &str) -> usize {
+        let map = self.topics.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(topic).map_or(0, Vec::len)
+    }
+
     fn subscribe(&self, topic: &str) -> tokio::sync::mpsc::UnboundedReceiver<String> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut map = self.topics.lock().unwrap_or_else(|e| e.into_inner());
-        map.entry(topic.to_string()).or_default().push(tx);
+        let list = map.entry(topic.to_string()).or_default();
+        list.retain(|existing| !existing.is_closed());
+        list.push(tx);
         rx
     }
 
     fn publish(&self, topic: &str, envelope: &str) {
         let senders = {
-            let map = self.topics.lock().unwrap_or_else(|e| e.into_inner());
-            map.get(topic).cloned().unwrap_or_default()
+            let mut map = self.topics.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(list) = map.get_mut(topic) {
+                list.retain(|tx| !tx.is_closed());
+                let cloned = list.clone();
+                if list.is_empty() {
+                    map.remove(topic);
+                }
+                cloned
+            } else {
+                Vec::new()
+            }
         };
         for tx in senders {
             let _ = tx.send(envelope.to_string());
@@ -376,6 +411,40 @@ impl InfnodeCrossShardPubSub {
         }
         out
     }
+}
+
+/// Forward messages from both the overlay and local-bus receivers into `tx`
+/// until BOTH input channels close or `tx` is closed by the downstream receiver.
+fn spawn_merged_topic_forwarder(
+    mut overlay: tokio::sync::mpsc::UnboundedReceiver<String>,
+    mut local: tokio::sync::mpsc::UnboundedReceiver<String>,
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+) {
+    tokio::spawn(async move {
+        let mut overlay_open = true;
+        let mut local_open = true;
+        while overlay_open || local_open {
+            tokio::select! {
+                _ = tx.closed() => return,
+                msg = overlay.recv(), if overlay_open => match msg {
+                    Some(m) => {
+                        if tx.send(m).is_err() {
+                            return;
+                        }
+                    }
+                    None => overlay_open = false,
+                },
+                msg = local.recv(), if local_open => match msg {
+                    Some(m) => {
+                        if tx.send(m).is_err() {
+                            return;
+                        }
+                    }
+                    None => local_open = false,
+                },
+            }
+        }
+    });
 }
 
 impl CrossShardPubSub for InfnodeCrossShardPubSub {
@@ -510,33 +579,12 @@ impl CrossShardPubSub for InfnodeCrossShardPubSub {
         Box::pin(async move {
             // The overlay subscription: the terminal `pubsub.msg` delivery
             // lands in this receiver.
-            let mut overlay = self.node.register_app_sub(topic).await;
+            let overlay = self.node.register_app_sub(topic).await;
             // The same-process bus.
-            let mut local = self.local.subscribe(topic);
+            let local = self.local.subscribe(topic);
             // Merge both into a single stream.
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        msg = overlay.recv() => match msg {
-                            Some(m) => {
-                                if tx.send(m).is_err() {
-                                    return;
-                                }
-                            }
-                            None => return,
-                        },
-                        msg = local.recv() => match msg {
-                            Some(m) => {
-                                if tx.send(m).is_err() {
-                                    return;
-                                }
-                            }
-                            None => return,
-                        },
-                    }
-                }
-            });
+            spawn_merged_topic_forwarder(overlay, local, tx);
             // Network subscription: every peer relays what it publishes on
             // this topic to us (idempotent, safe to repeat).
             let payload = serde_json::json!({ "topic": topic })
@@ -744,6 +792,7 @@ impl P2pCrossShardTransport {
         if msg_ids.is_empty() {
             return 0;
         }
+        let drop_set: std::collections::HashSet<[u8; 32]> = msg_ids.iter().copied().collect();
         // The raw channel and the inbox are two hops: give the pump task a
         // chance to move a just-delivered payload into the inbox, so a prune
         // racing a delivery still sees the entry.
@@ -753,7 +802,7 @@ impl P2pCrossShardTransport {
             return 0;
         };
         let before = queue.len();
-        queue.retain(|m| !msg_ids.contains(&m.msg_id));
+        queue.retain(|m| !drop_set.contains(&m.msg_id));
         before - queue.len()
     }
 
@@ -925,5 +974,121 @@ impl CrossShardTransport {
             Self::Node(node) => node.prune_cross_shard_consumed(target_shard, msg_ids).await,
             Self::P2p(p2p) => p2p.prune_consumed(target_shard, msg_ids).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sharding::Transaction;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    #[tokio::test]
+    async fn in_memory_pubsub_prunes_closed_subscribers() {
+        let bus = InMemoryCrossShardPubSub::new();
+        let rx1 = bus.subscribe("topic-a").await.unwrap();
+        let mut rx2 = bus.subscribe("topic-a").await.unwrap();
+        assert_eq!(bus.subscriber_count("topic-a"), 2);
+
+        drop(rx1);
+        bus.publish("topic-a", "msg-1").await.unwrap();
+        assert_eq!(bus.subscriber_count("topic-a"), 1);
+
+        let received = rx2.recv().await.expect("live subscriber receives msg-1");
+        let parsed: serde_json::Value = serde_json::from_str(&received).unwrap();
+        assert_eq!(parsed["data"].as_str(), Some("msg-1"));
+
+        drop(rx2);
+        let rx3 = bus.subscribe("topic-a").await.unwrap();
+        assert_eq!(bus.subscriber_count("topic-a"), 1);
+
+        drop(rx3);
+        bus.publish("topic-a", "msg-2").await.unwrap();
+        assert_eq!(bus.subscriber_count("topic-a"), 0);
+    }
+
+    #[tokio::test]
+    async fn local_topic_bus_prunes_closed_subscribers() {
+        let bus = LocalTopicBus::default();
+        let rx1 = bus.subscribe("topic-b");
+        let mut rx2 = bus.subscribe("topic-b");
+        assert_eq!(bus.subscriber_count("topic-b"), 2);
+
+        drop(rx1);
+        bus.publish("topic-b", "env-1");
+        assert_eq!(bus.subscriber_count("topic-b"), 1);
+        assert_eq!(rx2.recv().await.as_deref(), Some("env-1"));
+
+        drop(rx2);
+        let rx3 = bus.subscribe("topic-b");
+        assert_eq!(bus.subscriber_count("topic-b"), 1);
+
+        drop(rx3);
+        bus.publish("topic-b", "env-2");
+        assert_eq!(bus.subscriber_count("topic-b"), 0);
+    }
+
+    #[tokio::test]
+    async fn merged_topic_forwarder_survives_single_branch_close_until_both_close() {
+        // Case 1: overlay closes first, local remains open and delivers messages.
+        let (overlay_tx, overlay_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (local_tx, local_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        spawn_merged_topic_forwarder(overlay_rx, local_rx, out_tx);
+
+        drop(overlay_tx);
+        tokio::task::yield_now().await;
+        local_tx.send("from-local".to_string()).unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(1), out_rx.recv())
+            .await
+            .expect("local message must still arrive after overlay closes")
+            .expect("merged stream must stay open while local is open");
+        assert_eq!(got, "from-local");
+
+        drop(local_tx);
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(1), out_rx.recv())
+            .await
+            .expect("stream must close promptly once both branches close");
+        assert!(closed.is_none());
+
+        // Case 2: local closes first, overlay remains open and delivers messages.
+        let (overlay_tx, overlay_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (local_tx, local_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        spawn_merged_topic_forwarder(overlay_rx, local_rx, out_tx);
+
+        drop(local_tx);
+        tokio::task::yield_now().await;
+        overlay_tx.send("from-overlay".to_string()).unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(1), out_rx.recv())
+            .await
+            .expect("overlay message must still arrive after local closes")
+            .expect("merged stream must stay open while overlay is open");
+        assert_eq!(got, "from-overlay");
+
+        drop(overlay_tx);
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(1), out_rx.recv())
+            .await
+            .expect("stream must close promptly once both branches close");
+        assert!(closed.is_none());
+    }
+
+    #[tokio::test]
+    async fn local_kv_prune_removes_matching_ids_via_hashset() {
+        let kv = LocalCrossShardKv::new();
+        let sk = SigningKey::generate(&mut OsRng);
+        let tx1 = Transaction::sign(&sk, [1u8; 32], 10, 0, 0, 1, 2);
+        let tx2 = Transaction::sign(&sk, [2u8; 32], 20, 1, 0, 1, 2);
+        let m1 = CrossShardMessage::new_trusted(1, 2, tx1, [0u8; 32], [1u8; 32]);
+        let m2 = CrossShardMessage::new_trusted(1, 2, tx2, [0u8; 32], [2u8; 32]);
+        kv.broadcast_cross_shard(&m1).await.unwrap();
+        kv.broadcast_cross_shard(&m2).await.unwrap();
+
+        let removed = kv.prune(2, &[m1.msg_id, [0x99u8; 32]]).await;
+        assert_eq!(removed, 1);
+        let remaining = kv.fetch_cross_shard_inbound(2).await;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].msg_id, m2.msg_id);
     }
 }

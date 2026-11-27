@@ -1,0 +1,24 @@
+[workspace]
+
+[package]
+name = "stellereum-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Zero-C-toolchain WebAssembly Falcon-512 signer and STL_ADDR_V4 address derivation for browser/JS clients"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+blake3 = { version = "1", features = ["pure"] }
+falcon-rust = "0.3.1"
+getrandom = { version = "0.4", default-features = false }
+zeroize = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

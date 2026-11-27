@@ -89,15 +89,55 @@ host and submit via JSON-RPC `stell_sendRawTransaction` (`{"tx": "<hex>"}`).
 - **v1 Legacy (`Signer` / `RemoteSigner` / `HttpSignerTransport`)**:
   Ed25519 legacy path (`ValidatorSigner::Remote`).
 
-### 3.1 Environment variables (`stellereum/src/remote_signer.rs`, `bootstrap.rs`)
+### 3.1 Daemon CLI (`stellereum remote-signer serve`)
+
+The standalone v2 Falcon-512 remote signer daemon is served directly by the
+`stellereum` binary (`stellereum/src/cli/args.rs`, `handlers.rs`,
+`tx_builders.rs`):
+
+```sh
+stellereum remote-signer serve \
+  --listen 127.0.0.1:8443 \
+  --falcon-key-file /etc/stellereum/remote-signer/falcon.key \
+  --data-dir /var/lib/stellereum-remote-signer \
+  --token-file /etc/stellereum/remote-signer/bearer.token
+```
+
+Exact CLI flags and defaults:
+- `--listen <ADDR>` (default: `127.0.0.1:8443`): TCP socket address to bind.
+- `--falcon-key-file <PATH>` (default: `$STELL_FALCON_KEY_FILE` or
+  `./keys/falcon.key`): Falcon-512 voting/proposal key file (`0600` regular
+  file inside a `0700` non-symlink parent directory).
+- `--data-dir <PATH>` (default: `./remote-signer-data`): Durable directory for
+  the signer's `SafetyRecordStore` (`ConsensusSafetyGuard::from_durable`).
+- `--token-file <PATH>` / `--token <TOKEN>`: Bearer token required on all HTTP
+  requests (or set `STELL_REMOTE_SIGNER_TOKEN`). Prefer `--token-file` (`0600`)
+  so the secret never appears in process listings (`ps`).
+- `--allow-insecure-http` (default: `false`): Allow plaintext HTTP on
+  non-loopback addresses. **Do not use in production**; keep
+  `--listen 127.0.0.1:8443` behind a TLS/mTLS terminator (or SSH/WireGuard
+  tunnel) for cross-host deployments.
+
+Startup policy enforced fail-closed (`validate_remote_signer_serve_policy`):
+- Refuses to start without a non-empty bearer token (`--token-file`,
+  `--token`, or `STELL_REMOTE_SIGNER_TOKEN`).
+- Refuses to bind a non-loopback address unless `--allow-insecure-http` is
+  explicitly passed.
+- Uses `STELL_NODE_PASSPHRASE` / `STELL_KEY_PASSPHRASE` /
+  `INFNODE_KEY_PASSPHRASE` to decrypt an `enc2:` `falcon.key`, and
+  `STELL_CHAIN_ID` (via `effective_chain_id()`) to scope the durable safety
+  record identity.
+
+### 3.2 Validator environment variables (`stellereum/src/remote_signer.rs`, `bootstrap.rs`)
 
 - `STELL_REMOTE_SIGNER_URL` (`REMOTE_SIGNER_URL_ENV`): Base URL of the remote
   signing service (e.g. `https://signer.internal:8443` or loopback
   `http://127.0.0.1:8443`).
-- `STELL_REMOTE_SIGNER_TOKEN` (`REMOTE_SIGNER_TOKEN_ENV`): Optional bearer token
-  sent as `Authorization: Bearer <token>`.
+- `STELL_REMOTE_SIGNER_TOKEN` (`REMOTE_SIGNER_TOKEN_ENV`): Bearer token sent as
+  `Authorization: Bearer <token>` (must match `--token-file` / `--token` on the
+  remote signer daemon).
 
-### 3.2 Fail-closed guarantees enforced in code
+### 3.3 Fail-closed guarantees enforced in code
 
 1. **Zero local fallback**: When `STELL_REMOTE_SIGNER_URL` is non-empty,
    `bootstrap.rs` and `consensus_driver.rs` **never** open or generate
@@ -124,13 +164,47 @@ host and submit via JSON-RPC `stell_sendRawTransaction` (`{"tx": "<hex>"}`).
 5. **Transport hardening**: 5 s request timeout (`DEFAULT_TIMEOUT`), `redirects(0)`,
    `try_proxy_from_env(false)`, and `8 KiB` response cap (`MAX_RESPONSE_BYTES`).
 
-### 3.3 Startup checklist with `RemotePqSigner`
+### 3.4 Systemd installation & validator wiring (`scripts/systemd/stell-remote-signer.service`)
 
-1. On the remote signer host (`PqSignerService` / `serve_v2_http_connection`),
-   bind to loopback or TLS/mTLS endpoint, configure `ConsensusSafetyGuard::from_durable`
-   on a dedicated `SafetyRecordStore`, and set a strong bearer token.
-2. Ensure all legacy validator processes and signers for this key are stopped
-   and fenced. If initializing a fresh safety store on the node side:
+1. **Prepare signer directories, encrypted key, and bearer token** on the
+   remote signer host (strict permissions enforced by `node_keys.rs`):
+   ```sh
+   sudo install -d -m 0700 /etc/stellereum/remote-signer
+   sudo install -d -m 0700 /var/lib/stellereum-remote-signer
+
+   # Place or generate the enc2:-encrypted Falcon-512 voting key (0600):
+   # STELL_KEY_PASSPHRASE='<passphrase>' stellereum keys init --keys-dir /tmp/signer-init --falcon-file /etc/stellereum/remote-signer/falcon.key
+   sudo chmod 0600 /etc/stellereum/remote-signer/falcon.key
+
+   # Generate a 32-byte hex bearer token (0600, no trailing newline required):
+   umask 0077
+   openssl rand -hex 32 | sudo tee /etc/stellereum/remote-signer/bearer.token >/dev/null
+   sudo chmod 0600 /etc/stellereum/remote-signer/bearer.token
+   ```
+2. **Create `/etc/stellereum/remote-signer.env` (`0600`)** if `falcon.key` is
+   `enc2:`-encrypted or an explicit chain id is used:
+   ```sh
+   # /etc/stellereum/remote-signer.env (chmod 0600)
+   STELL_KEY_PASSPHRASE=<REDACT_PASSPHRASE>
+   # STELL_CHAIN_ID=5757
+   ```
+3. **Install and start `stell-remote-signer.service`** (hardened with
+   `NoNewPrivileges=yes`, `PrivateTmp=yes`, `ProtectSystem=strict`,
+   `ProtectHome=read-only`, `ReadWritePaths=/var/lib/stellereum-remote-signer`,
+   `UMask=0077`, `Restart=always`):
+   ```sh
+   sudo cp /home/imm/stellereum-project/scripts/systemd/stell-remote-signer.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now stell-remote-signer.service
+   sudo systemctl status stell-remote-signer.service
+   sudo journalctl -u stell-remote-signer.service -n 50 --no-pager
+   ```
+   Confirm the startup log prints:
+   `Stellereum PQ remote-signer v2 listening on 127.0.0.1:8443 (validator_id=..., data_dir=/var/lib/stellereum-remote-signer)`.
+   For cross-host deployments, terminate TLS/mTLS (e.g. nginx/caddy/envoy or an
+   authenticated tunnel) in front of `127.0.0.1:8443`.
+4. **Initialize validator consensus safety** after confirming all legacy
+   validator processes and signers for this key are stopped and fenced:
    ```sh
    stellereum safety-init \
      --store-dir ./data/store \
@@ -139,14 +213,19 @@ host and submit via JSON-RPC `stell_sendRawTransaction` (`{"tx": "<hex>"}`).
      --shard 0 \
      --i-fenced-all-signers
    ```
-3. In the node's `0600` environment file (never in git or shell history):
+5. **Wire the validator node's `0600` environment file** (never commit or paste
+   into shell history):
    ```sh
-   STELL_REMOTE_SIGNER_URL=https://signer.internal:8443
+   # Loopback / tunnel:
+   STELL_REMOTE_SIGNER_URL=http://127.0.0.1:8443
+   # Or remote TLS/mTLS terminator:
+   # STELL_REMOTE_SIGNER_URL=https://signer.internal:8443
    STELL_REMOTE_SIGNER_TOKEN=<REDACT_TOKEN>
    ```
-4. Remove or archive any stale `./keys/falcon.key` from the validator host after
-   verifying the remote signer is active, and start the node (`stellereum run ...`).
-   Confirm `[post-quantum] validator Falcon-512 pubkey (v2 signer): ...` in logs.
+6. **Remove or archive any stale `./keys/falcon.key`** from the validator host,
+   then start the node (`stellereum run ...`). Confirm
+   `[post-quantum] validator Falcon-512 pubkey (v2 signer): ...` in the node
+   logs.
 
 ---
 

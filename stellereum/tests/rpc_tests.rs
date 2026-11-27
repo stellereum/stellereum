@@ -476,3 +476,371 @@ async fn test_evm_read_views_are_state_backed_and_subscribe_refuses() {
         "subscribe refusal names the gap, got {sub}"
     );
 }
+
+#[tokio::test]
+async fn test_get_program_accounts_with_proof_no_deadlock_and_exact_proofs() {
+    use stellereum::token::{TokenMetadata, TokenOp};
+
+    let st = test_rpc_state(None).await;
+    let creator = [0x11u8; 32];
+    let holder2 = [0x22u8; 32];
+
+    let metadata = TokenMetadata {
+        name: "ProofToken".to_string(),
+        symbol: "PRF".to_string(),
+        decimals: 6,
+        total_supply: 0,
+        max_supply: Some(1_000_000),
+        minter: creator,
+        paused: false,
+        description: String::new(),
+    };
+    let token_id = st
+        .engine
+        .create_token(creator, metadata, 1_000_000)
+        .await
+        .expect("create token");
+    st.engine
+        .token_execute(
+            &token_id,
+            creator,
+            TokenOp::Transfer {
+                to: holder2,
+                amount: 250_000,
+            },
+        )
+        .await
+        .expect("transfer token");
+
+    let token_res = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        st.call(
+            "stell_getProgramAccounts",
+            json!({
+                "program": "token",
+                "token": hex::encode(token_id),
+                "with_proof": true,
+            }),
+        ),
+    )
+    .await
+    .expect("token getProgramAccounts must not deadlock");
+    assert!(
+        token_res.get("error").is_none(),
+        "unexpected token error: {token_res}"
+    );
+    let token_items = token_res["items"].as_array().expect("token items");
+    assert_eq!(token_items.len(), 2);
+    for item in token_items {
+        let owner_hex = item["owner"].as_str().expect("owner hex");
+        let owner_bytes: [u8; 32] = hex::decode(owner_hex)
+            .expect("hex")
+            .try_into()
+            .expect("32 bytes");
+        let expected_proof = serde_json::to_value(
+            st.engine
+                .get_token_balance_proof(&token_id, &owner_bytes)
+                .await,
+        )
+        .expect("serialize proof");
+        assert!(!expected_proof.is_null(), "token balance proof must exist");
+        assert_eq!(item["proof"], expected_proof);
+    }
+
+    let owner_res = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        st.call(
+            "stell_getProgramAccounts",
+            json!({
+                "program": "token",
+                "owner": hex::encode(holder2),
+                "with_proof": true,
+            }),
+        ),
+    )
+    .await
+    .expect("owner getProgramAccounts must not deadlock");
+    let owner_items = owner_res["items"].as_array().expect("owner items");
+    assert_eq!(owner_items.len(), 1);
+    let expected_owner_proof =
+        serde_json::to_value(st.engine.get_token_balance_proof(&token_id, &holder2).await)
+            .expect("serialize proof");
+    assert_eq!(owner_items[0]["proof"], expected_owner_proof);
+
+    let wasm = wat::parse_str(
+        r#"(module
+             (func (export "answer") (result i64)
+               (i64.const 42)))"#,
+    )
+    .expect("compile wat");
+    let contract_addr = st
+        .engine
+        .deploy_contract(creator, wasm.clone(), 1_000)
+        .await
+        .expect("deploy contract");
+    st.engine
+        .update_account(AccountState::new(contract_addr, 50_000))
+        .await;
+
+    let contract_res = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        st.call(
+            "stell_getProgramAccounts",
+            json!({
+                "program": "contract",
+                "creator": hex::encode(creator),
+                "with_proof": true,
+                "include_code": true,
+            }),
+        ),
+    )
+    .await
+    .expect("contract getProgramAccounts must not deadlock");
+    assert!(
+        contract_res.get("error").is_none(),
+        "unexpected contract error: {contract_res}"
+    );
+    let contract_items = contract_res["items"].as_array().expect("contract items");
+    assert_eq!(contract_items.len(), 1);
+    assert_eq!(contract_items[0]["code"], json!(hex::encode(&wasm)));
+    let expected_acct_proof =
+        serde_json::to_value(st.engine.get_account_proof(&contract_addr).await)
+            .expect("serialize account proof");
+    assert!(!expected_acct_proof.is_null(), "account proof must exist");
+    assert_eq!(contract_items[0]["proof"], expected_acct_proof);
+}
+
+#[tokio::test]
+async fn test_preview_contract_call_parity_with_heavy_unrelated_contracts() {
+    use stellereum::contract::Contract;
+    use stellereum::rpc::BlockSummary;
+
+    let wasm = wat::parse_str(
+        r#"(module
+             (import "host" "sload" (func $sload (param i64) (result i64)))
+             (import "host" "sstore" (func $sstore (param i64 i64)))
+             (import "host" "emit" (func $emit (param i64 i64)))
+             (import "host" "block_time" (func $block_time (result i64)))
+             (func (export "inc") (param $key i64) (result i64)
+               (local $next i64)
+               (local.set $next (i64.add (call $sload (local.get $key)) (i64.const 1)))
+               (call $sstore (local.get $key) (local.get $next))
+               (call $emit (local.get $key) (local.get $next))
+               (i64.add (local.get $next) (call $block_time))))"#,
+    )
+    .expect("compile wat");
+
+    let creator = [0x33u8; 32];
+    let caller = [0x44u8; 32];
+    let st_clean = test_rpc_state(Some("test-token".to_string())).await;
+    let st_heavy = test_rpc_state(Some("test-token".to_string())).await;
+
+    let summary = BlockSummary {
+        height: 100,
+        hash: hex::encode([0xAAu8; 32]),
+        tx_count: 1,
+        timestamp: 1_700_000_123,
+    };
+    st_clean
+        .recent_blocks
+        .write()
+        .await
+        .push_front(summary.clone());
+    st_heavy.recent_blocks.write().await.push_front(summary);
+
+    let target_clean = st_clean
+        .engine
+        .deploy_contract(creator, wasm.clone(), 1_700_000_000)
+        .await
+        .expect("deploy clean");
+    let target_heavy = st_heavy
+        .engine
+        .deploy_contract(creator, wasm, 1_700_000_000)
+        .await
+        .expect("deploy heavy");
+    assert_eq!(target_clean, target_heavy);
+
+    {
+        let mut reg = st_heavy.engine.contracts_write().await;
+        for i in 0u8..16 {
+            let mut addr = [0x80u8; 32];
+            addr[31] = i;
+            let mut storage = std::collections::HashMap::new();
+            for slot in 0i64..100 {
+                storage.insert(slot, slot * 7);
+            }
+            reg.contracts.insert(
+                addr,
+                Contract {
+                    address: addr,
+                    creator: [0x99u8; 32],
+                    code_hash: [i; 32],
+                    code: vec![0xAAu8; 64 * 1024],
+                    storage,
+                    created_at: 1_600_000_000,
+                    paused: false,
+                    balance: 1_000_000,
+                    abi: None,
+                    source_hash: None,
+                },
+            );
+            reg.next_nonce = reg.next_nonce.saturating_add(1);
+        }
+    }
+
+    let req = json!({
+        "token": "test-token",
+        "contract": hex::encode(target_clean),
+        "method": "inc",
+        "args": [7],
+        "caller": hex::encode(caller),
+    });
+    let res_clean = st_clean.call("stell_callContract", req.clone()).await;
+    let res_heavy = st_heavy.call("stell_callContract", req).await;
+
+    assert_eq!(res_clean, res_heavy);
+    assert_eq!(res_heavy["status"], json!("success"));
+    assert_eq!(res_heavy["return_value"], json!(1_700_000_124i64));
+    assert_eq!(res_heavy["preview_only"], json!(true));
+    assert_eq!(res_heavy["mined"], json!(false));
+    assert_eq!(res_heavy["events"].as_array().expect("events").len(), 1);
+    assert!(
+        st_heavy
+            .engine
+            .get_contract(&target_heavy)
+            .await
+            .expect("target exists")
+            .storage
+            .is_empty(),
+        "preview must not mutate live contract storage"
+    );
+}
+
+#[tokio::test]
+async fn test_eth_get_logs_height_range_filtering_accuracy() {
+    use stellereum::evm_adapter::{EvmAdapter, EvmReceipt, EMPTY_LOGS_BLOOM};
+    use stellereum::rpc::TxReceipt;
+
+    let st = test_rpc_state(None).await;
+    {
+        let mut idx = st.receipts.write().await;
+        for (i, h) in [1u64, 2, 3, 3, 4, 5, 6].into_iter().enumerate() {
+            let mut tx_hash = [0u8; 32];
+            tx_hash[0] = (i + 1) as u8;
+            let mut block_hash = [0u8; 32];
+            block_hash[0] = h as u8;
+            if i == 3 {
+                block_hash[1] = 0xEE;
+            }
+            idx.insert(TxReceipt {
+                tx_hash,
+                height: h,
+                block_hash,
+                index: i as u32,
+                success: true,
+                gas_limit: 21_000,
+                fee_charged: 21_000,
+                raw_tx: None,
+                return_value: None,
+                gas_used: Some(21_000),
+                events: Vec::new(),
+                contract_address: None,
+            });
+        }
+        let range_heights: Vec<u64> = idx.by_height.range(2..=4).map(|(h, _)| *h).collect();
+        assert_eq!(range_heights, vec![2, 3, 4]);
+        assert_eq!(idx.by_height.get(&3).map(Vec::len), Some(2));
+    }
+
+    let isolated = "0xde17a710a710a710a710a710a710a710a710a717";
+    for query in [
+        json!([{ "address": isolated, "fromBlock": "0x2", "toBlock": "0x4" }]),
+        json!([{ "address": isolated, "fromBlock": "earliest", "toBlock": "0x3" }]),
+        json!([{ "address": isolated, "fromBlock": "0x4", "toBlock": "latest" }]),
+        json!([{ "address": isolated, "fromBlock": "0x5", "toBlock": "0x2" }]),
+        json!([{
+            "address": isolated,
+            "blockHash": format!("0x{:02x}{}", 3u8, "00".repeat(31))
+        }]),
+    ] {
+        let res = st
+            .eth_get_logs(&query)
+            .await
+            .expect("eth_get_logs succeeds");
+        assert_eq!(res, json!([]));
+    }
+
+    let mut adapter = EvmAdapter::new();
+    for b in 1u64..=5 {
+        let tx_hash = format!("0x{:064x}", b);
+        let block_hash = format!("0x{:064x}", b + 0x100);
+        let block_hex = format!("0x{:x}", b);
+        adapter.insert_receipt(EvmReceipt {
+            transaction_hash: tx_hash.clone(),
+            transaction_index: "0x0".to_string(),
+            block_hash: block_hash.clone(),
+            block_number: block_hex.clone(),
+            from: "0x1111111111111111111111111111111111111111".to_string(),
+            to: Some(isolated.to_string()),
+            cumulative_gas_used: "0x5208".to_string(),
+            gas_used: "0x5208".to_string(),
+            contract_address: None,
+            logs: vec![EvmLog {
+                address: isolated.to_string(),
+                topics: vec![format!("0x{:064x}", b)],
+                data: "0x".to_string(),
+                block_number: Some(block_hex),
+                transaction_hash: Some(tx_hash),
+                transaction_index: Some("0x0".to_string()),
+                block_hash: Some(block_hash),
+                log_index: Some("0x0".to_string()),
+                removed: false,
+            }],
+            logs_bloom: EMPTY_LOGS_BLOOM.to_string(),
+            status: Some("0x1".to_string()),
+            root: None,
+            tx_type: Some("0x0".to_string()),
+            effective_gas_price: Some("0x1".to_string()),
+            blob_gas_used: None,
+            blob_gas_price: None,
+        });
+    }
+
+    let mid = adapter
+        .eth_get_logs(&json!([{ "address": isolated, "fromBlock": "0x2", "toBlock": "0x4" }]))
+        .expect("bounded range");
+    let mid_blocks: Vec<&str> = mid
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|l| l["blockNumber"].as_str().expect("blockNumber"))
+        .collect();
+    assert_eq!(mid_blocks, vec!["0x2", "0x3", "0x4"]);
+
+    let early = adapter
+        .eth_get_logs(&json!([{ "address": isolated, "fromBlock": "earliest", "toBlock": "0x2" }]))
+        .expect("earliest to 0x2");
+    let early_blocks: Vec<&str> = early
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|l| l["blockNumber"].as_str().expect("blockNumber"))
+        .collect();
+    assert_eq!(early_blocks, vec!["0x1", "0x2"]);
+
+    let tail = adapter
+        .eth_get_logs(&json!([{ "address": isolated, "fromBlock": "0x4", "toBlock": "latest" }]))
+        .expect("0x4 to latest");
+    let tail_blocks: Vec<&str> = tail
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|l| l["blockNumber"].as_str().expect("blockNumber"))
+        .collect();
+    assert_eq!(tail_blocks, vec!["0x4", "0x5"]);
+
+    let inverted = adapter
+        .eth_get_logs(&json!([{ "address": isolated, "fromBlock": "0x5", "toBlock": "0x2" }]))
+        .expect("inverted range");
+    assert_eq!(inverted, json!([]));
+}

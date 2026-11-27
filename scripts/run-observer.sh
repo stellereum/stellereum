@@ -6,12 +6,53 @@
 # ==============================================================================
 set -euo pipefail
 
-REQUIRE_SHA256="${STELL_REQUIRE_SHA256:-0}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+REQUIRE_SHA256="${STELL_REQUIRE_SHA256:-1}"
+REQUIRE_COSIGN="${STELL_REQUIRE_COSIGN:-0}"
+SNAPSHOT_URL="${STELL_SNAPSHOT_URL:-https://rpc.stellereum.org/snapshot/latest.tar.zst}"
+SHA256_URL=""
+SHA256_URL_SET=0
+COSIGN_SIG_URL=""
+COSIGN_SIG_URL_SET=0
+COSIGN_PEM_URL=""
+COSIGN_PEM_URL_SET=0
+FORCE_ENV=0
 NODE_DIR=""
+
+usage() {
+    cat <<EOF
+Usage: $0 [NODE_DIR] [OPTIONS]
+
+Options:
+  --snapshot-url URL          Snapshot archive URL (default: \$STELL_SNAPSHOT_URL)
+  --sha256-url URL            Snapshot SHA-256 checksum URL
+  --require-sha256            Require SHA-256 verification (default)
+  --allow-unverified-snapshot Allow missing SHA-256 manifest
+  --cosign, --require-cosign  Verify snapshot with cosign via verify-cosign-artifact.sh
+  --cosign-sig-url URL        Override cosign .sig URL
+  --cosign-pem-url URL        Override cosign .pem URL
+  --force-env                 Overwrite existing env.observer tuning (creates backup)
+  -h, --help                  Show this help
+EOF
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --snapshot-url) SNAPSHOT_URL="${2:?--snapshot-url requires a URL}"; shift 2 ;;
+        --snapshot-url=*) SNAPSHOT_URL="${1#--snapshot-url=}"; shift ;;
+        --sha256-url) SHA256_URL="${2:?--sha256-url requires a URL}"; SHA256_URL_SET=1; shift 2 ;;
+        --sha256-url=*) SHA256_URL="${1#--sha256-url=}"; SHA256_URL_SET=1; shift ;;
         --require-sha256) REQUIRE_SHA256=1; shift ;;
-        -h|--help) echo "Usage: $0 [NODE_DIR] [--require-sha256]"; exit 0 ;;
+        --allow-unverified-snapshot) REQUIRE_SHA256=0; shift ;;
+        --cosign|--require-cosign) REQUIRE_COSIGN=1; shift ;;
+        --cosign-sig-url) COSIGN_SIG_URL="${2:?--cosign-sig-url requires a URL}"; COSIGN_SIG_URL_SET=1; shift 2 ;;
+        --cosign-sig-url=*) COSIGN_SIG_URL="${1#--cosign-sig-url=}"; COSIGN_SIG_URL_SET=1; shift ;;
+        --cosign-pem-url) COSIGN_PEM_URL="${2:?--cosign-pem-url requires a URL}"; COSIGN_PEM_URL_SET=1; shift 2 ;;
+        --cosign-pem-url=*) COSIGN_PEM_URL="${1#--cosign-pem-url=}"; COSIGN_PEM_URL_SET=1; shift ;;
+        --force-env) FORCE_ENV=1; shift ;;
+        -h|--help) usage; exit 0 ;;
         -*) echo "Unknown flag: $1" >&2; exit 2 ;;
         *)
             if [[ -z "$NODE_DIR" ]]; then
@@ -25,14 +66,44 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 NODE_DIR="${NODE_DIR:-$HOME/stell-observer}"
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_PATH="${STELL_BIN:-}"
+
+case "$REQUIRE_COSIGN" in
+    0|1) ;;
+    *) echo -e "\033[1;31m[ERROR]\033[0m STELL_REQUIRE_COSIGN must be 0 or 1 (got '$REQUIRE_COSIGN')" >&2; exit 2 ;;
+esac
+if [[ "$COSIGN_SIG_URL_SET" == "1" && -z "$COSIGN_SIG_URL" ]]; then
+    echo -e "\033[1;31m[ERROR]\033[0m --cosign-sig-url cannot be empty" >&2; exit 2
+fi
+if [[ "$COSIGN_PEM_URL_SET" == "1" && -z "$COSIGN_PEM_URL" ]]; then
+    echo -e "\033[1;31m[ERROR]\033[0m --cosign-pem-url cannot be empty" >&2; exit 2
+fi
+if [[ "$COSIGN_SIG_URL_SET" == "1" && "$COSIGN_PEM_URL_SET" == "0" ]]; then
+    if [[ "$REQUIRE_COSIGN" == "1" ]]; then
+        COSIGN_PEM_URL="${SNAPSHOT_URL}.pem"
+    else
+        echo -e "\033[1;31m[ERROR]\033[0m --cosign-sig-url requires --cosign-pem-url" >&2; exit 2
+    fi
+fi
+if [[ "$COSIGN_PEM_URL_SET" == "1" && "$COSIGN_SIG_URL_SET" == "0" ]]; then
+    if [[ "$REQUIRE_COSIGN" == "1" ]]; then
+        COSIGN_SIG_URL="${SNAPSHOT_URL}.sig"
+    else
+        echo -e "\033[1;31m[ERROR]\033[0m --cosign-pem-url requires --cosign-sig-url" >&2; exit 2
+    fi
+fi
+USE_COSIGN=0
+if [[ "$REQUIRE_COSIGN" == "1" || ( -n "$COSIGN_SIG_URL" && -n "$COSIGN_PEM_URL" ) ]]; then
+    USE_COSIGN=1
+    [[ -n "$COSIGN_SIG_URL" ]] || COSIGN_SIG_URL="${SNAPSHOT_URL}.sig"
+    [[ -n "$COSIGN_PEM_URL" ]] || COSIGN_PEM_URL="${SNAPSHOT_URL}.pem"
+fi
 
 if [[ -z "$BIN_PATH" ]]; then
     for cand in \
         "$ROOT_DIR/target/release/stellereum" \
-        "$ROOT_DIR/target/debug/stellereum" \
         "$ROOT_DIR/stellereum/target/release/stellereum" \
+        "$ROOT_DIR/target/debug/stellereum" \
         "$ROOT_DIR/stellereum/target/debug/stellereum" \
         "$(command -v stellereum 2>/dev/null || true)"; do
         if [[ -n "$cand" && -x "$cand" ]]; then
@@ -43,7 +114,7 @@ if [[ -z "$BIN_PATH" ]]; then
 fi
 
 if [[ -z "$BIN_PATH" || ! -x "$BIN_PATH" ]]; then
-    echo -e "\033[1;31m[ERROR]\033[0m stellereum binary not found. Build it with 'cargo build --release' in stellereum/ first." >&2
+    echo -e "\033[1;31m[ERROR]\033[0m stellereum binary not found. Build it with 'cargo build --release' from repo root first." >&2
     exit 1
 fi
 
@@ -117,71 +188,122 @@ if [[ -z "$KEY_PASSPHRASE" ]]; then
     KEY_PASSPHRASE="$(head -c 32 /dev/urandom | base64 | tr -d '\n=' | tr '/+' '_-')"
 fi
 
-# Environment for Observer (no faucet key, single-shard masterchain 0)
-cat << EOF > "$NODE_DIR/env.observer"
+# Preserve existing env.observer tuning unless --force-env is given
+if [[ -f "$NODE_DIR/env.observer" && "$FORCE_ENV" == "0" ]]; then
+    echo -e "\033[1;34m[stell-observer]\033[0m Preserving existing $NODE_DIR/env.observer (pass --force-env to overwrite)"
+    if ! grep -q '^STELL_KEY_PASSPHRASE=' "$NODE_DIR/env.observer"; then
+        printf '\nSTELL_KEY_PASSPHRASE=%s\n' "$KEY_PASSPHRASE" >> "$NODE_DIR/env.observer"
+    fi
+    chmod 600 "$NODE_DIR/env.observer"
+else
+    if [[ -f "$NODE_DIR/env.observer" ]]; then
+        cp "$NODE_DIR/env.observer" "$NODE_DIR/env.observer.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+    fi
+    # Environment for Observer (no faucet key, single-shard masterchain 0)
+    cat << EOF > "$NODE_DIR/env.observer"
 STELL_OBSERVER=1
 STELL_RPC_LISTEN=${STELL_RPC_LISTEN:-127.0.0.1:8547}
 STELL_EXPLORER_LISTEN=${STELL_EXPLORER_LISTEN:-127.0.0.1:8082}
 STELL_ARCHIVE=0
 STELL_KEEP_BLOCKS=8000
+STELL_MIN_BLOCK_MS=${STELL_MIN_BLOCK_MS:-400}
 STELL_SHARDS=0
 STELL_DNS_SEEDS=seeds.stellereum.org
 STELL_BROADCAST_JOIN_MS=300
 STELL_KEY_PASSPHRASE=$KEY_PASSPHRASE
 EOF
-chmod 600 "$NODE_DIR/env.observer"
+    chmod 600 "$NODE_DIR/env.observer"
+fi
+
+# Guard against running observer safety-reset on a validator node directory
+env_observer_val="${STELL_OBSERVER:-}"
+if [[ -z "$env_observer_val" && -f "$NODE_DIR/env.observer" ]]; then
+    env_observer_val="$(sed -n 's/^[[:space:]]*STELL_OBSERVER=//p' "$NODE_DIR/env.observer" | tail -n 1 | tr -d "\"'[:space:]")"
+fi
+if [[ -e "$NODE_DIR/keys/validator.key" ]]; then
+    echo -e "\033[1;31m[ERROR]\033[0m Refusing observer bootstrap/safety-reset: $NODE_DIR/keys/validator.key exists (validator directory!)" >&2
+    exit 1
+fi
+if [[ "$env_observer_val" == "0" || "$env_observer_val" == "false" ]]; then
+    echo -e "\033[1;31m[ERROR]\033[0m Refusing observer bootstrap/safety-reset: STELL_OBSERVER=$env_observer_val" >&2
+    exit 1
+fi
 
 if [[ ! -d "$NODE_DIR/data/store" ]]; then
     echo -e "\033[1;34m[stell-observer]\033[0m Initializing state from live HTTP snapshot..."
-    snap_url="${STELL_SNAPSHOT_URL:-https://rpc.stellereum.org/snapshot/latest.tar.zst}"
-    snap_tmp="$(mktemp "$NODE_DIR/data/.snapshot.XXXXXX.tar.zst")"
-    cleanup_snap() { rm -f "$snap_tmp"; }
-    trap cleanup_snap EXIT
+    snap_url="$SNAPSHOT_URL"
+    COSIGN_WORK_DIR=""
+    cleanup_cosign_work() {
+        if [[ -n "$COSIGN_WORK_DIR" && -d "$COSIGN_WORK_DIR" ]]; then
+            rm -rf "$COSIGN_WORK_DIR"
+        fi
+    }
+    trap cleanup_cosign_work EXIT
 
-    if ! curl -fsSL "$snap_url" -o "$snap_tmp"; then
-        echo -e "\033[1;31m[ERROR]\033[0m Failed to download snapshot from $snap_url" >&2
-        exit 1
-    fi
-    if ! zstd -t "$snap_tmp"; then
-        echo -e "\033[1;31m[ERROR]\033[0m Snapshot archive failed zstd integrity check" >&2
-        exit 1
-    fi
-    sha_body="$(curl -fsSL "${snap_url}.sha256" 2>/dev/null || true)"
-    if [[ -n "$sha_body" ]]; then
-        expected_sha="$(printf '%s\n' "$sha_body" | awk 'NR==1 {print tolower($1)}')"
-        if [[ ! "$expected_sha" =~ ^[0-9a-f]{64}$ ]]; then
-            echo -e "\033[1;31m[ERROR]\033[0m Malformed .sha256 manifest from ${snap_url}.sha256" >&2
+    bootstrap_args=(
+        store bootstrap
+        --observer
+        --data-dir "$NODE_DIR/data"
+        --shard 0
+        --snapshot-url "$snap_url"
+    )
+    if [[ "$USE_COSIGN" == "1" ]]; then
+        COSIGN_VERIFIER="$SCRIPT_DIR/verify-cosign-artifact.sh"
+        if [[ ! -x "$COSIGN_VERIFIER" ]]; then
+            echo -e "\033[1;31m[ERROR]\033[0m Cosign verifier script missing or not executable: $COSIGN_VERIFIER" >&2
             exit 1
         fi
-        actual_sha="$(sha256sum "$snap_tmp" | awk '{print tolower($1)}')"
-        if [[ "$actual_sha" != "$expected_sha" ]]; then
-            echo -e "\033[1;31m[ERROR]\033[0m Snapshot sha256 mismatch: expected=$expected_sha actual=$actual_sha" >&2
-            exit 1
-        fi
-        echo -e "\033[1;32m[OK]\033[0m Verified snapshot sha256 ($actual_sha)"
-    elif [[ "$REQUIRE_SHA256" = "1" ]]; then
-        echo -e "\033[1;31m[ERROR]\033[0m --require-sha256 set, but ${snap_url}.sha256 is unavailable" >&2
-        exit 1
-    else
-        echo -e "\033[1;33m[WARN]\033[0m ${snap_url}.sha256 unavailable; continuing after zstd -t check" >&2
-    fi
+        for tool in curl cosign; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+                echo -e "\033[1;31m[ERROR]\033[0m Required tool '$tool' not found in PATH for --cosign" >&2
+                exit 1
+            fi
+        done
 
-    tar -I 'zstd -d' -xf "$snap_tmp" -C "$NODE_DIR/data/"
-    rm -f "$snap_tmp"
-    trap - EXIT
-    rm -f "$NODE_DIR/data/store"/snap* "$NODE_DIR/data/store-shard"*"/snap"* 2>/dev/null || true
+        COSIGN_WORK_DIR="$(mktemp -d)"
+        archive_file="$COSIGN_WORK_DIR/snapshot.tar.zst"
+        sig_file="$COSIGN_WORK_DIR/snapshot.tar.zst.sig"
+        pem_file="$COSIGN_WORK_DIR/snapshot.tar.zst.pem"
+
+        echo -e "\033[1;34m[stell-observer]\033[0m Downloading snapshot and cosign bundle for verification..."
+        curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -o "$archive_file" "$snap_url"
+        curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -o "$sig_file" "$COSIGN_SIG_URL"
+        curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -o "$pem_file" "$COSIGN_PEM_URL"
+        "$COSIGN_VERIFIER" --require --sig "$sig_file" --pem "$pem_file" "$archive_file"
+        echo -e "\033[1;32m[OK]\033[0m Snapshot cosign signature verified"
+
+        bootstrap_args+=(--archive "$archive_file")
+        if [[ "$SHA256_URL_SET" == "1" ]]; then
+            bootstrap_args+=(--sha256-url "$SHA256_URL")
+        else
+            bootstrap_args+=(--sha256-url "${snap_url}.sha256")
+        fi
+    elif [[ "$SHA256_URL_SET" == "1" ]]; then
+        bootstrap_args+=(--sha256-url "$SHA256_URL")
+    fi
+    if [[ "$REQUIRE_SHA256" = "1" ]]; then
+        bootstrap_args+=(--require-sha256)
+    fi
+    "$BIN_PATH" "${bootstrap_args[@]}"
+    cleanup_cosign_work
     if [[ ! -d "$NODE_DIR/data/store" ]]; then
-        echo -e "\033[1;31m[ERROR]\033[0m Snapshot extraction did not populate $NODE_DIR/data/store" >&2
+        echo -e "\033[1;31m[ERROR]\033[0m Snapshot bootstrap did not populate $NODE_DIR/data/store" >&2
+        exit 1
+    fi
+else
+    # Ensure a pre-existing observer store never carries a foreign safety_record_v1
+    if ! "$BIN_PATH" safety-reset --store-dir "$NODE_DIR/data/store" --i-fenced-all-signers; then
+        echo -e "\033[1;31m[ERROR]\033[0m safety-reset failed on $NODE_DIR/data/store" >&2
         exit 1
     fi
 fi
 
 echo -e "\033[1;32m[OK]\033[0m Observer configuration ready!"
-echo -e "\033[1;34m[stell-observer]\033[0m Starting Observer node (RPC at ${STELL_RPC_LISTEN:-127.0.0.1:8547})..."
 
 cd "$NODE_DIR"
 set -a
 # shellcheck disable=SC1091
 source env.observer
 set +a
+echo -e "\033[1;34m[stell-observer]\033[0m Starting Observer node (RPC at ${STELL_RPC_LISTEN:-127.0.0.1:8547})..."
 exec "$BIN_PATH" run --config observer.yaml --shard 0 --parallel-exec

@@ -2533,11 +2533,12 @@ impl Eip1559Transaction {
         }
 
         let v = items[9].as_u64()?;
-        let y_parity = if v >= 27 {
-            ((v - 27) % 2) as u8
-        } else {
-            (v % 2) as u8
-        };
+        if v > 1 {
+            return Err(RlpError::Custom(format!(
+                "invalid EIP-1559 y_parity: expected 0 or 1, got {v}"
+            )));
+        }
+        let y_parity = v as u8;
         let r = items[10].as_bytes32()?;
         let s = items[11].as_bytes32()?;
 
@@ -2923,5 +2924,56 @@ mod sub_nano_exact_tests {
         // The legacy helper stays byte-compatible: truncation + saturation.
         assert_eq!(wei_to_nano(1_500_000_000), 1);
         assert_eq!(wei_to_nano((u64::MAX as u128 + 1) * WEI_PER_NANO), u64::MAX);
+    }
+}
+
+#[cfg(test)]
+mod eip1559_y_parity_tests {
+    use super::*;
+
+    fn encode_raw_eip1559_with_v(v: u64) -> Vec<u8> {
+        let fields = vec![
+            rlp_encode_u64(CHAIN_ID),
+            rlp_encode_u64(1),
+            rlp_encode_u128(1_000_000_000),
+            rlp_encode_u128(20_000_000_000),
+            rlp_encode_u64(21_000),
+            rlp_encode_bytes(&[0x11; 20]),
+            rlp_encode_u128(1_000),
+            rlp_encode_bytes(&[]),
+            rlp_encode_list(&[]),
+            rlp_encode_u64(v),
+            rlp_encode_bytes(&[0x22; 32]),
+            rlp_encode_bytes(&[0x33; 32]),
+        ];
+        let payload = rlp_encode_list(&fields);
+        let mut raw = Vec::with_capacity(1 + payload.len());
+        raw.push(0x02);
+        raw.extend_from_slice(&payload);
+        raw
+    }
+
+    #[test]
+    fn accepts_canonical_y_parity_0_and_1() {
+        for v in [0u64, 1u64] {
+            let raw = encode_raw_eip1559_with_v(v);
+            let decoded = Eip1559Transaction::decode_envelope(&raw).expect("valid y_parity");
+            assert_eq!(decoded.y_parity, v as u8);
+            assert_eq!(decoded.v, v);
+            assert_eq!(decoded.compute_hash(), keccak256(&raw));
+        }
+    }
+
+    #[test]
+    fn rejects_non_canonical_y_parity_gt_1() {
+        for bad_v in [2u64, 27u64, 28u64, 35u64, u64::MAX] {
+            let raw = encode_raw_eip1559_with_v(bad_v);
+            let err = Eip1559Transaction::decode_envelope(&raw)
+                .expect_err("non-canonical y_parity > 1 must be rejected");
+            match err {
+                RlpError::Custom(msg) => assert!(msg.contains("y_parity"), "unexpected msg: {msg}"),
+                other => panic!("expected RlpError::Custom, got {other:?}"),
+            }
+        }
     }
 }

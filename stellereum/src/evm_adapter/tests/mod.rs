@@ -1444,7 +1444,8 @@ fn test_ecrecover_eip1559_transaction_roundtrip() {
         value,
         &data,
         &[],
-    );
+    )
+    .unwrap();
 
     // Sign with secp256k1 recoverable
     let (signature, recid) = signing_key.sign_prehash_recoverable(&sighash).unwrap();

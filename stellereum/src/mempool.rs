@@ -5,9 +5,21 @@
 use crate::post_quantum::StatefulImplicitKeyRegistry;
 use crate::sharding::Transaction;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 
 pub type TxHash = [u8; 32];
+
+#[derive(Clone, Copy, Debug)]
+struct TxMeta {
+    fee_density: u128,
+    wire_bytes: usize,
+    proof_units: usize,
+}
+
+type DensityKey = (Reverse<u128>, Reverse<u64>, Reverse<u64>, TxHash);
+type SenderOrderKey = (u64, Reverse<u128>, Reverse<u64>, Reverse<u64>, TxHash);
+type SealedDensityKey = (Reverse<u128>, Reverse<u64>, Reverse<u64>, [u8; 32]);
 
 /// Maximum out-of-order nonces buffered per unactivated account (§2.3).
 ///
@@ -62,6 +74,9 @@ pub struct PendingActivationBuffer {
     /// hash -> admission wall-clock seconds
     #[serde(default)]
     pub(crate) inserted_at: HashMap<TxHash, u64>,
+    /// `(inserted_at, hash)` time index so `drain_stale` runs in `O(expired log N)`.
+    #[serde(skip)]
+    pub(crate) by_time: BTreeSet<(u64, TxHash)>,
 }
 
 impl PendingActivationBuffer {
@@ -82,6 +97,7 @@ impl PendingActivationBuffer {
             buffered: HashMap::new(),
             by_hash: HashMap::new(),
             inserted_at: HashMap::new(),
+            by_time: BTreeSet::new(),
         }
     }
 
@@ -134,10 +150,13 @@ impl PendingActivationBuffer {
         if let Some(ref old) = old_tx {
             let old_hash = old.compute_tx_hash();
             self.by_hash.remove(&old_hash);
-            self.inserted_at.remove(&old_hash);
+            if let Some(old_ts) = self.inserted_at.remove(&old_hash) {
+                self.by_time.remove(&(old_ts, old_hash));
+            }
         }
         self.by_hash.insert(hash, (sender, nonce));
         self.inserted_at.insert(hash, now_secs);
+        self.by_time.insert((now_secs, hash));
         Ok((hash, old_tx))
     }
 
@@ -192,7 +211,9 @@ impl PendingActivationBuffer {
         for tx in map.values() {
             let h = tx.compute_tx_hash();
             self.by_hash.remove(&h);
-            self.inserted_at.remove(&h);
+            if let Some(ts) = self.inserted_at.remove(&h) {
+                self.by_time.remove(&(ts, h));
+            }
         }
         map.into_values().collect()
     }
@@ -208,7 +229,9 @@ impl PendingActivationBuffer {
             while let Some(tx) = map.remove(&start_nonce) {
                 let h = tx.compute_tx_hash();
                 self.by_hash.remove(&h);
-                self.inserted_at.remove(&h);
+                if let Some(ts) = self.inserted_at.remove(&h) {
+                    self.by_time.remove(&(ts, h));
+                }
                 ready.push(tx);
                 start_nonce = start_nonce.saturating_add(1);
             }
@@ -221,7 +244,9 @@ impl PendingActivationBuffer {
 
     /// Remove a single transaction by hash.
     pub fn remove_by_hash(&mut self, hash: &TxHash) -> Option<Transaction> {
-        self.inserted_at.remove(hash);
+        if let Some(ts) = self.inserted_at.remove(hash) {
+            self.by_time.remove(&(ts, *hash));
+        }
         let (sender, nonce) = self.by_hash.remove(hash)?;
         let tx = self
             .buffered
@@ -235,18 +260,31 @@ impl PendingActivationBuffer {
 
     /// Drain stale entries that have been buffered longer than TTL.
     pub fn drain_stale(&mut self, now_secs: u64, ttl_secs: u64) -> Vec<Transaction> {
-        let expired: Vec<TxHash> = self
-            .by_hash
-            .keys()
-            .filter_map(|hash| {
-                let inserted = self.inserted_at.get(hash).copied().unwrap_or(now_secs);
-                if now_secs.saturating_sub(inserted) >= ttl_secs {
-                    Some(*hash)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let expired: Vec<TxHash> = if self.by_time.len() == self.inserted_at.len() {
+            if ttl_secs == 0 {
+                self.by_time.iter().map(|&(_, h)| h).collect()
+            } else if now_secs < ttl_secs {
+                return Vec::new();
+            } else {
+                let cutoff = now_secs - ttl_secs;
+                self.by_time
+                    .range(..=(cutoff, [0xFFu8; 32]))
+                    .map(|&(_, h)| h)
+                    .collect()
+            }
+        } else {
+            self.by_hash
+                .keys()
+                .filter_map(|hash| {
+                    let inserted = self.inserted_at.get(hash).copied().unwrap_or(now_secs);
+                    if now_secs.saturating_sub(inserted) >= ttl_secs {
+                        Some(*hash)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
         let mut out = Vec::with_capacity(expired.len());
         for hash in &expired {
             if let Some(tx) = self.remove_by_hash(hash) {
@@ -555,6 +593,113 @@ pub struct MempoolSaveSnapshot {
     base_fee: u64,
 }
 
+/// Node-local MEV KEM material: the committee registry handle plus this
+/// node's 64-byte ML-KEM-768 seed (`d || z`).
+///
+/// WHY IT LIVES ON THE POOL: the runtime and the RPC layer share ONE
+/// [`Mempool`] (`with_mempool`), and bootstrap has the pool in hand before it
+/// spawns the consensus loop. Carrying the wiring here lets bootstrap supply it
+/// WITHOUT a second runtime constructor path, while the runtime mirrors it into
+/// its own explicit fields when the caller uses `with_mev_kem`.
+///
+/// SECRET HYGIENE: the seed is held through `Arc<Zeroizing<[u8; 64]>>` so a
+/// pool clone only bumps the refcount (it never copies the secret into a plain
+/// array), and both `Debug` and `Serialize`/`Deserialize` are redacted/skipped.
+/// A restart re-derives it from the node's persisted secret in bootstrap.
+#[derive(Clone)]
+pub struct MevKemWiring {
+    registry: std::sync::Arc<crate::mev_kem_registry::MevKemRegistry>,
+    peer_overlay: std::sync::Arc<std::sync::RwLock<crate::mev_kem_registry::MevKemRegistry>>,
+    seed: std::sync::Arc<zeroize::Zeroizing<[u8; 64]>>,
+}
+
+impl std::fmt::Debug for MevKemWiring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let overlay_entries = self.peer_overlay.read().map(|g| g.len()).unwrap_or(0);
+        f.debug_struct("MevKemWiring")
+            .field("registry_entries", &self.registry.len())
+            .field("peer_overlay_entries", &overlay_entries)
+            .field("seed", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl MevKemWiring {
+    pub fn new(
+        registry: std::sync::Arc<crate::mev_kem_registry::MevKemRegistry>,
+        seed: [u8; 64],
+    ) -> Self {
+        Self {
+            registry,
+            peer_overlay: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::mev_kem_registry::MevKemRegistry::new(),
+            )),
+            seed: std::sync::Arc::new(zeroize::Zeroizing::new(seed)),
+        }
+    }
+
+    /// Shared registry handle (never a deep clone of registry contents).
+    pub fn registry(&self) -> std::sync::Arc<crate::mev_kem_registry::MevKemRegistry> {
+        self.registry.clone()
+    }
+
+    /// Upsert a verified peer ML-KEM-768 encapsulation key into the interior
+    /// overlay without mutating the base registry snapshot.
+    ///
+    /// Fail-closed: unknown validator, malformed key, future activation height
+    /// (`activation_height > now_height`), or conflicting key for a validator
+    /// already present in either the base registry or the overlay returns an
+    /// error without modifying state. Identical re-announcements are idempotent
+    /// (`Ok(false)`).
+    pub fn upsert_peer_ek(
+        &self,
+        validator: crate::consensus::ValidatorId,
+        ek: Vec<u8>,
+        activation_height: u64,
+        now_height: u64,
+        validator_known: bool,
+    ) -> Result<bool, crate::mev_kem_registry::MevKemRegistryError> {
+        if !validator_known {
+            return Err(crate::mev_kem_registry::MevKemRegistryError::UnknownValidator);
+        }
+        crate::mev_kem_registry::validate_ek_bytes(&ek)?;
+        if activation_height > now_height {
+            return Err(crate::mev_kem_registry::MevKemRegistryError::ActivationInFuture);
+        }
+        if let Some(existing) = self.registry.record_of(&validator) {
+            if existing.ek == ek {
+                return Ok(false);
+            }
+            return Err(crate::mev_kem_registry::MevKemRegistryError::AlreadyRegistered);
+        }
+        let mut overlay = self.peer_overlay.write().unwrap_or_else(|e| e.into_inner());
+        overlay.upsert_registered_ek(
+            validator,
+            ek,
+            activation_height,
+            now_height,
+            validator_known,
+        )
+    }
+
+    /// Return an up-to-date registry snapshot merging the base registry with
+    /// any valid, non-conflicting peer-announced ML-KEM-768 keys in the overlay.
+    pub fn effective_registry(&self) -> std::sync::Arc<crate::mev_kem_registry::MevKemRegistry> {
+        let overlay = self.peer_overlay.read().unwrap_or_else(|e| e.into_inner());
+        if overlay.is_empty() {
+            return self.registry.clone();
+        }
+        let mut merged = (*self.registry).clone();
+        merged.merge_non_conflicting(&overlay);
+        std::sync::Arc::new(merged)
+    }
+
+    /// A wiping copy of the node-local KEM seed for one protocol call.
+    pub fn seed(&self) -> zeroize::Zeroizing<[u8; 64]> {
+        zeroize::Zeroizing::new(**self.seed)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Mempool {
     /// hash -> transaction
@@ -638,20 +783,6 @@ pub struct Mempool {
     /// units by design, deliberately unmapped) — EVM fee fields are
     /// decorative until a mempool-pressure feed drives them.
     pub base_fee: u64,
-    /// Handle on the state engine's ON-CHAIN session-key registry.
-    ///
-    /// Retained for construction-site/API compatibility, but NO LONGER read on
-    /// the synchronous admission path: `try_read` could silently skip the
-    /// stateful check under lock contention, which is not a reproducible
-    /// admission decision. The authoritative registry check runs in the
-    /// proposer filter and in execution (`session_gate`), against the committed
-    /// registry and the block clock - see the note in `insert`.
-    ///
-    /// `#[serde(skip)]` like `mev`: pending transactions persist, the registry
-    /// lives in consensus state and is re-read by the consensus paths.
-    #[serde(skip)]
-    #[allow(dead_code)]
-    session_registry: Option<std::sync::Arc<tokio::sync::RwLock<crate::zkml::SessionKeyRegistry>>>,
     /// Node-local MEV preemption engine. Seals every admitted transaction
     /// (envelopes kept inside the engine, keyed by tx hash) so the block build
     /// can re-open and byte-compare it before execution, and records the
@@ -679,6 +810,11 @@ pub struct Mempool {
     /// layout is unchanged and restarts begin unpenalized.
     #[serde(skip)]
     failed_penalty: HashMap<[u8; 32], u64>,
+    /// FIFO insertion-order ring for [`Self::failed_penalty`] eviction at
+    /// [`MAX_FAILED_PENALTY_ENTRIES`]. `#[serde(skip)]` keeps the `MP03`
+    /// bincode layout unchanged.
+    #[serde(skip)]
+    failed_penalty_order: VecDeque<[u8; 32]>,
     /// Buffer for out-of-order nonces for unactivated accounts (§2.3).
     #[serde(skip)]
     pub activation_buffer: PendingActivationBuffer,
@@ -712,6 +848,36 @@ pub struct Mempool {
     /// `MP03` bincode layout unchanged.
     #[serde(skip)]
     sealed_inserted_at: HashMap<[u8; 32], u64>,
+    /// Ordered index `(inserted_at, priority_fee_per_gas, gas_limit, tx_hash)`
+    /// for O(log N) expired-entry eviction in [`Self::add_sealed`]. `#[serde(skip)]`
+    /// keeps the `MP03` bincode layout unchanged.
+    #[serde(skip)]
+    sealed_by_time: BTreeSet<(u64, u64, u64, [u8; 32])>,
+    /// Ordered index `(priority_fee_per_gas, gas_limit, inserted_at, tx_hash)`
+    /// for O(log N) lowest-priority eviction in [`Self::add_sealed`]. `#[serde(skip)]`
+    /// keeps the `MP03` bincode layout unchanged.
+    #[serde(skip)]
+    sealed_by_priority: BTreeSet<(u64, u64, u64, [u8; 32])>,
+    /// Ordered index `(Reverse(density), Reverse(priority), Reverse(gas_limit), tx_hash)`
+    /// for O(K) `sealed_candidates` without cloning & sorting all sealed entries.
+    #[serde(skip)]
+    sealed_by_density: BTreeSet<SealedDensityKey>,
+    /// Cached immutable per-tx `(fee_density, wire_bytes, proof_units)` kept in
+    /// lockstep with `self.txs`. `#[serde(skip)]` preserves the `MP03` layout.
+    #[serde(skip)]
+    tx_meta: HashMap<TxHash, TxMeta>,
+    /// Total deterministic density order kept in lockstep with `self.txs`.
+    /// `#[serde(skip)]` preserves the `MP03` layout.
+    #[serde(skip)]
+    by_density: BTreeSet<DensityKey>,
+    /// Per-sender nonces + density order for `O(S log S + K log S)` frontier
+    /// selection in `select_multi`. `#[serde(skip)]` preserves the `MP03` layout.
+    #[serde(skip)]
+    sender_ordered: HashMap<[u8; 32], BTreeSet<SenderOrderKey>>,
+    /// Secondary account index (`from` and `to` -> set of pooled `TxHash`) for
+    /// `matching_account`. `#[serde(skip)]` preserves the `MP03` layout.
+    #[serde(skip)]
+    by_account: HashMap<[u8; 32], HashSet<TxHash>>,
     /// The MEV epoch the pool currently accepts sealed transactions for.
     /// A sealed envelope for another epoch is refused: the epoch key is
     /// rotated every 128 blocks and a stale ciphertext can never be
@@ -728,6 +894,30 @@ pub struct Mempool {
     /// layout is unchanged and a restart re-runs the DKG.
     #[serde(skip)]
     pub mev_seal: crate::mev_epoch::EpochSealManager,
+    /// Node-local MEV KEM wiring: the committee ML-KEM registry + THIS node's
+    /// 64-byte ML-KEM seed (see [`MevKemWiring`]).
+    ///
+    /// `None` is the default and the historical fail-closed posture: without
+    /// both halves the runtime refuses node-side epoch DKG rather than falling
+    /// back to the removed classical X25519 transport. `#[serde(skip)]` keeps
+    /// the on-disk mempool layout byte-identical; bootstrap re-derives and
+    /// re-installs the wiring on every start.
+    #[serde(skip)]
+    pub mev_kem: Option<MevKemWiring>,
+    /// Peer-announced ML-KEM-768 encapsulation keys verified by the runtime.
+    ///
+    /// Kept alongside `mev_kem` (and `#[serde(skip)]` like it) so both
+    /// `Mempool::with_mev_kem` and `ValidatorRuntime::with_mev_kem` wiring
+    /// paths can absorb authenticated peer KEM announcements deterministically.
+    #[serde(skip)]
+    pub peer_kem_keys: crate::mev_kem_registry::MevKemRegistry,
+    /// Last time this node broadcast its own `MevFrame::KemKey` announcement.
+    #[serde(skip)]
+    pub last_kem_announce: Option<std::time::Instant>,
+    /// Most recently built `KemKeyAnnouncement` for this node (public key
+    /// material + Falcon signature only; no secrets).
+    #[serde(skip)]
+    pub own_kem_announcement: Option<crate::mev_epoch::KemKeyAnnouncement>,
 }
 
 /// Bond a previously-failing sender must over-post per re-admission (D2).
@@ -739,6 +929,9 @@ pub const FAILED_SENDER_PENALTY: u64 = crate::svm::GAS_BASIC_TRANSFER;
 /// never price out a sender permanently — the worst case is bounded, and one
 /// applied transaction clears it entirely.
 pub const MAX_FAILED_SENDER_PENALTY: u64 = 10 * crate::svm::GAS_BASIC_TRANSFER;
+/// Hard cap on tracked per-sender failure-penalty entries so unique spammer
+/// addresses cannot grow [`Mempool::failed_penalty`] unboundedly.
+pub const MAX_FAILED_PENALTY_ENTRIES: usize = 16_384;
 
 impl Default for Mempool {
     fn default() -> Self {
@@ -769,16 +962,27 @@ impl Mempool {
             admission_shard: None,
             // No base fee by default; governance/config raises it under load.
             base_fee: 0,
-            session_registry: None,
             mev: crate::mev::MevPreemptionEngine::new(),
             failed_penalty: HashMap::new(),
+            failed_penalty_order: VecDeque::new(),
             activation_buffer: PendingActivationBuffer::new(),
             implicit_registry: None,
             pure_pq_enforced: None,
             sealed: HashMap::new(),
             sealed_inserted_at: HashMap::new(),
+            sealed_by_time: BTreeSet::new(),
+            sealed_by_priority: BTreeSet::new(),
+            sealed_by_density: BTreeSet::new(),
+            tx_meta: HashMap::new(),
+            by_density: BTreeSet::new(),
+            sender_ordered: HashMap::new(),
+            by_account: HashMap::new(),
             sealed_epoch: crate::mev_epoch::epoch_of_height(0),
             mev_seal: crate::mev_epoch::EpochSealManager::new(),
+            mev_kem: None,
+            peer_kem_keys: crate::mev_kem_registry::MevKemRegistry::new(),
+            last_kem_announce: None,
+            own_kem_announcement: None,
         }
     }
 
@@ -805,6 +1009,8 @@ impl Mempool {
     /// The previous envelope version (pre-priority-bid layout). Still
     /// accepted on load (see `load_into`), never written.
     pub const LEGACY_MEMPOOL_FILE_MAGIC: &[u8; 4] = b"MP02";
+    /// Maximum persisted mempool file size accepted by [`Mempool::load_into`] (128 MiB).
+    pub const MAX_MEMPOOL_FILE_BYTES: u64 = 128 * 1024 * 1024;
     /// How far ahead of the sender's executable head a nonce may be at
     /// admission (audit: blocks troubles). Rapid sequential submits stay
     /// inside; wild gaps fail fast with `NonceGap` instead of clogging the
@@ -935,6 +1141,11 @@ impl Mempool {
     pub fn effective_floor(&self, sender: &[u8; 32]) -> u64 {
         self.base_fee
             .saturating_add(self.failed_penalty.get(sender).copied().unwrap_or(0))
+    }
+
+    /// Failure penalty currently attached to `sender` (0 if unpenalized).
+    pub fn failed_penalty_of(&self, sender: &[u8; 32]) -> u64 {
+        self.failed_penalty.get(sender).copied().unwrap_or(0)
     }
 
     /// The additive surcharges a transaction pays ON TOP of the base floor:
@@ -1221,12 +1432,36 @@ impl Mempool {
     /// Integer-only and scaled by `DENSITY_SCALE`, so the comparison is exact
     /// and identical on every node (no float, no HashMap order).
     pub fn fee_density(tx: &Transaction) -> u128 {
+        let wire = Self::estimate_tx_wire_bytes(tx);
+        let proofs = Self::count_tx_proof_units(tx);
+        Self::fee_density_from_parts(tx.priority_fee_per_gas, tx.gas_limit, wire, proofs)
+    }
+
+    #[inline]
+    fn fee_density_from_parts(
+        priority_fee_per_gas: u64,
+        gas_limit: u64,
+        wire_bytes: usize,
+        proof_units: usize,
+    ) -> u128 {
         const DENSITY_SCALE: u128 = 1_000_000;
         const PROOF_UNIT_WIRE_BYTES: u64 = 10_000;
-        let wire = Self::estimate_tx_wire_bytes(tx) as u64;
-        let proofs = (Self::count_tx_proof_units(tx) as u64).saturating_mul(PROOF_UNIT_WIRE_BYTES);
-        let weight = tx.gas_limit.max(wire).max(proofs).max(1);
-        (tx.priority_fee_per_gas as u128) * DENSITY_SCALE / (weight as u128)
+        let wire = wire_bytes as u64;
+        let proofs = (proof_units as u64).saturating_mul(PROOF_UNIT_WIRE_BYTES);
+        let weight = gas_limit.max(wire).max(proofs).max(1);
+        (priority_fee_per_gas as u128) * DENSITY_SCALE / (weight as u128)
+    }
+
+    #[inline]
+    fn sealed_density_key(env: &crate::mev_epoch::SealedEnvelope) -> SealedDensityKey {
+        let density = (env.meta.priority_fee_per_gas as u128) * 1_000_000
+            / (env.meta.gas_limit.max(1) as u128);
+        (
+            Reverse(density),
+            Reverse(env.meta.priority_fee_per_gas),
+            Reverse(env.meta.gas_limit),
+            env.tx_hash,
+        )
     }
 
     /// Admission floor for `tx`: includes failure penalty floor, plus
@@ -1386,6 +1621,9 @@ impl Mempool {
                 self.release_sender_slot(&envelope.meta.from);
             }
             self.sealed_inserted_at.clear();
+            self.sealed_by_time.clear();
+            self.sealed_by_priority.clear();
+            self.sealed_by_density.clear();
             self.sealed_epoch = epoch;
         }
     }
@@ -1440,33 +1678,19 @@ impl Mempool {
             // Prefer evicting an expired sealed entry first (oldest expired wins);
             // otherwise evict the lowest-priority sealed entry iff the incoming
             // transaction has a strictly higher `priority_fee_per_gas`.
-            let expired_victim = self
-                .sealed
-                .iter()
-                .filter_map(|(h, env)| {
-                    let ts = self.sealed_inserted_at.get(h).copied().unwrap_or(now_secs);
-                    if now_secs.saturating_sub(ts) >= Self::STUCK_TX_TTL_SECS {
-                        Some((*h, ts, env.meta.priority_fee_per_gas, env.meta.gas_limit))
-                    } else {
-                        None
-                    }
-                })
-                .min_by_key(|(h, ts, prio, gas)| (*ts, *prio, *gas, *h))
-                .map(|(h, ..)| h);
+            let expired_victim = self.sealed_by_time.first().and_then(|&(ts, _, _, h)| {
+                if now_secs.saturating_sub(ts) >= Self::STUCK_TX_TTL_SECS {
+                    Some(h)
+                } else {
+                    None
+                }
+            });
 
             let victim_hash = if let Some(h) = expired_victim {
                 Some(h)
             } else {
-                let lowest = self
-                    .sealed
-                    .iter()
-                    .map(|(h, env)| {
-                        let ts = self.sealed_inserted_at.get(h).copied().unwrap_or(now_secs);
-                        (*h, env.meta.priority_fee_per_gas, env.meta.gas_limit, ts)
-                    })
-                    .min_by_key(|(h, prio, gas, ts)| (*prio, *gas, *ts, *h));
-                match lowest {
-                    Some((vh, low_prio, ..)) if envelope.meta.priority_fee_per_gas > low_prio => {
+                match self.sealed_by_priority.first().copied() {
+                    Some((low_prio, _, _, vh)) if envelope.meta.priority_fee_per_gas > low_prio => {
                         Some(vh)
                     }
                     _ => None,
@@ -1476,8 +1700,7 @@ impl Mempool {
             let Some(vh) = victim_hash else {
                 return Err(MempoolError::Full);
             };
-            if let Some(evicted) = self.sealed.remove(&vh) {
-                self.sealed_inserted_at.remove(&vh);
+            if let Some(evicted) = self.remove_sealed_entry(&vh) {
                 self.release_sender_slot(&evicted.meta.from);
             }
         } else if self.sealed.len() + self.txs.len() >= self.max_size {
@@ -1485,6 +1708,20 @@ impl Mempool {
         }
         *self.per_sender.entry(sender).or_insert(0) += 1;
         self.sealed_inserted_at.insert(hash, now_secs);
+        self.sealed_by_time.insert((
+            now_secs,
+            envelope.meta.priority_fee_per_gas,
+            envelope.meta.gas_limit,
+            hash,
+        ));
+        self.sealed_by_priority.insert((
+            envelope.meta.priority_fee_per_gas,
+            envelope.meta.gas_limit,
+            now_secs,
+            hash,
+        ));
+        self.sealed_by_density
+            .insert(Self::sealed_density_key(&envelope));
         self.sealed.insert(hash, envelope);
         Ok(hash)
     }
@@ -1497,6 +1734,13 @@ impl Mempool {
     /// re-verified against the plaintext after the unseal, so a lying
     /// metadata field can buy priority only at the cost of being dropped.
     pub fn sealed_candidates(&self) -> Vec<crate::mev_epoch::SealedEnvelope> {
+        if self.sealed_by_density.len() == self.sealed.len() {
+            return self
+                .sealed_by_density
+                .iter()
+                .filter_map(|(_, _, _, hash)| self.sealed.get(hash).cloned())
+                .collect();
+        }
         let mut out: Vec<crate::mev_epoch::SealedEnvelope> =
             self.sealed.values().cloned().collect();
         out.sort_by(|a, b| {
@@ -1542,10 +1786,63 @@ impl Mempool {
         self.sealed.get(hash)
     }
 
+    fn remove_sealed_entry(&mut self, hash: &[u8; 32]) -> Option<crate::mev_epoch::SealedEnvelope> {
+        let ts = self.sealed_inserted_at.remove(hash);
+        let envelope = self.sealed.remove(hash)?;
+        self.sealed_by_density
+            .remove(&Self::sealed_density_key(&envelope));
+        if let Some(ts) = ts {
+            self.sealed_by_time.remove(&(
+                ts,
+                envelope.meta.priority_fee_per_gas,
+                envelope.meta.gas_limit,
+                *hash,
+            ));
+            self.sealed_by_priority.remove(&(
+                envelope.meta.priority_fee_per_gas,
+                envelope.meta.gas_limit,
+                ts,
+                *hash,
+            ));
+        }
+        Some(envelope)
+    }
+
+    #[cfg(test)]
+    fn set_sealed_inserted_at_for_test(&mut self, hash: &[u8; 32], new_ts: u64) {
+        if let Some(env) = self.sealed.get(hash) {
+            if let Some(old_ts) = self.sealed_inserted_at.insert(*hash, new_ts) {
+                self.sealed_by_time.remove(&(
+                    old_ts,
+                    env.meta.priority_fee_per_gas,
+                    env.meta.gas_limit,
+                    *hash,
+                ));
+                self.sealed_by_priority.remove(&(
+                    env.meta.priority_fee_per_gas,
+                    env.meta.gas_limit,
+                    old_ts,
+                    *hash,
+                ));
+            }
+            self.sealed_by_time.insert((
+                new_ts,
+                env.meta.priority_fee_per_gas,
+                env.meta.gas_limit,
+                *hash,
+            ));
+            self.sealed_by_priority.insert((
+                env.meta.priority_fee_per_gas,
+                env.meta.gas_limit,
+                new_ts,
+                *hash,
+            ));
+        }
+    }
+
     /// Drop a sealed transaction that left the pool (included in a block).
     pub fn remove_sealed(&mut self, hash: &[u8; 32]) {
-        self.sealed_inserted_at.remove(hash);
-        if let Some(envelope) = self.sealed.remove(hash) {
+        if let Some(envelope) = self.remove_sealed_entry(hash) {
             self.release_sender_slot(&envelope.meta.from);
         }
     }
@@ -1578,22 +1875,55 @@ impl Mempool {
     /// transaction is NOT implemented (it would need a new block-level
     /// construct); see `docs/MEV.md`.
     pub fn drop_sealed(&mut self, hash: &[u8; 32], from: &[u8; 32]) {
-        self.sealed_inserted_at.remove(hash);
-        if self.sealed.remove(hash).is_some() {
+        if self.remove_sealed_entry(hash).is_some() {
             self.release_sender_slot(from);
         }
         self.penalize_sender(from);
     }
 
-    /// Raise a sender's admission bond by one step (the D2 failure gate).
-    pub fn penalize_sender(&mut self, from: &[u8; 32]) {
-        let e = self.failed_penalty.entry(*from).or_insert(0);
-        *e = (*e)
-            .saturating_add(FAILED_SENDER_PENALTY)
-            .min(MAX_FAILED_SENDER_PENALTY);
+    fn evict_failed_penalty_slot(&mut self) {
+        if self.failed_penalty.len() < MAX_FAILED_PENALTY_ENTRIES {
+            return;
+        }
+        // Reclaim zero-penalty entries first.
+        self.failed_penalty.retain(|_, penalty| *penalty > 0);
+        // Otherwise evict oldest inserted entries until under capacity.
+        while self.failed_penalty.len() >= MAX_FAILED_PENALTY_ENTRIES {
+            if let Some(oldest) = self.failed_penalty_order.pop_front() {
+                self.failed_penalty.remove(&oldest);
+            } else {
+                let Some(victim) = self
+                    .failed_penalty
+                    .iter()
+                    .min_by_key(|(k, p)| (**p, **k))
+                    .map(|(k, _)| *k)
+                else {
+                    break;
+                };
+                self.failed_penalty.remove(&victim);
+            }
+        }
     }
 
-    /// Feed one applied block's verdicts back into admission policy (D2).    ///
+    /// Raise a sender's admission bond by one step (the D2 failure gate).
+    pub fn penalize_sender(&mut self, from: &[u8; 32]) {
+        if let Some(e) = self.failed_penalty.get_mut(from) {
+            *e = (*e)
+                .saturating_add(FAILED_SENDER_PENALTY)
+                .min(MAX_FAILED_SENDER_PENALTY);
+            return;
+        }
+        self.evict_failed_penalty_slot();
+        self.failed_penalty
+            .insert(*from, FAILED_SENDER_PENALTY.min(MAX_FAILED_SENDER_PENALTY));
+        self.failed_penalty_order.push_back(*from);
+        if self.failed_penalty_order.len() > MAX_FAILED_PENALTY_ENTRIES.saturating_mul(2) {
+            self.failed_penalty_order
+                .retain(|k| self.failed_penalty.contains_key(k));
+        }
+    }
+
+    /// Feed one applied block's verdicts back into admission policy (D2).
     /// Every `failed` sender's penalty grows by one bond step (capped);
     /// every `succeeded` sender is cleared. Called by the runtime after each
     /// apply with the block's own (sender, status) pairs, so the penalty
@@ -1610,15 +1940,18 @@ impl Mempool {
             if succeeded_set.contains(s) {
                 continue;
             }
-            let e = self.failed_penalty.entry(*s).or_insert(0);
-            *e = (*e)
-                .saturating_add(FAILED_SENDER_PENALTY)
-                .min(MAX_FAILED_SENDER_PENALTY);
+            self.penalize_sender(s);
         }
         for s in &succeeded_set {
             if !failed_set.contains(s) {
                 self.failed_penalty.remove(s);
             }
+        }
+        if self.failed_penalty.is_empty() {
+            self.failed_penalty_order.clear();
+        } else if self.failed_penalty_order.len() > MAX_FAILED_PENALTY_ENTRIES.saturating_mul(2) {
+            self.failed_penalty_order
+                .retain(|k| self.failed_penalty.contains_key(k));
         }
     }
 
@@ -1644,16 +1977,13 @@ impl Mempool {
         Self::FROZEN_MIN_GAS_FLOOR
     }
 
-    /// Attach the engine's session-key registry lock (see
-    /// `InMemoryStateEngine::session_keys_handle`). Kept so every node
-    /// construction site and the public API stay unchanged; the synchronous
-    /// admission path no longer consults it (the authoritative check is the
-    /// consensus `session_gate`), so this is currently a no-op for admission.
+    /// Kept for construction-site API compatibility; the synchronous admission
+    /// path no longer consults the session-key registry (the authoritative check
+    /// is the consensus `session_gate`), so this builder is a no-op.
     pub fn with_session_registry(
-        mut self,
-        handle: std::sync::Arc<tokio::sync::RwLock<crate::zkml::SessionKeyRegistry>>,
+        self,
+        _handle: std::sync::Arc<tokio::sync::RwLock<crate::zkml::SessionKeyRegistry>>,
     ) -> Self {
-        self.session_registry = Some(handle);
         self
     }
 
@@ -1663,6 +1993,65 @@ impl Mempool {
     pub fn with_mev_engine(mut self, engine: crate::mev::MevPreemptionEngine) -> Self {
         self.mev = engine;
         self
+    }
+
+    /// Install the node-local MEV KEM wiring (registry + this node's 64-byte
+    /// ML-KEM seed). Bootstrap calls this on the shared pool BEFORE the
+    /// consensus runtime is spawned; the runtime reads it through
+    /// `mev_kem_material` unless it was given the same wiring directly via
+    /// `ValidatorRuntime::with_mev_kem`.
+    ///
+    /// The seed is copied ONCE into a `Zeroizing` buffer; it is never logged
+    /// and never serialized with the pool.
+    pub fn with_mev_kem(
+        mut self,
+        registry: std::sync::Arc<crate::mev_kem_registry::MevKemRegistry>,
+        seed: [u8; 64],
+    ) -> Self {
+        self.mev_kem = Some(MevKemWiring::new(registry, seed));
+        self
+    }
+
+    /// The node-local MEV KEM wiring, if bootstrap installed it.
+    pub fn mev_kem(&self) -> Option<MevKemWiring> {
+        self.mev_kem.clone()
+    }
+
+    /// Record a verified peer ML-KEM-768 encapsulation key in the pool's peer
+    /// key store (and in `MevKemWiring`'s overlay when pool-level wiring is
+    /// installed).
+    pub fn upsert_peer_kem_ek(
+        &mut self,
+        validator: crate::consensus::ValidatorId,
+        ek: Vec<u8>,
+        activation_height: u64,
+        now_height: u64,
+        validator_known: bool,
+    ) -> Result<bool, crate::mev_kem_registry::MevKemRegistryError> {
+        if let Some(wiring) = &self.mev_kem {
+            let inserted = wiring.upsert_peer_ek(
+                validator,
+                ek.clone(),
+                activation_height,
+                now_height,
+                validator_known,
+            )?;
+            if !inserted {
+                return Ok(false);
+            }
+        }
+        self.peer_kem_keys.upsert_registered_ek(
+            validator,
+            ek,
+            activation_height,
+            now_height,
+            validator_known,
+        )
+    }
+
+    /// This node's most recently sealed `KemKeyAnnouncement`, if any.
+    pub fn own_kem_announcement(&self) -> Option<&crate::mev_epoch::KemKeyAnnouncement> {
+        self.own_kem_announcement.as_ref()
     }
 
     pub fn len(&self) -> usize {
@@ -1780,109 +2169,112 @@ impl Mempool {
         accounts: &crate::state_engine::InMemoryStateEngine,
         ctx: AdmissionCtx,
     ) -> usize {
-        let Ok(bytes) = std::fs::read(path) else {
-            return 0;
-        };
-        // Versioned envelope with legacy fallback (see `save`): strip the
-        // magic if present, else decode the bare pre-TTL layout directly.
-        // Legacy entries re-admit with fresh timestamps (their age restarts
-        // instead of their txs vanishing).
-        let body: &[u8] = bytes
-            .strip_prefix(Self::MEMPOOL_FILE_MAGIC)
-            .or_else(|| bytes.strip_prefix(Self::LEGACY_MEMPOOL_FILE_MAGIC))
-            .unwrap_or(&bytes);
-        // Pre-TTL layout mirror (no `inserted_at`): bincode cannot skip a
-        // missing trailing field, so legacy files decode here explicitly and
-        // re-enter with fresh timestamps.
-        //
-        // The mirror also carries the PRE-PRIORITY shapes: the order index was
-        // keyed by `(gas_limit, hash)` and the transaction had no priority
-        // field. Bincode is positional, so a legacy file cannot be decoded
-        // with the current types — the trailing priority field of the last
-        // transaction would eat the next element's bytes, and the order index
-        // would mis-parse. The mirror keeps the old shapes and the
-        // transactions are converted to the current type (priority 0) below.
-        #[derive(serde::Serialize, serde::Deserialize)]
-        struct LegacyTransaction {
-            from: [u8; 32],
-            to: [u8; 32],
-            amount: u64,
-            gas_limit: u64,
-            nonce: u64,
-            source_shard: crate::sharding::ShardId,
-            target_shard: crate::sharding::ShardId,
-            signature: Vec<u8>,
-            #[serde(default)]
-            payload: Vec<crate::svm::OpCode>,
-        }
+        let path_owned = path.to_path_buf();
+        let Ok(Some(order)) = tokio::task::spawn_blocking(move || -> Option<Vec<Transaction>> {
+            use bincode::Options;
+            let meta = std::fs::metadata(&path_owned).ok()?;
+            if meta.len() > Self::MAX_MEMPOOL_FILE_BYTES {
+                return None;
+            }
+            let bytes = std::fs::read(&path_owned).ok()?;
+            if (bytes.len() as u64) > Self::MAX_MEMPOOL_FILE_BYTES {
+                return None;
+            }
+            // Versioned envelope with legacy fallback (see `save`): strip the
+            // magic if present, else decode the bare pre-TTL layout directly.
+            // Legacy entries re-admit with fresh timestamps (their age restarts
+            // instead of their txs vanishing).
+            let body: &[u8] = bytes
+                .strip_prefix(Self::MEMPOOL_FILE_MAGIC)
+                .or_else(|| bytes.strip_prefix(Self::LEGACY_MEMPOOL_FILE_MAGIC))
+                .unwrap_or(&bytes);
 
-        impl From<LegacyTransaction> for Transaction {
-            fn from(t: LegacyTransaction) -> Self {
-                Transaction {
-                    from: t.from,
-                    to: t.to,
-                    amount: t.amount,
-                    gas_limit: t.gas_limit,
-                    nonce: t.nonce,
-                    source_shard: t.source_shard,
-                    target_shard: t.target_shard,
-                    signature: t.signature,
-                    payload: t.payload,
-                    priority_fee_per_gas: 0,
+            #[derive(serde::Serialize, serde::Deserialize)]
+            struct LegacyTransaction {
+                from: [u8; 32],
+                to: [u8; 32],
+                amount: u64,
+                gas_limit: u64,
+                nonce: u64,
+                source_shard: crate::sharding::ShardId,
+                target_shard: crate::sharding::ShardId,
+                signature: Vec<u8>,
+                #[serde(default)]
+                payload: Vec<crate::svm::OpCode>,
+            }
+
+            impl From<LegacyTransaction> for Transaction {
+                fn from(t: LegacyTransaction) -> Self {
+                    Transaction {
+                        from: t.from,
+                        to: t.to,
+                        amount: t.amount,
+                        gas_limit: t.gas_limit,
+                        nonce: t.nonce,
+                        source_shard: t.source_shard,
+                        target_shard: t.target_shard,
+                        signature: t.signature,
+                        payload: t.payload,
+                        priority_fee_per_gas: 0,
+                    }
                 }
             }
-        }
 
-        #[derive(serde::Serialize, serde::Deserialize)]
-        struct LegacyMempool {
-            txs: HashMap<TxHash, LegacyTransaction>,
-            order: BTreeMap<(u64, TxHash), TxHash>,
-            per_sender: HashMap<[u8; 32], usize>,
-            max_size: usize,
-            per_sender_limit: usize,
-            base_fee: u64,
-        }
+            #[derive(serde::Serialize, serde::Deserialize)]
+            struct LegacyMempool {
+                txs: HashMap<TxHash, LegacyTransaction>,
+                order: BTreeMap<(u64, TxHash), TxHash>,
+                per_sender: HashMap<[u8; 32], usize>,
+                max_size: usize,
+                per_sender_limit: usize,
+                base_fee: u64,
+            }
 
-        // The `MP02` layout: the same pre-priority shapes PLUS the `inserted_at`
-        // map. Kept as its own mirror because the two legacy layouts differ by
-        // exactly that trailing map, and bincode cannot skip it.
-        #[derive(serde::Serialize, serde::Deserialize)]
-        struct Mp02Mempool {
-            txs: HashMap<TxHash, LegacyTransaction>,
-            order: BTreeMap<(u64, TxHash), TxHash>,
-            per_sender: HashMap<[u8; 32], usize>,
-            inserted_at: HashMap<TxHash, u64>,
-            max_size: usize,
-            per_sender_limit: usize,
-            base_fee: u64,
-        }
+            #[derive(serde::Serialize, serde::Deserialize)]
+            struct Mp02Mempool {
+                txs: HashMap<TxHash, LegacyTransaction>,
+                order: BTreeMap<(u64, TxHash), TxHash>,
+                per_sender: HashMap<[u8; 32], usize>,
+                inserted_at: HashMap<TxHash, u64>,
+                max_size: usize,
+                per_sender_limit: usize,
+                base_fee: u64,
+            }
 
-        let saved: Mempool = if let Ok(s) = bincode::deserialize::<Mempool>(body) {
-            s
-        } else if let Ok(old) = bincode::deserialize::<Mp02Mempool>(body) {
-            let mut m =
-                Mempool::new(old.max_size, old.per_sender_limit).with_base_fee(old.base_fee);
-            m.txs = old.txs.into_iter().map(|(h, t)| (h, t.into())).collect();
-            m.per_sender = old.per_sender;
-            m.inserted_at = old.inserted_at;
-            m
-        } else if let Ok(legacy) = bincode::deserialize::<LegacyMempool>(body) {
-            let mut m = Mempool::new(legacy.max_size, legacy.per_sender_limit)
-                .with_base_fee(legacy.base_fee);
-            m.txs = legacy.txs.into_iter().map(|(h, t)| (h, t.into())).collect();
-            m.per_sender = legacy.per_sender;
-            // `order` is rebuilt by the re-admission loop below (with the
-            // CURRENT `(priority, fee, hash)` key), so the legacy index is
-            // deliberately not carried over.
-            m
-        } else {
+            let opts = bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .allow_trailing_bytes()
+                .with_limit(Self::MAX_MEMPOOL_FILE_BYTES);
+
+            let saved: Mempool = if let Ok(s) = opts.deserialize::<Mempool>(body) {
+                s
+            } else if let Ok(old) = opts.deserialize::<Mp02Mempool>(body) {
+                let mut m =
+                    Mempool::new(old.max_size, old.per_sender_limit).with_base_fee(old.base_fee);
+                m.txs = old.txs.into_iter().map(|(h, t)| (h, t.into())).collect();
+                m.per_sender = old.per_sender;
+                m.inserted_at = old.inserted_at;
+                m
+            } else if let Ok(legacy) = opts.deserialize::<LegacyMempool>(body) {
+                let mut m = Mempool::new(legacy.max_size, legacy.per_sender_limit)
+                    .with_base_fee(legacy.base_fee);
+                m.txs = legacy.txs.into_iter().map(|(h, t)| (h, t.into())).collect();
+                m.per_sender = legacy.per_sender;
+                m
+            } else {
+                return None;
+            };
+            let mut order: Vec<Transaction> = saved.txs.into_values().collect();
+            // Oldest-nonce-first per sender so a contiguous sequence re-admits in
+            // full instead of tripping over its own gaps.
+            order.sort_by_key(|t| (t.from, t.nonce));
+            Some(order)
+        })
+        .await
+        else {
             return 0;
         };
         let mut kept = 0usize;
-        let mut order: Vec<_> = saved.txs.values().cloned().collect();
-        // Oldest-nonce-first per sender so a contiguous sequence re-admits in
-        // full instead of tripping over its own gaps.
-        order.sort_by_key(|t| (t.from, t.nonce));
         for tx in order {
             let acct = accounts.get_account(&tx.from).await;
             let bal = acct.as_ref().map(|a| a.balance).unwrap_or(0);
@@ -2168,6 +2560,53 @@ impl Mempool {
         now_secs.saturating_sub(inserted)
     }
 
+    fn rebuild_runtime_indexes(&mut self) {
+        self.tx_meta.clear();
+        self.by_density.clear();
+        self.sender_ordered.clear();
+        self.sender_nonces.clear();
+        self.by_account.clear();
+        for (&hash, tx) in &self.txs {
+            let wire_bytes = Self::estimate_tx_wire_bytes(tx);
+            let proof_units = Self::count_tx_proof_units(tx);
+            let fee_density = Self::fee_density_from_parts(
+                tx.priority_fee_per_gas,
+                tx.gas_limit,
+                wire_bytes,
+                proof_units,
+            );
+            let meta = TxMeta {
+                fee_density,
+                wire_bytes,
+                proof_units,
+            };
+            self.tx_meta.insert(hash, meta);
+            self.by_density.insert((
+                Reverse(fee_density),
+                Reverse(tx.priority_fee_per_gas),
+                Reverse(tx.gas_limit),
+                hash,
+            ));
+            self.sender_ordered.entry(tx.from).or_default().insert((
+                tx.nonce,
+                Reverse(fee_density),
+                Reverse(tx.priority_fee_per_gas),
+                Reverse(tx.gas_limit),
+                hash,
+            ));
+            *self
+                .sender_nonces
+                .entry(tx.from)
+                .or_default()
+                .entry(tx.nonce)
+                .or_insert(0) += 1;
+            self.by_account.entry(tx.from).or_default().insert(hash);
+            if tx.to != tx.from {
+                self.by_account.entry(tx.to).or_default().insert(hash);
+            }
+        }
+    }
+
     fn insert(
         &mut self,
         tx: Transaction,
@@ -2175,6 +2614,9 @@ impl Mempool {
         check_balance: bool,
         ctx: AdmissionCtx,
     ) -> Result<TxHash, MempoolError> {
+        if self.tx_meta.len() != self.txs.len() {
+            self.rebuild_runtime_indexes();
+        }
         // A14 phase 3 (chain binding, defense in depth for P2P-received
         // transactions): refuse unbound envelopes at/after the configured
         // activation height instead of pooling them.
@@ -2422,10 +2864,9 @@ impl Mempool {
         // expiry, scope, value cap and budget (`check_session_policy` above),
         // which depends only on the transaction and the admission clock.
         //
-        // `session_registry` / `with_session_registry` are kept so the node's
-        // construction is unchanged and a future async admission path can
-        // consult the registry without a lock-timing race; nothing reads the
-        // handle on this path any more.
+        // `with_session_registry` is kept as a no-op builder so existing node
+        // construction sites remain unchanged; nothing reads the handle on
+        // this synchronous admission path.
         // If this is an implicit post-quantum transaction for an account that
         // is not yet activated (public key not registered in implicit registry),
         // buffer it in PendingActivationBuffer rather than rejecting.
@@ -2626,6 +3067,28 @@ impl Mempool {
             self.mev.seal_admitted(&hash, &bytes);
         }
         self.order.insert((priority, fee, hash), hash);
+        let fee_density = Self::fee_density_from_parts(priority, fee, wire_bytes, proof_units);
+        self.tx_meta.insert(
+            hash,
+            TxMeta {
+                fee_density,
+                wire_bytes,
+                proof_units,
+            },
+        );
+        self.by_density
+            .insert((Reverse(fee_density), Reverse(priority), Reverse(fee), hash));
+        self.sender_ordered.entry(sender).or_default().insert((
+            tx.nonce,
+            Reverse(fee_density),
+            Reverse(priority),
+            Reverse(fee),
+            hash,
+        ));
+        self.by_account.entry(sender).or_default().insert(hash);
+        if tx.to != sender {
+            self.by_account.entry(tx.to).or_default().insert(hash);
+        }
         *self.per_sender.entry(sender).or_insert(0) += 1;
         *self
             .sender_nonces
@@ -3003,14 +3466,51 @@ impl Mempool {
     }
 
     fn evict(&mut self, hash: &TxHash) {
+        if self.tx_meta.len() != self.txs.len() {
+            self.rebuild_runtime_indexes();
+        }
         // Envelopes follow their transactions: no stale ciphertext may outlive
         // the pool entry it was sealed for (a re-admitted different transaction
         // hashes differently, but leaking entries would still grow memory).
         self.mev.drop_envelope(hash);
         self.inserted_at.remove(hash);
         if let Some(tx) = self.txs.remove(hash) {
-            self.order
-                .remove(&(tx.priority_fee_per_gas, Self::effective_fee(&tx), *hash));
+            let fee = Self::effective_fee(&tx);
+            self.order.remove(&(tx.priority_fee_per_gas, fee, *hash));
+            if let Some(meta) = self.tx_meta.remove(hash) {
+                self.by_density.remove(&(
+                    Reverse(meta.fee_density),
+                    Reverse(tx.priority_fee_per_gas),
+                    Reverse(fee),
+                    *hash,
+                ));
+                if let Some(ordered) = self.sender_ordered.get_mut(&tx.from) {
+                    ordered.remove(&(
+                        tx.nonce,
+                        Reverse(meta.fee_density),
+                        Reverse(tx.priority_fee_per_gas),
+                        Reverse(fee),
+                        *hash,
+                    ));
+                    if ordered.is_empty() {
+                        self.sender_ordered.remove(&tx.from);
+                    }
+                }
+            }
+            if let Some(set) = self.by_account.get_mut(&tx.from) {
+                set.remove(hash);
+                if set.is_empty() {
+                    self.by_account.remove(&tx.from);
+                }
+            }
+            if tx.to != tx.from {
+                if let Some(set) = self.by_account.get_mut(&tx.to) {
+                    set.remove(hash);
+                    if set.is_empty() {
+                        self.by_account.remove(&tx.to);
+                    }
+                }
+            }
             if let Some(c) = self.per_sender.get_mut(&tx.from) {
                 *c = c.saturating_sub(1);
                 if *c == 0 {
@@ -3135,203 +3635,294 @@ impl Mempool {
         max_gas: u64,
         accept: F,
     ) -> Vec<Transaction> {
-        Self::select_multi(&self.order, &self.txs, max_txs, max_gas, accept, 1)
+        self.select_multi(max_txs, max_gas, accept, 1)
     }
 
-    /// Multi-pass `select_for_block`: repeats the fee-order walk until a pass
-    /// adds nothing (max 64 passes). A single pass skips a transaction whose
-    /// nonce is not yet expected and never revisits it, so one out-of-hash-order
-    /// nonce starves its whole suffix for the height (observed: 10 contiguous
-    /// txs draining 1,3,1,2 per height instead of all at once; and a 200-deep
-    /// single-sender chain selecting only 37/200 under a 16-pass cap). Later
-    /// passes pick up newly-eligible followers through the SAME stateful
-    /// filter, so fee priority is preserved and contiguity completes. Bounded:
-    /// 64 passes worst case, each O(pool) (640k cheap ops for a full 10k pool,
-    /// ms-scale; the loop exits early on the first fruitless pass, so the cap
-    /// only costs when it is making progress).
+    /// Multi-pass `select_for_block`: selects executable transactions across
+    /// up to `64` fee-density passes using a sender-grouped ready-head
+    /// `BinaryHeap` frontier (`O(S log S + K log S)`). Preserves exact tie-breaking,
+    /// `max_txs`, `max_gas`, `MAX_BLOCK_WIRE_BYTES`, `MAX_BLOCK_PROOF_UNITS`, and
+    /// stateful `accept` parity with a 64-pass full-pool scan.
     pub fn select_for_block_multi<F: Fn(&Transaction) -> bool>(
         &self,
         max_txs: usize,
         max_gas: u64,
         accept: F,
     ) -> Vec<Transaction> {
-        Self::select_multi(&self.order, &self.txs, max_txs, max_gas, accept, 64)
+        self.select_multi(max_txs, max_gas, accept, 64)
+    }
+
+    fn select_frontier_with<'a, F: Fn(&Transaction) -> bool>(
+        txs: &HashMap<TxHash, Transaction>,
+        tx_meta: &HashMap<TxHash, TxMeta>,
+        iters: &mut [std::collections::btree_set::Iter<'a, SenderOrderKey>],
+        accept: F,
+        (max_txs, max_gas, passes): (usize, u64, usize),
+    ) -> Vec<Transaction> {
+        #[derive(Clone, Copy, Eq)]
+        struct FrontierEntry {
+            pass: usize,
+            fee_density: u128,
+            priority_fee_per_gas: u64,
+            gas_limit: u64,
+            hash: TxHash,
+            sender_idx: usize,
+        }
+
+        impl PartialEq for FrontierEntry {
+            fn eq(&self, other: &Self) -> bool {
+                self.cmp(other) == std::cmp::Ordering::Equal
+            }
+        }
+
+        impl Ord for FrontierEntry {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                other
+                    .pass
+                    .cmp(&self.pass)
+                    .then_with(|| self.fee_density.cmp(&other.fee_density))
+                    .then_with(|| self.priority_fee_per_gas.cmp(&other.priority_fee_per_gas))
+                    .then_with(|| self.gas_limit.cmp(&other.gas_limit))
+                    .then_with(|| other.hash.cmp(&self.hash))
+            }
+        }
+
+        impl PartialOrd for FrontierEntry {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        let mut heap: BinaryHeap<FrontierEntry> = BinaryHeap::with_capacity(iters.len());
+        for (sender_idx, iter) in iters.iter_mut().enumerate() {
+            if let Some(&(
+                _,
+                Reverse(fee_density),
+                Reverse(priority_fee_per_gas),
+                Reverse(gas_limit),
+                hash,
+            )) = iter.next()
+            {
+                heap.push(FrontierEntry {
+                    pass: 0,
+                    fee_density,
+                    priority_fee_per_gas,
+                    gas_limit,
+                    hash,
+                    sender_idx,
+                });
+            }
+        }
+
+        let mut gas = 0u64;
+        let mut wire = 0usize;
+        let mut proofs = 0usize;
+        let mut selected: Vec<&Transaction> = Vec::with_capacity(max_txs.min(txs.len()));
+        let mut current_pass = 0usize;
+        let mut pass_selected = 0usize;
+
+        while let Some(entry) = heap.pop() {
+            if selected.len() >= max_txs {
+                break;
+            }
+            if entry.pass > current_pass {
+                if pass_selected == 0 {
+                    break;
+                }
+                current_pass = entry.pass;
+                pass_selected = 0;
+            }
+            let Some(tx) = txs.get(&entry.hash) else {
+                continue;
+            };
+            if accept(tx) {
+                let Some(meta) = tx_meta.get(&entry.hash) else {
+                    continue;
+                };
+                let g = tx.gas_limit;
+                if gas.saturating_add(g) <= max_gas
+                    && wire.saturating_add(meta.wire_bytes) <= Self::MAX_BLOCK_WIRE_BYTES
+                    && proofs.saturating_add(meta.proof_units) <= Self::MAX_BLOCK_PROOF_UNITS
+                {
+                    gas = gas.saturating_add(g);
+                    wire = wire.saturating_add(meta.wire_bytes);
+                    proofs = proofs.saturating_add(meta.proof_units);
+                    selected.push(tx);
+                    pass_selected += 1;
+                }
+            }
+            if selected.len() >= max_txs {
+                break;
+            }
+            if let Some(&(_, Reverse(nd), Reverse(np), Reverse(ng), nh)) =
+                iters[entry.sender_idx].next()
+            {
+                let next_better_priority = (nd, np, ng, Reverse(nh))
+                    > (
+                        entry.fee_density,
+                        entry.priority_fee_per_gas,
+                        entry.gas_limit,
+                        Reverse(entry.hash),
+                    );
+                let next_pass = if next_better_priority {
+                    entry.pass + 1
+                } else {
+                    entry.pass
+                };
+                if next_pass < passes {
+                    heap.push(FrontierEntry {
+                        pass: next_pass,
+                        fee_density: nd,
+                        priority_fee_per_gas: np,
+                        gas_limit: ng,
+                        hash: nh,
+                        sender_idx: entry.sender_idx,
+                    });
+                }
+            }
+        }
+        selected.into_iter().cloned().collect()
     }
 
     fn select_multi<F: Fn(&Transaction) -> bool>(
-        order: &std::collections::BTreeMap<(u64, u64, TxHash), TxHash>,
-        txs: &std::collections::HashMap<TxHash, Transaction>,
+        &self,
         max_txs: usize,
         max_gas: u64,
         accept: F,
         passes: usize,
     ) -> Vec<Transaction> {
-        if txs.is_empty() || max_txs == 0 {
+        if self.txs.is_empty() || max_txs == 0 {
             return Vec::new();
         }
-        let mut gas = 0u64;
-        let mut wire = 0usize;
-        let mut proofs = 0usize;
-        // Collect matching references until final selection so we avoid cloning
-        // full `Transaction` payloads into `out` prematurely and avoid
-        // copying 48-byte `order` keys into a separate vector.
-        let mut selected: Vec<&Transaction> = Vec::with_capacity(max_txs.min(txs.len()));
+        let indexed = self.tx_meta.len() == self.txs.len();
 
         if passes <= 1 {
-            // MP04 applies to the single-pass selector too: the whole pool is
-            // ranked once by fee density, so `select_for_block` and
-            // `select_for_block_multi` cannot disagree about what "best" means.
-            let mut ordered: Vec<(u128, &TxHash, &Transaction)> = order
-                .values()
-                .rev()
-                .filter_map(|h| txs.get(h).map(|tx| (Self::fee_density(tx), h, tx)))
-                .collect();
-            ordered.sort_unstable_by(|(da, ha, a), (db, hb, b)| {
-                db.cmp(da)
-                    .then(b.priority_fee_per_gas.cmp(&a.priority_fee_per_gas))
-                    .then(b.gas_limit.cmp(&a.gas_limit))
-                    .then(ha.cmp(hb))
-            });
-            for (_, _, tx) in ordered {
-                if selected.len() >= max_txs {
-                    break;
+            let mut gas = 0u64;
+            let mut wire = 0usize;
+            let mut proofs = 0usize;
+            let mut selected: Vec<&Transaction> = Vec::with_capacity(max_txs.min(self.txs.len()));
+            if indexed {
+                for &(_, _, _, hash) in &self.by_density {
+                    if selected.len() >= max_txs {
+                        break;
+                    }
+                    let Some(tx) = self.txs.get(&hash) else {
+                        continue;
+                    };
+                    if !accept(tx) {
+                        continue;
+                    }
+                    let g = tx.gas_limit;
+                    if gas.saturating_add(g) > max_gas {
+                        continue;
+                    }
+                    let meta = self.tx_meta[&hash];
+                    if wire.saturating_add(meta.wire_bytes) > Self::MAX_BLOCK_WIRE_BYTES {
+                        continue;
+                    }
+                    if proofs.saturating_add(meta.proof_units) > Self::MAX_BLOCK_PROOF_UNITS {
+                        continue;
+                    }
+                    gas = gas.saturating_add(g);
+                    wire = wire.saturating_add(meta.wire_bytes);
+                    proofs = proofs.saturating_add(meta.proof_units);
+                    selected.push(tx);
                 }
-                if !accept(tx) {
-                    continue;
+            } else {
+                let mut ordered: Vec<(DensityKey, &Transaction, usize, usize)> = self
+                    .txs
+                    .iter()
+                    .map(|(&h, tx)| {
+                        let w = Self::estimate_tx_wire_bytes(tx);
+                        let p = Self::count_tx_proof_units(tx);
+                        let d = Self::fee_density_from_parts(
+                            tx.priority_fee_per_gas,
+                            tx.gas_limit,
+                            w,
+                            p,
+                        );
+                        (
+                            (
+                                Reverse(d),
+                                Reverse(tx.priority_fee_per_gas),
+                                Reverse(tx.gas_limit),
+                                h,
+                            ),
+                            tx,
+                            w,
+                            p,
+                        )
+                    })
+                    .collect();
+                ordered.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                for (_, tx, w, p) in ordered {
+                    if selected.len() >= max_txs {
+                        break;
+                    }
+                    if !accept(tx) {
+                        continue;
+                    }
+                    let g = tx.gas_limit;
+                    if gas.saturating_add(g) > max_gas {
+                        continue;
+                    }
+                    if wire.saturating_add(w) > Self::MAX_BLOCK_WIRE_BYTES {
+                        continue;
+                    }
+                    if proofs.saturating_add(p) > Self::MAX_BLOCK_PROOF_UNITS {
+                        continue;
+                    }
+                    gas = gas.saturating_add(g);
+                    wire = wire.saturating_add(w);
+                    proofs = proofs.saturating_add(p);
+                    selected.push(tx);
                 }
-                let g = tx.gas_limit;
-                if gas.saturating_add(g) > max_gas {
-                    continue;
-                }
-                let w = Self::estimate_tx_wire_bytes(tx);
-                if wire.saturating_add(w) > Self::MAX_BLOCK_WIRE_BYTES {
-                    continue;
-                }
-                let p = Self::count_tx_proof_units(tx);
-                if proofs.saturating_add(p) > Self::MAX_BLOCK_PROOF_UNITS {
-                    continue;
-                }
-                gas = gas.saturating_add(g);
-                wire = wire.saturating_add(w);
-                proofs = proofs.saturating_add(p);
-                selected.push(tx);
             }
             return selected.into_iter().cloned().collect();
         }
 
-        // Multi-pass: ONE descending fee-order walk materializes the candidate
-        // array AND runs the first pass (the array is only needed again when a
-        // later pass could add something, which requires a rejection by
-        // `accept` — see below). Packing costs are computed lazily on first
-        // acceptance so never-selected txs pay no payload walk.
-        const UNCOMPUTED: usize = usize::MAX;
-        struct Candidate<'a> {
-            tx: &'a Transaction,
-            wire: usize,
-            proofs: usize,
-            taken: bool,
+        if indexed {
+            let mut iters: Vec<_> = self.sender_ordered.values().map(|s| s.iter()).collect();
+            return Self::select_frontier_with(
+                &self.txs,
+                &self.tx_meta,
+                &mut iters,
+                accept,
+                (max_txs, max_gas, passes),
+            );
         }
-        // MP04: rank the whole pool by fee DENSITY before packing, so a small
-        // high-bid transaction is never displaced by a bloated low-bid one.
-        // The tie-breakers make the order total and deterministic.
-        let mut ordered: Vec<(u128, &TxHash, &Transaction)> = order
-            .values()
-            .rev()
-            .filter_map(|h| txs.get(h).map(|tx| (Self::fee_density(tx), h, tx)))
-            .collect();
-        ordered.sort_unstable_by(|(da, ha, a), (db, hb, b)| {
-            db.cmp(da)
-                .then(b.priority_fee_per_gas.cmp(&a.priority_fee_per_gas))
-                .then(b.gas_limit.cmp(&a.gas_limit))
-                .then(ha.cmp(hb))
-        });
-        let mut candidates: Vec<Candidate<'_>> = Vec::with_capacity(ordered.len());
-        for (_, _, tx) in ordered {
-            if selected.len() >= max_txs {
-                break;
-            }
-            let idx = candidates.len();
-            candidates.push(Candidate {
-                tx,
-                wire: UNCOMPUTED,
-                proofs: UNCOMPUTED,
-                taken: false,
-            });
-            let c = &mut candidates[idx];
-            if !accept(c.tx) {
-                continue;
-            }
-            let g = c.tx.gas_limit;
-            if gas.saturating_add(g) > max_gas {
-                // This one does not fit. A cheaper one behind it might, so keep
-                // walking rather than truncating the block here.
-                continue;
-            }
-            if c.wire == UNCOMPUTED {
-                c.wire = Self::estimate_tx_wire_bytes(c.tx);
-                c.proofs = Self::count_tx_proof_units(c.tx);
-            }
-            // Wire + proof-unit caps (audit: blocks troubles): gas-valid
-            // does not mean gossipable or verifiable-in-time. Skip (do
-            // not truncate: a smaller tx behind may still fit).
-            if wire.saturating_add(c.wire) > Self::MAX_BLOCK_WIRE_BYTES {
-                continue;
-            }
-            if proofs.saturating_add(c.proofs) > Self::MAX_BLOCK_PROOF_UNITS {
-                continue;
-            }
-            gas = gas.saturating_add(g);
-            wire = wire.saturating_add(c.wire);
-            proofs = proofs.saturating_add(c.proofs);
-            c.taken = true;
-            selected.push(c.tx);
+
+        // Fallback for directly-deserialized pools whose #[serde(skip)] indexes were not populated.
+        let mut temp_meta: HashMap<TxHash, TxMeta> = HashMap::with_capacity(self.txs.len());
+        let mut temp_sender: HashMap<[u8; 32], BTreeSet<SenderOrderKey>> = HashMap::new();
+        for (&h, tx) in &self.txs {
+            let w = Self::estimate_tx_wire_bytes(tx);
+            let p = Self::count_tx_proof_units(tx);
+            let d = Self::fee_density_from_parts(tx.priority_fee_per_gas, tx.gas_limit, w, p);
+            temp_meta.insert(
+                h,
+                TxMeta {
+                    fee_density: d,
+                    wire_bytes: w,
+                    proof_units: p,
+                },
+            );
+            temp_sender.entry(tx.from).or_default().insert((
+                tx.nonce,
+                Reverse(d),
+                Reverse(tx.priority_fee_per_gas),
+                Reverse(tx.gas_limit),
+                h,
+            ));
         }
-        // Later passes revisit the txs a previous pass rejected (their nonce
-        // may have become expected); a pass that adds nothing ends the loop.
-        for _ in 1..passes {
-            let before = selected.len();
-            for c in &mut candidates {
-                if selected.len() >= max_txs {
-                    break;
-                }
-                // Only skip what a previous pass already took; rejected ones
-                // must be revisited (their nonce may have become expected).
-                if c.taken {
-                    continue;
-                }
-                if !accept(c.tx) {
-                    continue;
-                }
-                let g = c.tx.gas_limit;
-                if gas.saturating_add(g) > max_gas {
-                    // This one does not fit. A cheaper one behind it might, so keep
-                    // walking rather than truncating the block here.
-                    continue;
-                }
-                if c.wire == UNCOMPUTED {
-                    c.wire = Self::estimate_tx_wire_bytes(c.tx);
-                    c.proofs = Self::count_tx_proof_units(c.tx);
-                }
-                // Wire + proof-unit caps (audit: blocks troubles): gas-valid
-                // does not mean gossipable or verifiable-in-time. Skip (do
-                // not truncate: a smaller tx behind may still fit).
-                if wire.saturating_add(c.wire) > Self::MAX_BLOCK_WIRE_BYTES {
-                    continue;
-                }
-                if proofs.saturating_add(c.proofs) > Self::MAX_BLOCK_PROOF_UNITS {
-                    continue;
-                }
-                gas = gas.saturating_add(g);
-                wire = wire.saturating_add(c.wire);
-                proofs = proofs.saturating_add(c.proofs);
-                c.taken = true;
-                selected.push(c.tx);
-            }
-            if selected.len() == before {
-                break;
-            }
-        }
-        selected.into_iter().cloned().collect()
+        let mut iters: Vec<_> = temp_sender.values().map(|s| s.iter()).collect();
+        Self::select_frontier_with(
+            &self.txs,
+            &temp_meta,
+            &mut iters,
+            accept,
+            (max_txs, max_gas, passes),
+        )
     }
 
     /// Estimated bincode wire bytes of a transaction for packing (audit:
@@ -3375,6 +3966,9 @@ impl Mempool {
                 acc.saturating_add(Self::estimate_op_wire_bytes(child, depth + 1))
             }),
             OpCode::SysCallDeployContract { code } => 128 + code.len(),
+            OpCode::SysCallDeployContractWithAbi { code, abi_json } => 128usize
+                .saturating_add(code.len())
+                .saturating_add(abi_json.len()),
             OpCode::SysCallCallContract { method, .. } => 128 + method.len(),
             OpCode::SysCallCallContractArgs {
                 method,
@@ -3467,10 +4061,36 @@ impl Mempool {
         self.txs.values().cloned().collect()
     }
 
+    /// Iterate over all pending transactions without allocating a `Vec`.
+    pub fn iter_txs(&self) -> impl Iterator<Item = &Transaction> {
+        self.txs.values()
+    }
+
+    /// Visit each `(TxHash, &Transaction)` in the pool without cloning.
+    pub fn for_each_tx<F: FnMut(&TxHash, &Transaction)>(&self, mut f: F) {
+        for (hash, tx) in &self.txs {
+            f(hash, tx);
+        }
+    }
+
     /// Pending transactions matching `account` (`t.from == *account || t.to == *account`),
     /// returning `(total_matching, top_matching)` sorted by `nonce` descending and
     /// cloning at most `limit` transactions (zero clones of unrelated transactions).
     pub fn matching_account(&self, account: &[u8; 32], limit: usize) -> (usize, Vec<Transaction>) {
+        if self.tx_meta.len() == self.txs.len() {
+            let Some(hashes) = self.by_account.get(account) else {
+                return (0, Vec::new());
+            };
+            let total = hashes.len();
+            if total == 0 || limit == 0 {
+                return (total, Vec::new());
+            }
+            let mut refs: Vec<&Transaction> =
+                hashes.iter().filter_map(|h| self.txs.get(h)).collect();
+            refs.sort_by(|x, y| y.nonce.cmp(&x.nonce));
+            let txs = refs.into_iter().take(limit).cloned().collect();
+            return (total, txs);
+        }
         let mut refs: Vec<&Transaction> = self
             .txs
             .values()
@@ -3491,6 +4111,9 @@ impl Mempool {
     /// account once before the synchronous selection walk). Collecting it here
     /// avoids cloning every transaction just to read their `from` fields.
     pub fn senders(&self) -> std::collections::BTreeSet<[u8; 32]> {
+        if self.tx_meta.len() == self.txs.len() {
+            return self.sender_ordered.keys().copied().collect();
+        }
         self.txs.values().map(|t| t.from).collect()
     }
 
@@ -3545,42 +4168,17 @@ impl Mempool {
 
     /// Drop txs already present in a finalized block (by hash).
     pub fn prune_confirmed(&mut self, confirmed: &[TxHash]) {
-        let set: HashSet<TxHash> = confirmed.iter().copied().collect();
-        let to_remove: Vec<TxHash> = self
-            .txs
-            .keys()
-            .filter(|h| set.contains(*h))
-            .copied()
-            .collect();
-        for h in to_remove {
-            self.evict(&h);
-        }
-        // A confirmed hash that names an activation-buffered transaction
-        // leaves the buffer with it (releasing its reservation): buffered
-        // transactions are never `txs`, so the loop above cannot see them,
-        // and an unreleased claim would price the sender out of the pool
-        // forever.
         for h in confirmed {
-            if let Some(tx) = self.activation_buffer.remove_by_hash(h) {
+            if self.txs.contains_key(h) {
+                self.evict(h);
+            } else if let Some(tx) = self.activation_buffer.remove_by_hash(h) {
+                // A confirmed hash that names an activation-buffered transaction
+                // leaves the buffer with it (releasing its reservation).
                 self.release_activation_reservation(&tx);
             }
-        }
-        // The SEALED envelopes of the included transactions leave the pool
-        // with them: a sealed transaction that was unsealed and included
-        // must not be proposed AGAIN (it would be a duplicate), and it must
-        // not hold pool space either. The removal happens at APPLY time
-        // (like the plain path), not at build time: a block that is built
-        // but never finalized must not lose its transactions.
-        let sealed_gone: Vec<[u8; 32]> = self
-            .sealed
-            .iter()
-            .filter(|(h, _)| set.contains(*h))
-            .map(|(_, e)| e.meta.from)
-            .collect();
-        self.sealed.retain(|h, _| !set.contains(h));
-        self.sealed_inserted_at.retain(|h, _| !set.contains(h));
-        for sender in sealed_gone {
-            self.release_sender_slot(&sender);
+            if self.sealed.contains_key(h) {
+                self.remove_sealed(h);
+            }
         }
     }
 
@@ -3602,25 +4200,41 @@ impl Mempool {
     where
         F: FnMut(&[u8; 32]) -> Option<(u64, u64)>,
     {
-        // Pass 1: spent nonce / drained balance / aged future-nonce (same
-        // predicate the proposer sweep uses, now against post-commit state).
-        let mut dropped = self.evict_unexecutable_at(now_secs, &mut account);
-        // Pass 2: the fee floor moved under the tx (base fee rose or a D2
-        // failure penalty accrued at/after commit): `gas_limit` no longer
-        // covers `required_fee_for_tx`, so admission would refuse it today.
-        // `evict` keeps the fee index, per-sender quota and F-03 reservations
-        // in step (never remove straight from `txs`).
-        let stale_floor: Vec<TxHash> = self
+        let heads = self.sender_heads(&mut account);
+        let doomed: Vec<TxHash> = self
             .txs
             .iter()
-            .filter(|(_, tx)| tx.gas_limit < self.required_fee_for_tx(tx))
-            .map(|(&h, _)| h)
+            .filter_map(|(&hash, tx)| {
+                if tx.gas_limit < self.required_fee_for_tx(tx) {
+                    return Some(hash);
+                }
+                let (nonce, balance) = account(&tx.from)?;
+                let stale_nonce = tx.nonce < nonce;
+                let unaffordable = match Self::sponsored_pure_legs(tx) {
+                    Some((user_cost, sponsor_cost)) => {
+                        let sponsor = tx.fee_payer();
+                        let user_short = user_cost > balance;
+                        let sponsor_short = account(&sponsor)
+                            .map(|(_, sponsor_balance)| sponsor_cost > sponsor_balance)
+                            .unwrap_or(false);
+                        user_short || sponsor_short
+                    }
+                    None => Self::tx_cost(tx) > balance,
+                };
+                let head = heads.get(&tx.from).copied().unwrap_or(nonce);
+                let aged_future = tx.nonce > head
+                    && self.tx_age_secs_by_hash(now_secs, &hash) >= Self::FUTURE_NONCE_TTL_SECS;
+                if stale_nonce || unaffordable || aged_future {
+                    Some(hash)
+                } else {
+                    None
+                }
+            })
             .collect();
-        for h in &stale_floor {
+        for h in &doomed {
             self.evict(h);
         }
-        dropped += stale_floor.len();
-        dropped
+        doomed.len()
     }
 }
 
@@ -5557,14 +6171,116 @@ mod tests {
         assert_eq!(mp.per_sender.get(&s1).copied().unwrap_or(0), 0);
 
         // Mark h_mid as expired: even a priority-0 newcomer can evict it.
-        mp.sealed_inserted_at.insert(
-            h_mid,
+        mp.set_sealed_inserted_at_for_test(
+            &h_mid,
             crate::zkml::now_secs().saturating_sub(Mempool::STUCK_TX_TTL_SECS + 5),
         );
         let h_reclaim = mp.add_sealed(make_sealed(1, s4, 0, 5)).unwrap();
         assert_eq!(mp.sealed_count(), 2);
         assert!(mp.sealed_envelope(&h_mid).is_none());
         assert!(mp.sealed_envelope(&h_reclaim).is_some());
+    }
+
+    #[test]
+    fn failed_penalty_is_bounded_and_evicts_zero_or_oldest_entries() {
+        let mut mp = Mempool::new(16, 16);
+        let mk_sender = |idx: usize| -> [u8; 32] {
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&(idx as u64).to_le_bytes());
+            s
+        };
+
+        // Insert MAX_FAILED_PENALTY_ENTRIES + 64 distinct failing senders.
+        let extra = 64usize;
+        let total = MAX_FAILED_PENALTY_ENTRIES + extra;
+        for i in 0..total {
+            mp.penalize_sender(&mk_sender(i));
+            assert!(mp.failed_penalty.len() <= MAX_FAILED_PENALTY_ENTRIES);
+        }
+        assert_eq!(mp.failed_penalty.len(), MAX_FAILED_PENALTY_ENTRIES);
+
+        // Oldest `extra` entries were evicted; newer entries are retained.
+        for i in 0..extra {
+            assert!(!mp.failed_penalty.contains_key(&mk_sender(i)));
+        }
+        for i in extra..total {
+            assert_eq!(
+                mp.failed_penalty.get(&mk_sender(i)).copied(),
+                Some(FAILED_SENDER_PENALTY)
+            );
+        }
+
+        // Zero-penalty entries are reclaimed before live penalized entries.
+        let live_key = mk_sender(extra);
+        let zero_key = mk_sender(total + 100);
+        mp.failed_penalty.remove(&live_key);
+        mp.failed_penalty.insert(zero_key, 0);
+        assert_eq!(mp.failed_penalty.len(), MAX_FAILED_PENALTY_ENTRIES);
+
+        let newcomer = mk_sender(total + 101);
+        mp.note_apply_feedback(&[newcomer], &[]);
+        assert_eq!(mp.failed_penalty.len(), MAX_FAILED_PENALTY_ENTRIES);
+        assert!(!mp.failed_penalty.contains_key(&zero_key));
+        assert!(mp.failed_penalty.contains_key(&newcomer));
+    }
+
+    #[test]
+    fn add_sealed_indexed_eviction_keeps_indexes_consistent() {
+        use crate::mev_epoch::{SealedEnvelope, TransparentMeta};
+        use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+
+        let make_sealed = |epoch: u64, from: [u8; 32], prio: u64, uniq: u64| {
+            let mut tx_hash = [0u8; 32];
+            tx_hash[..8].copy_from_slice(&uniq.to_le_bytes());
+            tx_hash[8] = 1;
+            SealedEnvelope {
+                epoch,
+                tx_hash,
+                ephemeral_pk: RISTRETTO_BASEPOINT_POINT.compress().to_bytes(),
+                nonce: [uniq as u8; 24],
+                ciphertext: vec![uniq as u8, 0x42],
+                meta: TransparentMeta {
+                    from,
+                    nonce: 0,
+                    gas_limit: 300_000,
+                    priority_fee_per_gas: prio,
+                    source_shard: 1,
+                    target_shard: 1,
+                },
+            }
+        };
+
+        // 40-slot pool -> sealed_cap = 10.
+        let mut mp = Mempool::new(40, 20);
+        mp.set_sealed_epoch(1);
+        assert_eq!(mp.sealed_cap(), 10);
+
+        let mut hashes = Vec::new();
+        for i in 0..10u64 {
+            let mut from = [0u8; 32];
+            from[..8].copy_from_slice(&i.to_le_bytes());
+            hashes.push(
+                mp.add_sealed(make_sealed(1, from, (i + 1) * 10, i + 1))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(mp.sealed.len(), 10);
+        assert_eq!(mp.sealed_by_time.len(), 10);
+        assert_eq!(mp.sealed_by_priority.len(), 10);
+
+        // Higher-priority newcomer evicts the lowest-priority entry (prio=10, hashes[0]).
+        let s_hi = [0xAAu8; 32];
+        let h_hi = mp.add_sealed(make_sealed(1, s_hi, 500, 100)).unwrap();
+        assert!(mp.sealed_envelope(&hashes[0]).is_none());
+        assert!(mp.sealed_envelope(&h_hi).is_some());
+        assert_eq!(mp.sealed_by_time.len(), 10);
+        assert_eq!(mp.sealed_by_priority.len(), 10);
+
+        // prune_confirmed removes sealed entries cleanly across all indexes.
+        mp.prune_confirmed(&[h_hi, hashes[1]]);
+        assert_eq!(mp.sealed.len(), 8);
+        assert_eq!(mp.sealed_by_time.len(), 8);
+        assert_eq!(mp.sealed_by_priority.len(), 8);
     }
 
     #[test]
@@ -5603,6 +6319,490 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "leftover tmp files: {leftovers:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[allow(clippy::too_many_arguments)] // GATE: test-only PQ transaction builder fixture
+    fn unique_pq_tx(
+        kp: &crate::post_quantum::FalconKeypair,
+        seed_id: u64,
+        to: [u8; 32],
+        amount: u64,
+        gas_limit: u64,
+        nonce: u64,
+        payload: Vec<crate::svm::OpCode>,
+        priority_fee_per_gas: u64,
+    ) -> Transaction {
+        use crate::post_quantum::{derive_pq_address, PqScheme, PqSignatureEnvelope};
+        let mut salt = [0u8; 16];
+        salt[..8].copy_from_slice(&seed_id.to_le_bytes());
+        salt[8..].copy_from_slice(&0x57E1_1E7E_0000_0001u64.to_le_bytes());
+        let from = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &salt);
+        Transaction::global_implicit_registry()
+            .register(from, PqScheme::Falcon512, &kp.public_key, &salt)
+            .expect("PQ test key must register");
+        let mut t = Transaction {
+            from,
+            to,
+            amount,
+            gas_limit,
+            nonce,
+            source_shard: 1,
+            target_shard: 1,
+            signature: Vec::new(),
+            payload,
+            priority_fee_per_gas,
+        };
+        let msg = t.signing_message();
+        let sig = kp.sign(&msg);
+        t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+        t
+    }
+
+    #[test]
+    fn select_multi_differential_parity_with_reference_64_pass() {
+        let kp = crate::post_quantum::FalconKeypair::generate_from_seed(0xC3);
+        let mut mp = Mempool::new(2_000, 500);
+        let mut all = Vec::new();
+        let bal = 1_000_000_000_000u64;
+
+        // Multi-sender nonce chains with out-of-order bids (nonce 1 > nonce 0),
+        // gaps (missing nonce 2), and ties on density/priority/gas.
+        for s in 0..12u64 {
+            let sender_id = 10_000 + s;
+            let nonces: &[u64] = match s % 3 {
+                0 => &[0, 1, 2, 3, 4],
+                1 => &[0, 1, 3, 4], // gap at 2
+                _ => &[1, 2],       // gap at 0
+            };
+            for &n in nonces {
+                let bid = match (s % 4, n) {
+                    (0, 0) => 100,
+                    (0, 1) => 1_500, // forces pass 2
+                    (0, 2) => 2_500, // forces pass 3
+                    (1, _) => 500,   // exact ties across senders
+                    _ => 200 + n * 150,
+                };
+                let t = unique_pq_tx(
+                    &kp,
+                    sender_id,
+                    [0x22; 32],
+                    10,
+                    crate::svm::GAS_BASIC_TRANSFER + bid + 100,
+                    n,
+                    Vec::new(),
+                    bid,
+                );
+                mp.add_checked(t.clone(), bal).unwrap();
+                all.push(t);
+            }
+        }
+
+        // Same-sender, same-nonce sibling where the higher-bid one exceeds the
+        // filter's amount cap and the lower-bid sibling is accepted.
+        let rbf_hi = unique_pq_tx(
+            &kp,
+            20_001,
+            [0x22; 32],
+            50_000, // rejected by amount cap below
+            crate::svm::GAS_BASIC_TRANSFER + 900,
+            0,
+            Vec::new(),
+            900,
+        );
+        let rbf_lo = unique_pq_tx(
+            &kp,
+            20_001,
+            [0x22; 32],
+            10,
+            crate::svm::GAS_BASIC_TRANSFER + 300,
+            0,
+            Vec::new(),
+            300,
+        );
+        mp.add_checked(rbf_hi.clone(), bal).unwrap();
+        mp.add_checked(rbf_lo.clone(), bal).unwrap();
+        all.push(rbf_hi);
+        all.push(rbf_lo);
+
+        // Wire pressure (fat payload ~1MB each) + proof pressure (64 units each).
+        for i in 0..30u64 {
+            let fat_ops = vec![
+                crate::svm::OpCode::Transfer {
+                    recipient: [0x33; 32],
+                    amount: 1,
+                };
+                4_000
+            ];
+            let fat = unique_pq_tx(
+                &kp,
+                30_000 + i,
+                [0x33; 32],
+                1,
+                crate::svm::GAS_BASIC_TRANSFER + 20_000 + i,
+                0,
+                fat_ops,
+                20_000 + i,
+            );
+            mp.add_checked(fat.clone(), bal).unwrap();
+            all.push(fat);
+        }
+        for i in 0..36u64 {
+            let att = unique_pq_tx(
+                &kp,
+                40_000 + i,
+                [0x44; 32],
+                1,
+                crate::svm::GAS_BASIC_TRANSFER + 10_000 + i,
+                0,
+                vec![crate::svm::OpCode::SysCallVerifyZkMlAttestation {
+                    model_id: [1u8; 32],
+                    proof: Box::new(crate::zkml_attestation::AttestationProof {
+                        model_hash: [0u8; 32],
+                        spec_hash: [0u8; 32],
+                        public_inputs: Vec::new(),
+                        public_outputs: Vec::new(),
+                        proof_bytes: Vec::new(),
+                    }),
+                }],
+                10_000 + i,
+            );
+            mp.add_checked(att.clone(), bal).unwrap();
+            all.push(att);
+        }
+
+        let reference_scan = |passes: usize, max_txs: usize, max_gas: u64| -> Vec<TxHash> {
+            let mut ranked: Vec<(TxHash, &Transaction)> =
+                all.iter().map(|t| (t.compute_tx_hash(), t)).collect();
+            ranked.sort_unstable_by(|(ha, a), (hb, b)| {
+                Mempool::fee_density(b)
+                    .cmp(&Mempool::fee_density(a))
+                    .then(b.priority_fee_per_gas.cmp(&a.priority_fee_per_gas))
+                    .then(b.gas_limit.cmp(&a.gas_limit))
+                    .then(ha.cmp(hb))
+            });
+            let mut expected: HashMap<[u8; 32], u64> = HashMap::new();
+            let mut taken: HashSet<TxHash> = HashSet::new();
+            let mut out = Vec::new();
+            let mut gas = 0u64;
+            let mut wire = 0usize;
+            let mut proofs = 0usize;
+            for _ in 0..passes {
+                let before = out.len();
+                for (h, t) in &ranked {
+                    if out.len() >= max_txs {
+                        break;
+                    }
+                    if taken.contains(h) {
+                        continue;
+                    }
+                    let exp = expected.entry(t.from).or_insert(0);
+                    if t.amount > 10_000 || t.nonce != *exp {
+                        continue;
+                    }
+                    *exp += 1;
+                    let w = Mempool::estimate_tx_wire_bytes(t);
+                    let p = Mempool::count_tx_proof_units(t);
+                    if gas.saturating_add(t.gas_limit) <= max_gas
+                        && wire.saturating_add(w) <= Mempool::MAX_BLOCK_WIRE_BYTES
+                        && proofs.saturating_add(p) <= Mempool::MAX_BLOCK_PROOF_UNITS
+                    {
+                        gas = gas.saturating_add(t.gas_limit);
+                        wire = wire.saturating_add(w);
+                        proofs = proofs.saturating_add(p);
+                        taken.insert(*h);
+                        out.push(*h);
+                    }
+                }
+                if out.len() == before {
+                    break;
+                }
+            }
+            out
+        };
+
+        for (passes, max_txs, max_gas) in [
+            (64usize, 10_000usize, u64::MAX),
+            (64, 40, u64::MAX),
+            (64, 10_000, 5_000_000),
+            (1, 10_000, u64::MAX),
+        ] {
+            let expected_nonces = std::cell::RefCell::new(HashMap::<[u8; 32], u64>::new());
+            let accept = |t: &Transaction| -> bool {
+                if t.amount > 10_000 {
+                    return false;
+                }
+                let mut map = expected_nonces.borrow_mut();
+                let exp = map.entry(t.from).or_insert(0);
+                if t.nonce == *exp {
+                    *exp += 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            let got: Vec<TxHash> = if passes == 1 {
+                mp.select_for_block(max_txs, max_gas, accept)
+            } else {
+                mp.select_for_block_multi(max_txs, max_gas, accept)
+            }
+            .iter()
+            .map(|t| t.compute_tx_hash())
+            .collect();
+            let want = reference_scan(passes, max_txs, max_gas);
+            assert_eq!(
+                got, want,
+                "parity mismatch for passes={passes} max_txs={max_txs} max_gas={max_gas}"
+            );
+        }
+
+        // Also verify fallback path on directly-deserialized Mempool without #[serde(skip)] indexes.
+        let raw = bincode::serialize(&mp).unwrap();
+        let deserialized: Mempool = bincode::deserialize(&raw).unwrap();
+        let exp_cell = std::cell::RefCell::new(HashMap::<[u8; 32], u64>::new());
+        let got_deser: Vec<TxHash> = deserialized
+            .select_for_block_multi(10_000, u64::MAX, |t| {
+                if t.amount > 10_000 {
+                    return false;
+                }
+                let mut map = exp_cell.borrow_mut();
+                let exp = map.entry(t.from).or_insert(0);
+                if t.nonce == *exp {
+                    *exp += 1;
+                    true
+                } else {
+                    false
+                }
+            })
+            .iter()
+            .map(|t| t.compute_tx_hash())
+            .collect();
+        assert_eq!(got_deser, reference_scan(64, 10_000, u64::MAX));
+    }
+
+    #[test]
+    fn prune_confirmed_handles_plain_buffered_sealed_and_duplicates() {
+        use crate::mev_epoch::{SealedEnvelope, TransparentMeta};
+        use crate::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+        use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+
+        let registry = StatefulImplicitKeyRegistry::new();
+        let mut mp = Mempool::new(64, 32)
+            .with_base_fee(100)
+            .with_implicit_registry(registry);
+        mp.set_sealed_epoch(1);
+
+        let sk_plain = key();
+        let plain_tx = tx(&sk_plain, [0xAA; 32], 500, 0);
+        let plain_h = mp.add_checked(plain_tx, 100_000).unwrap();
+
+        let seed_act = 0x99u8;
+        let pk_act = Transaction::sample_falcon512_pubkey(seed_act);
+        let from_act = derive_pq_address(PqScheme::Falcon512, &pk_act, &DEFAULT_SALT);
+        let buf_tx = implicit_pq_tx(&pk_act, seed_act, from_act, [0xBB; 32], 50, 1_000, 1);
+        let buf_h = mp.add_checked(buf_tx, 100_000).unwrap();
+        assert!(mp.is_buffered(&buf_h));
+        assert!(mp.reserved_for(&from_act) > 0);
+
+        let sealed_h = [0xCC; 32];
+        let sealed_from = [0xDD; 32];
+        mp.add_sealed(SealedEnvelope {
+            epoch: 1,
+            tx_hash: sealed_h,
+            ephemeral_pk: RISTRETTO_BASEPOINT_POINT.compress().to_bytes(),
+            nonce: [7; 24],
+            ciphertext: vec![1, 2, 3],
+            meta: TransparentMeta {
+                from: sealed_from,
+                nonce: 0,
+                gas_limit: 300_000,
+                priority_fee_per_gas: 50,
+                source_shard: 1,
+                target_shard: 1,
+            },
+        })
+        .unwrap();
+
+        let unknown_h = [0xEE; 32];
+        mp.prune_confirmed(&[plain_h, plain_h, buf_h, sealed_h, unknown_h]);
+        assert!(mp.is_empty());
+        assert!(!mp.is_buffered(&buf_h));
+        assert_eq!(mp.reserved_for(&from_act), 0);
+        assert_eq!(mp.sealed_count(), 0);
+        assert!(mp.sealed_candidates().is_empty());
+        assert_eq!(mp.per_sender.get(&sealed_from).copied().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn pending_activation_buffer_drain_stale_uses_time_index() {
+        let mut buf = PendingActivationBuffer::new();
+        let mk = |n: u64, amt: u64| Transaction {
+            from: [0x12; 32],
+            to: [0x34; 32],
+            amount: amt,
+            gas_limit: 100,
+            nonce: n,
+            source_shard: 1,
+            target_shard: 1,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        };
+
+        let (h0, _) = buf.buffer_tx_with_timestamp(mk(0, 10), 50, 100).unwrap();
+        let (h1, _) = buf.buffer_tx_with_timestamp(mk(1, 10), 50, 120).unwrap();
+        // Overwrite nonce 0 at a later timestamp: old time entry must be evicted.
+        let (h0_new, _) = buf.buffer_tx_with_timestamp(mk(0, 20), 50, 150).unwrap();
+        assert!(!buf.contains_hash(&h0));
+        assert_eq!(buf.by_time.len(), 2);
+
+        // When now < ttl, nothing expires.
+        assert!(buf.drain_stale(10, 30).is_empty());
+        assert_eq!(buf.len(), 2);
+
+        // At now=150, ttl=30: cutoff=120 -> h1 (ts=120) expires, h0_new (ts=150) stays.
+        let drained = buf.drain_stale(150, 30);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].compute_tx_hash(), h1);
+        assert!(buf.contains_hash(&h0_new));
+        assert_eq!(buf.by_time.len(), 1);
+
+        // ttl == 0 drains everything remaining.
+        let rest = buf.drain_stale(0, 0);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].compute_tx_hash(), h0_new);
+        assert!(buf.is_empty());
+        assert!(buf.by_time.is_empty());
+    }
+
+    #[test]
+    fn by_account_index_tracks_sender_recipient_self_and_evictions() {
+        let kp = crate::post_quantum::FalconKeypair::generate_from_seed(0xC4);
+        let mut mp = Mempool::new(32, 32);
+        let a = unique_pq_tx(&kp, 50_001, [0x77; 32], 10, 1_000, 0, Vec::new(), 0);
+        let sender_a = a.from;
+        let recip_b = [0x77; 32];
+        let self_tx = unique_pq_tx(&kp, 50_001, sender_a, 5, 1_000, 1, Vec::new(), 0);
+        let other = unique_pq_tx(&kp, 50_002, recip_b, 15, 1_000, 0, Vec::new(), 0);
+
+        let ha = mp.add(a).unwrap();
+        let h_self = mp.add(self_tx).unwrap();
+        let h_other = mp.add(other.clone()).unwrap();
+
+        let (tot_a, top_a) = mp.matching_account(&sender_a, 1);
+        assert_eq!(tot_a, 2);
+        assert_eq!(top_a.len(), 1);
+        assert_eq!(top_a[0].compute_tx_hash(), h_self);
+
+        let (tot_b, top_b) = mp.matching_account(&recip_b, 10);
+        assert_eq!(tot_b, 2);
+        assert_eq!(top_b.len(), 2);
+
+        let senders = mp.senders();
+        assert!(senders.contains(&sender_a));
+        assert!(senders.contains(&other.from));
+
+        mp.remove(&h_self);
+        let (tot_a2, top_a2) = mp.matching_account(&sender_a, 10);
+        assert_eq!(tot_a2, 1);
+        assert_eq!(top_a2[0].compute_tx_hash(), ha);
+
+        mp.prune_confirmed(&[ha, h_other]);
+        assert_eq!(mp.matching_account(&sender_a, 10).0, 0);
+        assert_eq!(mp.matching_account(&recip_b, 10).0, 0);
+        assert!(mp.by_account.is_empty());
+        assert!(mp.senders().is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_into_rejects_oversized_and_corrupt_files_and_restores_valid() {
+        let dir = std::env::temp_dir().join(format!(
+            "stell_mempool_load_into_{}_{}",
+            std::process::id(),
+            crate::zkml::now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let kp = crate::post_quantum::FalconKeypair::generate_from_seed(0xC5);
+        let engine = crate::state_engine::InMemoryStateEngine::new();
+        let t0 = unique_pq_tx(&kp, 60_001, [0x55; 32], 10, 1_000, 0, Vec::new(), 5);
+        engine
+            .update_account(crate::state_engine::AccountState::new(t0.from, 1_000_000))
+            .await;
+
+        // 1. Corrupt file returns 0.
+        let corrupt_path = dir.join("corrupt.bin");
+        std::fs::write(&corrupt_path, b"MP03not-valid-bincode").unwrap();
+        let mut mp_corrupt = Mempool::new(16, 16);
+        assert_eq!(
+            mp_corrupt
+                .load_into(&corrupt_path, &engine, AdmissionCtx::wall_now())
+                .await,
+            0
+        );
+
+        // 2. Oversized file (> MAX_MEMPOOL_FILE_BYTES) is rejected without reading.
+        let big_path = dir.join("oversized.bin");
+        let f = std::fs::File::create(&big_path).unwrap();
+        f.set_len(Mempool::MAX_MEMPOOL_FILE_BYTES + 1).unwrap();
+        drop(f);
+        let mut mp_big = Mempool::new(16, 16);
+        assert_eq!(
+            mp_big
+                .load_into(&big_path, &engine, AdmissionCtx::wall_now())
+                .await,
+            0
+        );
+
+        // 3. Valid MP03 file restores and rebuilds runtime indexes.
+        let valid_path = dir.join("valid.bin");
+        let mut mp_src = Mempool::new(16, 16);
+        mp_src.add(t0.clone()).unwrap();
+        mp_src.save(&valid_path);
+
+        let mut mp_dst = Mempool::new(16, 16);
+        let kept = mp_dst
+            .load_into(&valid_path, &engine, AdmissionCtx::wall_now())
+            .await;
+        assert_eq!(kept, 1);
+        assert_eq!(mp_dst.len(), 1);
+        assert_eq!(mp_dst.tx_meta.len(), 1);
+        assert_eq!(mp_dst.by_density.len(), 1);
+        assert_eq!(mp_dst.matching_account(&t0.from, 5).0, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sealed_candidates_matches_density_sort_order() {
+        use crate::mev_epoch::{SealedEnvelope, TransparentMeta};
+        use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+
+        let mut mp = Mempool::new(40, 20);
+        mp.set_sealed_epoch(1);
+        let mk = |prio: u64, gas: u64, id: u8| SealedEnvelope {
+            epoch: 1,
+            tx_hash: [id; 32],
+            ephemeral_pk: RISTRETTO_BASEPOINT_POINT.compress().to_bytes(),
+            nonce: [id; 24],
+            ciphertext: vec![id],
+            meta: TransparentMeta {
+                from: [id; 32],
+                nonce: 0,
+                gas_limit: gas,
+                priority_fee_per_gas: prio,
+                source_shard: 1,
+                target_shard: 1,
+            },
+        };
+        // High raw prio but huge gas (low density) vs moderate prio and small gas (high density),
+        // plus two identical-density entries broken by tx_hash ascending.
+        mp.add_sealed(mk(1_000, 10_000_000, 3)).unwrap();
+        mp.add_sealed(mk(500, 300_000, 2)).unwrap();
+        mp.add_sealed(mk(500, 300_000, 1)).unwrap();
+
+        let cands = mp.sealed_candidates();
+        let got: Vec<[u8; 32]> = cands.into_iter().map(|c| c.tx_hash).collect();
+        assert_eq!(got, vec![[1; 32], [2; 32], [3; 32]]);
     }
 }
 

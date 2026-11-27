@@ -33,6 +33,17 @@ pub trait PqSigner {
         stellereum::post_quantum::derive_pq_address(self.scheme(), self.public_key(), salt)
     }
     fn sign(&self, message: &[u8]) -> Vec<u8>;
+    fn try_sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
+        let sig = self.sign(message);
+        if sig.is_empty() {
+            Err(format!(
+                "signing failed or scheme {:?} is unsupported",
+                self.scheme()
+            ))
+        } else {
+            Ok(sig)
+        }
+    }
 }
 
 impl<T: PqSigner> PqSigner for &T {
@@ -48,6 +59,9 @@ impl<T: PqSigner> PqSigner for &T {
     fn sign(&self, message: &[u8]) -> Vec<u8> {
         (*self).sign(message)
     }
+    fn try_sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
+        (*self).try_sign(message)
+    }
 }
 
 /// Free function alias for `LightClient::build_pq_transfer_tx`
@@ -59,7 +73,7 @@ pub fn build_pq_transfer_tx<K: PqSigner>(
     nonce: u64,
     shard: u32,
     is_activation: bool,
-) -> Transaction {
+) -> Result<Transaction, String> {
     LightClient::build_pq_transfer_tx(key, to, amount, nonce, shard, is_activation)
 }
 
@@ -74,6 +88,9 @@ pub struct TxRecord {
     pub is_confidential: bool,
     pub status: String,
 }
+
+/// Maximum number of transactions retained in `recent_local_txs` / `local_txs.bin`.
+pub const MAX_LOCAL_TX_HISTORY: usize = 200;
 
 #[derive(Clone)]
 pub struct LightClient {
@@ -155,6 +172,10 @@ impl LightClient {
                 }
             }
         }
+        if initial_local_txs.len() > MAX_LOCAL_TX_HISTORY {
+            let excess = initial_local_txs.len() - MAX_LOCAL_TX_HISTORY;
+            initial_local_txs.drain(..excess);
+        }
 
         Ok(Self {
             state_engine,
@@ -218,11 +239,8 @@ impl LightClient {
         if history.len() > 100 {
             history.truncate(100);
         }
-        if let Some(parent) = self.history_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         if let Ok(json) = serde_json::to_string_pretty(&history) {
-            let _ = std::fs::write(&self.history_path, json);
+            let _ = write_private_file(&self.history_path, json.as_bytes());
         }
     }
 
@@ -238,10 +256,7 @@ impl LightClient {
     /// Persist current state cache to disk
     pub async fn persist_cache(&self) {
         let snapshot = self.state_engine.create_snapshot().await;
-        if let Some(parent) = self.cache_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&self.cache_path, snapshot);
+        let _ = write_private_file(&self.cache_path, &snapshot);
     }
 
     /// Current nonce for an address: on-chain via RPC (or local cache),
@@ -276,17 +291,28 @@ impl LightClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let e = m.entry(*sender).or_insert((0, 0));
-        if nonce + 1 > e.0 {
-            *e = (nonce + 1, now_secs());
+        let next = nonce.saturating_add(1);
+        if next > e.0 {
+            *e = (next, now_secs());
         }
     }
 
     /// Chain id: from the node in RPC mode, default otherwise.
-    pub fn chain_id(&self) -> u64 {
-        if let Some(cfg) = &self.rpc {
-            rpc::chain_id(cfg).unwrap_or(stellereum::zkml::DEFAULT_CHAIN_ID)
-        } else {
-            stellereum::zkml::DEFAULT_CHAIN_ID
+    /// Propagates RPC errors via [`Self::try_chain_id`].
+    #[allow(dead_code)]
+    // GATE: test helper retained on LightClient alongside error-propagating try_chain_id.
+    pub fn chain_id(&self) -> anyhow::Result<u64> {
+        let id = self.try_chain_id()?;
+        Ok(id)
+    }
+
+    /// Resolve a signing chain without substituting a default for an RPC error.
+    pub fn try_chain_id(&self) -> anyhow::Result<u64> {
+        match &self.rpc {
+            Some(cfg) => {
+                rpc::chain_id(cfg).map_err(|e| anyhow::anyhow!("chain ID lookup failed: {e}"))
+            }
+            None => Ok(stellereum::zkml::DEFAULT_CHAIN_ID),
         }
     }
 
@@ -317,7 +343,7 @@ impl LightClient {
         }
 
         let account = self.state_engine.get_account(address).await;
-        let (balance, nonce) = match account {
+        let (balance, nonce) = match &account {
             Some(a) => (a.balance, a.nonce),
             None => (0, 0),
         };
@@ -327,12 +353,17 @@ impl LightClient {
         let proof_opt = self.state_engine.get_account_proof(address).await;
 
         let verified = if let Some(proof) = proof_opt {
-            let mut expected_bytes = Vec::new();
-            expected_bytes.extend_from_slice(&balance.to_be_bytes());
-            expected_bytes.extend_from_slice(&nonce.to_be_bytes());
-            PatriciaTrie::verify_merkle_proof(&root, address, &expected_bytes, &proof)
+            if let Some(acc) = &account {
+                let bytes = acc.to_trie_bytes();
+                PatriciaTrie::verify_merkle_proof(&root, address, &bytes, &proof)
+            } else {
+                let mut expected_bytes = Vec::with_capacity(16);
+                expected_bytes.extend_from_slice(&balance.to_be_bytes());
+                expected_bytes.extend_from_slice(&nonce.to_be_bytes());
+                PatriciaTrie::verify_merkle_proof(&root, address, &expected_bytes, &proof)
+            }
         } else {
-            balance == 0 // Uninitialized zero balance is implicitly clean
+            balance == 0 && nonce == 0 // Uninitialized zero account is implicitly clean
         };
 
         Ok((balance, nonce, verified))
@@ -376,13 +407,20 @@ impl LightClient {
         }
         let tx_hash = tx.compute_tx_hash();
         {
-            let mut list = self.recent_local_txs.lock().unwrap();
+            let mut list = self
+                .recent_local_txs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if !list.iter().any(|t| t.compute_tx_hash() == tx_hash) {
                 list.push(tx.clone());
             }
+            if list.len() > MAX_LOCAL_TX_HISTORY {
+                let excess = list.len() - MAX_LOCAL_TX_HISTORY;
+                list.drain(..excess);
+            }
             if let Ok(bytes) = bincode::serialize(&*list) {
                 let local_txs_path = stellereum::wallet::default_wallet_dir().join("local_txs.bin");
-                let _ = std::fs::write(local_txs_path, bytes);
+                let _ = write_private_file(&local_txs_path, &bytes);
             }
         }
 
@@ -432,9 +470,12 @@ impl LightClient {
         // Snapshot for rollback (audit 2026-10-06): the old code took the
         // native fee first and failed the token leg after — chain mode is
         // atomic, local must be too.
+        let total_cost = tx
+            .amount
+            .checked_add(tx.gas_limit)
+            .ok_or_else(|| "Transaction amount + gas_limit overflows u64".to_string())?;
         let snap = self.state_engine.get_account(&tx.from).await;
         if let Some(mut sender_acc) = self.state_engine.get_account(&tx.from).await {
-            let total_cost = tx.amount + tx.gas_limit;
             if sender_acc.balance < total_cost {
                 return Err(format!(
                     "Insufficient balance: have {} nano-STELL, need {}",
@@ -444,15 +485,32 @@ impl LightClient {
             // Token/contract payloads move no native value beyond gas: the
             // native `amount` leg still settles against the local cache.
             sender_acc.balance -= total_cost;
-            sender_acc.nonce += 1;
+            sender_acc.nonce = sender_acc
+                .nonce
+                .checked_add(1)
+                .ok_or_else(|| "Sender nonce overflows u64".to_string())?;
             self.state_engine.update_account(sender_acc).await;
-        } else if tx.amount + tx.gas_limit > 0 {
+        } else if total_cost > 0 {
             return Err("Insufficient balance: unknown sender has 0 nano-STELL".to_string());
         }
 
+        let rec_snap = if tx.amount > 0 {
+            self.state_engine.get_account(&tx.to).await
+        } else {
+            None
+        };
         if tx.amount > 0 {
-            if let Some(mut rec_acc) = self.state_engine.get_account(&tx.to).await {
-                rec_acc.balance += tx.amount;
+            if let Some(mut rec_acc) = rec_snap.clone() {
+                let new_rec_balance = match rec_acc.balance.checked_add(tx.amount) {
+                    Some(b) => b,
+                    None => {
+                        if let Some(acc) = snap {
+                            self.state_engine.update_account(acc).await;
+                        }
+                        return Err("Recipient balance overflows u64".to_string());
+                    }
+                };
+                rec_acc.balance = new_rec_balance;
                 self.state_engine.update_account(rec_acc).await;
             } else {
                 self.state_engine
@@ -527,6 +585,13 @@ impl LightClient {
         }
         .await;
         if let Err(e) = token_res {
+            if tx.amount > 0 && tx.to != tx.from {
+                if let Some(rec_acc) = rec_snap {
+                    self.state_engine.update_account(rec_acc).await;
+                } else {
+                    self.state_engine.accounts.write().await.remove(&tx.to);
+                }
+            }
             if let Some(acc) = snap {
                 self.state_engine.update_account(acc).await;
             }
@@ -586,7 +651,7 @@ impl LightClient {
         Ok((answer.balance, verified, hex::encode(answer.state_root)))
     }
 
-    /// Build a post-quantum transfer transaction using Falcon-512 or Hybrid scheme.
+    /// Build a post-quantum transfer transaction using Falcon-512.
     ///
     /// - Computes sender's 32-byte address using PQ-BFT v4 address derivation
     ///   `derive_pq_address(scheme, pubkey, salt)`.
@@ -601,7 +666,7 @@ impl LightClient {
         nonce: u64,
         shard: u32,
         is_activation: bool,
-    ) -> Transaction {
+    ) -> Result<Transaction, String> {
         Self::build_pq_transfer_tx_with_gas(
             key,
             to,
@@ -625,15 +690,17 @@ impl LightClient {
         source_shard: u32,
         target_shard: u32,
         is_activation: bool,
-    ) -> Transaction {
-        use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope, DEFAULT_SALT};
+    ) -> Result<Transaction, String> {
+        use stellereum::post_quantum::{PqScheme, DEFAULT_SALT};
+        use stellereum::sharding::PqSignatureEnvelope;
 
         let scheme = key.scheme();
-        assert!(
-            scheme == PqScheme::Falcon512 || scheme == PqScheme::Hybrid,
-            "build_pq_transfer_tx supports PqScheme::Falcon512 or PqScheme::Hybrid, got: {:?}",
-            scheme
-        );
+        if scheme != PqScheme::Falcon512 {
+            return Err(format!(
+                "build_pq_transfer_tx_with_gas requires PqScheme::Falcon512, got: {:?}",
+                scheme
+            ));
+        }
 
         let from = key.derive_address(&DEFAULT_SALT);
         let mut tx = Transaction {
@@ -651,16 +718,21 @@ impl LightClient {
         };
 
         let msg = tx.signing_message();
-        let sig_bytes = key.sign(&msg);
+        let sig_bytes = key.try_sign(&msg)?;
 
         let envelope = if is_activation {
-            PqSignatureEnvelope::new_explicit(scheme, key.public_key().to_vec(), sig_bytes)
+            PqSignatureEnvelope::new_explicit_with_salt(
+                scheme,
+                key.public_key().to_vec(),
+                sig_bytes,
+                DEFAULT_SALT,
+            )
         } else {
             PqSignatureEnvelope::new_implicit(scheme, sig_bytes)
         };
 
         tx.signature = envelope.encode();
-        tx
+        Ok(tx)
     }
 
     /// Build a post-quantum transaction carrying an SVM payload AND bound to
@@ -687,7 +759,7 @@ impl LightClient {
         is_activation: bool,
         payload: Vec<stellereum::svm::OpCode>,
         chain_id: u64,
-    ) -> Transaction {
+    ) -> Result<Transaction, String> {
         // NOTE: the CHAIN-BEARING envelope lives in `sharding` (salt +
         // chain_id); the legacy `post_quantum` envelope cannot carry a
         // chain id. Both decode through the same `pq_envelope()` path.
@@ -695,11 +767,12 @@ impl LightClient {
         use stellereum::sharding::PqSignatureEnvelope;
 
         let scheme = key.scheme();
-        assert!(
-            scheme == PqScheme::Falcon512 || scheme == PqScheme::Hybrid,
-            "build_pq_payload_tx_bound supports PqScheme::Falcon512 or PqScheme::Hybrid, got: {:?}",
-            scheme
-        );
+        if scheme != PqScheme::Falcon512 {
+            return Err(format!(
+                "build_pq_payload_tx_bound requires PqScheme::Falcon512, got: {:?}",
+                scheme
+            ));
+        }
 
         let from = key.derive_address(&DEFAULT_SALT);
         let mut tx = Transaction {
@@ -717,7 +790,7 @@ impl LightClient {
         };
 
         let msg = tx.signing_message_for_chain(chain_id);
-        let sig_bytes = key.sign(&msg);
+        let sig_bytes = key.try_sign(&msg)?;
 
         let envelope = if is_activation {
             PqSignatureEnvelope::new_explicit_with_chain(
@@ -732,7 +805,7 @@ impl LightClient {
         };
 
         tx.signature = envelope.encode();
-        tx
+        Ok(tx)
     }
 
     /// Build a post-quantum transfer transaction bound to `chain_id`
@@ -749,7 +822,7 @@ impl LightClient {
         target_shard: u32,
         is_activation: bool,
         chain_id: u64,
-    ) -> Transaction {
+    ) -> Result<Transaction, String> {
         // NOTE: the CHAIN-BEARING envelope lives in `sharding` (salt +
         // chain id); the legacy `post_quantum` envelope cannot carry a
         // chain id. Both decode through the same `pq_envelope()` path.
@@ -757,11 +830,12 @@ impl LightClient {
         use stellereum::sharding::PqSignatureEnvelope;
 
         let scheme = key.scheme();
-        assert!(
-            scheme == PqScheme::Falcon512 || scheme == PqScheme::Hybrid,
-            "build_pq_transfer_tx_bound supports PqScheme::Falcon512 or PqScheme::Hybrid, got: {:?}",
-            scheme
-        );
+        if scheme != PqScheme::Falcon512 {
+            return Err(format!(
+                "build_pq_transfer_tx_bound requires PqScheme::Falcon512, got: {:?}",
+                scheme
+            ));
+        }
 
         let from = key.derive_address(&DEFAULT_SALT);
         let mut tx = Transaction {
@@ -779,7 +853,7 @@ impl LightClient {
         };
 
         let msg = tx.signing_message_for_chain(chain_id);
-        let sig_bytes = key.sign(&msg);
+        let sig_bytes = key.try_sign(&msg)?;
 
         let envelope = if is_activation {
             PqSignatureEnvelope::new_explicit_with_chain(
@@ -794,7 +868,7 @@ impl LightClient {
         };
 
         tx.signature = envelope.encode();
-        tx
+        Ok(tx)
     }
 
     /// Build a post-quantum transaction carrying an SVM payload (e.g.
@@ -816,15 +890,17 @@ impl LightClient {
         target_shard: u32,
         is_activation: bool,
         payload: Vec<stellereum::svm::OpCode>,
-    ) -> Transaction {
-        use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope, DEFAULT_SALT};
+    ) -> Result<Transaction, String> {
+        use stellereum::post_quantum::{PqScheme, DEFAULT_SALT};
+        use stellereum::sharding::PqSignatureEnvelope;
 
         let scheme = key.scheme();
-        assert!(
-            scheme == PqScheme::Falcon512 || scheme == PqScheme::Hybrid,
-            "build_pq_payload_tx supports PqScheme::Falcon512 or PqScheme::Hybrid, got: {:?}",
-            scheme
-        );
+        if scheme != PqScheme::Falcon512 {
+            return Err(format!(
+                "build_pq_payload_tx requires PqScheme::Falcon512, got: {:?}",
+                scheme
+            ));
+        }
 
         let from = key.derive_address(&DEFAULT_SALT);
         let mut tx = Transaction {
@@ -842,16 +918,21 @@ impl LightClient {
         };
 
         let msg = tx.signing_message();
-        let sig_bytes = key.sign(&msg);
+        let sig_bytes = key.try_sign(&msg)?;
 
         let envelope = if is_activation {
-            PqSignatureEnvelope::new_explicit(scheme, key.public_key().to_vec(), sig_bytes)
+            PqSignatureEnvelope::new_explicit_with_salt(
+                scheme,
+                key.public_key().to_vec(),
+                sig_bytes,
+                DEFAULT_SALT,
+            )
         } else {
             PqSignatureEnvelope::new_implicit(scheme, sig_bytes)
         };
 
         tx.signature = envelope.encode();
-        tx
+        Ok(tx)
     }
 
     /// Build a PQ-signed token-transfer transaction (`SysCallTokenTransfer`).
@@ -863,7 +944,7 @@ impl LightClient {
         nonce: u64,
         shard: u32,
         chain_id: u64,
-    ) -> Transaction {
+    ) -> Result<Transaction, String> {
         let from = signer.derive_address(&crate::pq::DEFAULT_SALT);
         let gas = stellereum::token::GAS_TOKEN_TRANSFER
             .max(stellereum::svm::GAS_BASIC_TRANSFER)
@@ -895,7 +976,7 @@ impl LightClient {
         nonce: u64,
         shard: u32,
         chain_id: u64,
-    ) -> Transaction {
+    ) -> Result<Transaction, String> {
         let from = signer.derive_address(&crate::pq::DEFAULT_SALT);
         let gas = stellereum::token::GAS_TOKEN_APPROVE
             .max(stellereum::svm::GAS_BASIC_TRANSFER)
@@ -930,7 +1011,7 @@ impl LightClient {
         nonce: u64,
         shard: u32,
         chain_id: u64,
-    ) -> Transaction {
+    ) -> Result<Transaction, String> {
         let from = signer.derive_address(&crate::pq::DEFAULT_SALT);
         let gas = stellereum::token::GAS_TOKEN_CREATE
             .max(stellereum::svm::GAS_BASIC_TRANSFER)
@@ -962,7 +1043,7 @@ impl LightClient {
         amount: u64,
         nonce: u64,
         chain_id: u64,
-    ) -> Transaction {
+    ) -> Result<Transaction, String> {
         let from = signer.derive_address(&crate::pq::DEFAULT_SALT);
         let gas = (stellereum::svm::GAS_STAKE_BOND + stellereum::svm::GAS_BASIC_TRANSFER)
             .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
@@ -987,7 +1068,7 @@ impl LightClient {
         amount: u64,
         nonce: u64,
         chain_id: u64,
-    ) -> Transaction {
+    ) -> Result<Transaction, String> {
         let from = signer.derive_address(&crate::pq::DEFAULT_SALT);
         let gas = (stellereum::svm::GAS_STAKE_UNBOND + stellereum::svm::GAS_BASIC_TRANSFER)
             .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
@@ -1011,7 +1092,7 @@ impl LightClient {
         validator: [u8; 32],
         nonce: u64,
         chain_id: u64,
-    ) -> Transaction {
+    ) -> Result<Transaction, String> {
         let from = signer.derive_address(&crate::pq::DEFAULT_SALT);
         let gas = (stellereum::svm::GAS_STAKE_UNBOND + stellereum::svm::GAS_BASIC_TRANSFER)
             .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
@@ -1036,7 +1117,7 @@ impl LightClient {
         is_delegator: bool,
         nonce: u64,
         chain_id: u64,
-    ) -> Transaction {
+    ) -> Result<Transaction, String> {
         let from = signer.derive_address(&crate::pq::DEFAULT_SALT);
         let gas = (stellereum::svm::GAS_STAKE_CLAIM + stellereum::svm::GAS_BASIC_TRANSFER)
             .saturating_add(stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS);
@@ -1119,7 +1200,7 @@ impl LightClient {
 
         let ob_cache_path = stellereum::wallet::default_wallet_dir().join("orderbook_cache.json");
         if let Ok(json) = serde_json::to_string(&*ob) {
-            let _ = std::fs::write(ob_cache_path, json);
+            let _ = write_private_file(&ob_cache_path, json.as_bytes());
         }
 
         Ok((order.order_id, trades.len()))
@@ -1132,7 +1213,7 @@ impl LightClient {
 
         let ob_cache_path = stellereum::wallet::default_wallet_dir().join("orderbook_cache.json");
         if let Ok(json) = serde_json::to_string(&*ob) {
-            let _ = std::fs::write(ob_cache_path, json);
+            let _ = write_private_file(&ob_cache_path, json.as_bytes());
         }
 
         Ok(cancelled.is_some())
@@ -1164,6 +1245,63 @@ impl LightClient {
             ]
         }
     }
+}
+
+/// Atomically persist private wallet state/cache data with POSIX 0600 permissions.
+pub fn write_private_file(path: &Path, data: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create parent directory {:?}: {e}", parent))?;
+    }
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("Invalid file path {:?}", path))?
+        .to_string_lossy();
+    let tmp_name = format!("{}.tmp.{}", file_name, std::process::id());
+    let tmp_path = match path.parent() {
+        Some(parent) => parent.join(tmp_name),
+        None => PathBuf::from(tmp_name),
+    };
+
+    {
+        use std::io::Write;
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open_opts.mode(0o600);
+        }
+
+        let mut file = open_opts
+            .open(&tmp_path)
+            .map_err(|e| format!("Failed to open temp file {:?}: {e}", tmp_path))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("Failed to set 0600 permissions on {:?}: {e}", tmp_path))?;
+        }
+
+        file.write_all(data)
+            .map_err(|e| format!("Failed to write temp file {:?}: {e}", tmp_path))?;
+        file.sync_all()
+            .map_err(|e| format!("Failed to sync temp file {:?}: {e}", tmp_path))?;
+    }
+
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| format!("Failed to rename {:?} to {:?}: {e}", tmp_path, path))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("Failed to enforce 0600 permissions on {:?}: {e}", path))?;
+    }
+
+    Ok(())
 }
 
 fn now_secs() -> u64 {

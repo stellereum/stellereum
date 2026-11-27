@@ -5,16 +5,13 @@
   "description": "Stellereum testnet: explorer + faucet (separate sites)",
   "workspaces": [
     "explorer",
-    "faucet",
     "backend"
   ],
   "scripts": {
     "dev:explorer": "npm run dev --workspace explorer",
-    "dev:faucet": "npm run dev --workspace faucet",
     "dev:backend": "npm run dev --workspace backend",
     "build": "npm run build --workspaces",
-    "build:explorer": "npm run build --workspace explorer",
-    "build:faucet": "npm run build --workspace faucet"
+    "build:explorer": "npm run build --workspace explorer"
   },
   "engines": {
     "node": ">=18"

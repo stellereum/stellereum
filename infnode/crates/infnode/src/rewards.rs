@@ -18,6 +18,7 @@ use crate::node::Node;
 const INTERVAL_SECS: u64 = 600; // 10 минут
 const UPTIME_WINDOW_MS: i64 = 24 * 3600 * 1000; // окно аптайма — 24 часа
 const REQ_TIMEOUT_SECS: u64 = 5;
+const MAX_PAYOUT_LEDGER_ENTRIES: usize = 10_000;
 
 /// Минимальная доля веса, которая начисляется за сам факт аптайма (даже если хранилище мало).
 /// 0.3 + 0.7 × ratio → надёжная мелкая нода не получает ~0.
@@ -221,6 +222,22 @@ fn load_state(p: &Path) -> serde_json::Map<String, Value> {
         .unwrap_or_default()
 }
 
+fn append_payout_ledger_capped(ledger_file: &Path, entry: Value, max_entries: usize) {
+    let mut ledger: Vec<Value> = std::fs::read_to_string(ledger_file)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    ledger.push(entry);
+    if max_entries > 0 && ledger.len() > max_entries {
+        let excess = ledger.len() - max_entries;
+        ledger.drain(..excess);
+    }
+    if let Ok(raw) = serde_json::to_string_pretty(&json!(ledger)) {
+        let _ = std::fs::write(ledger_file, raw);
+    }
+}
+
 /// Парсит node_id вида "inf1:<hex>" в массив байт [u8; NODEID_LEN].
 #[allow(dead_code)] // GATE: peer-id helper for rewards audit tooling
 fn pid(node_id: &str) -> [u8; crate::proto::NODEID_LEN] {
@@ -236,7 +253,10 @@ fn pid(node_id: &str) -> [u8; crate::proto::NODEID_LEN] {
 pub async fn run(node: &Arc<Node>, data_dir: &Path) -> Result<()> {
     let state_file = data_dir.join("rewards_state.json");
     let out_file = data_dir.join("rewards.json");
-    let mut state = load_state(&state_file);
+    let sf_init = state_file.clone();
+    let mut state = tokio::task::spawn_blocking(move || load_state(&sf_init))
+        .await
+        .unwrap_or_default();
 
     loop {
         let ts = now_ms();
@@ -447,21 +467,19 @@ pub async fn run(node: &Arc<Node>, data_dir: &Path) -> Result<()> {
             "payouts": payouts,
         });
 
-        let _ = std::fs::write(&state_file, serde_json::to_string(&json!(new_state))?);
+        let state_bytes = serde_json::to_string(&json!(new_state))?;
         let out = json!({ "ts": ts, "interval_secs": INTERVAL_SECS, "nodes": nodes });
-        let _ = std::fs::write(&out_file, serde_json::to_string_pretty(&out)?);
-
-        // append в payout_ledger.json (регистр распределения, читаемый оператором для Distribute)
+        let out_pretty = serde_json::to_string_pretty(&out)?;
+        let state_file_c = state_file.clone();
+        let out_file_c = out_file.clone();
         let ledger_file = data_dir.join("payout_ledger.json");
-        let mut ledger: Vec<Value> = std::fs::read_to_string(&ledger_file)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .and_then(|v| v.as_array().cloned())
-            .unwrap_or_default();
-        ledger.push(ledger_entry);
-        if let Ok(raw) = serde_json::to_string_pretty(&json!(ledger)) {
-            let _ = std::fs::write(&ledger_file, raw);
-        }
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = std::fs::write(&state_file_c, state_bytes);
+            let _ = std::fs::write(&out_file_c, out_pretty);
+            // append в payout_ledger.json (регистр распределения, читаемый оператором для Distribute)
+            append_payout_ledger_capped(&ledger_file, ledger_entry, MAX_PAYOUT_LEDGER_ENTRIES);
+        })
+        .await;
 
         eprintln!(
             "[rewards] rewards.json updated: {}",
@@ -603,6 +621,25 @@ mod tests {
         assert_eq!(rf_bytes[2], 1000, "uptime 0.7 should be rewarded");
         assert_eq!(rf_bytes[3], 1000, "uptime 0.2 should be 3rd");
         assert_eq!(rf_bytes[0], 0, "4th copy (uptime 0.1) must NOT be rewarded");
+    }
+
+    #[test]
+    fn payout_ledger_is_capped() {
+        let dir = std::env::temp_dir().join(format!("infnode-ledger-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger_file = dir.join("payout_ledger.json");
+
+        for i in 0..15 {
+            append_payout_ledger_capped(&ledger_file, json!({ "round": i }), 10);
+        }
+        let raw = std::fs::read_to_string(&ledger_file).unwrap();
+        let arr: Vec<Value> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(arr.len(), 10);
+        assert_eq!(arr.first().unwrap()["round"].as_i64(), Some(5));
+        assert_eq!(arr.last().unwrap()["round"].as_i64(), Some(14));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

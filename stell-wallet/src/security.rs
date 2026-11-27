@@ -105,6 +105,9 @@ pub struct HardenedKeystore {
     /// Optional post-quantum public key in hex
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pq_pubkey_hex: Option<String>,
+    /// Preserve unrecognized metadata when an older or newer keystore is saved.
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl HardenedKeystore {
@@ -138,12 +141,12 @@ impl HardenedKeystore {
             .map_err(|e| format!("Argon2 params error: {:?}", e))?;
         let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
-        let mut derived_key = [0u8; 32];
+        let mut derived_key = zeroize::Zeroizing::new([0u8; 32]);
         argon2
-            .hash_password_into(password.as_bytes(), &salt, &mut derived_key)
+            .hash_password_into(password.as_bytes(), &salt, &mut *derived_key)
             .map_err(|e| format!("Argon2 KDF failed: {:?}", e))?;
 
-        let cipher = XChaCha20Poly1305::new((&derived_key).into());
+        let cipher = XChaCha20Poly1305::new((&*derived_key).into());
         let mut nonce = [0u8; 24];
         OsRng.fill_bytes(&mut nonce);
         let xnonce = XNonce::from_slice(&nonce);
@@ -183,6 +186,7 @@ impl HardenedKeystore {
             auth_tag_hex: hex::encode(auth_tag),
             scheme: scheme.to_string(),
             pq_pubkey_hex,
+            extra: Default::default(),
         })
     }
 
@@ -210,9 +214,9 @@ impl HardenedKeystore {
             .map_err(|e| format!("Argon2 params error: {:?}", e))?;
         let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
-        let mut derived_key = [0u8; 32];
+        let mut derived_key = zeroize::Zeroizing::new([0u8; 32]);
         argon2
-            .hash_password_into(password.as_bytes(), &salt, &mut derived_key)
+            .hash_password_into(password.as_bytes(), &salt, &mut *derived_key)
             .map_err(|e| format!("Argon2 derivation error: {:?}", e))?;
 
         if nonce.len() != 24 {
@@ -221,7 +225,7 @@ impl HardenedKeystore {
                 nonce.len()
             ));
         }
-        let cipher = XChaCha20Poly1305::new((&derived_key).into());
+        let cipher = XChaCha20Poly1305::new((&*derived_key).into());
         let xnonce = XNonce::from_slice(&nonce);
 
         // Reconstruct full AEAD payload (ciphertext + tag)
@@ -236,22 +240,24 @@ impl HardenedKeystore {
             self.pq_pubkey_hex.as_deref(),
         );
 
-        let mut decrypted = cipher
-            .decrypt(xnonce, Payload { msg: &full_ct, aad: &aad })
-            .map_err(|_| "Decryption failed: incorrect password, tampered keystore, or address/metadata mismatch!".to_string())?;
+        let mut decrypted = zeroize::Zeroizing::new(
+            cipher
+                .decrypt(xnonce, Payload { msg: &full_ct, aad: &aad })
+                .map_err(|_| "Decryption failed: incorrect password, tampered keystore, or address/metadata mismatch!".to_string())?,
+        );
 
-        derived_key.zeroize();
+        drop(derived_key);
 
         if decrypted.len() != 32 {
-            decrypted.zeroize();
             return Err("Decrypted secret has invalid length".to_string());
         }
 
-        let mut secret_arr = [0u8; 32];
+        let mut secret_arr = zeroize::Zeroizing::new([0u8; 32]);
         secret_arr.copy_from_slice(&decrypted);
         decrypted.zeroize();
 
-        Ok(SecureSecret::new(secret_arr))
+        let out = SecureSecret::new(*secret_arr);
+        Ok(out)
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
@@ -378,4 +384,40 @@ pub fn format_address_with_visual_checksum(address_hex: &str) -> String {
         mid.white(),
         suffix.green().bold()
     )
+}
+
+#[cfg(test)]
+mod legacy_keystore_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_keystore_metadata_and_secret_survive_read_and_write() {
+        let secret = SecureSecret::new([73; 32]);
+        for scheme in ["ed25519", "hybrid", "mldsa44", "future-scheme"] {
+            let store = HardenedKeystore::encrypt_with_scheme(
+                &secret,
+                "legacy-address",
+                "password",
+                scheme,
+                None,
+            )
+            .unwrap();
+            let mut json = serde_json::to_value(store).unwrap();
+            json["future_field"] = serde_json::json!({"preserve": [1, 2, 3]});
+            if scheme == "ed25519" {
+                json.as_object_mut().unwrap().remove("scheme");
+            }
+            let loaded: HardenedKeystore = serde_json::from_value(json).unwrap();
+            assert_eq!(loaded.scheme, scheme);
+            assert_eq!(loaded.decrypt("password").unwrap().bytes, secret.bytes);
+            let saved = serde_json::to_value(&loaded).unwrap();
+            assert_eq!(
+                saved["future_field"]["preserve"],
+                serde_json::json!([1, 2, 3])
+            );
+            let reloaded: HardenedKeystore = serde_json::from_value(saved).unwrap();
+            assert_eq!(reloaded.scheme, scheme);
+            assert_eq!(reloaded.decrypt("password").unwrap().bytes, secret.bytes);
+        }
+    }
 }

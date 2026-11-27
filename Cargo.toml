@@ -16,6 +16,7 @@ members = [
     "stellereum-indexer",
     "stellereum-upgrader",
     "stellereum-ledger-tool",
+    "stellereum-verifier",
 ]
 exclude = [
     "stellereum-contracts",
@@ -24,6 +25,10 @@ exclude = [
     "scripts/tools/stelops",
     "scripts/loadtest/loadtest",
     "infnode/tools/ec-mail-recovery",
+    # Independent browser signer: a `cdylib` for `wasm32-unknown-unknown` only.
+    # It must not join the native workspace (its `getrandom` custom backend and
+    # wasm-only cdylib target would leak into native builds).
+    "stellereum-wasm",
 ]
 resolver = "2"
 

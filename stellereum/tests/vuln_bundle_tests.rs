@@ -340,7 +340,7 @@ async fn persist_queue_full_counts_drops() {
     let before = stellereum::metrics::global()
         .snapshot()
         .persist_queue_dropped;
-    let ap = AsyncPersistence::start(storage);
+    let (ap, _release_gate) = AsyncPersistence::start_gated_for_test(storage);
     for _ in 0..PERSIST_QUEUE_CAP + 5 {
         ap.enqueue_prune(1);
     }

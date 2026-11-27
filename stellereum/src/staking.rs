@@ -287,6 +287,23 @@ pub const DOWNTIME_SLASH_BPS: u64 = 10;
 /// `ceil(duration_ms / 240)`; the resulting wall-clock is always >= the
 /// intent. Full table: `docs/RULESET_V2.md`.
 pub const DOWNTIME_MISS_THRESHOLD: u32 = 42;
+/// Jail budget v2 downtime miss threshold: 200 heights (`200 * 400 ms = 80.0 s`
+/// outage tolerance), gated behind
+/// [`crate::chain_spec::JAIL_BUDGET_V2_ACTIVATION_HEIGHT`] (`u64::MAX`, INERT).
+pub const DOWNTIME_MISS_THRESHOLD_V2: u32 = 200;
+
+/// Effective downtime miss threshold at `height`.
+///
+/// Returns [`DOWNTIME_MISS_THRESHOLD_V2`] (`200`) when
+/// [`crate::chain_spec::jail_budget_v2_active_at`] is true for `height`, and
+/// [`DOWNTIME_MISS_THRESHOLD`] (`42`) otherwise.
+pub fn downtime_miss_threshold_at(height: u64) -> u32 {
+    if crate::chain_spec::jail_budget_v2_active_at(height) {
+        DOWNTIME_MISS_THRESHOLD_V2
+    } else {
+        DOWNTIME_MISS_THRESHOLD
+    }
+}
 /// Minimum heights between two downtime slashes for the same validator, so a
 /// long outage costs a bounded amount rather than draining the whole bond.
 ///
@@ -1150,31 +1167,41 @@ fn mul_div_floor(a: u128, b: u128, d: u128) -> u128 {
 ///  - general case: quorum needs 100% of the set, i.e. losing even the
 ///    smallest validator already drops below quorum (`total - min < quorum`).
 ///    Otherwise `None`.
-pub fn validator_powers_fragility(powers: &[u64]) -> Option<String> {
-    let n = powers.len();
+fn fragility_from_summary(
+    n: usize,
+    total: u64,
+    min: u64,
+    equal_three: Option<u64>,
+) -> Option<String> {
     if n == 0 {
         return Some("fragile validator set: empty set cannot reach quorum".to_string());
     }
-    let total = powers.iter().fold(0u64, |a, &p| a.saturating_add(p));
     if total == 0 {
         return Some("fragile validator set: zero total power cannot reach quorum".to_string());
     }
     // Same curve as `ValidatorSet::quorum_power` (floor(2T/3)+1), in u128 so
     // a huge total cannot wrap the `*2`.
     let quorum = ((total as u128 * 2) / 3 + 1).min(u64::MAX as u128) as u64;
-    if n == 3 && powers[0] == powers[1] && powers[1] == powers[2] {
+    if let Some(p) = equal_three {
         return Some(format!(
-            "fragile validator set: N=3 equal power ({}) needs 3/3 for quorum {quorum} of {total}: any single halt stops the chain",
-            powers[0]
+            "fragile validator set: N=3 equal power ({p}) needs 3/3 for quorum {quorum} of {total}: any single halt stops the chain",
         ));
     }
-    let min = powers.iter().copied().min().unwrap_or(0);
     if total.saturating_sub(min) < quorum {
         return Some(format!(
             "fragile validator set: quorum {quorum} of total {total} requires 100% of the set: losing even the smallest validator ({min}) stops the chain"
         ));
     }
     None
+}
+
+pub fn validator_powers_fragility(powers: &[u64]) -> Option<String> {
+    let n = powers.len();
+    let total = powers.iter().fold(0u64, |a, &p| a.saturating_add(p));
+    let min = powers.iter().copied().min().unwrap_or(0);
+    let equal_three =
+        (n == 3 && powers[0] == powers[1] && powers[1] == powers[2]).then_some(powers[0]);
+    fragility_from_summary(n, total, min, equal_three)
 }
 
 /// Structural registration bound (papers/13_grinding_and_structural_capture.md
@@ -2755,10 +2782,50 @@ impl StakingLedger {
     /// [`Self::to_validator_set`): `Some(reason)` when the set is fragile —
     /// see [`validator_powers_fragility`]. This is the verdict `main.rs`
     /// WARNs about and `stell_getValidators` reports as `fragile`.
+    ///
+    /// Computes fragility directly over `self.validators` active power without
+    /// allocating or sorting a full `ValidatorSet` in the common
+    /// `<= MAX_ACTIVE_VALIDATORS` case.
     pub fn quorum_fragility(&self) -> Option<String> {
-        let vs = self.to_validator_set();
-        let powers: Vec<u64> = vs.validators.values().copied().collect();
-        validator_powers_fragility(&powers)
+        let min_bond = self.min_validator_bond.unwrap_or(MIN_VALIDATOR_BOND);
+        let mut n = 0usize;
+        let mut total = 0u64;
+        let mut min = u64::MAX;
+        let mut first_three = [0u64; 3];
+        for (id, v) in &self.validators {
+            if v.self_bond < min_bond || self.jail.contains_key(id) {
+                continue;
+            }
+            let power = v.total();
+            if power == 0 {
+                continue;
+            }
+            if n < 3 {
+                first_three[n] = power;
+            }
+            n += 1;
+            total = total.saturating_add(power);
+            min = min.min(power);
+            if n > MAX_ACTIVE_VALIDATORS {
+                let mut powers: Vec<u64> = self
+                    .validators
+                    .iter()
+                    .filter(|(id, v)| v.self_bond >= min_bond && !self.jail.contains_key(*id))
+                    .map(|(_, v)| v.total())
+                    .filter(|&p| p > 0)
+                    .collect();
+                let keep = MAX_ACTIVE_VALIDATORS;
+                if powers.len() > keep {
+                    powers.select_nth_unstable_by(keep - 1, |a, b| b.cmp(a));
+                    powers.truncate(keep);
+                }
+                return validator_powers_fragility(&powers);
+            }
+        }
+        let equal_three =
+            (n == 3 && first_three[0] == first_three[1] && first_three[1] == first_three[2])
+                .then_some(first_three[0]);
+        fragility_from_summary(n, total, min, equal_three)
     }
 
     /// Loud-by-design: every stake mutation that leaves a fragile set logs a
@@ -4433,6 +4500,7 @@ impl StakingLedger {
         //
         // `slash` already does all of this correctly, so the fix is to use it. It
         // needs `&mut self`, hence the two-phase structure.
+        let miss_threshold = downtime_miss_threshold_at(height);
         let mut penalise: Vec<ValidatorId> = Vec::new();
         for v in eligible {
             // Resolve the id whose record currently owns this stake. The
@@ -4460,7 +4528,7 @@ impl StakingLedger {
             let cooled = (rec.last_downtime_penalty == 0 || height >= rec.last_downtime_penalty)
                 && (rec.last_downtime_penalty == 0
                     || height - rec.last_downtime_penalty >= DOWNTIME_PENALTY_COOLDOWN);
-            if rec.missed >= DOWNTIME_MISS_THRESHOLD && cooled {
+            if rec.missed >= miss_threshold && cooled {
                 rec.last_downtime_penalty = height;
                 rec.missed = 0;
                 penalise.push(target);
@@ -5146,6 +5214,482 @@ impl StakingLedger {
         }
         Ok(())
     }
+
+    /// Plan a single-validator staking slice against an immutable
+    /// `&StakingLedger` without cloning the ledger.
+    ///
+    /// # Staleness contract
+    ///
+    /// A delta carries a **whole** `ValidatorStake` snapshot, so two deltas that
+    /// touch the SAME validator must never be planned against the same base:
+    /// the later `apply_tx_delta` would revert fields the earlier one changed.
+    /// The parallel executor guarantees this by keying every staking op on
+    /// `ResourceKeyV2::Validator(id)` with `AccessMode::Write`, which forces
+    /// same-validator operations into different waves. Any new caller must
+    /// either apply each same-validator delta before planning the next, or key
+    /// them the same way.
+    pub fn plan_tx_slice(&self, op: StakingTxSliceOp) -> Result<StakingTxDelta, StakingError> {
+        match op {
+            StakingTxSliceOp::Delegate {
+                delegator,
+                validator,
+                amount,
+            } => self.plan_delegate(delegator, validator, amount),
+            StakingTxSliceOp::Unbond {
+                validator,
+                amount,
+                now,
+            } => self.plan_unbond(validator, amount, now),
+            StakingTxSliceOp::BeginUndelegate {
+                delegator,
+                validator,
+                amount,
+                now,
+            } => self.plan_begin_undelegate(delegator, validator, amount, now),
+            StakingTxSliceOp::Undelegate {
+                delegator,
+                validator,
+            } => self.plan_undelegate(delegator, validator),
+            StakingTxSliceOp::ClaimRewards { validator } => self.plan_claim_rewards(validator),
+            StakingTxSliceOp::ClaimDelegatorRewards {
+                delegator,
+                validator,
+            } => self.plan_claim_delegator_rewards(delegator, validator),
+            StakingTxSliceOp::WithdrawSelfBond { validator } => {
+                self.plan_withdraw_self_bond(validator)
+            }
+        }
+    }
+
+    /// Read-only planning helper computing the settled delegator reward and
+    /// updated checkpoint without mutating `self`.
+    fn plan_settle_delegator_rewards(
+        &self,
+        delegator: [u8; 32],
+        validator: ValidatorId,
+    ) -> (Vec<StagedStakeAmount>, Vec<StagedStakeCheckpoint>) {
+        let key = (validator, delegator);
+        let pending = self.unsettled_delegator_rewards(delegator, validator);
+        let mut delegator_rewards = Vec::new();
+        if pending > 0 {
+            let amount = pending.min(u64::MAX as u128) as u64;
+            let cur = self.delegator_rewards.get(&key).copied().unwrap_or(0);
+            delegator_rewards.push((key, cur.saturating_add(amount)));
+        }
+        let rate_now = self.reward_rate(&validator);
+        let mut delegator_checkpoints = Vec::new();
+        if rate_now > 0 || self.delegator_reward_checkpoints.contains_key(&key) {
+            delegator_checkpoints.push((key, rate_now));
+        }
+        (delegator_rewards, delegator_checkpoints)
+    }
+
+    /// Plan [`Self::delegate`] against an immutable `&StakingLedger`.
+    pub fn plan_delegate(
+        &self,
+        delegator: [u8; 32],
+        validator: ValidatorId,
+        amount: u64,
+    ) -> Result<StakingTxDelta, StakingError> {
+        if delegator == [0u8; 32] {
+            return Err(StakingError::ZeroAddress);
+        }
+        if amount < MIN_DELEGATION {
+            return Err(StakingError::DelegationBelowMinimum);
+        }
+        let v = self
+            .validators
+            .get(&validator)
+            .ok_or(StakingError::NotValidator)?;
+        let held = self
+            .delegations
+            .get(&(validator, delegator))
+            .copied()
+            .unwrap_or(0);
+        if v.self_bond < MIN_VALIDATOR_BOND {
+            return Err(StakingError::NotValidator);
+        }
+        if self.jail.contains_key(&validator) {
+            return Err(StakingError::Jailed);
+        }
+        if held == 0 && self.delegation_count(&validator) >= MAX_DELEGATORS_PER_VALIDATOR {
+            return Err(StakingError::DelegationCapReached);
+        }
+        let new_delegated = v
+            .delegated
+            .checked_add(amount)
+            .ok_or(StakingError::ArithmeticOverflow)?;
+        let new_held = held
+            .checked_add(amount)
+            .ok_or(StakingError::ArithmeticOverflow)?;
+        let (delegator_rewards, delegator_checkpoints) =
+            self.plan_settle_delegator_rewards(delegator, validator);
+        let mut new_v = v.clone();
+        new_v.delegated = new_delegated;
+        Ok(StakingTxDelta {
+            validator_id: validator,
+            validator: Some(new_v),
+            reward_acc: None,
+            delegations: vec![((validator, delegator), new_held)],
+            delegator_rewards,
+            delegator_checkpoints,
+            withdrawable: Vec::new(),
+            appended_unbonding: Vec::new(),
+            rewards_pool_debit: 0,
+            staking_pool_delta: amount as i128,
+        })
+    }
+
+    /// Plan [`Self::unbond`] against an immutable `&StakingLedger`.
+    pub fn plan_unbond(
+        &self,
+        validator: ValidatorId,
+        amount: u64,
+        now: u64,
+    ) -> Result<StakingTxDelta, StakingError> {
+        let v = self
+            .validators
+            .get(&validator)
+            .ok_or(StakingError::NotValidator)?;
+        if amount > v.self_bond {
+            return Err(StakingError::InsufficientBond);
+        }
+        let locked = self.locked_governance.get(&validator).copied().unwrap_or(0);
+        if amount > v.self_bond.saturating_sub(locked) {
+            return Err(StakingError::LockedInGovernanceVote);
+        }
+        let remaining = v.self_bond - amount;
+        if remaining != 0 && remaining < required_bond_floor_nano() {
+            return Err(StakingError::BondBelowMinimum);
+        }
+        let mut new_v = v.clone();
+        new_v.self_bond = remaining;
+        Ok(StakingTxDelta {
+            validator_id: validator,
+            validator: Some(new_v),
+            reward_acc: None,
+            delegations: Vec::new(),
+            delegator_rewards: Vec::new(),
+            delegator_checkpoints: Vec::new(),
+            withdrawable: Vec::new(),
+            appended_unbonding: vec![UnbondingEntry {
+                validator,
+                owner: None,
+                amount,
+                release_at: now.saturating_add(UNBONDING_PERIOD_SECS),
+            }],
+            rewards_pool_debit: 0,
+            staking_pool_delta: 0,
+        })
+    }
+
+    /// Plan [`Self::undelegate`] (`SysCallBeginUndelegate`) against an
+    /// immutable `&StakingLedger`.
+    pub fn plan_begin_undelegate(
+        &self,
+        delegator: [u8; 32],
+        validator: ValidatorId,
+        amount: u64,
+        now: u64,
+    ) -> Result<StakingTxDelta, StakingError> {
+        let key = (validator, delegator);
+        let current = self.delegations.get(&key).copied().unwrap_or(0);
+        if amount > current {
+            return Err(StakingError::InsufficientDelegation);
+        }
+        let locked = self.locked_governance.get(&delegator).copied().unwrap_or(0);
+        if amount > current.saturating_sub(locked) {
+            return Err(StakingError::LockedInGovernanceVote);
+        }
+        let v = self
+            .validators
+            .get(&validator)
+            .ok_or(StakingError::NotValidator)?;
+        let (delegator_rewards, delegator_checkpoints) =
+            self.plan_settle_delegator_rewards(delegator, validator);
+        let mut new_v = v.clone();
+        new_v.delegated = new_v.delegated.saturating_sub(amount);
+        Ok(StakingTxDelta {
+            validator_id: validator,
+            validator: Some(new_v),
+            reward_acc: None,
+            delegations: vec![(key, current - amount)],
+            delegator_rewards,
+            delegator_checkpoints,
+            withdrawable: Vec::new(),
+            appended_unbonding: vec![UnbondingEntry {
+                validator,
+                owner: Some(delegator),
+                amount,
+                release_at: now.saturating_add(UNBONDING_PERIOD_SECS),
+            }],
+            rewards_pool_debit: 0,
+            staking_pool_delta: 0,
+        })
+    }
+
+    /// Plan [`Self::withdraw_delegator`] (`SysCallUndelegate`) against an
+    /// immutable `&StakingLedger`.
+    pub fn plan_undelegate(
+        &self,
+        delegator: [u8; 32],
+        validator: ValidatorId,
+    ) -> Result<StakingTxDelta, StakingError> {
+        if delegator == [0u8; 32] {
+            return Err(StakingError::ZeroAddress);
+        }
+        let key = (validator, delegator);
+        let amount = self.withdrawable.get(&key).copied().unwrap_or(0);
+        if amount == 0 {
+            return Err(StakingError::NothingToWithdraw);
+        }
+        Ok(StakingTxDelta {
+            validator_id: validator,
+            validator: None,
+            reward_acc: None,
+            delegations: Vec::new(),
+            delegator_rewards: Vec::new(),
+            delegator_checkpoints: Vec::new(),
+            withdrawable: vec![(key, 0)],
+            appended_unbonding: Vec::new(),
+            rewards_pool_debit: 0,
+            staking_pool_delta: -(amount as i128),
+        })
+    }
+
+    /// Plan [`Self::claim_validator_rewards`] (`SysCallClaimRewards`) against
+    /// an immutable `&StakingLedger`.
+    pub fn plan_claim_rewards(
+        &self,
+        validator: ValidatorId,
+    ) -> Result<StakingTxDelta, StakingError> {
+        let v = self
+            .validators
+            .get(&validator)
+            .ok_or(StakingError::NotValidator)?;
+        let pending = v.pending_rewards;
+        if pending > self.rewards_pool {
+            return Err(StakingError::RewardsPoolShortfall);
+        }
+        let mut new_v = v.clone();
+        new_v.pending_rewards = 0;
+        Ok(StakingTxDelta {
+            validator_id: validator,
+            validator: Some(new_v),
+            reward_acc: None,
+            delegations: Vec::new(),
+            delegator_rewards: Vec::new(),
+            delegator_checkpoints: Vec::new(),
+            withdrawable: Vec::new(),
+            appended_unbonding: Vec::new(),
+            rewards_pool_debit: pending,
+            staking_pool_delta: 0,
+        })
+    }
+
+    /// Plan [`Self::claim_delegator_rewards`] (`SysCallClaimDelegatorRewards`)
+    /// against an immutable `&StakingLedger`.
+    pub fn plan_claim_delegator_rewards(
+        &self,
+        delegator: [u8; 32],
+        validator: ValidatorId,
+    ) -> Result<StakingTxDelta, StakingError> {
+        let key = (validator, delegator);
+        let amount = self.delegator_rewards_of(delegator, validator);
+        if amount == 0 || amount > self.rewards_pool {
+            return Ok(StakingTxDelta {
+                validator_id: validator,
+                ..Default::default()
+            });
+        }
+        let delegator_rewards = if self.delegator_rewards.contains_key(&key) {
+            vec![(key, 0)]
+        } else {
+            Vec::new()
+        };
+        let rate_now = self.reward_rate(&validator);
+        let delegator_checkpoints =
+            if rate_now > 0 || self.delegator_reward_checkpoints.contains_key(&key) {
+                vec![(key, rate_now)]
+            } else {
+                Vec::new()
+            };
+        let reward_acc = self
+            .reward_accumulators
+            .get(&validator)
+            .cloned()
+            .map(|mut state| {
+                state.remaining_rewards = state.remaining_rewards.saturating_sub(amount as u128);
+                state
+            });
+        Ok(StakingTxDelta {
+            validator_id: validator,
+            validator: None,
+            reward_acc,
+            delegations: Vec::new(),
+            delegator_rewards,
+            delegator_checkpoints,
+            withdrawable: Vec::new(),
+            appended_unbonding: Vec::new(),
+            rewards_pool_debit: amount,
+            staking_pool_delta: 0,
+        })
+    }
+
+    /// Plan [`Self::withdraw`] (`SysCallWithdrawSelfBond`) against an
+    /// immutable `&StakingLedger`.
+    pub fn plan_withdraw_self_bond(
+        &self,
+        validator: ValidatorId,
+    ) -> Result<StakingTxDelta, StakingError> {
+        let key = (validator, [0u8; 32]);
+        let amount = self.withdrawable.get(&key).copied().unwrap_or(0);
+        if amount == 0 {
+            return Err(StakingError::NothingToWithdraw);
+        }
+        Ok(StakingTxDelta {
+            validator_id: validator,
+            validator: None,
+            reward_acc: None,
+            delegations: Vec::new(),
+            delegator_rewards: Vec::new(),
+            delegator_checkpoints: Vec::new(),
+            withdrawable: vec![(key, 0)],
+            appended_unbonding: Vec::new(),
+            rewards_pool_debit: 0,
+            staking_pool_delta: -(amount as i128),
+        })
+    }
+
+    /// Commit a planned [`StakingTxDelta`] into this ledger.
+    ///
+    /// Checks `rewards_pool >= delta.rewards_pool_debit` before mutating any
+    /// state, removes `0` delegations/rewards/checkpoints/withdrawable entries
+    /// identically to sequential `StakingLedger` methods, and appends
+    /// `appended_unbonding` in commit order.
+    ///
+    /// # Staleness (read before batching)
+    ///
+    /// `delta.validator` REPLACES the stored `ValidatorStake` wholesale. Two
+    /// deltas for the same validator planned from one base therefore lose the
+    /// first one's changes. Batch only deltas whose validator ids are disjoint
+    /// (exactly what `DisjointScheduler::schedule_v2` enforces), or interleave
+    /// plan/apply per validator.
+    pub fn apply_tx_delta(&mut self, delta: StakingTxDelta) -> Result<(), StakingError> {
+        if delta.rewards_pool_debit > self.rewards_pool {
+            return Err(StakingError::RewardsPoolShortfall);
+        }
+        self.rewards_pool -= delta.rewards_pool_debit;
+
+        if let Some(v) = delta.validator {
+            self.validators.insert(delta.validator_id, v);
+        }
+        if let Some(acc) = delta.reward_acc {
+            self.reward_accumulators.insert(delta.validator_id, acc);
+        }
+        for (key, amt) in delta.delegations {
+            if amt == 0 {
+                self.delegations.remove(&key);
+            } else {
+                self.delegations.insert(key, amt);
+            }
+        }
+        for (key, amt) in delta.delegator_rewards {
+            if amt == 0 {
+                self.delegator_rewards.remove(&key);
+            } else {
+                self.delegator_rewards.insert(key, amt);
+            }
+        }
+        for (key, cp) in delta.delegator_checkpoints {
+            if cp == 0 {
+                self.delegator_reward_checkpoints.remove(&key);
+            } else {
+                self.delegator_reward_checkpoints.insert(key, cp);
+            }
+        }
+        for (key, amt) in delta.withdrawable {
+            if amt == 0 {
+                self.withdrawable.remove(&key);
+            } else {
+                self.withdrawable.insert(key, amt);
+            }
+        }
+        self.unbonding.extend(delta.appended_unbonding);
+        Ok(())
+    }
+}
+
+/// `(validator, delegator) -> u64` staging pair used by the staking overlay.
+pub type StagedStakeAmount = (([u8; 32], [u8; 32]), u64);
+/// `(validator, delegator) -> u128` checkpoint pair used by the staking overlay.
+pub type StagedStakeCheckpoint = (([u8; 32], [u8; 32]), u128);
+
+/// Per-validator delta overlay produced by planning a single-validator staking
+/// operation against an immutable `&StakingLedger`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StakingTxDelta {
+    pub validator_id: ValidatorId,
+    pub validator: Option<ValidatorStake>,
+    pub reward_acc: Option<ValidatorRewardState>,
+    pub delegations: Vec<StagedStakeAmount>,
+    pub delegator_rewards: Vec<StagedStakeAmount>,
+    pub delegator_checkpoints: Vec<StagedStakeCheckpoint>,
+    pub withdrawable: Vec<StagedStakeAmount>,
+    pub appended_unbonding: Vec<UnbondingEntry>,
+    pub rewards_pool_debit: u64,
+    pub staking_pool_delta: i128,
+}
+
+impl StakingTxDelta {
+    /// Reward payout debited from `REWARDS_POOL` by this delta.
+    pub fn claimed_rewards(&self) -> u64 {
+        self.rewards_pool_debit
+    }
+
+    /// Matured principal payout withdrawn from `STAKING_POOL` by this delta.
+    pub fn withdrawn_amount(&self) -> u64 {
+        if self.staking_pool_delta < 0 {
+            (-self.staking_pool_delta) as u64
+        } else {
+            0
+        }
+    }
+}
+
+/// Operation descriptor for [`StakingLedger::plan_tx_slice`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StakingTxSliceOp {
+    Delegate {
+        delegator: [u8; 32],
+        validator: ValidatorId,
+        amount: u64,
+    },
+    Unbond {
+        validator: ValidatorId,
+        amount: u64,
+        now: u64,
+    },
+    BeginUndelegate {
+        delegator: [u8; 32],
+        validator: ValidatorId,
+        amount: u64,
+        now: u64,
+    },
+    Undelegate {
+        delegator: [u8; 32],
+        validator: ValidatorId,
+    },
+    ClaimRewards {
+        validator: ValidatorId,
+    },
+    ClaimDelegatorRewards {
+        delegator: [u8; 32],
+        validator: ValidatorId,
+    },
+    WithdrawSelfBond {
+        validator: ValidatorId,
+    },
 }
 
 /// `StakingLedger` as written before the E2 rewards-pool fix (no

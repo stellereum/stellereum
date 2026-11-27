@@ -558,8 +558,130 @@ fn select_committee_from_seed(
     selected
 }
 
-/// Canonical parent-hash sortition committee selector (v5 draw, byte-pinned).
-pub fn derive_sortition_committee(
+/// Maximum number of rejection-sampling draws before falling back
+/// deterministically (probability of exhausting 64 attempts is `< 2^-64`).
+pub const SORTITION_UNBIASED_MAX_ATTEMPTS: u32 = 64;
+
+/// Unbiased 64-bit rejection sampling over `[0, modulus)` using BLAKE3 key
+/// derivation.
+///
+/// Computes `limit = (1u128 << 64) - ((1u128 << 64) % (modulus as u128))` and
+/// draws `u64` values from `BLAKE3(domain, seed, [step,] attempt: u32)`,
+/// returning `(rand_val as u128 % modulus) as u64` for the first draw with
+/// `(rand_val as u128) < limit`. Bounded at [`SORTITION_UNBIASED_MAX_ATTEMPTS`]
+/// attempts with a deterministic fallback if exhausted.
+pub(crate) fn rejection_sample_u64(
+    domain: &str,
+    seed: &[u8; 32],
+    step: Option<u32>,
+    modulus: u64,
+) -> u64 {
+    debug_assert!(modulus > 0);
+    let modulus_u128 = modulus as u128;
+    let two_pow_64 = 1u128 << 64;
+    let limit = two_pow_64 - (two_pow_64 % modulus_u128);
+    let mut last_rand = 0u64;
+    for attempt in 0..SORTITION_UNBIASED_MAX_ATTEMPTS {
+        let mut hasher = blake3::Hasher::new_derive_key(domain);
+        hasher.update(seed);
+        if let Some(s) = step {
+            hasher.update(&s.to_le_bytes());
+        }
+        hasher.update(&attempt.to_le_bytes());
+        let hash = hasher.finalize();
+        let rand_val = u64::from_le_bytes(
+            hash.as_bytes()[0..8]
+                .try_into()
+                .expect("blake3 digest is 32 bytes"),
+        );
+        last_rand = rand_val;
+        if (rand_val as u128) < limit {
+            return ((rand_val as u128) % modulus_u128) as u64;
+        }
+    }
+    ((last_rand as u128) % modulus_u128) as u64
+}
+
+/// Height-gated stake-weighted without-replacement committee draw from a
+/// pre-derived 32-byte seed and domain separator (`W6-A7-7`).
+///
+/// Below [`crate::chain_spec::SORTITION_UNBIASED_ACTIVATION_HEIGHT`], delegates
+/// to [`select_committee_from_seed`] (`rand_val % total_power`), preserving
+/// 100% byte-identical legacy output. At/above activation, draws each ticket via
+/// exact 64-bit rejection sampling ([`rejection_sample_u64`]).
+pub fn select_committee_from_seed_at(
+    validators: &ValidatorSet,
+    committee_size: u32,
+    domain: &str,
+    seed: &[u8; 32],
+    height: Height,
+) -> Vec<ValidatorId> {
+    if !crate::chain_spec::sortition_unbiased_active_at(height) {
+        return select_committee_from_seed(validators, committee_size, domain, seed);
+    }
+
+    if committee_size == 0 || validators.is_empty() || validators.total_power() == 0 {
+        return Vec::new();
+    }
+
+    let pool: Vec<(ValidatorId, u64)> = validators
+        .validators
+        .iter()
+        .filter(|(_, &p)| p > 0)
+        .map(|(&id, &p)| (id, p))
+        .collect();
+
+    let target_k = (committee_size as usize).min(pool.len());
+    if target_k == 0 {
+        return Vec::new();
+    }
+    if target_k == pool.len() {
+        let mut ids: Vec<ValidatorId> = pool.into_iter().map(|(id, _)| id).collect();
+        ids.sort_unstable();
+        return ids;
+    }
+
+    let mut selected = Vec::with_capacity(target_k);
+    let mut total_power: u64 = pool.iter().fold(0u64, |acc, (_, p)| acc.saturating_add(*p));
+
+    let ids: Vec<ValidatorId> = pool.iter().map(|(id, _)| *id).collect();
+    let mut weights: Vec<u64> = pool.iter().map(|(_, p)| *p).collect();
+    let mut index = StableWeightIndex::new(&weights);
+
+    for step in 0..target_k {
+        if total_power == 0 {
+            break;
+        }
+
+        let ticket = rejection_sample_u64(domain, seed, Some(step as u32), total_power);
+
+        let chosen_idx = {
+            let idx = index.first_prefix_gt(ticket as u128);
+            if idx < ids.len() {
+                idx
+            } else {
+                0
+            }
+        };
+
+        let winner_id = ids[chosen_idx];
+        let winner_power = weights[chosen_idx];
+        weights[chosen_idx] = 0;
+        index.remove(chosen_idx, winner_power);
+        total_power = total_power.saturating_sub(winner_power);
+        selected.push(winner_id);
+    }
+
+    selected.sort_unstable();
+    selected
+}
+
+/// Height-gated parent-hash sortition committee selector (`W6-A7-7`).
+///
+/// Below `SORTITION_UNBIASED_ACTIVATION_HEIGHT`, byte-identical to the legacy
+/// v5 draw (`rand_val % total_power`); at/above activation, uses unbiased
+/// rejection sampling via [`select_committee_from_seed_at`].
+pub fn derive_sortition_committee_at(
     validators: &ValidatorSet,
     height: Height,
     round: Round,
@@ -573,7 +695,24 @@ pub fn derive_sortition_committee(
     // Per-(height, round) seed: the parent block hash is the only entropy
     // that is not known before the chain reaches this height.
     let seed = sortition_seed(prev_block_hash, height, round);
-    select_committee_from_seed(validators, committee_size, SORTITION_DRAW_DOMAIN, &seed)
+    select_committee_from_seed_at(
+        validators,
+        committee_size,
+        SORTITION_DRAW_DOMAIN,
+        &seed,
+        height,
+    )
+}
+
+/// Canonical parent-hash sortition committee selector (v5 draw, byte-pinned).
+pub fn derive_sortition_committee(
+    validators: &ValidatorSet,
+    height: Height,
+    round: Round,
+    committee_size: u32,
+    prev_block_hash: &[u8; 32],
+) -> Vec<ValidatorId> {
+    derive_sortition_committee_at(validators, height, round, committee_size, prev_block_hash)
 }
 
 /// Domain separator of the sortition draw (v5 = parent-block entropy).
@@ -698,7 +837,13 @@ pub fn beacon_draw_committee(
     // Same weighted without-replacement ticket loop as the parent-hash draw,
     // but seeded by the epoch-bound beacon instead of the parent hash.
     let seed = beacon_seed(beacon_output, beacon_epoch, height, round);
-    select_committee_from_seed(validators, committee_size, BEACON_DRAW_DOMAIN, &seed)
+    select_committee_from_seed_at(
+        validators,
+        committee_size,
+        BEACON_DRAW_DOMAIN,
+        &seed,
+        height,
+    )
 }
 
 // ============================================================================
@@ -813,7 +958,13 @@ pub fn cnvrf_v3_beacon_draw_committee(
         return Vec::new();
     }
     let seed = cnvrf_v3_beacon_seed(beacon_output, beacon_epoch, height, round);
-    select_committee_from_seed(validators, committee_size, CNVRF_V3_DRAW_DOMAIN, &seed)
+    select_committee_from_seed_at(
+        validators,
+        committee_size,
+        CNVRF_V3_DRAW_DOMAIN,
+        &seed,
+        height,
+    )
 }
 
 /// THE committee of `height`/`round` — the ONE source of truth for "who

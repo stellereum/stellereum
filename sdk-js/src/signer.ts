@@ -19,6 +19,15 @@
 
 import { spawn } from "node:child_process";
 import { SignerError } from "./errors.ts";
+import {
+  FROZEN_MIN_GAS_FLOOR,
+  MASTERCHAIN_SHARD,
+  PQ_ACTIVATION_SURCHARGE_GAS,
+  address32,
+  finishUnsigned,
+  hexToBytes,
+  type UnsignedTransaction,
+} from "./wire.ts";
 
 export type JsonCallArg =
   | { type: "i64"; value: number }
@@ -31,7 +40,7 @@ export type JsonCallArg =
 
 export interface TxCommon {
   nonce?: number;
-  chain_id?: number;
+  chain_id?: number | null;
   gas_limit?: number;
   base_fee?: number;
   priority_fee_per_gas?: number;
@@ -41,13 +50,170 @@ export interface TxCommon {
   unbound?: boolean;
 }
 
+export const OP_DEPLOY_CONTRACT = 19;
+export const OP_DEPLOY_CONTRACT_WITH_ABI = 65;
+export const MAX_CONTRACT_ABI_BYTES = 64 * 1024;
+export const GAS_CONTRACT_DEPLOY_BASE = 2_000;
+export const GAS_CONTRACT_DEPLOY_PER_BYTE = 2;
+
+export interface ContractDeployIntent extends TxCommon {
+  kind: "contractDeploy" | "contract_deploy";
+  /** WASM bytecode as raw bytes or hex string (`0x` optional). */
+  code?: Uint8Array | string;
+  /** Optional hex alias matching `stellereum-sdk-cli` (`code_hex`). */
+  code_hex?: string;
+  /** Optional typed ABI manifest (JSON string or manifest object). */
+  abi?: string | Record<string, unknown>;
+  /** Optional JSON string ABI alias matching `stellereum-sdk-cli` (`abi_json`). */
+  abi_json?: string;
+  /** Optional sender address (32-byte hex or `Stl57...`). */
+  from?: string;
+  /** Optional explicit gas limit (alias for `gas_limit`). */
+  gas?: number;
+  /** Optional chain id (alias for `chain_id`; `null` allowed when `unbound: true`). */
+  chainId?: number | null;
+}
+
+export function contractDeployGas(codeLen: number, abiLen = 0): number {
+  if (!Number.isSafeInteger(codeLen) || codeLen < 0) {
+    throw new RangeError(`code length must be a non-negative safe integer, got ${String(codeLen)}`);
+  }
+  if (!Number.isSafeInteger(abiLen) || abiLen < 0) {
+    throw new RangeError(`abi length must be a non-negative safe integer, got ${String(abiLen)}`);
+  }
+  const cappedAbi = Math.min(abiLen, MAX_CONTRACT_ABI_BYTES);
+  return GAS_CONTRACT_DEPLOY_BASE + (codeLen + cappedAbi) * GAS_CONTRACT_DEPLOY_PER_BYTE;
+}
+
+export function normalizeContractCode(code: Uint8Array | string): Uint8Array {
+  const bytes = typeof code === "string" ? hexToBytes(code, "code") : code;
+  if (bytes.length === 0) {
+    throw new Error("code: contract bytecode must not be empty");
+  }
+  return bytes;
+}
+
+export function normalizeContractAbi(abi: string | Record<string, unknown>): Uint8Array {
+  const json = typeof abi === "string" ? abi : JSON.stringify(abi);
+  const bytes = new TextEncoder().encode(json);
+  if (bytes.length === 0) {
+    throw new Error("abi: contract ABI manifest must not be empty");
+  }
+  if (bytes.length > MAX_CONTRACT_ABI_BYTES) {
+    throw new Error(`abi: contract ABI manifest exceeds ${MAX_CONTRACT_ABI_BYTES} bytes`);
+  }
+  return bytes;
+}
+
+/**
+ * Exact bincode encoding of `OpCode::SysCallDeployContract { code }` (discriminant 19)
+ * or `OpCode::SysCallDeployContractWithAbi { code, abi_json }` (discriminant 65)
+ * when `abi` is supplied.
+ */
+export function encodeContractDeployOp(
+  code: Uint8Array | string,
+  abi?: string | Record<string, unknown>,
+): Uint8Array {
+  const codeBytes = normalizeContractCode(code);
+  if (abi === undefined) {
+    const out = new Uint8Array(4 + 8 + codeBytes.length);
+    const view = new DataView(out.buffer);
+    view.setUint32(0, OP_DEPLOY_CONTRACT, true);
+    view.setBigUint64(4, BigInt(codeBytes.length), true);
+    out.set(codeBytes, 12);
+    return out;
+  }
+  const abiBytes = normalizeContractAbi(abi);
+  const out = new Uint8Array(4 + 8 + codeBytes.length + 8 + abiBytes.length);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, OP_DEPLOY_CONTRACT_WITH_ABI, true);
+  view.setBigUint64(4, BigInt(codeBytes.length), true);
+  out.set(codeBytes, 12);
+  view.setBigUint64(12 + codeBytes.length, BigInt(abiBytes.length), true);
+  out.set(abiBytes, 20 + codeBytes.length);
+  return out;
+}
+
+/**
+ * Exact bincode encoding of `Vec<OpCode>` carrying a single `SysCallDeployContract`
+ * or `SysCallDeployContractWithAbi`: `u64 LE count (1) || encodeContractDeployOp(code, abi)`.
+ */
+export function encodeContractDeployPayload(
+  code: Uint8Array | string,
+  abi?: string | Record<string, unknown>,
+): Uint8Array {
+  const op = encodeContractDeployOp(code, abi);
+  const out = new Uint8Array(8 + op.length);
+  new DataView(out.buffer).setBigUint64(0, 1n, true);
+  out.set(op, 8);
+  return out;
+}
+
+/**
+ * Build an unsigned `SysCallDeployContract` (or `SysCallDeployContractWithAbi`
+ * when `intent.abi` is set) transaction from a `ContractDeployIntent`
+ * (matching `TxBuilder::contract_deploy` / `contract_deploy_with_abi` in `stellereum-sdk`).
+ */
+export function buildContractDeployTransaction(
+  intent: ContractDeployIntent & { from: string },
+): UnsignedTransaction {
+  const rawCode = intent.code ?? intent.code_hex;
+  if (rawCode === undefined) {
+    throw new SignerError("invalid_argument", "contractDeploy requires code or code_hex");
+  }
+  const codeBytes = normalizeContractCode(rawCode);
+  const rawAbi = intent.abi ?? intent.abi_json;
+  const abiBytes = rawAbi === undefined ? undefined : normalizeContractAbi(rawAbi);
+  const from = address32(intent.from, "from");
+  const isUnbound = intent.unbound === true;
+  if (!isUnbound && (intent.chainId === null || intent.chain_id === null)) {
+    throw new SignerError("invalid_argument", "chainId: null requires unbound: true");
+  }
+  const chainId = isUnbound ? null : (intent.chainId ?? intent.chain_id ?? 5757);
+  const baseFee = intent.base_fee ?? FROZEN_MIN_GAS_FLOOR;
+  const priorityFee = intent.priority_fee_per_gas ?? 0;
+  const surcharge = intent.implicit ? 0 : PQ_ACTIVATION_SURCHARGE_GAS;
+  const deployGas = contractDeployGas(codeBytes.length, abiBytes?.length ?? 0);
+  const gasLimit =
+    intent.gas ??
+    intent.gas_limit ??
+    Math.max(deployGas, baseFee, FROZEN_MIN_GAS_FLOOR) +
+      surcharge +
+      priorityFee;
+
+  return finishUnsigned(
+    {
+      from,
+      to: from,
+      amount: 0,
+      gasLimit,
+      nonce: intent.nonce ?? 0,
+      sourceShard: intent.source_shard ?? MASTERCHAIN_SHARD,
+      targetShard: intent.target_shard ?? MASTERCHAIN_SHARD,
+      payload: encodeContractDeployPayload(codeBytes, rawAbi),
+      priorityFeePerGas: priorityFee,
+    },
+    chainId,
+  );
+}
+
 export type TxIntent =
   | ({ kind: "transfer"; to: string; amount: number } & TxCommon)
+  | ContractDeployIntent
   | ({
       kind: "contract_call";
       contract: string;
       method: string;
       args?: JsonCallArg[];
+      value?: number;
+    } & TxCommon)
+  | ({
+      kind: "contract_call_raw";
+      contract: string;
+      method: string;
+      args?: number[];
+      calldata_hex?: string;
+      rawCalldata?: Uint8Array | string;
       value?: number;
     } & TxCommon)
   | ({ kind: "stake"; validator: string; amount: number } & TxCommon)
@@ -57,6 +223,7 @@ export type TxIntent =
       kind: "evm_carrier";
       evm_tx: string;
       to_pq: string;
+      evm_address?: string;
       amount_nano?: number;
     } & TxCommon)
   | ({

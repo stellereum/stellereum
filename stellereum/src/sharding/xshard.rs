@@ -1764,6 +1764,12 @@ impl CrossShardMessage {
 /// Maximum transactions in one L2 batch (anti-DoS bound on a single submit).
 pub const L2_MAX_TXS_PER_BATCH: usize = 1024;
 
+/// Maximum number of admitted-but-unincluded L2 batches held in [`L2Sequencer`].
+pub const MAX_L2_PENDING_BATCHES: usize = 4_096;
+
+/// Maximum number of distinct `l2_id`s tracked by [`L2Sequencer`].
+pub const MAX_TRACKED_L2_IDS: usize = 1_024;
+
 /// One externally-submitted L2 batch: an ordered list of transactions with a
 /// binding payload hash. Never embedded in `Block` (no format change); the
 /// sequencer only orders batches, and inclusion reuses normal tx admission.
@@ -1849,6 +1855,12 @@ impl L2Sequencer {
     /// rejected, never queued).
     pub fn submit_batch(&mut self, batch: L2Batch) -> Result<(), String> {
         batch.verify()?;
+        if !self.expected.contains_key(&batch.l2_id) && self.expected.len() >= MAX_TRACKED_L2_IDS {
+            return Err(format!(
+                "L2 sequencer tracked L2 ID cap ({MAX_TRACKED_L2_IDS}) reached; rejecting l2_id {}",
+                batch.l2_id
+            ));
+        }
         let next = self.expected.get(&batch.l2_id).copied().unwrap_or(0);
         if batch.batch_index != next {
             return Err(format!(
@@ -1856,9 +1868,18 @@ impl L2Sequencer {
                 batch.l2_id, batch.batch_index
             ));
         }
+        if self.pending.len() >= MAX_L2_PENDING_BATCHES {
+            return Err(format!(
+                "L2 sequencer pending batch cap ({MAX_L2_PENDING_BATCHES}) reached; rejecting l2_id {} batch {}",
+                batch.l2_id, batch.batch_index
+            ));
+        }
+        let next_expected = next
+            .checked_add(1)
+            .ok_or_else(|| format!("L2 {} batch index overflow", batch.l2_id))?;
         self.pending
             .insert((batch.l2_id, batch.batch_index), batch.clone());
-        self.expected.insert(batch.l2_id, next + 1);
+        self.expected.insert(batch.l2_id, next_expected);
         Ok(())
     }
 
@@ -1897,5 +1918,89 @@ impl L2Sequencer {
     /// How many batches of `l2_id` have been marked included (0 if none).
     pub fn included_count(&self, l2_id: u32) -> u64 {
         self.included_through.get(&l2_id).copied().unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    use crate::sharding::PqSignatureEnvelope;
+
+    fn signed_pq_tx() -> Transaction {
+        let seed = 0x51;
+        let pk = Transaction::sample_falcon512_pubkey(seed);
+        let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+        let mut tx = Transaction {
+            from,
+            to: [2u8; 32],
+            amount: 10,
+            gas_limit: 21_000,
+            nonce: 0,
+            source_shard: MASTERCHAIN_SHARD,
+            target_shard: MASTERCHAIN_SHARD,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        };
+        let msg = tx.signing_message();
+        let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+        tx.signature = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk, sig).encode();
+        tx
+    }
+
+    #[test]
+    fn l2_sequencer_enforces_pending_batch_cap() {
+        let tx = signed_pq_tx();
+        let mut seq = L2Sequencer::new();
+        for idx in 0..MAX_L2_PENDING_BATCHES as u64 {
+            seq.submit_batch(L2Batch::new(1, idx, vec![tx.clone()]))
+                .expect("batches up to MAX_L2_PENDING_BATCHES must be admitted");
+        }
+        assert_eq!(seq.pending_len(), MAX_L2_PENDING_BATCHES);
+
+        let err = seq
+            .submit_batch(L2Batch::new(
+                1,
+                MAX_L2_PENDING_BATCHES as u64,
+                vec![tx.clone()],
+            ))
+            .unwrap_err();
+        assert!(
+            err.contains("pending batch cap"),
+            "unexpected error message: {err}"
+        );
+        assert_eq!(seq.pending_len(), MAX_L2_PENDING_BATCHES);
+
+        // Pruning one included batch frees capacity for the next submission.
+        seq.mark_included(1, 0);
+        assert_eq!(seq.pending_len(), MAX_L2_PENDING_BATCHES - 1);
+        seq.submit_batch(L2Batch::new(1, MAX_L2_PENDING_BATCHES as u64, vec![tx]))
+            .expect("batch after prune must be admitted");
+    }
+
+    #[test]
+    fn l2_sequencer_enforces_tracked_l2_id_cap() {
+        let tx = signed_pq_tx();
+        let mut seq = L2Sequencer::new();
+        for l2_id in 0..MAX_TRACKED_L2_IDS as u32 {
+            seq.submit_batch(L2Batch::new(l2_id, 0, vec![tx.clone()]))
+                .expect("tracked L2 IDs up to MAX_TRACKED_L2_IDS must be admitted");
+            seq.mark_included(l2_id, 0);
+        }
+        assert_eq!(seq.pending_len(), 0);
+
+        // A new, previously unseen l2_id is rejected even when pending is empty.
+        let err = seq
+            .submit_batch(L2Batch::new(MAX_TRACKED_L2_IDS as u32, 0, vec![tx.clone()]))
+            .unwrap_err();
+        assert!(
+            err.contains("tracked L2 ID cap"),
+            "unexpected error message: {err}"
+        );
+
+        // An already-tracked l2_id can continue submitting subsequent batches.
+        seq.submit_batch(L2Batch::new(0, 1, vec![tx]))
+            .expect("already-tracked L2 ID must remain submittable");
     }
 }

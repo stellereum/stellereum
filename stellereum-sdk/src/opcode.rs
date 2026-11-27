@@ -16,12 +16,18 @@ use crate::error::{Result, SdkError};
 use crate::evm::put_vec;
 use crate::governance::{put_string, put_u64, GovAction, VoteChoice};
 
+/// Bincode discriminant of `OpCode::SysCallDeployContract`
+/// (`stellereum/src/svm.rs:629`, 20th variant = index 19).
+pub const OP_DEPLOY_CONTRACT: u32 = 19;
 /// Bincode discriminant of `OpCode::SysCallStake`
 /// (`stellereum/src/svm.rs:548`, 22nd variant).
 pub const OP_STAKE: u32 = 21;
 /// Bincode discriminant of `OpCode::SysCallCallContractArgs`
 /// (`stellereum/src/svm.rs:994`).
 pub const OP_CALL_CONTRACT_ARGS: u32 = 50;
+/// Bincode discriminant of `OpCode::SysCallStakeWithCommission`
+/// (`stellereum/src/svm.rs:1178`, 53rd variant = index 52).
+pub const OP_STAKE_WITH_COMMISSION: u32 = 52;
 /// Bincode discriminant of `OpCode::SysCallGovPropose`.
 pub const OP_GOV_PROPOSE: u32 = 53;
 /// Bincode discriminant of `OpCode::SysCallGovVote`.
@@ -33,6 +39,12 @@ pub const OP_UNJAIL: u32 = 56;
 pub const OP_EVM_CARRIER: u32 = 57;
 /// Bincode discriminant of `OpCode::SysCallBindEvmAddress`.
 pub const OP_BIND_EVM_ADDRESS: u32 = 58;
+/// Bincode discriminant of `OpCode::SysCallDeployContractWithAbi`
+/// (`stellereum/src/svm.rs`, 66th variant = index 65).
+pub const OP_DEPLOY_CONTRACT_WITH_ABI: u32 = 65;
+
+/// Maximum inline ABI manifest size (`stellereum/src/svm.rs:MAX_CONTRACT_ABI_BYTES`).
+pub const MAX_CONTRACT_ABI_BYTES: usize = 64 * 1024;
 
 /// `GAS_BASIC_TRANSFER` (`stellereum/src/svm.rs:36`).
 pub const GAS_BASIC_TRANSFER: u64 = 280_000;
@@ -56,6 +68,10 @@ pub const GAS_CONTRACT_CALL: u64 = 1_000;
 pub const GAS_CONTRACT_CALL_PER_ARG: u64 = 10;
 /// `GAS_CONTRACT_CALL_PER_BYTE` (`stellereum/src/svm.rs:70`).
 pub const GAS_CONTRACT_CALL_PER_BYTE: u64 = 2;
+/// `GAS_DEPLOY_BASE` (`stellereum/src/contract.rs:75`, `stellereum/src/svm.rs:58`).
+pub const GAS_CONTRACT_DEPLOY_BASE: u64 = 2_000;
+/// `GAS_PER_BYTE` (`stellereum/src/contract.rs:77`, `stellereum/src/svm.rs:59`).
+pub const GAS_CONTRACT_DEPLOY_PER_BYTE: u64 = 2;
 
 /// Maximum ABI arguments for one call.
 ///
@@ -165,8 +181,18 @@ pub fn encode_calldata(args: &[CallArg]) -> Result<Vec<u8>> {
 /// One supported opcode.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
+    /// `SysCallDeployContract { code }`.
+    DeployContract { code: Vec<u8> },
+    /// `SysCallDeployContractWithAbi { code, abi_json }`.
+    DeployContractWithAbi { code: Vec<u8>, abi_json: Vec<u8> },
     /// `SysCallStake { validator, amount }`.
     Stake { validator: [u8; 32], amount: u64 },
+    /// `SysCallStakeWithCommission { validator, amount, commission_bps }`.
+    StakeWithCommission {
+        validator: [u8; 32],
+        amount: u64,
+        commission_bps: u64,
+    },
     /// `SysCallUnjail { validator }`.
     Unjail { validator: [u8; 32] },
     /// `SysCallCallContractArgs { contract, method, args, calldata }`.
@@ -220,14 +246,65 @@ impl Op {
         })
     }
 
+    /// Build a contract call with raw `host.calldata` bytes (e.g. for `*_pq`
+    /// contract entrypoints that read raw LE byte layouts via `calldata()`).
+    pub fn call_raw(
+        contract: [u8; 32],
+        method: &str,
+        args: &[i64],
+        calldata: Vec<u8>,
+    ) -> Result<Self> {
+        if method.is_empty() || method.len() > 256 {
+            return Err(SdkError::InvalidArgument(
+                "contract method must be 1..=256 bytes".into(),
+            ));
+        }
+        if args.len() > MAX_ABI_ARGS {
+            return Err(SdkError::InvalidArgument(format!(
+                "{} scalar args, max {MAX_ABI_ARGS}",
+                args.len()
+            )));
+        }
+        if calldata.len() > MAX_CONTRACT_ABI_BYTES {
+            return Err(SdkError::InvalidArgument(format!(
+                "calldata exceeds {MAX_CONTRACT_ABI_BYTES} bytes"
+            )));
+        }
+        Ok(Self::CallContractArgs {
+            contract,
+            method: method.as_bytes().to_vec(),
+            args: args.to_vec(),
+            calldata,
+        })
+    }
+
     /// Bincode bytes of this single enum value (discriminant + fields).
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
+            Op::DeployContract { code } => {
+                out.extend_from_slice(&OP_DEPLOY_CONTRACT.to_le_bytes());
+                put_vec(&mut out, code);
+            }
+            Op::DeployContractWithAbi { code, abi_json } => {
+                out.extend_from_slice(&OP_DEPLOY_CONTRACT_WITH_ABI.to_le_bytes());
+                put_vec(&mut out, code);
+                put_vec(&mut out, abi_json);
+            }
             Op::Stake { validator, amount } => {
                 out.extend_from_slice(&OP_STAKE.to_le_bytes());
                 out.extend_from_slice(validator);
                 out.extend_from_slice(&amount.to_le_bytes());
+            }
+            Op::StakeWithCommission {
+                validator,
+                amount,
+                commission_bps,
+            } => {
+                out.extend_from_slice(&OP_STAKE_WITH_COMMISSION.to_le_bytes());
+                out.extend_from_slice(validator);
+                out.extend_from_slice(&amount.to_le_bytes());
+                out.extend_from_slice(&commission_bps.to_le_bytes());
             }
             Op::Unjail { validator } => {
                 out.extend_from_slice(&OP_UNJAIL.to_le_bytes());
@@ -308,7 +385,11 @@ impl Op {
     /// (`stellereum/src/svm.rs:355-440`).
     pub fn gas(&self) -> u64 {
         match self {
-            Op::Stake { .. } => GAS_STAKE_BOND,
+            Op::DeployContract { code } => contract_deploy_gas(code.len()),
+            Op::DeployContractWithAbi { code, abi_json } => {
+                contract_deploy_with_abi_gas(code.len(), abi_json.len())
+            }
+            Op::Stake { .. } | Op::StakeWithCommission { .. } => GAS_STAKE_BOND,
             Op::Unjail { .. } => GAS_STAKE_UNBOND,
             Op::GovPropose { .. } => GAS_GOV_PROPOSE,
             Op::GovVote { .. } => GAS_GOV_VOTE,
@@ -342,6 +423,21 @@ impl Op {
                 ),
         }
     }
+}
+
+/// `contract_deploy_gas(code_len)`
+/// (`stellereum/src/svm.rs:224`, `stellereum/src/contract.rs:82`).
+pub fn contract_deploy_gas(code_len: usize) -> u64 {
+    GAS_CONTRACT_DEPLOY_BASE
+        .saturating_add((code_len as u64).saturating_mul(GAS_CONTRACT_DEPLOY_PER_BYTE))
+}
+
+/// `contract_deploy_with_abi_gas(code_len, abi_len)`
+/// (`stellereum/src/svm.rs`).
+pub fn contract_deploy_with_abi_gas(code_len: usize, abi_len: usize) -> u64 {
+    contract_deploy_gas(code_len).saturating_add(
+        (abi_len.min(MAX_CONTRACT_ABI_BYTES) as u64).saturating_mul(GAS_CONTRACT_DEPLOY_PER_BYTE),
+    )
 }
 
 /// `pq_verify_gas(pubkey_len, message_len, signature_len)`
@@ -410,5 +506,70 @@ mod tests {
             Op::call([0u8; 32], "f", &nine),
             Err(SdkError::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn deploy_contract_bincode_discriminant_and_gas() {
+        let code = b"\0asm\x01\0\0\0".to_vec();
+        let op = Op::DeployContract { code: code.clone() };
+        let encoded = op.encode();
+        // Variant index 19 (`SysCallDeployContract`) as u32 LE + u64 LE len + bytes.
+        assert_eq!(&encoded[..4], &19u32.to_le_bytes());
+        assert_eq!(&encoded[4..12], &(code.len() as u64).to_le_bytes());
+        assert_eq!(&encoded[12..], code.as_slice());
+        assert_eq!(
+            op.gas(),
+            GAS_CONTRACT_DEPLOY_BASE + (code.len() as u64) * GAS_CONTRACT_DEPLOY_PER_BYTE
+        );
+
+        // Existing discriminants remain untouched.
+        assert_eq!(OP_STAKE, 21);
+        assert_eq!(OP_CALL_CONTRACT_ARGS, 50);
+        assert_eq!(OP_GOV_PROPOSE, 53);
+        assert_eq!(OP_GOV_VOTE, 54);
+        assert_eq!(OP_UNJAIL, 56);
+        assert_eq!(OP_EVM_CARRIER, 57);
+        assert_eq!(OP_BIND_EVM_ADDRESS, 58);
+
+        let payload = encode_payload(&[op]);
+        assert_eq!(&payload[..8], &1u64.to_le_bytes());
+        assert_eq!(&payload[8..], encoded.as_slice());
+    }
+
+    #[test]
+    fn stake_with_commission_bincode_discriminant_layout_and_gas() {
+        let validator = [0x42u8; 32];
+        let op = Op::StakeWithCommission {
+            validator,
+            amount: 1_500_000_000_000,
+            commission_bps: 750,
+        };
+        let encoded = op.encode();
+        assert_eq!(encoded.len(), 4 + 32 + 8 + 8);
+        assert_eq!(&encoded[..4], &52u32.to_le_bytes());
+        assert_eq!(&encoded[4..36], &validator);
+        assert_eq!(&encoded[36..44], &1_500_000_000_000u64.to_le_bytes());
+        assert_eq!(&encoded[44..52], &750u64.to_le_bytes());
+        assert_eq!(op.gas(), GAS_STAKE_BOND);
+    }
+
+    #[test]
+    fn deploy_contract_with_abi_bincode_discriminant_and_gas() {
+        let code = b"\0asm\x01\0\0\0".to_vec();
+        let abi_json = br#"{"methods":[]}"#.to_vec();
+        let op = Op::DeployContractWithAbi {
+            code: code.clone(),
+            abi_json: abi_json.clone(),
+        };
+        let encoded = op.encode();
+        assert_eq!(&encoded[..4], &65u32.to_le_bytes());
+        assert_eq!(
+            op.gas(),
+            contract_deploy_with_abi_gas(code.len(), abi_json.len())
+        );
+        assert_eq!(
+            contract_deploy_with_abi_gas(10, MAX_CONTRACT_ABI_BYTES + 100),
+            contract_deploy_with_abi_gas(10, MAX_CONTRACT_ABI_BYTES)
+        );
     }
 }

@@ -420,55 +420,69 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
 
         Commands::Wallet { sub } => match sub {
             WalletCommands::Generate => {
-                let signing_key = SigningKey::generate(&mut OsRng);
-                let pub_bytes = signing_key.verifying_key().to_bytes();
-                let priv_bytes = signing_key.to_bytes();
+                use rand::RngCore;
+                use zeroize::Zeroizing;
 
-                // Shielded keys removed with Ristretto deletion wave
-                // (crypto_privacy excised); transparent ed25519 wallet only.
+                let mut seed = Zeroizing::new([0u8; 32]);
+                OsRng.fill_bytes(&mut *seed);
+                let kp = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed);
+                let addr = falcon_pq_address(&kp);
+                let seed_hex = Zeroizing::new(hex::encode(*seed));
+
                 println!("╔═══════════════════════════════════════════════════════════════╗");
-                println!("║                   🔑 NEW STELLEREUM WALLET                   ║");
+                println!("║              🔑 NEW STELLEREUM WALLET (FALCON-512)            ║");
                 println!("╚═══════════════════════════════════════════════════════════════╝");
-                println!("• Address (Public Key):   {}", hex::encode(pub_bytes));
-                println!("• Private Key:            {}", hex::encode(priv_bytes));
-                println!("\n⚠️  Keep your private keys safe! Do not share them.");
+                println!("• Address (Falcon-512 PQ): {}", hex::encode(addr));
+                println!("• Private Seed:            {}", &*seed_hex);
+                println!("\n⚠️  Keep your private seed safe! Do not share it.");
             }
 
-            WalletCommands::Balance { address } => {
-                let addr_bytes =
-                    hex::decode(&address).map_err(|e| anyhow::anyhow!("Invalid hex: {e}"))?;
-                if addr_bytes.len() != 32 {
-                    anyhow::bail!("Address must be 32 bytes (64 hex characters)");
-                }
-                println!("Querying balance for address {}...", address);
-                let state_engine = InMemoryStateEngine::new();
-                let mut fixed_addr = [0u8; 32];
-                fixed_addr.copy_from_slice(&addr_bytes);
-
-                let balance = state_engine
-                    .get_account(&fixed_addr)
-                    .await
-                    .map(|a| a.balance)
-                    .unwrap_or(0);
+            WalletCommands::Balance { address, rpc } => {
+                let addr_arr = parse_wallet_address(&address)?;
+                let addr_hex = hex::encode(addr_arr);
+                println!("Querying balance for address {addr_hex} from {rpc}...");
+                let res = rpc_call(
+                    &rpc,
+                    "stell_getBalance",
+                    serde_json::json!({ "address": addr_hex }),
+                )?;
+                let balance = json_nano_amount(&res["balance"]).ok_or_else(|| {
+                    anyhow::anyhow!("node at {rpc} did not return a valid balance")
+                })?;
+                let nonce = res["nonce"].as_u64().unwrap_or(0);
                 println!(
-                    "Account Balance: {} nano-STELL ({:.6} STELL)",
+                    "Account Balance: {} nano-STELL ({:.6} STELL), nonce: {}",
                     balance,
-                    (balance as f64) / 1_000_000_000.0
+                    (balance as f64) / 1_000_000_000.0,
+                    nonce
                 );
             }
 
-            WalletCommands::Address { from_key } => {
-                let bytes = hex::decode(&from_key)
-                    .map_err(|e| anyhow::anyhow!("Invalid from_key hex: {e}"))?;
-                let arr: [u8; 32] = bytes
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("Private key must be 32 bytes"))?;
-                let addr = SigningKey::from_bytes(&arr).verifying_key().to_bytes();
-                println!("{}", hex::encode(addr));
+            WalletCommands::Address {
+                from_key,
+                falcon_seed,
+                falcon_seed_file,
+                falcon_key_file,
+            } => {
+                let seed_hex = match (falcon_seed, from_key) {
+                    (Some(_), Some(_)) => {
+                        anyhow::bail!("pass either --falcon-seed or --from-key, not both");
+                    }
+                    (s, f) => s.or(f),
+                };
+                let pq_key = resolve_falcon_keypair_with_seed_file(
+                    falcon_key_file,
+                    seed_hex,
+                    falcon_seed_file,
+                    "falcon",
+                )?;
+                println!("{}", hex::encode(falcon_pq_address(&pq_key)));
             }
 
             WalletCommands::Send {
                 from_key,
+                falcon_seed,
+                falcon_seed_file,
                 to,
                 amount,
                 target_shard,
@@ -478,7 +492,15 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 dry_run,
                 verbose,
             } => {
-                let pq_key = falcon_from_hex_seed(&from_key, "from_key")?;
+                let seed_hex = match (falcon_seed, from_key) {
+                    (Some(_), Some(_)) => {
+                        anyhow::bail!("pass either --falcon-seed or --from-key, not both");
+                    }
+                    (s, f) => s.or(f),
+                };
+                let seed = resolve_falcon_seed(seed_hex, falcon_seed_file)?;
+                let pq_key =
+                    stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed);
                 let to_arr = parse_wallet_address(&to)?;
                 let chain_id = resolve_chain_id(&rpc, chain_id)?;
 
@@ -495,8 +517,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                     if verbose {
                         eprintln!("  rpc -> {method}: {body}");
                     }
-                    let resp: serde_json::Value =
-                        ureq::post(&rpc).send_string(&body)?.into_json()?;
+                    let resp: serde_json::Value = cli_post_json(&rpc, &body)?;
                     if verbose {
                         eprintln!("  rpc <- {method}: {resp}");
                     }
@@ -579,7 +600,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                     "params": { "tx": raw }
                 })
                 .to_string();
-                let resp: serde_json::Value = ureq::post(&rpc).send_string(&body)?.into_json()?;
+                let resp: serde_json::Value = cli_post_json(&rpc, &body)?;
                 if let Some(e) = resp.get("error") {
                     anyhow::bail!("rejected by node: {e}");
                 }
@@ -631,8 +652,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                     if verbose {
                         eprintln!("  rpc -> {method}: {body}");
                     }
-                    let resp: serde_json::Value =
-                        ureq::post(&rpc).send_string(&body)?.into_json()?;
+                    let resp: serde_json::Value = cli_post_json(&rpc, &body)?;
                     if verbose {
                         eprintln!("  rpc <- {method}: {resp}");
                     }
@@ -722,7 +742,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                     "params": { "tx": raw }
                 })
                 .to_string();
-                let resp: serde_json::Value = ureq::post(&rpc).send_string(&body)?.into_json()?;
+                let resp: serde_json::Value = cli_post_json(&rpc, &body)?;
                 if let Some(e) = resp.get("error") {
                     anyhow::bail!("rejected by node: {e}");
                 }
@@ -734,6 +754,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
 
             WalletCommands::Unjail {
                 falcon_seed,
+                falcon_seed_file,
                 falcon_key_file,
                 validator,
                 top_up,
@@ -750,7 +771,12 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                         "--top-up must be positive; omit --top-up instead of passing zero"
                     );
                 }
-                let pq_key = resolve_falcon_keypair(falcon_key_file, falcon_seed, "falcon")?;
+                let pq_key = resolve_falcon_keypair_with_seed_file(
+                    falcon_key_file,
+                    falcon_seed,
+                    falcon_seed_file,
+                    "falcon",
+                )?;
                 let chain_id = resolve_chain_id(&rpc, chain_id)?;
                 let signer_addr = falcon_pq_address(&pq_key);
                 let validator_addr = match validator {
@@ -772,8 +798,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                     if verbose {
                         eprintln!("  rpc -> {method}: {body}");
                     }
-                    let resp: serde_json::Value =
-                        ureq::post(&rpc).send_string(&body)?.into_json()?;
+                    let resp: serde_json::Value = cli_post_json(&rpc, &body)?;
                     if verbose {
                         eprintln!("  rpc <- {method}: {resp}");
                     }
@@ -937,12 +962,18 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 scheme,
                 falcon_key_file,
                 falcon_seed,
+                falcon_seed_file,
                 message,
                 message_hex,
                 chain_id,
             } => {
-                let key =
-                    resolve_wallet_signing_key(&scheme, from_key, falcon_key_file, falcon_seed)?;
+                let key = resolve_wallet_signing_key(
+                    &scheme,
+                    from_key,
+                    falcon_key_file,
+                    falcon_seed,
+                    falcon_seed_file,
+                )?;
                 let msg = stellereum::wallet_signing::parse_message_param(
                     message.as_deref(),
                     message_hex.as_deref(),
@@ -998,6 +1029,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 scheme,
                 falcon_key_file,
                 falcon_seed,
+                falcon_seed_file,
                 contract,
                 method,
                 args,
@@ -1005,8 +1037,13 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 nonce,
                 chain_id,
             } => {
-                let key =
-                    resolve_wallet_signing_key(&scheme, from_key, falcon_key_file, falcon_seed)?;
+                let key = resolve_wallet_signing_key(
+                    &scheme,
+                    from_key,
+                    falcon_key_file,
+                    falcon_seed,
+                    falcon_seed_file,
+                )?;
                 let data = parse_wallet_typed_data(
                     &contract,
                     &method,
@@ -1082,7 +1119,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                     "params": { "pair": pair }
                 })
                 .to_string();
-                let resp: serde_json::Value = ureq::post(&rpc).send_string(&body)?.into_json()?;
+                let resp: serde_json::Value = cli_post_json(&rpc, &body)?;
                 if let Some(e) = resp.get("error") {
                     anyhow::bail!("rejected by node: {e}");
                 }
@@ -1166,6 +1203,13 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 if !tx.verify_signature() {
                     anyhow::bail!("refusing to submit: built PQ transaction does not verify");
                 }
+                if let Some(cid) = chain_id {
+                    if !tx.verify_signature_for_chain(cid, true) {
+                        anyhow::bail!(
+                            "refusing to submit: built orderbook place tx failed chain-bound verify for chain {cid}"
+                        );
+                    }
+                }
 
                 println!("✅ Order Signed (Falcon-512, PQ1):");
                 println!("  Hash:    {}", hex::encode(tx.compute_tx_hash()));
@@ -1207,6 +1251,13 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 };
                 if !tx.verify_signature() {
                     anyhow::bail!("refusing to submit: built PQ transaction does not verify");
+                }
+                if let Some(cid) = chain_id {
+                    if !tx.verify_signature_for_chain(cid, true) {
+                        anyhow::bail!(
+                            "refusing to submit: built orderbook cancel tx failed chain-bound verify for chain {cid}"
+                        );
+                    }
                 }
 
                 println!("✅ Cancellation Signed (Falcon-512, PQ1):");
@@ -1285,8 +1336,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                             "jsonrpc": "2.0", "id": 1, "method": method, "params": params
                         })
                         .to_string();
-                        let resp: serde_json::Value =
-                            ureq::post(&rpc).send_string(&body)?.into_json()?;
+                        let resp: serde_json::Value = cli_post_json(&rpc, &body)?;
                         if let Some(e) = resp.get("error") {
                             anyhow::bail!("RPC error: {e}");
                         }
@@ -1339,6 +1389,13 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                     };
                     if !tx.verify_signature() {
                         anyhow::bail!("refusing to submit: built PQ transaction does not verify");
+                    }
+                    if let Some(cid) = chain_id {
+                        if !tx.verify_signature_for_chain(cid, true) {
+                            anyhow::bail!(
+                                "refusing to submit: built oracle feed tx failed chain-bound verify for chain {cid}"
+                            );
+                        }
                     }
                     println!("  Wrapping tx: {}", hex::encode(tx.compute_tx_hash()));
                     println!("  Sender:   {}", hex::encode(tx.from));
@@ -1453,6 +1510,13 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 if !tx.verify_signature() {
                     anyhow::bail!("refusing to submit: built PQ transaction does not verify");
                 }
+                if let Some(cid) = chain_id {
+                    if !tx.verify_signature_for_chain(cid, true) {
+                        anyhow::bail!(
+                            "refusing to submit: built bridge deposit tx failed chain-bound verify for chain {cid}"
+                        );
+                    }
+                }
 
                 println!("✅ Teleport Deposit Intent Signed (Falcon-512, PQ1):");
                 println!("  Source chain:   {chain}");
@@ -1511,6 +1575,13 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 };
                 if !tx.verify_signature() {
                     anyhow::bail!("refusing to submit: built PQ transaction does not verify");
+                }
+                if let Some(cid) = chain_id {
+                    if !tx.verify_signature_for_chain(cid, true) {
+                        anyhow::bail!(
+                            "refusing to submit: built bridge withdraw tx failed chain-bound verify for chain {cid}"
+                        );
+                    }
                 }
 
                 println!("✅ Bridge Withdrawal Intent Signed (Falcon-512, PQ1):");
@@ -1698,11 +1769,15 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 eprintln!("[bootstrap] --no-exec: gate passed, plan printed, node NOT started");
                 return Ok(());
             }
-            if data_dir.as_path() != std::path::Path::new("./data") {
+            let effective_data_dir = data_dir_from_env();
+            if data_dir.as_path() != effective_data_dir.as_path() {
                 anyhow::bail!(
-                    "[bootstrap] REFUSING to exec: --data-dir {} != ./data, but `run` persists to \
-                     ./data — bootstrapping elsewhere then running here would split. Re-run with \
-                     the default data dir (or --no-exec for a gate check only)",
+                    "[bootstrap] REFUSING to exec: --data-dir {} != {}, which `run` persists to \
+                     — bootstrapping elsewhere then running here would split. Re-run with \
+                     --data-dir {} or set STELL_DATA_DIR={}",
+                    data_dir.display(),
+                    effective_data_dir.display(),
+                    effective_data_dir.display(),
                     data_dir.display()
                 );
             }
@@ -2748,6 +2823,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
             ValidatorCommands::Delegate {
                 falcon_key_file,
                 falcon_seed,
+                falcon_seed_file,
                 validator_id,
                 amount,
                 rpc,
@@ -2759,8 +2835,12 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 if amount == 0 {
                     anyhow::bail!("amount must be positive");
                 }
-                let delegator_kp =
-                    resolve_falcon_keypair(falcon_key_file, falcon_seed, "delegator")?;
+                let delegator_kp = resolve_falcon_keypair_with_seed_file(
+                    falcon_key_file,
+                    falcon_seed,
+                    falcon_seed_file,
+                    "delegator",
+                )?;
                 let validator_id = parse_wallet_address(&validator_id)?;
                 let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
                 let delegator_addr = falcon_pq_address(&delegator_kp);
@@ -2789,6 +2869,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
             ValidatorCommands::BeginUndelegate {
                 falcon_key_file,
                 falcon_seed,
+                falcon_seed_file,
                 validator_id,
                 amount,
                 rpc,
@@ -2800,8 +2881,12 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 if amount == 0 {
                     anyhow::bail!("amount must be positive");
                 }
-                let delegator_kp =
-                    resolve_falcon_keypair(falcon_key_file, falcon_seed, "delegator")?;
+                let delegator_kp = resolve_falcon_keypair_with_seed_file(
+                    falcon_key_file,
+                    falcon_seed,
+                    falcon_seed_file,
+                    "delegator",
+                )?;
                 let validator_id = parse_wallet_address(&validator_id)?;
                 let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
                 let delegator_addr = falcon_pq_address(&delegator_kp);
@@ -2830,6 +2915,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
             ValidatorCommands::WithdrawDelegation {
                 falcon_key_file,
                 falcon_seed,
+                falcon_seed_file,
                 validator_id,
                 rpc,
                 nonce,
@@ -2837,8 +2923,12 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 dry_run,
                 token,
             } => {
-                let delegator_kp =
-                    resolve_falcon_keypair(falcon_key_file, falcon_seed, "delegator")?;
+                let delegator_kp = resolve_falcon_keypair_with_seed_file(
+                    falcon_key_file,
+                    falcon_seed,
+                    falcon_seed_file,
+                    "delegator",
+                )?;
                 let validator_id = parse_wallet_address(&validator_id)?;
                 let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
                 let delegator_addr = falcon_pq_address(&delegator_kp);
@@ -3043,6 +3133,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
             GovCommands::Propose {
                 falcon_key_file,
                 falcon_seed,
+                falcon_seed_file,
                 title,
                 action,
                 params,
@@ -3059,7 +3150,12 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 let gov_action =
                     stellereum::governance::gov_action_from_params(&action, &parsed_params)
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
-                let proposer_kp = resolve_falcon_keypair(falcon_key_file, falcon_seed, "falcon")?;
+                let proposer_kp = resolve_falcon_keypair_with_seed_file(
+                    falcon_key_file,
+                    falcon_seed,
+                    falcon_seed_file,
+                    "falcon",
+                )?;
                 let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
                 let proposer_addr = falcon_pq_address(&proposer_kp);
                 let account_nonce = resolve_nonce(&rpc, &proposer_addr, nonce)?;
@@ -3101,6 +3197,7 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
             GovCommands::Vote {
                 falcon_key_file,
                 falcon_seed,
+                falcon_seed_file,
                 id,
                 choice,
                 height,
@@ -3111,7 +3208,12 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 token,
             } => {
                 let vote_choice = parse_vote_choice(&choice)?;
-                let voter_kp = resolve_falcon_keypair(falcon_key_file, falcon_seed, "falcon")?;
+                let voter_kp = resolve_falcon_keypair_with_seed_file(
+                    falcon_key_file,
+                    falcon_seed,
+                    falcon_seed_file,
+                    "falcon",
+                )?;
                 let chain_id = resolve_required_chain_id(&rpc, chain_id)?;
                 let voter_addr = falcon_pq_address(&voter_kp);
                 let account_nonce = resolve_nonce(&rpc, &voter_addr, nonce)?;
@@ -3255,8 +3357,306 @@ pub(crate) async fn handle_command(command: Commands) -> anyhow::Result<()> {
                 )?;
             }
         },
+        Commands::RemoteSigner { sub } => match sub {
+            RemoteSignerCommands::Serve {
+                listen,
+                falcon_key_file,
+                data_dir,
+                token,
+                token_file,
+                allow_insecure_http,
+                genesis_hash,
+                shard,
+            } => {
+                const MAX_CONCURRENT_SIGNER_CONNS: usize = 32;
+                struct ActiveConnGuard(Arc<std::sync::atomic::AtomicUsize>);
+                impl Drop for ActiveConnGuard {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                    }
+                }
+
+                let bearer_token = validate_remote_signer_serve_policy(
+                    &listen,
+                    token,
+                    token_file,
+                    allow_insecure_http,
+                )?;
+                let genesis_root: [u8; 32] = match genesis_hash {
+                    Some(ref hex_str) => parse_wallet_address(hex_str)
+                        .map_err(|e| anyhow::anyhow!("invalid --genesis-hash: {e}"))?,
+                    None => {
+                        tracing::warn!(
+                            "[remote-signer] --genesis-hash not provided; using all-zero genesis hash in safety chain id"
+                        );
+                        [0u8; 32]
+                    }
+                };
+                let key_path = resolve_falcon_path(std::path::Path::new("./keys"), falcon_key_file);
+                let kp = stellereum::node_keys::load_falcon_key(&key_path).map_err(|e| {
+                    anyhow::anyhow!("cannot load falcon key {}: {e}", key_path.display())
+                })?;
+                let vid = kp.validator_id();
+                let storage = stellereum::storage::Storage::open(&data_dir).map_err(|e| {
+                    anyhow::anyhow!(
+                        "cannot open remote-signer store {}: {e}",
+                        data_dir.display()
+                    )
+                })?;
+                let chain_id = stellereum::zkml::effective_chain_id();
+                let identity = stellereum::storage::SafetyRecordIdentity {
+                    validator: vid,
+                    chain: stellereum::safety::derive_safety_chain_id(chain_id, &genesis_root),
+                    shard,
+                };
+                let safety_store = storage.safety_record_store(identity)?;
+                let guard = stellereum::remote_signer::ConsensusSafetyGuard::from_durable(
+                    safety_store,
+                    true,
+                )
+                .map_err(|e| anyhow::anyhow!("cannot initialize durable safety guard: {e}"))?;
+                let signer =
+                    stellereum::remote_signer::LocalPqSigner::with_safety_guard(kp, vid, guard)
+                        .map_err(|e| anyhow::anyhow!("cannot initialize PQ signer: {e}"))?;
+                let service = Arc::new(
+                    stellereum::remote_signer::PqSignerService::new(signer)
+                        .with_bearer_token(&*bearer_token),
+                );
+                drop(bearer_token);
+
+                let listener = std::net::TcpListener::bind(&listen)
+                    .map_err(|e| anyhow::anyhow!("cannot bind remote-signer on {listen}: {e}"))?;
+                listener.set_nonblocking(true).map_err(|e| {
+                    anyhow::anyhow!("cannot configure non-blocking remote-signer listener: {e}")
+                })?;
+                let bound_addr = listener.local_addr()?;
+                println!(
+                    "Stellereum PQ remote-signer v2 listening on {bound_addr} (validator_id={}, shard={}, genesis={}, data_dir={})",
+                    hex::encode(vid),
+                    shard,
+                    hex::encode(genesis_root),
+                    data_dir.display()
+                );
+
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stop_accept = Arc::clone(&stop);
+                let svc = Arc::clone(&service);
+                let active_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut server_task = tokio::task::spawn_blocking(move || {
+                    while !stop_accept.load(std::sync::atomic::Ordering::Acquire) {
+                        match listener.accept() {
+                            Ok((mut stream, _addr)) => {
+                                let _ = stream.set_nonblocking(false);
+                                let acquired = active_conns
+                                    .fetch_update(
+                                        std::sync::atomic::Ordering::AcqRel,
+                                        std::sync::atomic::Ordering::Acquire,
+                                        |n| (n < MAX_CONCURRENT_SIGNER_CONNS).then_some(n + 1),
+                                    )
+                                    .is_ok();
+                                if !acquired {
+                                    let _ = stream
+                                        .set_write_timeout(Some(std::time::Duration::from_secs(1)));
+                                    let body = r#"{"error":"too_many_connections"}"#;
+                                    let resp = format!(
+                                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                        body.len(),
+                                        body
+                                    );
+                                    let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+                                    let _ = std::io::Write::flush(&mut stream);
+                                    drop(stream);
+                                    continue;
+                                }
+                                let conn_guard = ActiveConnGuard(Arc::clone(&active_conns));
+                                let svc_conn = Arc::clone(&svc);
+                                std::thread::spawn(move || {
+                                    let _conn_guard = conn_guard;
+                                    stellereum::remote_signer::serve_v2_http_connection(
+                                        &svc_conn, stream,
+                                    );
+                                });
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(std::time::Duration::from_millis(25));
+                            }
+                            Err(e) => {
+                                tracing::warn!("[remote-signer] accept error: {e}");
+                                std::thread::sleep(std::time::Duration::from_millis(25));
+                            }
+                        }
+                    }
+                });
+                tokio::select! {
+                    res = &mut server_task => {
+                        res.map_err(|e| anyhow::anyhow!("remote-signer server panicked: {e}"))?;
+                    }
+                    _ = wait_for_shutdown_signal() => {
+                        stop.store(true, std::sync::atomic::Ordering::Release);
+                        tracing::info!("[remote-signer] shutting down on signal");
+                        let _ = server_task.await;
+                    }
+                }
+            }
+        },
+        Commands::Contract { sub } => match sub {
+            ContractCommands::Deploy {
+                wasm_file,
+                falcon_seed,
+                falcon_seed_file,
+                falcon_key_file,
+                rpc,
+                nonce,
+                chain_id,
+                gas_limit,
+                dry_run,
+                token,
+            } => {
+                let code = std::fs::read(&wasm_file).map_err(|e| {
+                    anyhow::anyhow!("cannot read wasm file {}: {e}", wasm_file.display())
+                })?;
+                let code_len = code.len();
+                let deployer_kp = resolve_falcon_keypair_with_seed_file(
+                    falcon_key_file,
+                    falcon_seed,
+                    falcon_seed_file,
+                    "deployer",
+                )?;
+                let chain_id = resolve_chain_id(&rpc, chain_id)?;
+                let deployer_addr = falcon_pq_address(&deployer_kp);
+                let account_nonce = resolve_nonce(&rpc, &deployer_addr, nonce)?;
+                let tx = build_contract_deploy_tx(
+                    &deployer_kp,
+                    code,
+                    account_nonce,
+                    gas_limit,
+                    chain_id,
+                )?;
+                if !tx.verify_signature() {
+                    anyhow::bail!("refusing to submit: built contract deploy tx does not verify");
+                }
+                if let Some(cid) = chain_id {
+                    if !tx.verify_signature_for_chain(cid, true) {
+                        anyhow::bail!(
+                            "refusing to submit: built contract deploy tx failed chain-bound verify for chain {cid}"
+                        );
+                    }
+                }
+                let predicted =
+                    stellereum::contract::contract_address(&deployer_addr, account_nonce);
+                println!("✅ Contract Deploy Signed (SysCallDeployContract, Falcon-512 PQ1):");
+                println!("  Deployer:           {}", hex::encode(deployer_addr));
+                println!("  Predicted Contract: {}", hex::encode(predicted));
+                println!("  Code Size:          {code_len} bytes");
+                println!("  Gas Limit:          {}", tx.gas_limit);
+                println!("  Nonce:              {account_nonce}");
+                if let Some(cid) = chain_id {
+                    println!("  Chain Id:           {cid} (signature bound)");
+                }
+                println!(
+                    "  Hash:               {}",
+                    hex::encode(tx.compute_tx_hash())
+                );
+                if dry_run {
+                    println!("  raw: {}", hex::encode(bincode::serialize(&tx)?));
+                    return Ok(());
+                }
+                let hash = rpc_submit_tx(&rpc, "stell_sendRawTransaction", &tx, token.as_deref())?;
+                println!("  Submitted, mempool tx hash: {hash}");
+            }
+            ContractCommands::Call {
+                contract,
+                method,
+                args,
+                calldata,
+                falcon_seed,
+                falcon_seed_file,
+                falcon_key_file,
+                value,
+                rpc,
+                nonce,
+                chain_id,
+                gas_limit,
+                dry_run,
+                token,
+            } => {
+                let contract_addr = parse_wallet_address(&contract)?;
+                let op = parse_contract_call_opcode_with_calldata(
+                    contract_addr,
+                    &method,
+                    args.as_deref(),
+                    calldata.as_deref(),
+                )?;
+                let caller_kp = resolve_falcon_keypair_with_seed_file(
+                    falcon_key_file,
+                    falcon_seed,
+                    falcon_seed_file,
+                    "caller",
+                )?;
+                let chain_id = resolve_chain_id(&rpc, chain_id)?;
+                let caller_addr = falcon_pq_address(&caller_kp);
+                let account_nonce = resolve_nonce(&rpc, &caller_addr, nonce)?;
+                let tx = build_contract_call_tx(
+                    &caller_kp,
+                    contract_addr,
+                    op,
+                    value,
+                    account_nonce,
+                    gas_limit,
+                    chain_id,
+                );
+                if !tx.verify_signature() {
+                    anyhow::bail!("refusing to submit: built contract call tx does not verify");
+                }
+                if let Some(cid) = chain_id {
+                    if !tx.verify_signature_for_chain(cid, true) {
+                        anyhow::bail!(
+                            "refusing to submit: built contract call tx failed chain-bound verify for chain {cid}"
+                        );
+                    }
+                }
+                println!("✅ Contract Call Signed (Falcon-512 PQ1):");
+                println!("  Caller:    {}", hex::encode(caller_addr));
+                println!("  Contract:  {}", hex::encode(contract_addr));
+                println!("  Method:    {method}");
+                println!("  Value:     {value} nano-STELL");
+                println!("  Gas Limit: {}", tx.gas_limit);
+                println!("  Nonce:     {account_nonce}");
+                if let Some(cid) = chain_id {
+                    println!("  Chain Id:  {cid} (signature bound)");
+                }
+                println!("  Hash:      {}", hex::encode(tx.compute_tx_hash()));
+                if dry_run {
+                    println!("  raw: {}", hex::encode(bincode::serialize(&tx)?));
+                    return Ok(());
+                }
+                let hash = rpc_submit_tx(&rpc, "stell_sendRawTransaction", &tx, token.as_deref())?;
+                println!("  Submitted, mempool tx hash: {hash}");
+            }
+        },
     }
     Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = async {
+            if let Some(ref mut s) = sigterm {
+                s.recv().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 pub(crate) fn resolve_consensus_validator_pubkey(
@@ -3537,7 +3937,7 @@ fn rpc_call(
         "params": params,
     })
     .to_string();
-    let resp: serde_json::Value = ureq::post(rpc).send_string(&body)?.into_json()?;
+    let resp: serde_json::Value = cli_post_json(rpc, &body)?;
     if let Some(e) = resp.get("error") {
         anyhow::bail!("RPC {method} error: {e}");
     }
@@ -3613,7 +4013,7 @@ fn submit_unjail_with_retry(
             })
             .to_string();
             eprintln!("  rpc -> stell_sendRawTransaction: {body}");
-            let resp: serde_json::Value = ureq::post(rpc).send_string(&body)?.into_json()?;
+            let resp: serde_json::Value = cli_post_json(rpc, &body)?;
             eprintln!("  rpc <- stell_sendRawTransaction: {resp}");
             if let Some(e) = resp.get("error") {
                 anyhow::bail!("rejected by node: {e}");

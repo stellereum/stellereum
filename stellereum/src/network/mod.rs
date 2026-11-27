@@ -25,6 +25,7 @@ const _: () = assert!(
 #[cfg(test)]
 mod tests;
 
+use futures::stream::StreamExt;
 use infnode::node::Node;
 use std::sync::Arc;
 
@@ -42,6 +43,14 @@ pub const VALIDATOR_MESH_HEARTBEAT_MS: u64 = 10_000;
 /// Per-peer direct-send budget. A mesh send must never stall consensus: the
 /// DHT fallback takes over at this point.
 pub const VALIDATOR_MESH_SEND_TIMEOUT_MS: u64 = 2_000;
+/// Bounded concurrency for [`ValidatorMesh::maintain`] peer probes.
+pub const VALIDATOR_MESH_PROBE_CONCURRENCY: usize = 8;
+/// Bounded timeout for the overlay fallback inside [`ValidatorMesh::deliver_frame`]
+/// so a hung overlay publish cannot stall `ConsensusNetwork`'s sender task forever.
+pub const VALIDATOR_MESH_OVERLAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Bounded timeout per rotated-out validator connection invalidation.
+pub const VALIDATOR_MESH_ROTATE_CLOSE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
 
 /// Boxed future used by [`ValidatorMeshTransport`] (object-safe async).
 pub type MeshFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
@@ -578,12 +587,23 @@ impl ValidatorMesh {
         // when the mesh has no direct target at all (all suspected/mesh down).
         if delivery.direct_failed > 0 || delivery.direct_ok == 0 {
             delivery.fallback_used = true;
-            delivery.fallback_ok = self
-                .transport
-                .publish_overlay(topic, data)
-                .await
-                .map(|n| n > 0)
-                .unwrap_or(false);
+            delivery.fallback_ok = match tokio::time::timeout(
+                VALIDATOR_MESH_OVERLAY_TIMEOUT,
+                self.transport.publish_overlay(topic, data),
+            )
+            .await
+            {
+                Ok(Ok(n)) => n > 0,
+                Ok(Err(_)) => false,
+                Err(_) => {
+                    tracing::warn!(
+                        topic = %topic,
+                        timeout_secs = VALIDATOR_MESH_OVERLAY_TIMEOUT.as_secs(),
+                        "[mesh] overlay fallback publish timed out"
+                    );
+                    false
+                }
+            };
             if delivery.fallback_ok {
                 self.fallback_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -622,9 +642,15 @@ impl ValidatorMesh {
                 .filter(|m| m.suspected && !m.reconnect_due(now_ms))
                 .count()
         };
-        for id in probes {
+        let mut stream = futures::stream::iter(probes.into_iter().map(|id| async move {
+            let res = self.transport.probe(id).await;
+            (id, res)
+        }))
+        .buffer_unordered(VALIDATOR_MESH_PROBE_CONCURRENCY);
+
+        while let Some((id, res)) = stream.next().await {
             report.probed += 1;
-            match self.transport.probe(id).await {
+            match res {
                 Ok(()) => {
                     let was_suspected = self.is_suspected(&id);
                     self.record_success(id, now_ms);
@@ -780,7 +806,17 @@ impl ValidatorMeshTransport for InfnodeMeshTransport {
         topic: &'a str,
         data: &'a str,
     ) -> MeshFuture<'a, Result<usize, String>> {
-        Box::pin(async move { Ok(self.node.publish_overlay(topic, data).await) })
+        Box::pin(async move {
+            match tokio::time::timeout(
+                VALIDATOR_MESH_OVERLAY_TIMEOUT,
+                self.node.publish_overlay(topic, data),
+            )
+            .await
+            {
+                Ok(n) => Ok(n),
+                Err(_) => Err("mesh overlay publish timeout".to_string()),
+            }
+        })
     }
 }
 
@@ -1007,9 +1043,17 @@ impl P2pNetworkAdapter {
     /// Close the persistent direct links of validators removed by a rotation
     /// (a warm QUIC connection would otherwise outlive its membership).
     async fn close_rotated_out(&self, rotation: &MeshRotation) {
-        for id in &rotation.removed_ids {
-            self.node.invalidate_peer_conn(*id).await;
+        if rotation.removed_ids.is_empty() {
+            return;
         }
+        let futs = rotation.removed_ids.iter().map(|id| async move {
+            let _ = tokio::time::timeout(
+                VALIDATOR_MESH_ROTATE_CLOSE_TIMEOUT,
+                self.node.invalidate_peer_conn(*id),
+            )
+            .await;
+        });
+        futures::future::join_all(futs).await;
     }
 
     /// One maintenance pass (heartbeat/reconnect). Exposed for the driver and
@@ -1072,5 +1116,69 @@ impl P2pNetworkAdapter {
 
     pub fn epoch(&self) -> EpochTag {
         self.epoch.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+#[cfg(test)]
+mod wave23c_tests {
+    use super::*;
+
+    struct HungOverlayTransport;
+
+    impl ValidatorMeshTransport for HungOverlayTransport {
+        fn deliver_direct<'a>(
+            &'a self,
+            _peer: [u8; infnode::proto::NODEID_LEN],
+            _topic: &'a str,
+            _data: &'a str,
+        ) -> MeshFuture<'a, Result<(), String>> {
+            Box::pin(async { Err("direct link down".to_string()) })
+        }
+
+        fn probe<'a>(
+            &'a self,
+            _peer: [u8; infnode::proto::NODEID_LEN],
+        ) -> MeshFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn publish_overlay<'a>(
+            &'a self,
+            _topic: &'a str,
+            _data: &'a str,
+        ) -> MeshFuture<'a, Result<usize, String>> {
+            Box::pin(std::future::pending::<Result<usize, String>>())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deliver_frame_times_out_on_hung_overlay_publish() {
+        let mesh = ValidatorMesh::new(Arc::new(HungOverlayTransport));
+        let peer = [0x11u8; 20];
+        mesh.install(
+            vec![ValidatorMeshMember::new(
+                peer,
+                vec!["127.0.0.1:9411".to_string()],
+                "v1",
+            )],
+            1_000,
+        );
+
+        let delivery = mesh
+            .deliver("stell/consensus/test", "deadbeef", 1_000)
+            .await;
+        assert_eq!(delivery.targets, 1);
+        assert_eq!(delivery.direct_ok, 0);
+        assert_eq!(delivery.direct_failed, 1);
+        assert!(delivery.fallback_used);
+        assert!(
+            !delivery.fallback_ok,
+            "hung overlay publish must time out as fallback_ok = false"
+        );
+        assert_eq!(
+            mesh.fallback_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 }

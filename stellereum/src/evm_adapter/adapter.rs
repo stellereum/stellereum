@@ -2,8 +2,12 @@ use super::*;
 use crate::rpc::RpcState;
 use crate::state_engine::InMemoryStateEngine;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
+
+/// Maximum number of blocks, receipts, or transactions retained in
+/// `EvmAdapter`'s in-memory lookup caches (oldest entries evicted FIFO).
+pub const MAX_EVM_ADAPTER_CACHE: usize = 50_000;
 
 // ============================================================================
 // Direct network info methods
@@ -307,6 +311,11 @@ pub struct EvmAdapter {
     pub blocks_by_hash: HashMap<String, EvmBlock>,
     pub receipts: HashMap<String, EvmReceipt>,
     pub transactions: HashMap<String, EvmTransaction>,
+    max_cache: usize,
+    block_order: VecDeque<u64>,
+    block_hash_order: VecDeque<String>,
+    receipt_order: VecDeque<String>,
+    tx_order: VecDeque<String>,
     pub token_name: String,
     pub token_symbol: String,
     pub token_decimals: u8,
@@ -366,6 +375,11 @@ impl Default for EvmAdapter {
             blocks_by_hash: HashMap::new(),
             receipts: HashMap::new(),
             transactions: HashMap::new(),
+            max_cache: MAX_EVM_ADAPTER_CACHE,
+            block_order: VecDeque::new(),
+            block_hash_order: VecDeque::new(),
+            receipt_order: VecDeque::new(),
+            tx_order: VecDeque::new(),
             token_name: DEFAULT_TOKEN_NAME.to_string(),
             token_symbol: DEFAULT_TOKEN_SYMBOL.to_string(),
             token_decimals: DEFAULT_TOKEN_DECIMALS,
@@ -493,6 +507,11 @@ impl EvmAdapter {
         self
     }
 
+    pub fn with_max_cache(mut self, max_cache: usize) -> Self {
+        self.max_cache = max_cache;
+        self
+    }
+
     pub fn set_balance(&self, address: impl AsRef<str>, balance: u128) {
         let norm = normalize_address(address.as_ref());
         if let Ok(mut b) = self.balances.write() {
@@ -511,7 +530,7 @@ impl EvmAdapter {
             if let Some(&val) = b.get(&norm) {
                 return val;
             }
-            if stripped.len() == 64 {
+            if stripped.len() == 64 && stripped.is_ascii() {
                 let evm_norm = format!("0x{}", &stripped[24..64].to_lowercase());
                 if let Some(&val) = b.get(&evm_norm) {
                     return val;
@@ -578,10 +597,8 @@ impl EvmAdapter {
     /// [`MAX_GET_LOGS_RESULTS`] (1000).
     pub fn eth_get_logs(&self, params: &Value) -> Result<Value, JsonRpcError> {
         let criteria = FilterCriteria::from_value(params)?;
-        let block_hash_filter = extract_block_hash_filter(params);
-        let mut out = self.collect_matching_logs(&criteria, block_hash_filter.as_deref());
-        out.sort_by_key(log_sort_key);
-        out.truncate(MAX_GET_LOGS_RESULTS);
+        let block_hash_filter = extract_block_hash_filter(params)?;
+        let out = self.collect_matching_logs(&criteria, block_hash_filter.as_deref());
         Ok(json!(out))
     }
 
@@ -591,31 +608,43 @@ impl EvmAdapter {
     }
 
     /// Collects all receipt logs matching `criteria` (and optional `block_hash`),
-    /// capped at [`MAX_GET_LOGS_RESULTS`]. Shared by the adapter-level
-    /// [`EvmAdapter::eth_get_logs`] and the RPC-level merged query so both
-    /// levels filter identically.
+    /// sorted deterministically before truncating at [`MAX_GET_LOGS_RESULTS`].
+    /// Shared by the adapter-level [`EvmAdapter::eth_get_logs`] and the
+    /// RPC-level merged query so both levels filter identically.
     pub fn collect_matching_logs(
         &self,
         criteria: &FilterCriteria,
         block_hash: Option<&str>,
     ) -> Vec<EvmLog> {
+        fn cmp_log_deterministic(a: &EvmLog, b: &EvmLog) -> std::cmp::Ordering {
+            log_sort_key(a)
+                .cmp(&log_sort_key(b))
+                .then_with(|| a.block_hash.cmp(&b.block_hash))
+                .then_with(|| a.transaction_hash.cmp(&b.transaction_hash))
+                .then_with(|| a.address.cmp(&b.address))
+        }
+
+        const COMPACT_THRESHOLD: usize = MAX_GET_LOGS_RESULTS * 8;
         let mut out = Vec::new();
         for receipt in self.receipts.values() {
             for log in &receipt.logs {
                 if let Some(want) = block_hash {
                     match &log.block_hash {
-                        Some(have) if have.to_lowercase() == want.to_lowercase() => {}
+                        Some(have) if have.eq_ignore_ascii_case(want) => {}
                         _ => continue,
                     }
                 }
                 if criteria.matches(log) {
                     out.push(log.clone());
-                    if out.len() >= MAX_GET_LOGS_RESULTS {
-                        return out;
+                    if out.len() >= COMPACT_THRESHOLD {
+                        out.sort_by(cmp_log_deterministic);
+                        out.truncate(MAX_GET_LOGS_RESULTS);
                     }
                 }
             }
         }
+        out.sort_by(cmp_log_deterministic);
+        out.truncate(MAX_GET_LOGS_RESULTS);
         out
     }
 
@@ -823,7 +852,7 @@ impl EvmAdapter {
                     if let Some(&val) = b.get(&norm) {
                         return abi_encode_u128(val);
                     }
-                    if stripped.len() == 64 {
+                    if stripped.len() == 64 && stripped.is_ascii() {
                         let evm_norm = format!("0x{}", &stripped[24..64].to_lowercase());
                         if let Some(&val) = b.get(&evm_norm) {
                             return abi_encode_u128(val);
@@ -854,24 +883,35 @@ impl EvmAdapter {
     }
 
     pub fn insert_block(&mut self, block: EvmBlock) {
+        let cap = self.max_cache;
         if let Some(ref num_hex) = block.number {
             if let Ok(num) = parse_hex_u64(num_hex) {
                 if num > self.head_block {
                     self.head_block = num;
                 }
-                self.blocks_by_number.insert(num, block.clone());
+                insert_bounded_u64(
+                    &mut self.blocks_by_number,
+                    &mut self.block_order,
+                    num,
+                    block.clone(),
+                    cap,
+                );
             }
         }
         if let Some(ref hash_hex) = block.hash {
             if let Ok(norm_hash) = normalize_hash(hash_hex) {
-                self.blocks_by_hash.insert(norm_hash, block.clone());
+                insert_bounded_str(
+                    &mut self.blocks_by_hash,
+                    &mut self.block_hash_order,
+                    norm_hash,
+                    block.clone(),
+                    cap,
+                );
             }
         }
         if let BlockTransactions::Full(ref txs) = block.transactions {
             for tx in txs {
-                if let Ok(norm_tx_hash) = normalize_hash(&tx.hash) {
-                    self.transactions.insert(norm_tx_hash, tx.clone());
-                }
+                self.insert_transaction(tx.clone());
             }
         }
     }
@@ -888,7 +928,13 @@ impl EvmAdapter {
 
     pub fn insert_receipt(&mut self, receipt: EvmReceipt) {
         if let Ok(norm_hash) = normalize_hash(&receipt.transaction_hash) {
-            self.receipts.insert(norm_hash, receipt);
+            insert_bounded_str(
+                &mut self.receipts,
+                &mut self.receipt_order,
+                norm_hash,
+                receipt,
+                self.max_cache,
+            );
         }
     }
 
@@ -902,7 +948,13 @@ impl EvmAdapter {
 
     pub fn insert_transaction(&mut self, tx: EvmTransaction) {
         if let Ok(norm_hash) = normalize_hash(&tx.hash) {
-            self.transactions.insert(norm_hash, tx);
+            insert_bounded_str(
+                &mut self.transactions,
+                &mut self.tx_order,
+                norm_hash,
+                tx,
+                self.max_cache,
+            );
         }
     }
 
@@ -2063,6 +2115,56 @@ impl EvmAdapter {
     }
 }
 
+fn insert_bounded_u64<V>(
+    map: &mut HashMap<u64, V>,
+    order: &mut VecDeque<u64>,
+    key: u64,
+    val: V,
+    cap: usize,
+) {
+    if cap == 0 {
+        return;
+    }
+    if !map.contains_key(&key) {
+        while map.len() >= cap {
+            if let Some(oldest) = order.pop_front() {
+                map.remove(&oldest);
+            } else if let Some(k) = map.keys().next().copied() {
+                map.remove(&k);
+            } else {
+                break;
+            }
+        }
+        order.push_back(key);
+    }
+    map.insert(key, val);
+}
+
+fn insert_bounded_str<V>(
+    map: &mut HashMap<String, V>,
+    order: &mut VecDeque<String>,
+    key: String,
+    val: V,
+    cap: usize,
+) {
+    if cap == 0 {
+        return;
+    }
+    if !map.contains_key(&key) {
+        while map.len() >= cap {
+            if let Some(oldest) = order.pop_front() {
+                map.remove(&oldest);
+            } else if let Some(k) = map.keys().next().cloned() {
+                map.remove(&k);
+            } else {
+                break;
+            }
+        }
+        order.push_back(key.clone());
+    }
+    map.insert(key, val);
+}
+
 /// Core implementation of `eth_estimateGas`.
 ///
 /// FEE HONESTY (audit 2026-10-14 F4): this is an ADMISSION estimate, not
@@ -2277,12 +2379,13 @@ pub fn fee_history_impl(
         None => None,
     };
 
-    let actual_count = block_count.min(newest_block + 1);
-    let oldest_block_num = newest_block + 1 - actual_count;
+    let available_blocks = u128::from(newest_block) + 1;
+    let actual_count = u128::from(block_count).min(available_blocks) as u64;
+    let oldest_block_num = (available_blocks - u128::from(actual_count)) as u64;
     let oldest_block = format_u64_hex(oldest_block_num);
 
     let base_fee_hex = format_u128_hex(base_fee);
-    let base_fee_per_gas = vec![base_fee_hex; (actual_count + 1) as usize];
+    let base_fee_per_gas = vec![base_fee_hex; actual_count.saturating_add(1) as usize];
     let gas_used_ratio = vec![gas_used_ratio_val; actual_count as usize];
 
     let reward = percentile_micros.map(|percentiles| {
@@ -3144,5 +3247,185 @@ mod fee_history_percentile_tests {
         assert!(reward_percentile_micro(f64::INFINITY).is_err());
         assert!(reward_percentile_micro(-0.5).is_err());
         assert!(reward_percentile_micro(100.5).is_err());
+    }
+
+    #[test]
+    fn fee_history_at_u64_max_does_not_overflow_or_panic() {
+        let hist = fee_history_impl(
+            &json!([1, "0xffffffffffffffff"]),
+            u64::MAX,
+            DEFAULT_BASE_FEE,
+            DEFAULT_MAX_PRIORITY_FEE,
+            0.5,
+        )
+        .expect("eth_feeHistory at u64::MAX must succeed");
+        assert_eq!(hist.oldest_block, "0xffffffffffffffff");
+        assert_eq!(hist.base_fee_per_gas.len(), 2);
+        assert_eq!(hist.gas_used_ratio.len(), 1);
+
+        let hist_multi = fee_history_impl(
+            &json!([5, "0xffffffffffffffff"]),
+            u64::MAX,
+            DEFAULT_BASE_FEE,
+            DEFAULT_MAX_PRIORITY_FEE,
+            0.25,
+        )
+        .expect("eth_feeHistory multi-block at u64::MAX must succeed");
+        assert_eq!(hist_multi.oldest_block, format_u64_hex(u64::MAX - 4));
+        assert_eq!(hist_multi.base_fee_per_gas.len(), 6);
+        assert_eq!(hist_multi.gas_used_ratio.len(), 5);
+    }
+
+    #[test]
+    fn get_balance_non_ascii_64_bytes_does_not_panic() {
+        let adapter = EvmAdapter::new().with_default_balance(77);
+        // 32 two-byte UTF-8 chars = 64 bytes, byte 24 is mid-character.
+        let non_ascii_64 = format!("0x{}", "é".repeat(32));
+        assert_eq!(non_ascii_64.strip_prefix("0x").unwrap().len(), 64);
+        assert_eq!(adapter.get_balance(&non_ascii_64), 77);
+    }
+
+    #[test]
+    fn eth_get_logs_rejects_malformed_block_hash_and_sorts_deterministically() {
+        let mut adapter = EvmAdapter::new();
+        let err = adapter
+            .eth_get_logs(&json!([{ "blockHash": "0xbad" }]))
+            .expect_err("malformed blockHash must return invalid_params");
+        assert_eq!(err.code, INVALID_PARAMS_CODE);
+
+        // Insert > MAX_GET_LOGS_RESULTS logs in reverse block order across receipts.
+        let total = MAX_GET_LOGS_RESULTS + 50;
+        for i in (0..total).rev() {
+            let tx_hash = format!("0x{:064x}", i + 1);
+            let block_hash = format!("0x{:064x}", i + 10_000);
+            let log = EvmLog {
+                address: "0x1111111111111111111111111111111111111111".to_string(),
+                topics: vec![],
+                data: "0x".to_string(),
+                block_number: Some(format_u64_hex(i as u64)),
+                transaction_hash: Some(tx_hash.clone()),
+                transaction_index: Some("0x0".to_string()),
+                block_hash: Some(block_hash.clone()),
+                log_index: Some("0x0".to_string()),
+                removed: false,
+            };
+            adapter.insert_receipt(EvmReceipt {
+                transaction_hash: tx_hash,
+                transaction_index: "0x0".to_string(),
+                block_hash,
+                block_number: format_u64_hex(i as u64),
+                from: "0x1111111111111111111111111111111111111111".to_string(),
+                to: None,
+                cumulative_gas_used: "0x5208".to_string(),
+                gas_used: "0x5208".to_string(),
+                contract_address: None,
+                logs: vec![log],
+                logs_bloom: EMPTY_LOGS_BLOOM.to_string(),
+                status: Some("0x1".to_string()),
+                root: None,
+                tx_type: Some("0x0".to_string()),
+                effective_gas_price: Some("0x1".to_string()),
+                blob_gas_used: None,
+                blob_gas_price: None,
+            });
+        }
+
+        let val = adapter.eth_get_logs(&json!([{}])).expect("eth_getLogs");
+        let logs = val.as_array().expect("array of logs");
+        assert_eq!(logs.len(), MAX_GET_LOGS_RESULTS);
+        assert_eq!(logs[0]["blockNumber"], json!("0x0"));
+        assert_eq!(
+            logs[MAX_GET_LOGS_RESULTS - 1]["blockNumber"],
+            json!(format_u64_hex((MAX_GET_LOGS_RESULTS - 1) as u64))
+        );
+    }
+
+    #[test]
+    fn evm_adapter_cache_evicts_oldest_entries() {
+        let mut adapter = EvmAdapter::new().with_max_cache(3);
+        for i in 0u64..5 {
+            let block_hash = format!("0x{:064x}", i + 1);
+            let tx_hash = format!("0x{:064x}", i + 100);
+            let tx = EvmTransaction {
+                hash: tx_hash.clone(),
+                nonce: format_u64_hex(i),
+                block_hash: Some(block_hash.clone()),
+                block_number: Some(format_u64_hex(i)),
+                transaction_index: Some("0x0".to_string()),
+                from: "0x1111111111111111111111111111111111111111".to_string(),
+                to: None,
+                value: "0x0".to_string(),
+                gas_price: Some("0x1".to_string()),
+                gas: "0x5208".to_string(),
+                input: "0x".to_string(),
+                v: "0x0".to_string(),
+                r: "0x0".to_string(),
+                s: "0x0".to_string(),
+                tx_type: Some("0x0".to_string()),
+                chain_id: Some("0x167d".to_string()),
+                max_fee_per_gas: None,
+                max_priority_fee_per_gas: None,
+                access_list: None,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            let block = EvmBlock {
+                number: Some(format_u64_hex(i)),
+                hash: Some(block_hash.clone()),
+                parent_hash: EMPTY_ROOT_HASH.to_string(),
+                nonce: None,
+                sha3_uncles: EMPTY_UNCLES_HASH.to_string(),
+                logs_bloom: None,
+                transactions_root: EMPTY_ROOT_HASH.to_string(),
+                state_root: EMPTY_ROOT_HASH.to_string(),
+                receipts_root: EMPTY_ROOT_HASH.to_string(),
+                miner: "0x0000000000000000000000000000000000000000".to_string(),
+                difficulty: "0x0".to_string(),
+                total_difficulty: None,
+                extra_data: "0x".to_string(),
+                size: "0x0".to_string(),
+                gas_limit: "0x1".to_string(),
+                gas_used: "0x0".to_string(),
+                timestamp: "0x0".to_string(),
+                transactions: BlockTransactions::Full(vec![tx]),
+                uncles: vec![],
+                base_fee_per_gas: None,
+                mix_hash: None,
+                withdrawals: None,
+                withdrawals_root: None,
+                blob_gas_used: None,
+                excess_blob_gas: None,
+                parent_beacon_block_root: None,
+            };
+            adapter.insert_block(block);
+            adapter.insert_receipt(EvmReceipt {
+                transaction_hash: tx_hash,
+                transaction_index: "0x0".to_string(),
+                block_hash,
+                block_number: format_u64_hex(i),
+                from: "0x1111111111111111111111111111111111111111".to_string(),
+                to: None,
+                cumulative_gas_used: "0x5208".to_string(),
+                gas_used: "0x5208".to_string(),
+                contract_address: None,
+                logs: vec![],
+                logs_bloom: EMPTY_LOGS_BLOOM.to_string(),
+                status: Some("0x1".to_string()),
+                root: None,
+                tx_type: Some("0x0".to_string()),
+                effective_gas_price: Some("0x1".to_string()),
+                blob_gas_used: None,
+                blob_gas_price: None,
+            });
+        }
+        assert_eq!(adapter.blocks_by_number.len(), 3);
+        assert_eq!(adapter.blocks_by_hash.len(), 3);
+        assert_eq!(adapter.receipts.len(), 3);
+        assert_eq!(adapter.transactions.len(), 3);
+        assert!(!adapter.blocks_by_number.contains_key(&0));
+        assert!(!adapter.blocks_by_number.contains_key(&1));
+        assert!(adapter.blocks_by_number.contains_key(&2));
+        assert!(adapter.blocks_by_number.contains_key(&3));
+        assert!(adapter.blocks_by_number.contains_key(&4));
     }
 }

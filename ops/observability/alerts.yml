@@ -53,7 +53,7 @@ groups:
       #     / rate(stell_validator_proposals_expected_total[15m])
       # which is useful when the gauge is stale or you want a raw count.
       - alert: ValidatorJailed
-        expr: max_over_time(stell_validator_efficiency_ratio[15m]) == 0
+        expr: max_over_time(stell_validator_efficiency_ratio{role="validator"}[15m]) == 0
         for: 5m
         labels:
           severity: critical
@@ -71,9 +71,9 @@ groups:
 
       - alert: ValidatorNotVoting
         expr: |
-          avg_over_time(stell_validator_efficiency_ratio[15m]) < 0.9
+          avg_over_time(stell_validator_efficiency_ratio{role="validator"}[15m]) < 0.9
             and
-          max_over_time(stell_validator_efficiency_ratio[15m]) > 0
+          max_over_time(stell_validator_efficiency_ratio{role="validator"}[15m]) > 0
         for: 10m
         labels:
           severity: warning
@@ -98,7 +98,7 @@ groups:
         expr: |
           max_over_time(stell_consensus_height[2m])
             <
-          (max(max_over_time(stell_consensus_height[2m])) - 50)
+          (scalar(max(max_over_time(stell_consensus_height[2m]))) - 50)
         for: 2m
         labels:
           severity: warning
@@ -331,17 +331,17 @@ groups:
       # stopped producing votes; the rate itself is on the dashboard panel.
       - alert: FalconSignRate
         expr: |
-          sum by (node) (rate(stell_falcon_sign_total[5m])) == 0
-            and on (node)
-          (changes(stell_consensus_height[5m]) > 0)
+          sum by (node, instance) (rate(stell_falcon_sign_total{role="validator"}[5m])) == 0
+            and on (node, instance)
+          (stell_ready{role="validator"} == 1)
         for: 10m
         labels:
           severity: info
         annotations:
-          summary: "Falcon signing rate is 0 on {{ $labels.node }} while the node reports ready"
+          summary: "Falcon signing rate is 0 on {{ $labels.node }} while the node reports ready (stell_ready == 1)"
           description: >-
             rate(stell_falcon_sign_total[5m]) is exactly 0 on
-            {{ $labels.instance }} for 10m while the chain height is advancing. Signing
+            {{ $labels.instance }} for 10m while stell_ready == 1. Signing
             normally dominates CPU on a 1-vCPU validator, so zero means the node
             is not voting/proposing (observer mode, wrong keys, or a stalled
             consensus loop). Expected > 0 on a voting validator.

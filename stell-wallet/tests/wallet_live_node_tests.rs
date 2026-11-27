@@ -140,7 +140,7 @@ async fn rpc_balance_spv_against_real_node_verifies() {
     fund(&node, me.address, 321_000_000_000).await;
 
     let client = rpc_client(&node, None, None).await;
-    assert_eq!(client.chain_id(), 5757);
+    assert_eq!(client.chain_id().expect("chain_id"), 5757);
     let (balance, nonce, verified) = client.get_balance_spv(&me.address, 1).await.unwrap();
     assert_eq!((balance, nonce), (321_000_000_000, 0));
     assert!(verified, "real node proof must verify locally");
@@ -169,7 +169,8 @@ async fn rpc_pay_pending_then_confirmed_after_finalize_hook() {
         1,
         true,
         stellereum::zkml::DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_transfer_tx_bound");
     let (hash, finality) = client.broadcast_tx(&tx).await.unwrap();
     assert_eq!(hash, tx.compute_tx_hash());
     // No blocks are produced here: the honest answer is Pending, never Confirmed.
@@ -210,7 +211,8 @@ async fn rpc_failed_receipt_reports_failed_not_confirmed() {
         1,
         true,
         stellereum::zkml::DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_transfer_tx_bound");
     let (hash, _) = client.broadcast_tx(&tx).await.unwrap();
     node.state
         .record_receipts(
@@ -254,7 +256,8 @@ async fn rpc_write_without_token_is_rejected() {
         1,
         true,
         stellereum::zkml::DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_transfer_tx_bound");
     let (_, finality) = anon
         .broadcast_tx(&tx)
         .await
@@ -324,7 +327,8 @@ async fn rpc_token_balance_spv_and_send_admission() {
         0,
         1,
         stellereum::zkml::DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_token_transfer_tx");
     let (hash, finality) = client.broadcast_tx(&tx).await.unwrap();
     assert_eq!(finality, TxFinality::Pending);
     node.state
@@ -390,7 +394,8 @@ async fn rpc_stake_payload_admitted_to_mempool() {
             amount: 5_000_000_000,
         }],
         stellereum::zkml::DEFAULT_CHAIN_ID,
-    );
+    )
+    .expect("build_pq_payload_tx_bound");
     // The builder signs a well-formed payload tx (verifies locally).
     assert!(stellereum::sharding::Transaction::verify_signatures_batch(
         std::slice::from_ref(&tx)

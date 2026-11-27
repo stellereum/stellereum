@@ -1,0 +1,43 @@
+[Unit]
+Description=Stellereum PQ Remote Signer v2 Daemon (Falcon-512 Anti-Equivocation)
+Documentation=file:/home/imm/stellereum-project/ops/keys_runbook.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Install the release binary outside any cargo target dir (e.g.
+# /usr/local/bin/stellereum) so `cargo clean` cannot remove it under the live
+# daemon. Override STELLEREUM_BIN in /etc/stellereum/remote-signer.env or via
+# `systemctl edit stell-remote-signer.service`.
+Environment=STELLEREUM_BIN=/usr/local/bin/stellereum
+# Optional 0600 environment file (e.g. STELL_KEY_PASSPHRASE for enc2: falcon.key, STELL_CHAIN_ID, STELLEREUM_BIN).
+EnvironmentFile=-/etc/stellereum/remote-signer.env
+ExecStart=/bin/sh -c 'exec "${STELLEREUM_BIN:-/usr/local/bin/stellereum}" remote-signer serve --listen 127.0.0.1:8443 --falcon-key-file /etc/stellereum/remote-signer/falcon.key --data-dir /var/lib/stellereum-remote-signer --token-file /etc/stellereum/remote-signer/bearer.token'
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stell-remote-signer
+UMask=0077
+
+# Ensure the durable SafetyRecordStore directory exists with 0700 permissions.
+StateDirectory=stellereum-remote-signer
+StateDirectoryMode=0700
+
+# Sandboxing & privilege hardening (defense-in-depth):
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/stellereum-remote-signer
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -49,6 +49,52 @@ pub const UPGRADE_VERSION_ENV: &str = "STELL_UPGRADE_VERSION";
 /// Marker field parser is strict on this header; a future format must bump it.
 pub const MAX_UPGRADE_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Maximum JSON-RPC response size accepted by [`UpgradePlan::read_rpc`].
+pub const MAX_UPGRADE_RPC_BYTES: usize = 64 * 1024;
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "x86",
+        target_arch = "riscv64"
+    )
+))]
+const O_NOFOLLOW: i32 = 0o400000;
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+const O_NOFOLLOW: i32 = 0x0100;
+
+#[cfg(all(
+    unix,
+    not(all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "x86",
+            target_arch = "riscv64"
+        )
+    )),
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))
+))]
+const O_NOFOLLOW: i32 = 0;
+
 /// Full v1 upgrade-halt marker written by `stellereum` (`upgrade_halt.rs`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HaltMarker {
@@ -392,6 +438,12 @@ impl UpgradePlan {
 
     /// Read the committed plan over JSON-RPC (`stell_governanceParams`).
     pub fn read_rpc(url: &str) -> Result<Option<Self>, String> {
+        if !is_loopback_http_or_https(url) {
+            return Err(format!(
+                "RPC {url}: refusing URL (requires https:// or strict loopback http:// without userinfo)"
+            ));
+        }
+        let is_https = url.trim().to_ascii_lowercase().starts_with("https://");
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -403,6 +455,7 @@ impl UpgradePlan {
             .timeout(Duration::from_secs(5))
             .redirects(0)
             .try_proxy_from_env(false)
+            .https_only(is_https)
             .build();
         let response = agent
             .post(url)
@@ -413,14 +466,56 @@ impl UpgradePlan {
         if !(200..300).contains(&status) {
             return Err(format!("RPC {url}: HTTP {status}"));
         }
-        let value: serde_json::Value = {
-            let text = response
-                .into_string()
-                .map_err(|e| format!("RPC {url}: read body: {e}"))?;
-            serde_json::from_str(&text).map_err(|e| format!("RPC {url}: invalid JSON: {e}"))?
-        };
+        let mut raw = Vec::new();
+        response
+            .into_reader()
+            .take((MAX_UPGRADE_RPC_BYTES + 1) as u64)
+            .read_to_end(&mut raw)
+            .map_err(|e| format!("RPC {url}: read body: {e}"))?;
+        if raw.len() > MAX_UPGRADE_RPC_BYTES {
+            return Err(format!(
+                "RPC {url}: response exceeded {MAX_UPGRADE_RPC_BYTES} bytes"
+            ));
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&raw).map_err(|e| format!("RPC {url}: invalid JSON: {e}"))?;
         Self::from_rpc_value(&value)
     }
+}
+
+/// Returns `true` iff `url` uses `https://` (with a non-empty authority and no
+/// `@` userinfo) or plain `http://` targeting a strict loopback host
+/// (`127.0.0.1`, `[::1]`, or `localhost`, optionally with a numeric TCP port and
+/// no `@` userinfo).
+pub fn is_loopback_http_or_https(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("https://") {
+        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let authority = &rest[..authority_end];
+        return !authority.is_empty()
+            && !authority.contains('@')
+            && !authority.chars().any(char::is_whitespace);
+    }
+    let Some(rest) = lower.strip_prefix("http://") else {
+        return false;
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.contains('@') {
+        return false;
+    }
+    for host in ["127.0.0.1", "[::1]", "localhost"] {
+        let port_ok = authority
+            .strip_prefix(host)
+            .and_then(|after_host| after_host.strip_prefix(':'))
+            .is_some_and(|p| {
+                !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok()
+            });
+        if authority == host || port_ok {
+            return true;
+        }
+    }
+    false
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
@@ -483,45 +578,7 @@ pub fn verify_staged(path: &Path, expected: &[u8; 32]) -> Result<VerifiedBinary,
     if *expected == [0u8; 32] {
         return Err("expected sha256 is all zero; refusing".to_string());
     }
-    let meta =
-        fs::symlink_metadata(path).map_err(|e| format!("staged binary {}: {e}", path.display()))?;
-    if meta.file_type().is_symlink() {
-        return Err(format!(
-            "staged binary {} is a SYMLINK; refusing (must be a regular file)",
-            path.display()
-        ));
-    }
-    if !meta.is_file() {
-        return Err(format!(
-            "staged binary {} is not a regular file",
-            path.display()
-        ));
-    }
-    if meta.len() > MAX_UPGRADE_BINARY_BYTES {
-        return Err(format!(
-            "staged binary {} is too large ({} bytes > {MAX_UPGRADE_BINARY_BYTES})",
-            path.display(),
-            meta.len()
-        ));
-    }
-    check_parent_dir(path, "staged binary")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = meta.permissions().mode();
-        if mode & 0o002 != 0 {
-            return Err(format!(
-                "staged binary {} is WORLD-WRITABLE (mode {:o}); refusing",
-                path.display(),
-                mode
-            ));
-        }
-    }
-    let bytes =
-        fs::read(path).map_err(|e| format!("read staged binary {}: {e}", path.display()))?;
-    if bytes.len() as u64 > MAX_UPGRADE_BINARY_BYTES {
-        return Err("staged binary grew past the size cap while reading".to_string());
-    }
+    let bytes = read_regular_executable_bytes(path, "staged binary")?;
     let digest = Sha256::digest(&bytes);
     let mut sha256 = [0u8; 32];
     sha256.copy_from_slice(&digest);
@@ -631,29 +688,29 @@ pub fn backup_path_for(live: &Path) -> PathBuf {
 }
 
 fn read_regular_executable_bytes(path: &Path, label: &str) -> Result<Vec<u8>, String> {
-    let meta =
+    let lmeta =
         fs::symlink_metadata(path).map_err(|e| format!("{label} {}: {e}", path.display()))?;
-    if meta.file_type().is_symlink() {
+    if lmeta.file_type().is_symlink() {
         return Err(format!(
             "{label} {} is a SYMLINK; refusing (must be a regular file)",
             path.display()
         ));
     }
-    if !meta.is_file() {
+    if !lmeta.is_file() {
         return Err(format!("{label} {} is not a regular file", path.display()));
     }
-    if meta.len() > MAX_UPGRADE_BINARY_BYTES {
+    if lmeta.len() > MAX_UPGRADE_BINARY_BYTES {
         return Err(format!(
             "{label} {} is too large ({} bytes > {MAX_UPGRADE_BINARY_BYTES})",
             path.display(),
-            meta.len()
+            lmeta.len()
         ));
     }
     check_parent_dir(path, label)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = meta.permissions().mode();
+        let mode = lmeta.permissions().mode();
         if mode & 0o002 != 0 {
             return Err(format!(
                 "{label} {} is WORLD-WRITABLE (mode {:o}); refusing",
@@ -662,7 +719,53 @@ fn read_regular_executable_bytes(path: &Path, label: &str) -> Result<Vec<u8>, St
             ));
         }
     }
-    let bytes = fs::read(path).map_err(|e| format!("read {label} {}: {e}", path.display()))?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if O_NOFOLLOW != 0 {
+            options.custom_flags(O_NOFOLLOW);
+        }
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("open {label} {}: {e}", path.display()))?;
+    let fmeta = file
+        .metadata()
+        .map_err(|e| format!("stat open {label} {}: {e}", path.display()))?;
+    if !fmeta.file_type().is_file() {
+        return Err(format!("{label} {} is not a regular file", path.display()));
+    }
+    if fmeta.len() > MAX_UPGRADE_BINARY_BYTES {
+        return Err(format!(
+            "{label} {} is too large ({} bytes > {MAX_UPGRADE_BINARY_BYTES})",
+            path.display(),
+            fmeta.len()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if lmeta.dev() != fmeta.dev() || lmeta.ino() != fmeta.ino() {
+            return Err(format!(
+                "{label} {} changed on disk during open (dev/ino mismatch); refusing",
+                path.display()
+            ));
+        }
+        let mode = fmeta.permissions().mode();
+        if mode & 0o002 != 0 {
+            return Err(format!(
+                "{label} {} is WORLD-WRITABLE (mode {:o}); refusing",
+                path.display(),
+                mode
+            ));
+        }
+    }
+    let mut bytes = Vec::with_capacity(fmeta.len().min(MAX_UPGRADE_BINARY_BYTES) as usize);
+    file.take(MAX_UPGRADE_BINARY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read {label} {}: {e}", path.display()))?;
     if bytes.len() as u64 > MAX_UPGRADE_BINARY_BYTES {
         return Err(format!("{label} grew past the size cap while reading"));
     }
@@ -1049,6 +1152,10 @@ WantedBy=multi-user.target\n\
 /// regular file, and the parent directory is neither group-writable (`0o020`)
 /// nor world-writable (`0o002`).
 pub fn check_progress_path(path: &Path) -> Result<(), String> {
+    check_progress_path_meta(path).map(|_| ())
+}
+
+fn check_progress_path_meta(path: &Path) -> Result<Option<fs::Metadata>, String> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1109,11 +1216,11 @@ pub fn check_progress_path(path: &Path) -> Result<(), String> {
                     path.display()
                 ));
             }
+            Ok(Some(target_meta))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("stat progress file {}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("stat progress file {}: {e}", path.display())),
     }
-    Ok(())
 }
 
 /// Append-only progress journal. One line per step, timestamped in epoch
@@ -1157,7 +1264,7 @@ impl Progress {
                 }
             }
         }
-        check_progress_path(&self.path)?;
+        let pre_meta = check_progress_path_meta(&self.path)?;
         let unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1169,10 +1276,48 @@ impl Progress {
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o644);
+            if O_NOFOLLOW != 0 {
+                options.custom_flags(O_NOFOLLOW);
+            }
         }
         let mut file = options
             .open(&self.path)
             .map_err(|e| format!("open progress {}: {e}", self.path.display()))?;
+        let post_meta = file
+            .metadata()
+            .map_err(|e| format!("stat open progress {}: {e}", self.path.display()))?;
+        if !post_meta.file_type().is_file() {
+            return Err(format!(
+                "progress file {} is not a regular file",
+                self.path.display()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Some(ref pre) = pre_meta {
+                if pre.dev() != post_meta.dev() || pre.ino() != post_meta.ino() {
+                    return Err(format!(
+                        "progress file {} changed on disk during open (dev/ino mismatch); refusing",
+                        self.path.display()
+                    ));
+                }
+            } else {
+                let lmeta = fs::symlink_metadata(&self.path)
+                    .map_err(|e| format!("stat progress file {}: {e}", self.path.display()))?;
+                if lmeta.file_type().is_symlink()
+                    || lmeta.dev() != post_meta.dev()
+                    || lmeta.ino() != post_meta.ino()
+                {
+                    return Err(format!(
+                        "progress file {} changed on disk during create (dev/ino mismatch); refusing",
+                        self.path.display()
+                    ));
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = pre_meta;
         file.write_all(line.as_bytes())
             .map_err(|e| format!("write progress {}: {e}", self.path.display()))?;
         file.sync_all()
@@ -1666,5 +1811,73 @@ mod tests {
         assert!(err.contains("SYMLINK"), "{err}");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_rpc_refuses_non_loopback_http_and_userinfo_bypass() {
+        assert!(is_loopback_http_or_https("http://127.0.0.1:8545"));
+        assert!(is_loopback_http_or_https("http://127.0.0.1"));
+        assert!(is_loopback_http_or_https("http://localhost:8545/rpc"));
+        assert!(is_loopback_http_or_https("http://LOCALHOST:8545"));
+        assert!(is_loopback_http_or_https("http://[::1]:8545"));
+        assert!(is_loopback_http_or_https("http://[::1]"));
+        assert!(is_loopback_http_or_https("http://127.0.0.1/path@with/at"));
+        assert!(is_loopback_http_or_https("https://rpc.example.com:8443"));
+        assert!(is_loopback_http_or_https("https://127.0.0.1:8443/v1"));
+
+        assert!(!is_loopback_http_or_https("http://rpc.example.com:8545"));
+        assert!(!is_loopback_http_or_https("http://192.168.1.5:8545"));
+        assert!(!is_loopback_http_or_https("http://127.0.0.1.evil.com:8545"));
+        assert!(!is_loopback_http_or_https("http://localhost.evil.com:8545"));
+        assert!(!is_loopback_http_or_https("http://127.0.0.1@evil.com:8545"));
+        assert!(!is_loopback_http_or_https(
+            "http://127.0.0.1:x@evil.com:8545"
+        ));
+        assert!(!is_loopback_http_or_https("http://user@127.0.0.1:8545"));
+        assert!(!is_loopback_http_or_https("http://[::1]@evil.com"));
+        assert!(!is_loopback_http_or_https(
+            "https://127.0.0.1@evil.com:8443"
+        ));
+        assert!(!is_loopback_http_or_https("ftp://127.0.0.1:8545"));
+        assert!(!is_loopback_http_or_https("http://127.0.0.1:notaport"));
+        assert!(!is_loopback_http_or_https("http://"));
+        assert!(!is_loopback_http_or_https("https://"));
+        assert!(!is_loopback_http_or_https(""));
+
+        for bad_url in [
+            "http://rpc.example.com:8545",
+            "http://127.0.0.1:x@evil.example:8545",
+            "http://localhost@evil.example:8545",
+            "http://user@127.0.0.1:8545",
+            "https://127.0.0.1@evil.example:8443",
+        ] {
+            let err = UpgradePlan::read_rpc(bad_url)
+                .expect_err("non-loopback http or @-userinfo URL must be refused");
+            assert!(err.contains("refusing URL"), "{bad_url}: {err}");
+        }
+    }
+
+    #[test]
+    fn read_rpc_refuses_oversized_response() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let addr = listener.local_addr().expect("addr");
+        let oversized_len = MAX_UPGRADE_RPC_BYTES + 128;
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {oversized_len}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let payload = vec![b' '; oversized_len];
+                let _ = stream.write_all(&payload);
+                let _ = stream.flush();
+            }
+        });
+        let url = format!("http://{addr}");
+        let err = UpgradePlan::read_rpc(&url).expect_err("oversized RPC body must be refused");
+        assert!(err.contains("exceeded"), "{err}");
+        let _ = handle.join();
     }
 }

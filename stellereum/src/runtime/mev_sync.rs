@@ -9,8 +9,48 @@ use crate::consensus::{Height, Round, Step};
 use crate::mempool::Mempool;
 use crate::sharding::{Block, CrossShardKey, CrossShardMessage, Transaction};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 impl ValidatorRuntime {
+    /// Resolve the node-local MEV KEM material for THIS node.
+    ///
+    /// Precedence is explicit and per-runtime first: a runtime built with
+    /// [`ValidatorRuntime::with_mev_kem`] uses those fields. Otherwise the
+    /// shared mempool's bootstrap-installed wiring is used (the node path:
+    /// bootstrap derives the seed and calls `Mempool::with_mev_kem` before the
+    /// consensus runtime is spawned). Both halves are required — a registry
+    /// without the seed, or a seed without the registry, is NOT enough and the
+    /// caller must fail closed.
+    ///
+    /// The returned seed is a fresh `Zeroizing` copy for one protocol call; it
+    /// is never placed in a plain array and never logged.
+    async fn mev_kem_material(
+        &self,
+    ) -> Option<(
+        Arc<crate::mev_kem_registry::MevKemRegistry>,
+        zeroize::Zeroizing<[u8; 64]>,
+    )> {
+        if let (Some(registry), Some(seed)) = (&self.mev_kem_registry, &self.mev_kem_seed) {
+            let pool = self.mempool.read().await;
+            if pool.peer_kem_keys.is_empty() {
+                return Some((Arc::clone(registry), zeroize::Zeroizing::new(**seed)));
+            }
+            let mut merged = (**registry).clone();
+            merged.merge_non_conflicting(&pool.peer_kem_keys);
+            return Some((Arc::new(merged), zeroize::Zeroizing::new(**seed)));
+        }
+        let pool = self.mempool.read().await;
+        pool.mev_kem().map(|wiring| {
+            let reg = wiring.effective_registry();
+            if pool.peer_kem_keys.is_empty() {
+                return (reg, wiring.seed());
+            }
+            let mut merged = (*reg).clone();
+            merged.merge_non_conflicting(&pool.peer_kem_keys);
+            (Arc::new(merged), wiring.seed())
+        })
+    }
+
     /// Whether a sealed transaction's transparent metadata matches the
     /// transaction it was sealed from.
     ///
@@ -250,7 +290,7 @@ impl ValidatorRuntime {
     /// reuse is disabled then, see `propose`), and when the cache already
     /// covers the target height.
     pub async fn prebuild_next_proposal(&mut self, timestamp: u64) {
-        if self.apply_in_flight.is_some() {
+        if !self.apply_in_flight.is_empty() {
             return;
         }
         // Target: our own imminent proposal — current round if we own it and
@@ -402,40 +442,144 @@ impl ValidatorRuntime {
         let our_id = self.key.verifying_key().to_bytes();
         let seed = self.key.to_bytes();
         let now = std::time::Instant::now();
-        let contribution = {
+        let pure_pq = crate::post_quantum::is_pure_pq_enforced();
+        let mev_kem = self.mev_kem_material().await;
+        let falcon = self.falcon_signing_key().cloned();
+        let kem_announce: Option<crate::mev_epoch::MevFrame> = if pure_pq
+            && self.validators.contains(&our_id)
+        {
+            if let (Some((registry, kem_seed)), Some(fk)) = (mev_kem.as_ref(), falcon.as_ref()) {
+                let ek = crate::mev_epoch::pq_kem_ek_from_seed(kem_seed);
+                if registry
+                    .get_active_ek(&our_id, self.hc.height)
+                    .is_some_and(|reg_ek| reg_ek != ek)
+                {
+                    tracing::warn!(
+                        "[mev-seal] epoch {epoch}: local ML-KEM seed does not match our \
+                             registered key; refusing to announce mismatched KEM key"
+                    );
+                    None
+                } else {
+                    let mut pool = self.mempool.write().await;
+                    let due = pool
+                        .last_kem_announce
+                        .is_none_or(|last| now.duration_since(last) >= DKG_REPUBLISH_INTERVAL);
+                    if due {
+                        let activation_height = registry
+                            .record_of(&our_id)
+                            .map(|r| match &r.pending {
+                                Some(p) if self.hc.height >= p.effective_height => {
+                                    p.effective_height
+                                }
+                                _ => r.activated_at,
+                            })
+                            .unwrap_or(self.hc.height)
+                            .min(self.hc.height);
+                        match crate::mev_epoch::kem_key_announcement_seal(
+                            fk,
+                            self.state.chain_id,
+                            our_id,
+                            ek,
+                            activation_height,
+                        ) {
+                            Ok(ann) => {
+                                pool.last_kem_announce = Some(now);
+                                pool.own_kem_announcement = Some(ann.clone());
+                                Some(crate::mev_epoch::MevFrame::KemKey(ann))
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "[mev-seal] epoch {epoch}: failed to seal kem key \
+                                         announcement: {e}"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(frame) = kem_announce {
+            tracing::info!("[mev-seal] epoch {epoch}: announcing our ML-KEM-768 transport key");
+            self.gossip_mev_frame(frame).await;
+        }
+        let published: Option<crate::mev_epoch::MevFrame> = {
             let mut pool = self.mempool.write().await;
             pool.set_sealed_epoch(epoch);
-            match pool.mev_seal.sync_epoch(epoch, &ids, our_id, &seed) {
-                Ok(c) => {
-                    if let Some(contribution) = &c {
-                        // Ingest OUR OWN contribution locally: the epoch key
-                        // is the aggregate over the WHOLE contributor set,
-                        // and our own evaluation is one of its terms.
-                        if let Err(e) = pool
-                            .mev_seal
-                            .ingest_contribution(contribution.clone(), &seed)
-                        {
-                            tracing::debug!("[mev-seal] our own dkg contribution refused: {e}");
+            if !pure_pq {
+                // The legacy `sync_epoch` entry point is an unconditional
+                // refusal now (the classical X25519 transport is removed).
+                // There is no safe non-PQ construction path, so fail closed
+                // with the cause instead of calling a known-dead stub.
+                tracing::warn!(
+                    "[mev-seal] epoch {epoch}: legacy node-side DKG is disabled (classical \
+                     X25519 transport removed); refusing epoch sealing"
+                );
+                None
+            } else if let Some((registry, kem_seed)) = mev_kem.as_ref() {
+                match pool.mev_seal.sync_epoch_pq(
+                    epoch,
+                    &ids,
+                    our_id,
+                    &seed,
+                    kem_seed,
+                    registry,
+                    self.hc.height,
+                ) {
+                    Ok(c) => {
+                        if let Some(contribution) = c {
+                            let Some(fk) = falcon.as_ref() else {
+                                tracing::warn!(
+                                    "[mev-seal] epoch {epoch}: no Falcon-512 keypair; cannot \
+                                     authenticate the DKG contribution in pure-PQ mode"
+                                );
+                                return;
+                            };
+                            let envelope = crate::mev_epoch::pq_transport_seal(fk, contribution);
+                            // Ingest OUR OWN contribution locally: the epoch key
+                            // is the aggregate over the WHOLE contributor set,
+                            // and our own evaluation is one of its terms.
+                            if let Err(e) = pool.mev_seal.ingest_contribution_pq(
+                                &envelope,
+                                kem_seed,
+                                &our_id,
+                                fk.public_key(),
+                                registry,
+                                self.hc.height,
+                            ) {
+                                tracing::debug!(
+                                    "[mev-seal] our own pq dkg contribution refused: {e}"
+                                );
+                            }
+                            pool.mev_seal.note_published(now);
+                            Some(crate::mev_epoch::MevFrame::PqDkg(envelope))
+                        } else {
+                            None
                         }
                     }
-                    if c.is_some() {
-                        pool.mev_seal.note_published(now);
+                    Err(e) => {
+                        tracing::debug!("[mev-seal] epoch {epoch}: no dkg ({e})");
+                        None
                     }
-                    c
                 }
-                Err(e) => {
-                    tracing::debug!("[mev-seal] epoch {epoch}: no dkg ({e})");
-                    None
-                }
+            } else {
+                // Pinned fail-closed state: no registry/seed => no material.
+                tracing::warn!(
+                    "[mev-seal] epoch {epoch}: MEV sealing unavailable without KEM wiring \
+                     (MEV KEM registry + node-local ML-KEM seed absent); refusing node-side DKG"
+                );
+                None
             }
         };
-        if let Some(contribution) = contribution {
-            tracing::info!(
-                "[mev-seal] epoch {epoch}: published our dkg contribution (index {})",
-                contribution.index
-            );
-            self.gossip_mev_frame(crate::mev_epoch::MevFrame::Dkg(contribution))
-                .await;
+        if let Some(frame) = published {
+            tracing::info!("[mev-seal] epoch {epoch}: published our pq dkg contribution");
+            self.gossip_mev_frame(frame).await;
             // The DKG may have completed with our own contribution (we are
             // the last contributor the node was waiting for).
             self.publish_epoch_announcement().await;
@@ -447,9 +591,11 @@ impl ValidatorRuntime {
         // the epoch's key generation would never complete.
         let republish = {
             let mut pool = self.mempool.write().await;
-            if pool
-                .mev_seal
-                .should_publish_contribution(now, DKG_REPUBLISH_INTERVAL)
+            if pure_pq
+                && mev_kem.is_some()
+                && pool
+                    .mev_seal
+                    .should_publish_contribution(now, DKG_REPUBLISH_INTERVAL)
             {
                 let c = pool.mev_seal.own_contribution().cloned();
                 if c.is_some() {
@@ -461,9 +607,12 @@ impl ValidatorRuntime {
             }
         };
         if let Some(c) = republish {
-            tracing::debug!("[mev-seal] epoch {epoch}: re-publishing our dkg contribution");
-            self.gossip_mev_frame(crate::mev_epoch::MevFrame::Dkg(c))
-                .await;
+            if let Some(fk) = falcon.as_ref() {
+                tracing::debug!("[mev-seal] epoch {epoch}: re-publishing our pq dkg contribution");
+                let envelope = crate::mev_epoch::pq_transport_seal(fk, c);
+                self.gossip_mev_frame(crate::mev_epoch::MevFrame::PqDkg(envelope))
+                    .await;
+            }
         }
     }
 
@@ -520,38 +669,21 @@ impl ValidatorRuntime {
                     tracing::debug!("[mev-seal] sealed admission refused: {e}");
                 }
             }
-            crate::mev_epoch::MevFrame::Dkg(contribution) => {
-                let seed = self.key.to_bytes();
-                let (material, announcement) = {
-                    let mut pool = self.mempool.write().await;
-                    if let Err(e) = pool.mev_seal.ingest_contribution(contribution, &seed) {
-                        tracing::debug!("[mev-seal] dkg contribution refused: {e}");
-                        return;
-                    }
-                    let material = pool.mev_seal.material().cloned();
-                    let announcement = material.as_ref().and_then(|_| {
-                        if let Some(fk) = self.falcon_signing_key() {
-                            pool.mev_seal.build_announcement_pq(&self.key, fk).ok()
-                        } else if !crate::post_quantum::is_pure_pq_enforced() {
-                            pool.mev_seal.build_announcement(&self.key).ok()
-                        } else {
-                            None
-                        }
-                    });
-                    (material, announcement)
-                };
-                if let Some(material) = material {
-                    tracing::info!(
-                        "[mev-seal] epoch {} key ready (threshold {})",
-                        material.epoch,
-                        material.threshold
+            crate::mev_epoch::MevFrame::Dkg(_contribution) => {
+                // FAIL-CLOSED: `ingest_contribution` is an unconditional
+                // refusal now (the classical X25519 transport is removed) and
+                // this frame carries no Falcon authentication, so it can never
+                // enter the ML-KEM path either. Never call the dead stub and
+                // never fall back.
+                if crate::post_quantum::is_pure_pq_enforced() {
+                    tracing::warn!(
+                        "[mev-seal] unauthenticated dkg contribution refused in pure-PQ mode"
                     );
-                }
-                // Announce the epoch key: the committee's agreement, signed by
-                // us, so a light client can check the key against the chain.
-                if let Some(announcement) = announcement {
-                    self.gossip_mev_frame(crate::mev_epoch::MevFrame::Announcement(announcement))
-                        .await;
+                } else {
+                    tracing::warn!(
+                        "[mev-seal] legacy dkg contribution refused: unauthenticated classical \
+                         ingest removed (use the Falcon-sealed PqDkg frame)"
+                    );
                 }
             }
             crate::mev_epoch::MevFrame::PqDkg(envelope) => {
@@ -582,13 +714,33 @@ impl ValidatorRuntime {
                     tracing::warn!("[mev-seal] pq dkg envelope refused: {e}");
                     return;
                 }
-                let seed = self.key.to_bytes();
+                if !crate::post_quantum::is_pure_pq_enforced() {
+                    tracing::warn!(
+                        "[mev-seal] pq dkg envelope refused: node-side DKG ingest requires \
+                         pure-PQ mode (legacy classical ingest is removed)"
+                    );
+                    return;
+                }
+                let Some((registry, kem_seed)) = self.mev_kem_material().await else {
+                    // Pinned fail-closed state: a valid envelope is NOT
+                    // material without the KEM wiring. Never fall back to the
+                    // removed classical transport.
+                    tracing::warn!(
+                        "[mev-seal] pq dkg envelope refused: MEV sealing unavailable without \
+                         KEM wiring (MEV KEM registry + node-local ML-KEM seed absent)"
+                    );
+                    return;
+                };
                 let (material, announcement) = {
                     let mut pool = self.mempool.write().await;
-                    if let Err(e) = pool
-                        .mev_seal
-                        .ingest_contribution(envelope.contribution, &seed)
-                    {
+                    if let Err(e) = pool.mev_seal.ingest_contribution_pq(
+                        &envelope,
+                        &kem_seed,
+                        &self.id,
+                        expected_falcon_pk,
+                        &registry,
+                        self.hc.height,
+                    ) {
                         tracing::debug!("[mev-seal] pq dkg contribution refused: {e}");
                         return;
                     }
@@ -686,10 +838,20 @@ impl ValidatorRuntime {
                     }
                 };
                 let mut pool = self.mempool.write().await;
-                match pool
-                    .mev_seal
-                    .ingest_release_authenticated(&envelope, expected_falcon_pk)
-                {
+                let ephemeral_pks: HashMap<[u8; 32], [u8; 32]> = envelope
+                    .release
+                    .partials
+                    .iter()
+                    .filter_map(|(tx_hash, _)| {
+                        pool.sealed_envelope(tx_hash)
+                            .map(|env| (*tx_hash, env.ephemeral_pk))
+                    })
+                    .collect();
+                match pool.mev_seal.ingest_release_authenticated_with_ephemeral(
+                    &envelope,
+                    expected_falcon_pk,
+                    |tx_hash| ephemeral_pks.get(tx_hash).copied(),
+                ) {
                     Ok(n) => tracing::debug!("[mev-seal] accepted {n} pq decryption partial(s)"),
                     Err(e) => tracing::debug!("[mev-seal] pq share release refused: {e}"),
                 }
@@ -702,6 +864,109 @@ impl ValidatorRuntime {
                 let mut pool = self.mempool.write().await;
                 if let Err(e) = pool.mev_seal.merge_announcement(announcement) {
                     tracing::debug!("[mev-seal] epoch announcement refused: {e}");
+                }
+            }
+            crate::mev_epoch::MevFrame::KemKey(ann) => {
+                if !self.validators.contains(&ann.validator_id) {
+                    tracing::warn!(
+                        "[mev-seal] kem key announcement refused: sender is not in validator set"
+                    );
+                    return;
+                }
+                if ann.chain_id != self.state.chain_id {
+                    tracing::warn!(
+                        "[mev-seal] kem key announcement refused: chain_id {} != expected {}",
+                        ann.chain_id,
+                        self.state.chain_id
+                    );
+                    return;
+                }
+                if ann.activation_height > self.hc.height {
+                    tracing::warn!(
+                        "[mev-seal] kem key announcement refused: activation_height {} > current height {}",
+                        ann.activation_height,
+                        self.hc.height
+                    );
+                    return;
+                }
+                if !crate::post_quantum::is_pure_pq_enforced() {
+                    tracing::warn!(
+                        "[mev-seal] kem key announcement refused: requires pure-PQ mode"
+                    );
+                    return;
+                }
+                let Some((base_registry, _)) = self.mev_kem_material().await else {
+                    tracing::warn!(
+                        "[mev-seal] kem key announcement refused: MEV sealing unavailable \
+                         without KEM wiring (MEV KEM registry + node-local ML-KEM seed absent)"
+                    );
+                    return;
+                };
+                let Some((scheme, pk)) =
+                    crate::consensus::pq_key_at_height(&ann.validator_id, self.hc.height)
+                else {
+                    tracing::warn!(
+                        "[mev-seal] kem key announcement refused: no registered PQ key for validator"
+                    );
+                    return;
+                };
+                let expected_falcon_pk: &[u8] = match scheme {
+                    crate::post_quantum::PqScheme::Falcon512 => &pk,
+                    _ => {
+                        tracing::warn!(
+                            "[mev-seal] kem key announcement refused: unsupported registered PQ \
+                             scheme {:?}",
+                            scheme
+                        );
+                        return;
+                    }
+                };
+                if let Err(e) = crate::mev_epoch::kem_key_announcement_verify(
+                    &ann,
+                    self.state.chain_id,
+                    expected_falcon_pk,
+                ) {
+                    tracing::warn!("[mev-seal] kem key announcement refused: {e}");
+                    return;
+                }
+                if let Some(existing) = base_registry.record_of(&ann.validator_id) {
+                    if existing.ek == ann.ek {
+                        tracing::debug!(
+                            "[mev-seal] idempotent ML-KEM-768 key re-announcement for validator {}",
+                            hex::encode(&ann.validator_id[..6])
+                        );
+                        return;
+                    }
+                    tracing::warn!(
+                        "[mev-seal] kem key announcement refused for {}: already registered with \
+                         a different key (rotation required)",
+                        hex::encode(&ann.validator_id[..6])
+                    );
+                    return;
+                }
+                let mut pool = self.mempool.write().await;
+                match pool.upsert_peer_kem_ek(
+                    ann.validator_id,
+                    ann.ek,
+                    ann.activation_height,
+                    self.hc.height,
+                    true,
+                ) {
+                    Ok(true) => {
+                        tracing::info!(
+                            "[mev-seal] learned ML-KEM-768 transport key for validator {}",
+                            hex::encode(&ann.validator_id[..6])
+                        );
+                    }
+                    Ok(false) => {
+                        tracing::debug!(
+                            "[mev-seal] idempotent ML-KEM-768 key re-announcement for validator {}",
+                            hex::encode(&ann.validator_id[..6])
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("[mev-seal] kem key announcement refused by registry: {e}");
+                    }
                 }
             }
         }
@@ -728,18 +993,26 @@ impl ValidatorRuntime {
             partials: Vec::new(),
         };
         let mut dleq_proofs: Vec<([u8; 32], crate::mev_epoch::PartialDleqProof)> = Vec::new();
-        for tx_hash in &commitment.tx_hashes {
-            let envelope = {
-                let pool = self.mempool.read().await;
-                pool.sealed_envelope(tx_hash).cloned()
-            };
-            let Some(envelope) = envelope else {
-                continue;
-            };
-            let (partial, dleq_opt) = {
-                let mut pool = self.mempool.write().await;
-                let partial = pool.mev_seal.release_partial(height, round, &envelope);
-                let dleq = match (&partial, pool.mev_seal.material()) {
+        let envelopes: Vec<([u8; 32], crate::mev_epoch::SealedEnvelope)> = {
+            let pool = self.mempool.read().await;
+            commitment
+                .tx_hashes
+                .iter()
+                .filter_map(|tx_hash| {
+                    pool.sealed_envelope(tx_hash)
+                        .cloned()
+                        .map(|env| (*tx_hash, env))
+                })
+                .collect()
+        };
+        if envelopes.is_empty() {
+            return;
+        }
+        {
+            let mut pool = self.mempool.write().await;
+            for (tx_hash, envelope) in &envelopes {
+                let partial = pool.mev_seal.release_partial(height, round, envelope);
+                let dleq_opt = match (&partial, pool.mev_seal.material()) {
                     (Ok(p), Some(mat)) => crate::mev_epoch::prove_partial_dleq(
                         &mat.share,
                         epoch,
@@ -750,16 +1023,15 @@ impl ValidatorRuntime {
                     .ok(),
                     _ => None,
                 };
-                (partial, dleq)
-            };
-            match partial {
-                Ok(p) => {
-                    if let Some(proof) = dleq_opt {
-                        dleq_proofs.push((*tx_hash, proof));
+                match partial {
+                    Ok(p) => {
+                        if let Some(proof) = dleq_opt {
+                            dleq_proofs.push((*tx_hash, proof));
+                        }
+                        release.partials.push((*tx_hash, p));
                     }
-                    release.partials.push((*tx_hash, p));
+                    Err(e) => tracing::debug!("[mev-seal] partial refused: {e}"),
                 }
-                Err(e) => tracing::debug!("[mev-seal] partial refused: {e}"),
             }
         }
         if release.partials.is_empty() {
@@ -1074,24 +1346,34 @@ impl ValidatorRuntime {
         if !self.is_proposer() || self.hc.step != Step::Propose {
             return None;
         }
-        // §7 Phase 2 gate: while a decided block is still executing on the
-        // sequenced worker, our state root is PRE-H and every read below
-        // (account snapshots for the filter, `state_root` for the header,
-        // cross-shard proofs) would build on it. Building now produces a block
-        // for the wrong parent state, so there is nothing to propose until the
-        // worker reports back. ("Propose while apply pending" must stay None.)
-        if self.apply_in_flight.is_some() {
+        if crate::chain_spec::execution_pipeline_v1_active_at(self.hc.height) {
+            self.ensure_genesis_root_seeded().await;
+        }
+        // §7 Phase 2 / Wave 12 Phase 2b gate: below `EXECUTION_PIPELINE_V1`, any
+        // pending apply blocks proposing (state_root is PRE-H). At/above the
+        // gate, lag-2 pipelining allows proposing when `apply_in_flight` holds
+        // at most 1 block and the committed post-state for `height - 2` is
+        // already recorded.
+        if !self.can_propose_at_height(self.hc.height) {
             return None;
         }
+        let pipeline_active = crate::chain_spec::execution_pipeline_v1_active_at(self.hc.height);
         // PARENT-BOUND PROPOSAL (HEIGHT-SPLIT): a block's `prev_hash` is always
-        // our finalized tip, so the ONLY height we may build at is
-        // `finalized_tip + 1` (height 1 at genesis). Any other relationship
-        // emits a block that skips heights or reuses a decided parent — every
-        // peer refuses it, and the node burns the round on a proposal nobody
-        // can vote. This is the runtime-level backstop for a restored head
-        // that could not be reconciled; the driver also gates it.
-        let (finalized_tip, finalized_hash) =
-            self.finalized.last().copied().unwrap_or((0, [0u8; 32]));
+        // our decided tip (`finalized.last()`, or the queued `height - 1`
+        // parent in `apply_in_flight` when lag-2 pipelining is active).
+        let (finalized_tip, finalized_hash) = if pipeline_active {
+            if let Some(inflight) = self
+                .apply_in_flight
+                .back()
+                .filter(|a| a.height.checked_add(1) == Some(self.hc.height))
+            {
+                (inflight.height, inflight.hash)
+            } else {
+                self.finalized.last().copied().unwrap_or((0, [0u8; 32]))
+            }
+        } else {
+            self.finalized.last().copied().unwrap_or((0, [0u8; 32]))
+        };
         if finalized_tip.checked_add(1) != Some(self.hc.height) {
             tracing::warn!(
                 hc_height = self.hc.height,
@@ -1318,7 +1600,11 @@ impl ValidatorRuntime {
                     self.demanded.remove(&value_id);
                 }
                 Some(body) => {
-                    let root = self.state.get_state_root().await;
+                    let root = if pipeline_active {
+                        self.state_root_for_committed_height(self.hc.height)?
+                    } else {
+                        self.state.get_state_root().await
+                    };
                     if self.validate_proposal_unaligned(&body, root).is_ok()
                         && self.check_actor_cap(&body).await.is_ok()
                     {
@@ -1367,7 +1653,11 @@ impl ValidatorRuntime {
                 }
             }
         }
-        let state_root = self.state.get_state_root().await;
+        let state_root = if pipeline_active {
+            self.state_root_for_committed_height(self.hc.height)?
+        } else {
+            self.state.get_state_root().await
+        };
         // Anti-DoS: bound the block by BOTH tx count and total gas.
         // Both caps plus the admission filter, so a flood of transactions that
         // cannot execute (spent nonce, drained balance) cannot occupy the block
@@ -1418,15 +1708,27 @@ impl ValidatorRuntime {
                     }
                     drop(guard);
                     // Store only if the state did not move under the snapshot.
-                    let root1 = self.state.get_state_root().await;
-                    if root1 == state_root {
-                        if let Ok(mut g) = self.pack_snapshot.lock() {
-                            *g = Some((self.hc.height, state_root, fresh.clone()));
+                    if !pipeline_active || self.apply_in_flight.is_empty() {
+                        let root1 = self.state.get_state_root().await;
+                        if root1 == state_root {
+                            if let Ok(mut g) = self.pack_snapshot.lock() {
+                                *g = Some((self.hc.height, state_root, fresh.clone()));
+                            }
                         }
                     }
                     fresh
                 }
             };
+        if pipeline_active && !self.apply_in_flight.is_empty() {
+            for (addr, entry) in accounts.iter_mut() {
+                if let (Some(n), Some(b)) = (
+                    self.pending_exec_view.predicted_nonce(addr),
+                    self.pending_exec_view.predicted_balance(addr),
+                ) {
+                    *entry = (n, b);
+                }
+            }
+        }
         // R0-fullness refresh (packing mechanics, no consensus change): the
         // sender snapshot above is taken BEFORE the per-sender account reads,
         // and each read awaits. The RPC layer shares this mempool, so
@@ -1662,8 +1964,13 @@ impl ValidatorRuntime {
                 {
                     let pool = self.mempool.read().await;
                     for t in &cached {
-                        if !pool.contains(&t.compute_tx_hash()) {
-                            // Evicted since the prebuild: skip, do not stall on it.
+                        let th = t.compute_tx_hash();
+                        if !pool.contains(&th)
+                            || (pipeline_active
+                                && !self.apply_in_flight.is_empty()
+                                && self.pending_exec_view.is_in_flight(&th))
+                        {
+                            // Evicted since the prebuild or riding an in-flight block: skip.
                             continue;
                         }
                         if Self::pack_filter_accept(&fctx, t) {
@@ -1682,7 +1989,12 @@ impl ValidatorRuntime {
                         MAX_BLOCK_TXS - kept.len(),
                         MAX_BLOCK_GAS.saturating_sub(kept_gas),
                         |t| {
-                            if kept_hashes.contains(&t.compute_tx_hash()) {
+                            let th = t.compute_tx_hash();
+                            if kept_hashes.contains(&th)
+                                || (pipeline_active
+                                    && !self.apply_in_flight.is_empty()
+                                    && self.pending_exec_view.is_in_flight(&th))
+                            {
                                 return false;
                             }
                             Self::pack_filter_accept(&fctx, t)
@@ -1704,7 +2016,15 @@ impl ValidatorRuntime {
                 self.mempool.read().await.select_for_block_multi(
                     MAX_BLOCK_TXS,
                     MAX_BLOCK_GAS,
-                    |t| Self::pack_filter_accept(&fctx, t),
+                    |t| {
+                        if pipeline_active
+                            && !self.apply_in_flight.is_empty()
+                            && self.pending_exec_view.is_in_flight(&t.compute_tx_hash())
+                        {
+                            return false;
+                        }
+                        Self::pack_filter_accept(&fctx, t)
+                    },
                 )
             }
         } else {
@@ -1714,6 +2034,12 @@ impl ValidatorRuntime {
                 .read()
                 .await
                 .select_for_block_multi(MAX_BLOCK_TXS, MAX_BLOCK_GAS, |t| {
+                    if pipeline_active
+                        && !self.apply_in_flight.is_empty()
+                        && self.pending_exec_view.is_in_flight(&t.compute_tx_hash())
+                    {
+                        return false;
+                    }
                     Self::pack_filter_accept(&fctx, t)
                 })
         };
@@ -1923,7 +2249,7 @@ impl ValidatorRuntime {
             .iter()
             .filter(|t| crate::sharding::tx_is_outbound_cross_shard(t, my_shard))
             .count();
-        let prev_hash = self.finalized.last().map(|(_, h)| *h).unwrap_or([0u8; 32]);
+        let prev_hash = self.expected_parent_hash_for_height(self.hc.height);
         // TRANSACTION-ORDER COMMITMENT: computed over the EXACT ordered list
         // this block packs, and put into the block BEFORE it is signed, so
         // the quorum that votes for the block votes for its ORDER too (the

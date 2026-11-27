@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# node-prune-cron.sh — the orphan-chunk + snapshot retention sweeper.
+# node-prune-cron.sh — the orphan DHT chunk + staging/backup file sweeper.
 #
 # RUN IT ON EVERY NODE (not just one): during the deployment attempt Node C
 # filled ALL 655360 inodes with 463589 ORPHAN CHUNK FILES, went read-only and
@@ -19,7 +19,7 @@
 #
 #   This script deletes exactly those: chunk files that
 #     (a) are NOT referenced by any manifest in kv.json, AND
-#     (b) are OLDER than the grace period (default 6h), AND
+#     (b) are OLDER than the grace period (default 2h), AND
 #     (c) are not newer than the newest manifest in their bucket.
 #
 # WHAT IT NEVER TOUCHES
@@ -50,7 +50,7 @@ set -u
 
 PRUNE_DIR=""
 PRUNE_DATA_DIR=""
-PRUNE_GRACE="${PRUNE_GRACE:-21600}"      # 6h: older than any kv.json debounce
+PRUNE_GRACE="${PRUNE_GRACE:-7200}"      # 2h: older than any kv.json debounce (30m)
 PRUNE_MAX_KV_AGE="${PRUNE_MAX_KV_AGE:-7200}"  # 2h: kv.json must be this fresh
 PRUNE_MAX_DELETE="${PRUNE_MAX_DELETE:-200000}"
 PRUNE_DRY_RUN=0
@@ -58,7 +58,7 @@ PRUNE_JSON=0
 
 usage() {
     cat <<EOF
-node-prune-cron.sh — orphan-chunk + snapshot retention sweeper for a Stellereum node
+node-prune-cron.sh — orphan DHT chunk + staging/backup file sweeper for a Stellereum node
 
 USAGE
   node-prune-cron.sh [options]
@@ -85,11 +85,11 @@ EOF
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --dir) PRUNE_DIR="$2"; shift 2 ;;
-        --data-dir) PRUNE_DATA_DIR="$2"; shift 2 ;;
-        --grace-seconds) PRUNE_GRACE="$2"; shift 2 ;;
-        --max-kv-age) PRUNE_MAX_KV_AGE="$2"; shift 2 ;;
-        --max-delete) PRUNE_MAX_DELETE="$2"; shift 2 ;;
+        --dir) [ $# -ge 2 ] || { echo "node-prune-cron.sh: --dir requires an argument" >&2; exit 2; }; PRUNE_DIR="$2"; shift 2 ;;
+        --data-dir) [ $# -ge 2 ] || { echo "node-prune-cron.sh: --data-dir requires an argument" >&2; exit 2; }; PRUNE_DATA_DIR="$2"; shift 2 ;;
+        --grace-seconds) [ $# -ge 2 ] || { echo "node-prune-cron.sh: --grace-seconds requires an argument" >&2; exit 2; }; PRUNE_GRACE="$2"; shift 2 ;;
+        --max-kv-age) [ $# -ge 2 ] || { echo "node-prune-cron.sh: --max-kv-age requires an argument" >&2; exit 2; }; PRUNE_MAX_KV_AGE="$2"; shift 2 ;;
+        --max-delete) [ $# -ge 2 ] || { echo "node-prune-cron.sh: --max-delete requires an argument" >&2; exit 2; }; PRUNE_MAX_DELETE="$2"; shift 2 ;;
         --dry-run) PRUNE_DRY_RUN=1; shift ;;
         --json) PRUNE_JSON=1; shift ;;
         --help|-h) usage; exit 0 ;;
@@ -111,9 +111,33 @@ fi
 CHUNKS_DIR="$PRUNE_DATA_DIR/chunks"
 KV="$PRUNE_DATA_DIR/kv.json"
 LOCKFILE="$PRUNE_DATA_DIR/.prune.lock"
-WORK="$(mktemp -d 2>/dev/null || echo /tmp/.prune.$$)"
-mkdir -p "$WORK" 2>/dev/null || true
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/stell-prune.XXXXXX" 2>/dev/null)" || {
+    echo "node-prune-cron.sh: failed to create temporary directory" >&2
+    exit 1
+}
+chmod 700 "$WORK"
 trap 'rm -rf "$WORK"' EXIT INT TERM
+
+json_escape() {
+    case "$1" in
+        *\\*|*\"*|*[![:print:]]*)
+            printf '%s' "$1" | awk '
+                BEGIN { ORS = "" }
+                {
+                    if (NR > 1) printf "\\n"
+                    gsub(/\\/, "\\\\")
+                    gsub(/"/, "\\\"")
+                    gsub(/\r/, "\\r")
+                    gsub(/\t/, "\\t")
+                    gsub(/\b/, "\\b")
+                    gsub(/\f/, "\\f")
+                    printf "%s", $0
+                }
+            '
+            ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
 
 now=$(date +%s)
 
@@ -132,9 +156,14 @@ fi
 report() {
     if [ "$PRUNE_JSON" = "1" ]; then
         printf '{"data_dir":"%s","chunks_dir":"%s","chunk_files":%s,"referenced":%s,"candidates":%s,"deleted":%s,"bytes_freed":%s,"inode_pct_before":"%s","inode_pct_after":"%s","skipped":"%s","reason":"%s"}\n' \
-            "$PRUNE_DATA_DIR" "$CHUNKS_DIR" "${CHUNK_FILES:-0}" "${REF_COUNT:-0}" "${CANDIDATES:-0}" \
-            "${DELETED:-0}" "${BYTES:-0}" "${INODE_PCT_BEFORE:-?}" "${INODE_PCT_AFTER:-?}" \
-            "${SKIPPED_REASON:-}" "${REASON:-ok}"
+            "$(json_escape "$PRUNE_DATA_DIR")" \
+            "$(json_escape "$CHUNKS_DIR")" \
+            "${CHUNK_FILES:-0}" "${REF_COUNT:-0}" "${CANDIDATES:-0}" \
+            "${DELETED:-0}" "${BYTES:-0}" \
+            "$(json_escape "${INODE_PCT_BEFORE:-?}")" \
+            "$(json_escape "${INODE_PCT_AFTER:-?}")" \
+            "$(json_escape "${SKIPPED_REASON:-}")" \
+            "$(json_escape "${REASON:-ok}")"
     else
         echo "data dir         : $PRUNE_DATA_DIR"
         echo "chunk files      : ${CHUNK_FILES:-0}"
@@ -241,10 +270,7 @@ awk -v now="$now" -v grace="$PRUNE_GRACE" '
 ' "$WORK/ref" "$WORK/old" > "$WORK/safe" 2>/dev/null || : > "$WORK/safe"
 
 DELETED=$(wc -l < "$WORK/safe" | tr -d ' ')
-# the byte total from the find pass (the sizes are known there)
-BYTES=$(awk 'NR == FNR { sz[$3] = $2; next } { if ($1 in sz) t += sz[$1] } END { print t + 0 }' \
-    "$WORK/raw" "$WORK/safe" 2>/dev/null || echo 0)
-BYTES=${BYTES:-0}
+REASON="swept"
 
 if [ "$DELETED" -gt "$PRUNE_MAX_DELETE" ] 2>/dev/null; then
     head -n "$PRUNE_MAX_DELETE" "$WORK/safe" > "$WORK/safe2"
@@ -252,6 +278,11 @@ if [ "$DELETED" -gt "$PRUNE_MAX_DELETE" ] 2>/dev/null; then
     DELETED="$PRUNE_MAX_DELETE"
     REASON="swept (capped at $PRUNE_MAX_DELETE per run)"
 fi
+
+# the byte total from the find pass (computed after capping to PRUNE_MAX_DELETE)
+BYTES=$(awk 'NR == FNR { sz[$3] = $2; next } { if ($1 in sz) t += sz[$1] } END { print t + 0 }' \
+    "$WORK/raw" "$WORK/safe" 2>/dev/null || echo 0)
+BYTES=${BYTES:-0}
 
 if [ "$DELETED" -gt 0 ]; then
     # xargs batches the paths; no fork per file.
@@ -273,6 +304,5 @@ if [ "${PRUNE_CLEAN_KVBAK:-1}" = "1" ]; then
 fi
 
 INODE_PCT_AFTER=$(df -i "$PRUNE_DATA_DIR" 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
-REASON="swept"
 report
 exit 0

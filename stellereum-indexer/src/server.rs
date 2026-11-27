@@ -384,9 +384,29 @@ pub struct EventsQuery {
     pub from_block: Option<u64>,
     pub to_block: Option<u64>,
     pub contract: Option<String>,
+    pub shard_id: Option<u32>,
+    pub shard: Option<u32>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
     pub cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct TxsQuery {
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+    pub cursor: Option<String>,
+    pub shard_id: Option<u32>,
+    pub shard: Option<u32>,
+}
+
+#[derive(Deserialize)]
+pub struct ContractsQuery {
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+    pub cursor: Option<String>,
+    pub shard_id: Option<u32>,
+    pub shard: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -718,25 +738,105 @@ async fn fetch_live_validators(state: &AppState) -> Option<Value> {
     }
 }
 
+fn configured_chain_id() -> u64 {
+    std::env::var("INDEXER_CHAIN_ID")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(5757)
+}
+
 // 1. Overview (gram.org/api/overview)
 async fn get_overview(State(state): State<AppState>) -> impl IntoResponse {
-    let stats = state.db.get_stats().unwrap_or(crate::db::NetworkStats {
-        tip_height: 0,
-        total_blocks: 0,
-        total_transactions: 0,
-        total_accounts: 0,
-        current_tps: 0.0,
-        avg_block_time: 0.0,
-    });
+    let db = state.db.clone();
+    let db_res = tokio::task::spawn_blocking(move || {
+        let stats = db.get_stats().unwrap_or(crate::db::NetworkStats {
+            tip_height: 0,
+            total_blocks: 0,
+            total_transactions: 0,
+            total_accounts: 0,
+            current_tps: 0.0,
+            avg_block_time: 0.0,
+        });
 
-    let charts = state
-        .db
-        .get_charts()
-        .unwrap_or_else(|_| json!({"hours":[], "days":[]}));
+        let charts = db
+            .get_charts()
+            .unwrap_or_else(|_| json!({"hours":[], "days":[]}));
+        let mc_stats = db
+            .get_stats_for_shard(0)
+            .unwrap_or(crate::db::NetworkStats {
+                tip_height: 0,
+                total_blocks: 0,
+                total_transactions: 0,
+                total_accounts: stats.total_accounts,
+                current_tps: 0.0,
+                avg_block_time: 0.0,
+            });
+        let current_tps = if stats.total_blocks == 0 {
+            0.0
+        } else {
+            let mut tps = mc_stats.current_tps;
+            for (sid, _, _) in db.get_shard_index_stats().unwrap_or_default() {
+                if sid > 0 {
+                    if let Ok(sh) = db.get_stats_for_shard(sid) {
+                        tps += sh.current_tps;
+                    }
+                }
+            }
+            tps
+        };
+        let event_total = db.count_events(&EventFilter::default()).unwrap_or(0);
+        let latest_rows = db
+            .get_events(&EventFilter::default(), 10, 0)
+            .unwrap_or_default();
+        (
+            stats,
+            charts,
+            mc_stats,
+            current_tps,
+            event_total,
+            latest_rows,
+        )
+    })
+    .await;
+
+    let (stats, charts, mc_stats, current_tps, event_total, latest_rows) = match db_res {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "overview query task failed"})),
+            )
+                .into_response();
+        }
+    };
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let today_start = (now / 86400) * 86400;
+    let yesterday_start = today_start.saturating_sub(86400);
+    let yesterday_txs = charts["days"]
+        .as_array()
+        .and_then(|days| {
+            days.iter().find_map(|entry| {
+                let arr = entry.as_array()?;
+                if arr.first()?.as_u64()? == yesterday_start {
+                    arr.get(1)?.as_u64()
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or(0);
+    let mc_seqno = mc_stats.tip_height;
+    let avg_block_time = if mc_stats.total_blocks < 2 {
+        0.0
+    } else {
+        mc_stats.avg_block_time
+    };
+    let chain_id = configured_chain_id();
 
     let live_staked = fetch_live_validators(&state)
         .await
@@ -745,11 +845,7 @@ async fn get_overview(State(state): State<AppState>) -> impl IntoResponse {
 
     // The explorer advertises what it can serve: the ABI manifests (which
     // make the events DECODED rather than raw) and the event endpoints.
-    let event_total = state.db.count_events(&EventFilter::default()).unwrap_or(0);
-    let latest_events = state
-        .db
-        .get_events(&EventFilter::default(), 10, 0)
-        .unwrap_or_default()
+    let latest_events = latest_rows
         .iter()
         .map(|e| event_json(e, &state.abis))
         .collect::<Vec<Value>>();
@@ -766,40 +862,36 @@ async fn get_overview(State(state): State<AppState>) -> impl IntoResponse {
             "team": "100000000000000000"
         },
         "transactions": {
-            "daily_average": stats.total_transactions.max(1000),
+            "daily_average": stats.total_transactions,
             "today": stats.total_transactions,
-            "yesterday": stats.total_transactions.saturating_sub(100),
-            "today_start": (now / 86400) * 86400,
-            "tps": stats.current_tps.max(1.0),
-            "current_tps": stats.current_tps.max(1.0),
+            "yesterday": yesterday_txs,
+            "today_start": today_start,
+            "tps": current_tps,
+            "current_tps": current_tps,
             "hours": charts["hours"],
             "days": charts["days"]
         },
-        "price": {
-            "base_usd": 0.25,
-            "market_cap_usd": 62500000.0,
-            "fdv_usd": 250000000.0
-        },
+        "price": Value::Null,
         "network": {
-            "chain_id": 5757,
+            "chain_id": chain_id,
             "consensus": "Pure PQ Falcon-512 BFT",
             "tip_height": stats.tip_height,
-            "mc_seqno": stats.tip_height,
-            "avg_block_time": stats.avg_block_time,
-            "block_time": stats.avg_block_time,
+            "mc_seqno": mc_seqno,
+            "avg_block_time": avg_block_time,
+            "block_time": avg_block_time,
             "total_blocks": stats.total_blocks,
             "indexed_blocks": stats.total_blocks,
             "total_transactions": stats.total_transactions,
             "indexed_txs": stats.total_transactions,
             "total_accounts": stats.total_accounts,
-            "tps": stats.current_tps.max(1.0),
-            "current_tps": stats.current_tps.max(1.0)
+            "tps": current_tps,
+            "current_tps": current_tps
         },
-        "tps": stats.current_tps.max(1.0),
-        "current_tps": stats.current_tps.max(1.0),
-        "block_time": stats.avg_block_time,
-        "avg_block_time": stats.avg_block_time,
-        "mc_seqno": stats.tip_height,
+        "tps": current_tps,
+        "current_tps": current_tps,
+        "block_time": avg_block_time,
+        "avg_block_time": avg_block_time,
+        "mc_seqno": mc_seqno,
         "tip_height": stats.tip_height,
         "indexed_blocks": stats.total_blocks,
         "total_blocks": stats.total_blocks,
@@ -837,7 +929,7 @@ async fn get_overview(State(state): State<AppState>) -> impl IntoResponse {
         "updated": now
     });
 
-    (StatusCode::OK, Json(overview))
+    (StatusCode::OK, Json(overview)).into_response()
 }
 
 async fn fetch_live_shards_count(state: &AppState) -> Option<u64> {
@@ -862,14 +954,69 @@ async fn fetch_live_shards_count(state: &AppState) -> Option<u64> {
 
 // 2. Stats (/api/v2/stats)
 async fn get_network_stats(State(state): State<AppState>) -> impl IntoResponse {
-    let stats = state.db.get_stats().unwrap_or(crate::db::NetworkStats {
-        tip_height: 0,
-        total_blocks: 0,
-        total_transactions: 0,
-        total_accounts: 0,
-        current_tps: 0.0,
-        avg_block_time: 0.0,
-    });
+    let db = state.db.clone();
+    let db_res = tokio::task::spawn_blocking(move || {
+        let stats = db.get_stats().unwrap_or(crate::db::NetworkStats {
+            tip_height: 0,
+            total_blocks: 0,
+            total_transactions: 0,
+            total_accounts: 0,
+            current_tps: 0.0,
+            avg_block_time: 0.0,
+        });
+        let mc_stats = db
+            .get_stats_for_shard(0)
+            .unwrap_or(crate::db::NetworkStats {
+                tip_height: 0,
+                total_blocks: 0,
+                total_transactions: 0,
+                total_accounts: stats.total_accounts,
+                current_tps: 0.0,
+                avg_block_time: 0.0,
+            });
+
+        let mut wc_blocks: u64 = 0;
+        let mut wc_txs: u64 = 0;
+        let mut wc_block_time_sum: f64 = 0.0;
+        let mut wc_block_time_shards: u64 = 0;
+        let mut wc_tps_sum: f64 = 0.0;
+        for (sid, _, _) in db.get_shard_index_stats().unwrap_or_default() {
+            if sid == 0 {
+                continue;
+            }
+            if let Ok(sh) = db.get_stats_for_shard(sid) {
+                wc_blocks = wc_blocks.saturating_add(sh.total_blocks);
+                wc_txs = wc_txs.saturating_add(sh.total_transactions);
+                wc_tps_sum += sh.current_tps;
+                if sh.total_blocks >= 2 && sh.avg_block_time > 0.0 {
+                    wc_block_time_sum += sh.avg_block_time;
+                    wc_block_time_shards += 1;
+                }
+            }
+        }
+        (
+            stats,
+            mc_stats,
+            wc_blocks,
+            wc_txs,
+            wc_block_time_sum,
+            wc_block_time_shards,
+            wc_tps_sum,
+        )
+    })
+    .await;
+
+    let (stats, mc_stats, wc_blocks, wc_txs, wc_block_time_sum, wc_block_time_shards, wc_tps_sum) =
+        match db_res {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "stats query task failed"})),
+                )
+                    .into_response();
+            }
+        };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -881,24 +1028,45 @@ async fn get_network_stats(State(state): State<AppState>) -> impl IntoResponse {
         .await
         .and_then(|v| v["validators"].as_array().map(|a| a.len() as u64));
 
+    let current_tps = if stats.total_blocks == 0 {
+        0.0
+    } else {
+        mc_stats.current_tps + wc_tps_sum
+    };
+    let avg_block_time = if mc_stats.total_blocks < 2 {
+        0.0
+    } else {
+        mc_stats.avg_block_time
+    };
+    let wc_block_time = if wc_block_time_shards > 0 {
+        wc_block_time_sum / wc_block_time_shards as f64
+    } else {
+        0.0
+    };
+    let mc_block_txs = if mc_stats.total_blocks > 0 {
+        mc_stats.total_transactions as f64 / mc_stats.total_blocks as f64
+    } else {
+        0.0
+    };
+    let wc_block_txs = if wc_blocks > 0 {
+        wc_txs as f64 / wc_blocks as f64
+    } else {
+        0.0
+    };
     let out = json!({
-        "chain_id": 5757,
-        "mc_seqno": stats.tip_height,
-        "tip_height": stats.tip_height,
+        "chain_id": configured_chain_id(),
+        "mc_seqno": mc_stats.tip_height,
+        "tip_height": mc_stats.tip_height,
         "mc_utime": now,
         "shards": shards,
         "validators_count": validators_count,
-        "tps": stats.current_tps,
-        "current_tps": stats.current_tps,
-        "block_time": stats.avg_block_time,
-        "avg_block_time": stats.avg_block_time,
-        "wc_block_time": stats.avg_block_time,
-        "mc_block_txs": if stats.total_blocks > 0 {
-            (stats.total_transactions as f64) / (stats.total_blocks as f64)
-        } else {
-            0.0
-        },
-        "wc_block_txs": 0.0,
+        "tps": current_tps,
+        "current_tps": current_tps,
+        "block_time": avg_block_time,
+        "avg_block_time": avg_block_time,
+        "wc_block_time": wc_block_time,
+        "mc_block_txs": mc_block_txs,
+        "wc_block_txs": wc_block_txs,
         "indexed_txs": stats.total_transactions,
         "total_transactions": stats.total_transactions,
         "indexed_blocks": stats.total_blocks,
@@ -906,7 +1074,7 @@ async fn get_network_stats(State(state): State<AppState>) -> impl IntoResponse {
         "total_accounts": stats.total_accounts
     });
 
-    (StatusCode::OK, Json(out))
+    (StatusCode::OK, Json(out)).into_response()
 }
 
 // 3. Price
@@ -926,12 +1094,39 @@ async fn get_price() -> impl IntoResponse {
 
 // 4. Status
 async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
-    let tip = state.db.get_tip_height().unwrap_or(0);
+    let db = state.db.clone();
+    let (shard0_tip, max_tip) = match tokio::task::spawn_blocking(move || {
+        let s0 = db.get_shard_tip_height(0).unwrap_or(0);
+        let max_all = db
+            .get_shard_index_stats()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, h, _)| h)
+            .max()
+            .unwrap_or(s0);
+        (s0, max_all)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "status query task failed"})),
+            )
+                .into_response();
+        }
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let sync = state.sync_status.read().await.clone();
+    let tip = if sync.node_tip_height.is_some() {
+        shard0_tip
+    } else {
+        max_tip
+    };
     let fresh = sync
         .last_sync_at
         .map(|ts| now.saturating_sub(ts) <= 60)
@@ -945,7 +1140,7 @@ async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
         StatusCode::OK,
         Json(json!({
             "ok": true,
-            "chain_id": 5757,
+            "chain_id": configured_chain_id(),
             "tip_height": tip,
             "node_tip_height": sync.node_tip_height,
             "lag": lag,
@@ -956,6 +1151,7 @@ async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
             "time": now
         })),
     )
+        .into_response()
 }
 
 // 5. Validators (live from node RPC `stell_getValidators`)
@@ -983,7 +1179,7 @@ async fn get_validators(State(state): State<AppState>) -> impl IntoResponse {
     let fragile = res["fragile"].as_bool().unwrap_or(false);
     let fragile_reason = res["fragile_reason"].clone();
 
-    let mut raw_vals: Vec<(String, u128, String)> = res["validators"]
+    let mut raw_vals: Vec<(String, u128, String, String)> = res["validators"]
         .as_array()
         .map(|arr| {
             arr.iter()
@@ -991,7 +1187,8 @@ async fn get_validators(State(state): State<AppState>) -> impl IntoResponse {
                     let addr = v["validator"].as_str()?.to_string();
                     let power_str = v["power"].as_str().unwrap_or("0").to_string();
                     let power_u128 = power_str.parse::<u128>().unwrap_or(0);
-                    Some((addr, power_u128, power_str))
+                    let falcon_pubkey = v["falcon_pubkey"].as_str().unwrap_or("").to_string();
+                    Some((addr, power_u128, power_str, falcon_pubkey))
                 })
                 .collect()
         })
@@ -1002,7 +1199,7 @@ async fn get_validators(State(state): State<AppState>) -> impl IntoResponse {
     let validators_json: Vec<Value> = raw_vals
         .iter()
         .enumerate()
-        .map(|(idx, (addr, power_u128, power_str))| {
+        .map(|(idx, (addr, power_u128, power_str, falcon_pubkey))| {
             let weight = if total_power_num > 0.0 {
                 ((*power_u128 as f64) / total_power_num * 10000.0).round() / 10000.0
             } else {
@@ -1022,7 +1219,7 @@ async fn get_validators(State(state): State<AppState>) -> impl IntoResponse {
                 "status": "active",
                 "uptime": 100.0,
                 "commission_bps": 0,
-                "falcon_pubkey": res["validators"][idx]["falcon_pubkey"].as_str().unwrap_or(""),
+                "falcon_pubkey": falcon_pubkey,
                 "blocks_proposed": 0
             })
         })
@@ -1383,15 +1580,20 @@ async fn get_block(
     let param_owned = param.clone();
     let res = tokio::task::spawn_blocking(move || {
         let block_opt = if let Some((sid, h)) = parse_shard_height(&param_owned) {
-            db.get_block_by_shard_and_height(sid, h)
-        } else if let Ok(h) = param_owned.trim().parse::<u64>() {
-            if let Some(sid) = shard_filter {
-                db.get_block_by_shard_and_height(sid, h)
+            if shard_filter.is_some_and(|expected| expected != sid) {
+                Ok(None)
             } else {
-                db.get_block_by_height(h)
+                db.get_block_by_shard_and_height(sid, h)
             }
+        } else if let Ok(h) = param_owned.trim().parse::<u64>() {
+            db.get_block_by_shard_and_height(shard_filter.unwrap_or(0), h)
         } else {
-            db.get_block_by_hash(&param_owned)
+            match db.get_block_by_hash(&param_owned) {
+                Ok(Some(b)) if shard_filter.is_some_and(|expected| expected != b.shard_id) => {
+                    Ok(None)
+                }
+                other => other,
+            }
         };
         match block_opt {
             Ok(Some(b)) => {
@@ -1433,9 +1635,10 @@ async fn get_block(
 // 10. Transactions
 async fn get_recent_txs(
     State(state): State<AppState>,
-    Query(p): Query<Pagination>,
+    Query(p): Query<TxsQuery>,
 ) -> impl IntoResponse {
     let limit = p.limit.unwrap_or(50).min(MAX_HISTORY_PAGE);
+    let shard_filter = p.shard_id.or(p.shard);
     let (cursor_str, offset) = match resolve_cursor_or_offset(p.cursor.as_deref(), p.offset) {
         Ok(v) => v,
         Err(r) => return r,
@@ -1445,11 +1648,17 @@ async fn get_recent_txs(
             Ok(c) => c,
             Err(e) => return bad_request(e),
         };
-        match state.db.get_account_txs_keyset("", limit, parsed) {
-            Ok(page) => (
+        let db = state.db.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            db.get_account_txs_by_shard_keyset("", shard_filter, limit, parsed)
+        })
+        .await;
+        match res {
+            Ok(Ok(page)) => (
                 StatusCode::OK,
                 Json(json!({
                     "transactions": page.items,
+                    "shard_id": shard_filter,
                     "limit": limit,
                     "offset": 0,
                     "next_cursor": page.next_cursor,
@@ -1457,36 +1666,65 @@ async fn get_recent_txs(
                 })),
             )
                 .into_response(),
-            Err(e) => (
+            Ok(Err(e)) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
             )
                 .into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "transactions query task failed"})),
+            )
+                .into_response(),
         }
     } else {
-        let txs = state
-            .db
-            .get_account_txs("", limit, offset)
-            .unwrap_or_default();
+        let db = state.db.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            db.get_account_txs_by_shard("", shard_filter, limit, offset)
+        })
+        .await;
+        let txs = match res {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(_)) => Vec::new(),
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "transactions query task failed"})),
+                )
+                    .into_response();
+            }
+        };
         (
             StatusCode::OK,
-            Json(json!({ "transactions": txs, "limit": limit, "offset": offset })),
+            Json(json!({
+                "transactions": txs,
+                "shard_id": shard_filter,
+                "limit": limit,
+                "offset": offset
+            })),
         )
             .into_response()
     }
 }
 
 async fn get_tx(State(state): State<AppState>, Path(hash): Path<String>) -> impl IntoResponse {
-    match state.db.get_tx_by_hash(&hash) {
-        Ok(Some(tx)) => (StatusCode::OK, Json(json!({ "transaction": tx }))).into_response(),
-        Ok(None) => (
+    let db = state.db.clone();
+    let res = tokio::task::spawn_blocking(move || db.get_tx_by_hash(&hash)).await;
+    match res {
+        Ok(Ok(Some(tx))) => (StatusCode::OK, Json(json!({ "transaction": tx }))).into_response(),
+        Ok(Ok(None)) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "Transaction not found"})),
         )
             .into_response(),
-        Err(e) => (
+        Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "tx query task failed"})),
         )
             .into_response(),
     }
@@ -1498,7 +1736,22 @@ async fn get_account_info(
     Path(address): Path<String>,
 ) -> impl IntoResponse {
     let norm = crate::db::normalize_address_info(&address);
-    let tx_count = state.db.get_account_tx_count(&address).unwrap_or(0);
+    let db = state.db.clone();
+    let addr = address.clone();
+    let tx_count = match tokio::task::spawn_blocking(move || {
+        db.get_account_tx_count(&addr).unwrap_or(0)
+    })
+    .await
+    {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "account info query task failed"})),
+            )
+                .into_response();
+        }
+    };
     (
         StatusCode::OK,
         Json(json!({
@@ -1509,6 +1762,7 @@ async fn get_account_info(
             "status": "active"
         })),
     )
+        .into_response()
 }
 
 async fn get_account_actions(
@@ -1527,8 +1781,13 @@ async fn get_account_actions(
             Ok(c) => c,
             Err(e) => return bad_request(e),
         };
-        match state.db.get_account_txs_keyset(&address, limit, parsed) {
-            Ok(page) => (
+        let db = state.db.clone();
+        let addr = address.clone();
+        let res =
+            tokio::task::spawn_blocking(move || db.get_account_txs_keyset(&addr, limit, parsed))
+                .await;
+        match res {
+            Ok(Ok(page)) => (
                 StatusCode::OK,
                 Json(json!({
                     "address": norm.hex_clean,
@@ -1543,15 +1802,24 @@ async fn get_account_actions(
                 })),
             )
                 .into_response(),
-            Err(e) => (
+            Ok(Err(e)) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
             )
                 .into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "account actions query task failed"})),
+            )
+                .into_response(),
         }
     } else {
-        match state.db.get_account_txs(&address, limit, offset) {
-            Ok(txs) => (
+        let db = state.db.clone();
+        let addr = address.clone();
+        let res =
+            tokio::task::spawn_blocking(move || db.get_account_txs(&addr, limit, offset)).await;
+        match res {
+            Ok(Ok(txs)) => (
                 StatusCode::OK,
                 Json(json!({
                     "address": norm.hex_clean,
@@ -1564,9 +1832,14 @@ async fn get_account_actions(
                 })),
             )
                 .into_response(),
-            Err(e) => (
+            Ok(Err(e)) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
+            )
+                .into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "account actions query task failed"})),
             )
                 .into_response(),
         }
@@ -1575,7 +1848,21 @@ async fn get_account_actions(
 
 async fn get_whales(State(state): State<AppState>) -> impl IntoResponse {
     // Derive top active addresses from indexed transactions instead of fabricated balances.
-    let txs = state.db.get_account_txs("", 200, 0).unwrap_or_default();
+    let db = state.db.clone();
+    let txs = match tokio::task::spawn_blocking(move || {
+        db.get_account_txs("", 200, 0).unwrap_or_default()
+    })
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "whales query task failed"})),
+            )
+                .into_response();
+        }
+    };
     let mut counts: std::collections::HashMap<String, (Option<String>, u64)> =
         std::collections::HashMap::new();
     for t in txs {
@@ -1617,6 +1904,7 @@ async fn get_whales(State(state): State<AppState>) -> impl IntoResponse {
             "whales": whales,
         })),
     )
+        .into_response()
 }
 
 // 12. Search & Charts
@@ -1628,73 +1916,73 @@ async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> 
         )
             .into_response();
     };
-    let trimmed = query.trim();
-
-    if let Some((sid, h)) = parse_shard_height(trimmed) {
-        if let Ok(Some(b)) = state.db.get_block_by_shard_and_height(sid, h) {
-            return (
-                StatusCode::OK,
-                Json(json!({ "type": "block", "result": b })),
-            )
-                .into_response();
+    let trimmed = query.trim().to_string();
+    let db = state.db.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        if let Some((sid, h)) = parse_shard_height(&trimmed) {
+            if let Ok(Some(b)) = db.get_block_by_shard_and_height(sid, h) {
+                return Some(json!({ "type": "block", "result": b }));
+            }
         }
-    }
 
-    if let Ok(h) = trimmed.parse::<u64>() {
-        if let Ok(Some(b)) = state.db.get_block_by_height(h) {
-            return (
-                StatusCode::OK,
-                Json(json!({ "type": "block", "result": b })),
-            )
-                .into_response();
+        if let Ok(h) = trimmed.parse::<u64>() {
+            if let Ok(Some(b)) = db.get_block_by_shard_and_height(0, h) {
+                return Some(json!({ "type": "block", "result": b }));
+            }
         }
-    }
 
-    if let Ok(Some(tx)) = state.db.get_tx_by_hash(trimmed) {
-        return (
-            StatusCode::OK,
-            Json(json!({ "type": "transaction", "result": tx })),
-        )
-            .into_response();
-    }
+        if let Ok(Some(tx)) = db.get_tx_by_hash(&trimmed) {
+            return Some(json!({ "type": "transaction", "result": tx }));
+        }
 
-    if let Ok(Some(b)) = state.db.get_block_by_hash(trimmed) {
-        return (
-            StatusCode::OK,
-            Json(json!({ "type": "block", "result": b })),
-        )
-            .into_response();
-    }
+        if let Ok(Some(b)) = db.get_block_by_hash(&trimmed) {
+            return Some(json!({ "type": "block", "result": b }));
+        }
 
-    let norm = crate::db::normalize_address_info(trimmed);
-    if norm.bytes32.is_some() {
-        let tx_count = state.db.get_account_tx_count(trimmed).unwrap_or(0);
-        return (
-            StatusCode::OK,
-            Json(json!({
+        let norm = crate::db::normalize_address_info(&trimmed);
+        if norm.bytes32.is_some() {
+            let tx_count = db.get_account_tx_count(&trimmed).unwrap_or(0);
+            return Some(json!({
                 "type": "account",
                 "address": norm.hex_clean,
                 "address_0x": norm.hex_0x,
                 "stl57": norm.stl57,
                 "tx_count": tx_count,
-            })),
-        )
-            .into_response();
-    }
+            }));
+        }
 
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({"error": "No match found"})),
-    )
-        .into_response()
+        None
+    })
+    .await;
+
+    match res {
+        Ok(Some(body)) => (StatusCode::OK, Json(body)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "No match found"})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "search query task failed"})),
+        )
+            .into_response(),
+    }
 }
 
 async fn get_charts(State(state): State<AppState>) -> impl IntoResponse {
-    match state.db.get_charts() {
-        Ok(charts) => (StatusCode::OK, Json(charts)).into_response(),
-        Err(e) => (
+    let db = state.db.clone();
+    let res = tokio::task::spawn_blocking(move || db.get_charts()).await;
+    match res {
+        Ok(Ok(charts)) => (StatusCode::OK, Json(charts)).into_response(),
+        Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "charts query task failed"})),
         )
             .into_response(),
     }
@@ -1794,17 +2082,20 @@ async fn get_contract_events(
             Ok(c) => c,
             Err(e) => return bad_request(e),
         };
-        match state.db.get_events_keyset(&filter, limit, parsed) {
-            Ok(page) => {
+        let db = state.db.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            let page = db.get_events_keyset(&filter, limit, parsed)?;
+            let total = db.count_events(&filter).unwrap_or(page.items.len() as u64);
+            Ok::<_, rusqlite::Error>((page, total))
+        })
+        .await;
+        match res {
+            Ok(Ok((page, total))) => {
                 let events: Vec<Value> = page
                     .items
                     .iter()
                     .map(|e| event_json(e, &state.abis))
                     .collect();
-                let total = state
-                    .db
-                    .count_events(&filter)
-                    .unwrap_or(events.len() as u64);
                 (
                     StatusCode::OK,
                     Json(json!({
@@ -1821,20 +2112,28 @@ async fn get_contract_events(
                 )
                     .into_response()
             }
-            Err(e) => (
+            Ok(Err(e)) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
             )
                 .into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "contract events query task failed"})),
+            )
+                .into_response(),
         }
     } else {
-        match state.db.get_events(&filter, limit, offset) {
-            Ok(rows) => {
+        let db = state.db.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            let rows = db.get_events(&filter, limit, offset)?;
+            let total = db.count_events(&filter).unwrap_or(rows.len() as u64);
+            Ok::<_, rusqlite::Error>((rows, total))
+        })
+        .await;
+        match res {
+            Ok(Ok((rows, total))) => {
                 let events: Vec<Value> = rows.iter().map(|e| event_json(e, &state.abis)).collect();
-                let total = state
-                    .db
-                    .count_events(&filter)
-                    .unwrap_or(events.len() as u64);
                 (
                     StatusCode::OK,
                     Json(json!({
@@ -1849,9 +2148,14 @@ async fn get_contract_events(
                 )
                     .into_response()
             }
-            Err(e) => (
+            Ok(Err(e)) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
+            )
+                .into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "contract events query task failed"})),
             )
                 .into_response(),
         }
@@ -1867,33 +2171,48 @@ async fn get_tx_events(
         tx_hash: Some(hash.clone()),
         ..Default::default()
     };
-    match state.db.get_events(&filter, MAX_EVENT_PAGE, 0) {
-        Ok(rows) => {
-            let events: Vec<Value> = rows.iter().map(|e| event_json(e, &state.abis)).collect();
+    let db = state.db.clone();
+    let res =
+        tokio::task::spawn_blocking(move || db.get_events_keyset(&filter, MAX_EVENT_PAGE, None))
+            .await;
+    match res {
+        Ok(Ok(page)) => {
+            let events: Vec<Value> = page
+                .items
+                .iter()
+                .map(|e| event_json(e, &state.abis))
+                .collect();
             (
                 StatusCode::OK,
                 Json(json!({
                     "tx_hash": hash,
                     "events": events,
                     "count": events.len(),
+                    "has_more": page.has_more,
                 })),
             )
                 .into_response()
         }
-        Err(e) => (
+        Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "tx events query task failed"})),
         )
             .into_response(),
     }
 }
 
-/// `GET /api/v2/events?from_block=&to_block=&contract=&cursor=&limit=` — filtered events.
+/// `GET /api/v2/events?from_block=&to_block=&contract=&shard_id=&cursor=&limit=` — filtered events.
 async fn get_events(
     State(state): State<AppState>,
     Query(q): Query<EventsQuery>,
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(50).min(MAX_EVENT_PAGE);
+    let shard_filter = q.shard_id.or(q.shard);
     let (cursor_str, offset) = match resolve_cursor_or_offset(q.cursor.as_deref(), q.offset) {
         Ok(v) => v,
         Err(r) => return r,
@@ -1903,23 +2222,27 @@ async fn get_events(
         to_block: q.to_block,
         contract: q.contract.clone(),
         tx_hash: None,
+        shard_id: shard_filter,
     };
     if cursor_str.is_some() || offset == 0 {
         let parsed = match cursor_str.as_deref().map(parse_event_cursor).transpose() {
             Ok(c) => c,
             Err(e) => return bad_request(e),
         };
-        match state.db.get_events_keyset(&filter, limit, parsed) {
-            Ok(page) => {
+        let db = state.db.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            let page = db.get_events_keyset(&filter, limit, parsed)?;
+            let total = db.count_events(&filter).unwrap_or(page.items.len() as u64);
+            Ok::<_, rusqlite::Error>((page, total))
+        })
+        .await;
+        match res {
+            Ok(Ok((page, total))) => {
                 let events: Vec<Value> = page
                     .items
                     .iter()
                     .map(|e| event_json(e, &state.abis))
                     .collect();
-                let total = state
-                    .db
-                    .count_events(&filter)
-                    .unwrap_or(events.len() as u64);
                 (
                     StatusCode::OK,
                     Json(json!({
@@ -1929,6 +2252,7 @@ async fn get_events(
                         "from_block": q.from_block,
                         "to_block": q.to_block,
                         "contract": q.contract,
+                        "shard_id": shard_filter,
                         "limit": limit,
                         "offset": 0,
                         "next_cursor": page.next_cursor,
@@ -1937,20 +2261,28 @@ async fn get_events(
                 )
                     .into_response()
             }
-            Err(e) => (
+            Ok(Err(e)) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
             )
                 .into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "events query task failed"})),
+            )
+                .into_response(),
         }
     } else {
-        match state.db.get_events(&filter, limit, offset) {
-            Ok(rows) => {
+        let db = state.db.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            let rows = db.get_events(&filter, limit, offset)?;
+            let total = db.count_events(&filter).unwrap_or(rows.len() as u64);
+            Ok::<_, rusqlite::Error>((rows, total))
+        })
+        .await;
+        match res {
+            Ok(Ok((rows, total))) => {
                 let events: Vec<Value> = rows.iter().map(|e| event_json(e, &state.abis)).collect();
-                let total = state
-                    .db
-                    .count_events(&filter)
-                    .unwrap_or(events.len() as u64);
                 (
                     StatusCode::OK,
                     Json(json!({
@@ -1960,15 +2292,21 @@ async fn get_events(
                         "from_block": q.from_block,
                         "to_block": q.to_block,
                         "contract": q.contract,
+                        "shard_id": shard_filter,
                         "limit": limit,
                         "offset": offset,
                     })),
                 )
                     .into_response()
             }
-            Err(e) => (
+            Ok(Err(e)) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
+            )
+                .into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "events query task failed"})),
             )
                 .into_response(),
         }
@@ -1979,9 +2317,10 @@ async fn get_events(
 /// emitters), bounded and keyset-paginated.
 async fn get_contracts(
     State(state): State<AppState>,
-    Query(p): Query<Pagination>,
+    Query(p): Query<ContractsQuery>,
 ) -> impl IntoResponse {
     let limit = p.limit.unwrap_or(50).min(MAX_EVENT_PAGE);
+    let shard_filter = p.shard_id.or(p.shard);
     let (cursor_str, offset) = match resolve_cursor_or_offset(p.cursor.as_deref(), p.offset) {
         Ok(v) => v,
         Err(r) => return r,
@@ -2009,8 +2348,10 @@ async fn get_contracts(
         };
         let db = state.db.clone();
         let res = tokio::task::spawn_blocking(move || {
-            let page = db.list_contracts_keyset(limit, parsed)?;
-            let total = db.count_contracts().unwrap_or(page.items.len() as u64);
+            let page = db.list_contracts_in_shard_keyset(shard_filter, limit, parsed)?;
+            let total = db
+                .count_contracts_in_shard(shard_filter)
+                .unwrap_or(page.items.len() as u64);
             Ok::<_, rusqlite::Error>((page, total))
         })
         .await;
@@ -2023,6 +2364,7 @@ async fn get_contracts(
                         "contracts": contracts,
                         "count": contracts.len(),
                         "total": total,
+                        "shard_id": shard_filter,
                         "limit": limit,
                         "offset": 0,
                         "next_cursor": page.next_cursor,
@@ -2045,8 +2387,10 @@ async fn get_contracts(
     } else {
         let db = state.db.clone();
         let res = tokio::task::spawn_blocking(move || {
-            let rows = db.list_contracts(limit, offset)?;
-            let total = db.count_contracts().unwrap_or(rows.len() as u64);
+            let rows = db.list_contracts_in_shard(shard_filter, limit, offset)?;
+            let total = db
+                .count_contracts_in_shard(shard_filter)
+                .unwrap_or(rows.len() as u64);
             Ok::<_, rusqlite::Error>((rows, total))
         })
         .await;
@@ -2059,6 +2403,7 @@ async fn get_contracts(
                         "contracts": contracts,
                         "count": contracts.len(),
                         "total": total,
+                        "shard_id": shard_filter,
                         "limit": limit,
                         "offset": offset,
                     })),
@@ -2109,14 +2454,33 @@ async fn get_shards(
     match fetched.as_ref().map(|d| d["result"].clone()) {
         Some(result) if !result.is_null() => {
             let mut out = result;
-            let indexed_map: std::collections::HashMap<u32, (u64, u64)> = state
-                .db
-                .get_shard_index_stats()
-                .unwrap_or_default()
+            let db = state.db.clone();
+            let shard_stats = match tokio::task::spawn_blocking(move || {
+                db.get_shard_index_stats().unwrap_or_default()
+            })
+            .await
+            {
+                Ok(s) => s,
+                Err(_) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "shards query task failed"})),
+                    )
+                        .into_response();
+                }
+            };
+            let indexed_map: std::collections::HashMap<u32, (u64, u64)> = shard_stats
                 .into_iter()
                 .map(|(sid, tip, cnt)| (sid, (tip, cnt)))
                 .collect();
-            let mut workchain_ids: Vec<u32> = Vec::new();
+            struct ShardPrefixInfo {
+                shard_id: u32,
+                prefix: u64,
+                prefix_len: u8,
+                has_prefix: bool,
+            }
+
+            let mut workchain_shards: Vec<ShardPrefixInfo> = Vec::new();
             let mut shard_len: usize = 0;
 
             if let Some(obj) = out.as_object_mut() {
@@ -2128,7 +2492,44 @@ async fn get_shards(
                             .and_then(|v| u32::try_from(v).ok())
                         {
                             if sid > 0 {
-                                workchain_ids.push(sid);
+                                let explicit_len = item
+                                    .get("prefix_len")
+                                    .and_then(|v| v.as_u64())
+                                    .and_then(|v| u8::try_from(v).ok());
+                                let explicit_prefix = item.get("prefix").and_then(|v| v.as_u64());
+                                let (prefix, prefix_len, has_prefix) =
+                                    if explicit_len.is_some() || explicit_prefix.is_some() {
+                                        (
+                                            explicit_prefix.unwrap_or(0),
+                                            explicit_len.unwrap_or(0),
+                                            true,
+                                        )
+                                    } else if let Some(bits) =
+                                        item.get("prefix_bits").and_then(|v| v.as_str())
+                                    {
+                                        let trimmed = bits.trim();
+                                        if trimmed.is_empty() {
+                                            (0, 0, true)
+                                        } else if trimmed.len() <= 64
+                                            && trimmed.bytes().all(|b| b == b'0' || b == b'1')
+                                        {
+                                            let len = trimmed.len() as u8;
+                                            let val = u64::from_str_radix(trimmed, 2).unwrap_or(0);
+                                            let shift = 64u32.saturating_sub(u32::from(len));
+                                            let word = if shift >= 64 { 0 } else { val << shift };
+                                            (word, len, true)
+                                        } else {
+                                            (0, 0, false)
+                                        }
+                                    } else {
+                                        (0, 0, false)
+                                    };
+                                workchain_shards.push(ShardPrefixInfo {
+                                    shard_id: sid,
+                                    prefix,
+                                    prefix_len,
+                                    has_prefix,
+                                });
                             }
                             let (indexed_tip, indexed_blocks) =
                                 indexed_map.get(&sid).copied().unwrap_or((0, 0));
@@ -2154,10 +2555,40 @@ async fn get_shards(
                     let norm = crate::db::normalize_address_info(raw_addr);
                     let routed_shard = if let Some(hint) = norm.shard_hint {
                         Some(hint)
-                    } else if norm.bytes32.is_some() {
-                        if workchain_ids.len() == 1 {
-                            Some(workchain_ids[0])
-                        } else if workchain_ids.is_empty() && shard_len == 1 {
+                    } else if let Some(addr32) = norm.bytes32 {
+                        if workchain_shards.len() == 1 {
+                            Some(workchain_shards[0].shard_id)
+                        } else if workchain_shards.len() >= 2 {
+                            if workchain_shards.iter().any(|s| s.has_prefix) {
+                                let mut best: Option<&ShardPrefixInfo> = None;
+                                for s in &workchain_shards {
+                                    let desc = stellereum::sharding::ShardDescriptor::new(
+                                        s.shard_id,
+                                        0,
+                                        s.prefix,
+                                        s.prefix_len,
+                                    );
+                                    if !desc.contains_address(&addr32) {
+                                        continue;
+                                    }
+                                    best = match best {
+                                        None => Some(s),
+                                        Some(b)
+                                            if s.prefix_len > b.prefix_len
+                                                || (s.prefix_len == b.prefix_len
+                                                    && s.shard_id < b.shard_id) =>
+                                        {
+                                            Some(s)
+                                        }
+                                        other => other,
+                                    };
+                                }
+                                best.map(|s| s.shard_id)
+                                    .or_else(|| workchain_shards.iter().map(|s| s.shard_id).min())
+                            } else {
+                                None
+                            }
+                        } else if shard_len == 1 {
                             Some(0)
                         } else {
                             None
@@ -2441,12 +2872,23 @@ async fn verify_contract_source(
                 .to_string(),
             verified_at: now,
         };
-        if let Err(e) = state.db.upsert_verified_source(&row) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-                .into_response();
+        let db = state.db.clone();
+        match tokio::task::spawn_blocking(move || db.upsert_verified_source(&row)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "verify source save task failed"})),
+                )
+                    .into_response();
+            }
         }
         let mut out = result;
         if let Some(obj) = out.as_object_mut() {
@@ -2467,8 +2909,10 @@ async fn get_contract_source(
     Path(address): Path<String>,
 ) -> impl IntoResponse {
     let key = normalize_contract_key(&address);
-    match state.db.get_verified_source(&key) {
-        Ok(Some(v)) => (
+    let db = state.db.clone();
+    let key_owned = key.clone();
+    match tokio::task::spawn_blocking(move || db.get_verified_source(&key_owned)).await {
+        Ok(Ok(Some(v))) => (
             StatusCode::OK,
             Json(json!({
                 "contract": v.contract,
@@ -2483,7 +2927,7 @@ async fn get_contract_source(
             })),
         )
             .into_response(),
-        Ok(None) => (
+        Ok(Ok(None)) => (
             StatusCode::NOT_FOUND,
             Json(json!({
                 "contract": key,
@@ -2492,9 +2936,14 @@ async fn get_contract_source(
             })),
         )
             .into_response(),
-        Err(e) => (
+        Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "contract source query task failed"})),
         )
             .into_response(),
     }
@@ -2524,15 +2973,23 @@ async fn get_account_tokens(
         Err(e) => return bad_request(e),
     };
     let include_zero = q.include_zero.unwrap_or(false);
-    match state.db.get_account_tokens_keyset(
-        &address,
-        q.token.as_deref(),
-        include_zero,
-        q.shard_id,
-        limit,
-        cursor,
-    ) {
-        Ok(page) => (
+    let db = state.db.clone();
+    let addr_owned = address.clone();
+    let token_opt = q.token.clone();
+    let shard_id = q.shard_id;
+    let res = tokio::task::spawn_blocking(move || {
+        db.get_account_tokens_keyset(
+            &addr_owned,
+            token_opt.as_deref(),
+            include_zero,
+            shard_id,
+            limit,
+            cursor,
+        )
+    })
+    .await;
+    match res {
+        Ok(Ok(page)) => (
             StatusCode::OK,
             Json(json!({
                 "address": norm.hex_clean,
@@ -2546,9 +3003,14 @@ async fn get_account_tokens(
             })),
         )
             .into_response(),
-        Err(e) => (
+        Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "account tokens query task failed"})),
         )
             .into_response(),
     }
@@ -2574,11 +3036,15 @@ async fn get_token_holders(
         Err(e) => return bad_request(e),
     };
     let include_zero = q.include_zero.unwrap_or(false);
-    match state
-        .db
-        .get_token_holders_keyset(&token, include_zero, q.shard_id, limit, cursor)
-    {
-        Ok(page) => (
+    let db = state.db.clone();
+    let token_owned = token.clone();
+    let shard_id = q.shard_id;
+    let res = tokio::task::spawn_blocking(move || {
+        db.get_token_holders_keyset(&token_owned, include_zero, shard_id, limit, cursor)
+    })
+    .await;
+    match res {
+        Ok(Ok(page)) => (
             StatusCode::OK,
             Json(json!({
                 "token": norm.hex_clean,
@@ -2592,9 +3058,14 @@ async fn get_token_holders(
             })),
         )
             .into_response(),
-        Err(e) => (
+        Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "token holders query task failed"})),
         )
             .into_response(),
     }
@@ -2802,6 +3273,9 @@ async fn proxy_program_accounts_rpc(
     }
     if let Some(v) = q.cursor.as_deref().filter(|s| !s.trim().is_empty()) {
         rpc_params.insert("cursor".to_string(), json!(v));
+    }
+    if let Some(v) = q.shard_id {
+        rpc_params.insert("shard_id".to_string(), json!(v));
     }
     let payload = json!({
         "jsonrpc": "2.0",
@@ -3013,7 +3487,13 @@ async fn stream_events(
     let rx = state.stream_hub.subscribe();
     let mut pending_replay = VecDeque::new();
     let mut replay_overflow = 0usize;
-    if let Some(after_seq) = q.after_seq {
+    let after_seq = q.after_seq.or_else(|| {
+        headers
+            .get("last-event-id")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    });
+    if let Some(after_seq) = after_seq {
         match state.stream_hub.replay_since(after_seq) {
             Ok(events) => {
                 for ev in events {
@@ -3072,6 +3552,7 @@ async fn stream_events(
     let stream: IndexerSseStream =
         Box::pin(futures::stream::unfold(init_state, |mut st| async move {
             if let Some(lag_body) = st.pending_lag.take() {
+                st.deadline = tokio::time::Instant::now() + st.idle_timeout;
                 return Some((Ok(SseEvent::default().event("lagged").data(lag_body)), st));
             }
             if let Some(ev) = st.pending_replay.pop_front() {
@@ -3085,15 +3566,16 @@ async fn stream_events(
                 match tokio::time::timeout_at(st.deadline, st.rx.recv()).await {
                     Err(_elapsed) => return None,
                     Ok(Ok(ev)) => {
+                        st.deadline = tokio::time::Instant::now() + st.idle_timeout;
                         if ev.seq <= st.last_sent_seq || !st.filter.matches(&ev) {
                             continue;
                         }
                         st.last_sent_seq = ev.seq;
-                        st.deadline = tokio::time::Instant::now() + st.idle_timeout;
                         let sse_ev = build_sse_event(&ev);
                         return Some((Ok(sse_ev), st));
                     }
                     Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                        st.deadline = tokio::time::Instant::now() + st.idle_timeout;
                         let oldest = st.hub.oldest_available_seq();
                         let payload = json!({
                             "lagged": skipped,

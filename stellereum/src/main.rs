@@ -39,49 +39,71 @@ fn main() -> anyhow::Result<()> {
     // reading `runtime_limits` or spawning the Tokio runtime / any threads so
     // `std::env::set_var` executes strictly single-threaded.
     let cli = cli::args::Cli::parse();
-    if let cli::args::Commands::Run {
-        ref node_toml,
-        no_telemetry,
-        ..
-    } = cli.command
-    {
-        let toml_source = stellereum::node_config::discover_toml_path(node_toml.as_deref())?;
-        let loaded_cfg = if let Some(path) = toml_source.path() {
-            let cfg = stellereum::node_config::NodeTomlConfig::from_file(path)?;
-            let applied = cfg.apply_defaults_to_env();
-            tracing::info!(
-                "[config] loaded {} (source={}, applied={} env defaults)",
-                path.display(),
-                toml_source.label(),
-                applied.len(),
-            );
-            Some(cfg)
-        } else {
-            None
-        };
-        if no_telemetry {
-            std::env::set_var(stellereum::node_config::NO_TELEMETRY_ENV, "1");
-            tracing::info!(
-                "[telemetry] disabled via -t/--no-telemetry ({}=1): /status dashboard disabled; /health, /healthz, /readyz, /metrics remain active",
-                stellereum::node_config::NO_TELEMETRY_ENV,
-            );
-        }
-        if let Some(cfg) = loaded_cfg {
-            let report = cfg.validate();
-            for warn in &report.warnings {
-                tracing::warn!("[config] {warn}");
+    match cli.command {
+        cli::args::Commands::Run {
+            ref node_toml,
+            no_telemetry,
+            ..
+        } => {
+            let toml_source = stellereum::node_config::discover_toml_path(node_toml.as_deref())?;
+            let loaded_cfg = if let Some(path) = toml_source.path() {
+                let cfg = stellereum::node_config::NodeTomlConfig::from_file(path)?;
+                let applied = cfg.apply_defaults_to_env();
+                tracing::info!(
+                    "[config] loaded {} (source={}, applied={} env defaults)",
+                    path.display(),
+                    toml_source.label(),
+                    applied.len(),
+                );
+                Some(cfg)
+            } else {
+                None
+            };
+            if no_telemetry {
+                std::env::set_var(stellereum::node_config::NO_TELEMETRY_ENV, "1");
+                tracing::info!(
+                    "[telemetry] disabled via -t/--no-telemetry ({}=1): /status dashboard disabled; /health, /healthz, /readyz, /metrics remain active",
+                    stellereum::node_config::NO_TELEMETRY_ENV,
+                );
             }
-            if !report.is_ok() {
-                for err in &report.errors {
-                    tracing::error!("[config] {err}");
+            if let Some(cfg) = loaded_cfg {
+                let report = cfg.validate();
+                for warn in &report.warnings {
+                    tracing::warn!("[config] {warn}");
                 }
-                anyhow::bail!(
-                    "node TOML config validation failed ({} error(s)): {}",
-                    report.errors.len(),
-                    report.errors.join("; "),
+                if !report.is_ok() {
+                    for err in &report.errors {
+                        tracing::error!("[config] {err}");
+                    }
+                    anyhow::bail!(
+                        "node TOML config validation failed ({} error(s)): {}",
+                        report.errors.len(),
+                        report.errors.join("; "),
+                    );
+                }
+            }
+        }
+        cli::args::Commands::Store {
+            sub: cli::args::StoreCommands::Bootstrap { .. },
+        }
+        | cli::args::Commands::NodeBootstrap { .. }
+        | cli::args::Commands::SafetyInit { .. }
+        | cli::args::Commands::SafetyReset { .. }
+        | cli::args::Commands::UpgradeStatus { .. } => {
+            let toml_source = stellereum::node_config::discover_toml_path(None)?;
+            if let Some(path) = toml_source.path() {
+                let cfg = stellereum::node_config::NodeTomlConfig::from_file(path)?;
+                let applied = cfg.apply_defaults_to_env();
+                tracing::info!(
+                    "[config] loaded {} (source={}, applied={} env defaults; STELL_DATA_DIR={:?})",
+                    path.display(),
+                    toml_source.label(),
+                    applied.len(),
+                    std::env::var("STELL_DATA_DIR").ok(),
                 );
             }
         }
+        _ => {}
     }
     let limits = node::runtime_limits::detect();
     tracing::info!(

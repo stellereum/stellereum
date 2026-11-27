@@ -16,7 +16,7 @@ use falcon_rust::falcon512;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use std::path::Path;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Параметры KDF (memory-hard Argon2id): 64 MiB, 3 прохода, 4 линии.
 const KDF_MEM_KIB: u32 = 65_536;
@@ -24,32 +24,34 @@ const KDF_ITERS: u32 = 3;
 const KDF_LANES: u32 = 4;
 
 /// Вывести 32-байтовый ключ шифрования из пассфразы через Argon2id (memory-hard).
-fn derive_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
+fn derive_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
     let params = argon2::Params::new(KDF_MEM_KIB, KDF_ITERS, KDF_LANES, Some(32))
         .map_err(|e| anyhow!("argon2 params: {e}"))?;
     let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-    let mut key = [0u8; 32];
+    let mut key = Zeroizing::new([0u8; 32]);
     argon2
-        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .hash_password_into(passphrase.as_bytes(), salt, key.as_mut())
         .map_err(|e| anyhow!("argon2 kdf: {e}"))?;
     Ok(key)
 }
 
-fn get_passphrase() -> Option<String> {
+fn get_passphrase() -> Option<Zeroizing<String>> {
     std::env::var("STELL_NODE_PASSPHRASE")
         .ok()
         .or_else(|| std::env::var("INFNODE_KEY_PASSPHRASE").ok())
         .filter(|p| !p.is_empty())
+        .map(Zeroizing::new)
 }
 
 /// LEGACY KDF (iterated blake3) — только для чтения старых `enc:` файлов.
-fn legacy_passphrase_key() -> Option<[u8; 32]> {
+fn legacy_passphrase_key() -> Option<Zeroizing<[u8; 32]>> {
     let p = get_passphrase()?;
-    let mut h = blake3::hash(format!("infnode-key-v1:{p}").as_bytes());
+    let input = Zeroizing::new(format!("infnode-key-v1:{}", p.as_str()));
+    let mut h = blake3::hash(input.as_bytes());
     for _ in 0..65536 {
         h = blake3::hash(h.as_bytes());
     }
-    let mut k = [0u8; 32];
+    let mut k = Zeroizing::new([0u8; 32]);
     k.copy_from_slice(&h.as_bytes()[..32]);
     Some(k)
 }
@@ -66,14 +68,13 @@ pub fn protect(data: &[u8]) -> String {
 
     let mut salt = [0u8; 16];
     OsRng.fill_bytes(&mut salt);
-    let mut key = derive_key(&pass, &salt).expect("argon2 kdf");
+    let key = derive_key(pass.as_str(), &salt).expect("argon2 kdf");
     let mut nonce = [0u8; 24];
     OsRng.fill_bytes(&mut nonce);
-    let c = XChaCha20Poly1305::new(Key::from_slice(&key));
+    let c = XChaCha20Poly1305::new(Key::from_slice(key.as_ref()));
     let ct = c
         .encrypt(XNonce::from_slice(&nonce), data)
         .expect("key encrypt");
-    key.zeroize();
     format!(
         "enc2:{}:{}:{}",
         hex::encode(salt),
@@ -97,14 +98,13 @@ pub fn unprotect(data: &str) -> Result<String> {
         let ct = hex::decode(parts[2])?;
         let pass = get_passphrase()
             .ok_or_else(|| anyhow!("ключи зашифрованы, но STELL_NODE_PASSPHRASE не задан"))?;
-        let mut key = derive_key(&pass, &salt)?;
-        let c = XChaCha20Poly1305::new(Key::from_slice(&key));
-        let plain = c
-            .decrypt(XNonce::from_slice(&nonce), ct.as_ref())
-            .map_err(|_| anyhow!("неверная пассфраза"));
-        key.zeroize();
-        let plain = plain?;
-        Ok(String::from_utf8_lossy(&plain).to_string())
+        let key = derive_key(pass.as_str(), &salt)?;
+        let c = XChaCha20Poly1305::new(Key::from_slice(key.as_ref()));
+        let plain = Zeroizing::new(
+            c.decrypt(XNonce::from_slice(&nonce), ct.as_ref())
+                .map_err(|_| anyhow!("неверная пассфраза"))?,
+        );
+        Ok(String::from_utf8_lossy(plain.as_slice()).to_string())
     } else if let Some(b64) = data.strip_prefix("enc:") {
         // Legacy iterated-blake3 формат (обратная совместимость)
         let key = legacy_passphrase_key()
@@ -114,11 +114,12 @@ pub fn unprotect(data: &str) -> Result<String> {
             bail!("bad enc blob");
         }
         let (nonce, ct) = blob.split_at(24);
-        let c = XChaCha20Poly1305::new(Key::from_slice(&key));
-        let plain = c
-            .decrypt(XNonce::from_slice(nonce), ct)
-            .map_err(|_| anyhow!("неверная пассфраза"))?;
-        Ok(String::from_utf8_lossy(&plain).to_string())
+        let c = XChaCha20Poly1305::new(Key::from_slice(key.as_ref()));
+        let plain = Zeroizing::new(
+            c.decrypt(XNonce::from_slice(nonce), ct)
+                .map_err(|_| anyhow!("неверная пассфраза"))?,
+        );
+        Ok(String::from_utf8_lossy(plain.as_slice()).to_string())
     } else {
         if get_passphrase().is_none() {
             eprintln!("[WARN] STELL_NODE_PASSPHRASE не задан: загрузка ключей в открытом виде");
@@ -127,17 +128,30 @@ pub fn unprotect(data: &str) -> Result<String> {
     }
 }
 
-/// Записать приватный файл с правами 0600 (только владелец).
+/// Записать приватный файл с правами 0600 (только владелец), без следования по симлинкам.
 #[cfg(unix)]
 pub fn write_private(path: &Path, contents: &str) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    match std::fs::symlink_metadata(path) {
+        Ok(md) => {
+            if md.file_type().is_symlink() {
+                bail!("{}: refusing to follow symlink", path.display());
+            }
+            if !md.file_type().is_file() {
+                bail!("{}: not a regular file", path.display());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .open(path)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     f.write_all(contents.as_bytes())?;
     Ok(())
 }
@@ -192,13 +206,14 @@ impl NodeKeys {
         // Шифруем (если задана пассфраза) и пишем с правами 0600.
         // FULL-PQ: only the KEM seed is persisted; `identity.key` (classical
         // Ed25519) is never written.
-        let mut kem_hex = hex::encode(self.kem_seed);
-        write_private(&dir.join("e2e.key"), &protect(kem_hex.as_bytes()))?;
-        kem_hex.zeroize();
+        let kem_hex = Zeroizing::new(hex::encode(self.kem_seed));
+        let protected = Zeroizing::new(protect(kem_hex.as_bytes()));
+        write_private(&dir.join("e2e.key"), &protected)?;
         Ok(())
     }
 
     pub fn load(dir: &Path) -> Result<Self> {
+        use std::io::Read;
         // Fail closed on a leftover classical identity: it is NOT an identity
         // and silently ignoring it would hide a half-wiped keystore.
         let legacy_identity = dir.join("identity.key");
@@ -207,11 +222,15 @@ impl NodeKeys {
                 "identity.key: legacy Ed25519 identity refused (FULL-PQ wipe: delete identity.key; node identity is pq-identity.key/Falcon-512)"
             );
         }
+        let e2e_path = dir.join("e2e.key");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let dir_meta = std::fs::metadata(dir)
+            let dir_meta = std::fs::symlink_metadata(dir)
                 .map_err(|e| anyhow!("keystore dir {}: {e}", dir.display()))?;
+            if dir_meta.file_type().is_symlink() {
+                bail!("keystore dir {} must not be a symlink", dir.display());
+            }
             let dir_mode = dir_meta.permissions().mode() & 0o777;
             if dir_mode != 0o700 {
                 bail!(
@@ -220,8 +239,11 @@ impl NodeKeys {
                     dir_mode
                 );
             }
-            let e2e_path = dir.join("e2e.key");
-            let e2e_meta = std::fs::metadata(&e2e_path).map_err(|e| anyhow!("e2e.key: {e}"))?;
+            let e2e_meta =
+                std::fs::symlink_metadata(&e2e_path).map_err(|e| anyhow!("e2e.key: {e}"))?;
+            if e2e_meta.file_type().is_symlink() {
+                bail!("e2e.key must not be a symlink");
+            }
             let e2e_mode = e2e_meta.permissions().mode() & 0o777;
             if e2e_mode != 0o600 {
                 bail!(
@@ -230,25 +252,31 @@ impl NodeKeys {
                 );
             }
         }
-        let e2e =
-            std::fs::read_to_string(dir.join("e2e.key")).map_err(|e| anyhow!("e2e.key: {e}"))?;
-        let mut kem_plain = unprotect(e2e.trim())?;
-        let kem_bytes = hex::decode(kem_plain.trim())?;
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&e2e_path)
+            .map_err(|e| anyhow!("e2e.key: {e}"))?;
+        let mut e2e = Zeroizing::new(String::new());
+        f.read_to_string(&mut e2e)
+            .map_err(|e| anyhow!("e2e.key: {e}"))?;
+        let kem_plain = Zeroizing::new(unprotect(e2e.trim())?);
+        let kem_bytes = Zeroizing::new(hex::decode(kem_plain.trim())?);
         if kem_bytes.len() == 32 {
             // Wipe-compat: a 32-byte seed is the pre-PQ X25519 static secret —
             // refused loudly, never silently accepted as KEM material.
-            kem_plain.zeroize();
             bail!(
                 "e2e.key: legacy x25519 key refused (FULL-PQ wipe: delete e2e.key and restart to generate a KEM key)"
             );
         }
-        let kem_seed: [u8; crate::mailbox::KEM_SEED_LEN] = kem_bytes
-            .try_into()
-            .map_err(|_| anyhow!("e2e kem seed должен быть 64 байта"))?;
-        // Стереть промежуточные plaintext-строки из памяти
-        kem_plain.zeroize();
+        let kem_seed = Zeroizing::new(
+            <[u8; crate::mailbox::KEM_SEED_LEN]>::try_from(kem_bytes.as_slice())
+                .map_err(|_| anyhow!("e2e kem seed должен быть 64 байта"))?,
+        );
         let kem_ek = crate::mailbox::kem_ek_from_seed(&kem_seed);
-        Ok(Self { kem_seed, kem_ek })
+        Ok(Self {
+            kem_seed: *kem_seed,
+            kem_ek,
+        })
     }
 }
 
@@ -355,9 +383,9 @@ impl PqKeys {
 
     pub fn save(&self, dir: &Path) -> Result<()> {
         secure_dir(dir)?;
-        let mut seed_hex = hex::encode(self.seed);
-        write_private(&dir.join(PQ_IDENTITY_FILE), &protect(seed_hex.as_bytes()))?;
-        seed_hex.zeroize();
+        let seed_hex = Zeroizing::new(hex::encode(self.seed));
+        let protected = Zeroizing::new(protect(seed_hex.as_bytes()));
+        write_private(&dir.join(PQ_IDENTITY_FILE), &protected)?;
         Ok(())
     }
 
@@ -402,11 +430,16 @@ impl PqKeys {
     /// persists it — and `load_opt` must read the same file. Kept private:
     /// callers use `save`/`load_opt`, never raw seeds.
     fn load_seed(dir: &Path) -> Result<[u8; 32]> {
+        use std::io::Read;
+        let path = dir.join(PQ_IDENTITY_FILE);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let dir_meta = std::fs::metadata(dir)
+            let dir_meta = std::fs::symlink_metadata(dir)
                 .map_err(|e| anyhow!("keystore dir {}: {e}", dir.display()))?;
+            if dir_meta.file_type().is_symlink() {
+                bail!("keystore dir {} must not be a symlink", dir.display());
+            }
             let dir_mode = dir_meta.permissions().mode() & 0o777;
             if dir_mode != 0o700 {
                 bail!(
@@ -415,21 +448,30 @@ impl PqKeys {
                     dir_mode
                 );
             }
-            let path = dir.join(PQ_IDENTITY_FILE);
-            let meta = std::fs::metadata(&path).map_err(|e| anyhow!("{PQ_IDENTITY_FILE}: {e}"))?;
+            let meta =
+                std::fs::symlink_metadata(&path).map_err(|e| anyhow!("{PQ_IDENTITY_FILE}: {e}"))?;
+            if meta.file_type().is_symlink() {
+                bail!("{PQ_IDENTITY_FILE} must not be a symlink");
+            }
             let mode = meta.permissions().mode() & 0o777;
             if mode != 0o600 {
                 bail!("{PQ_IDENTITY_FILE} has insecure permissions 0o{mode:03o}, expected 0o600");
             }
         }
-        let raw = std::fs::read_to_string(dir.join(PQ_IDENTITY_FILE))
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
             .map_err(|e| anyhow!("{PQ_IDENTITY_FILE}: {e}"))?;
-        let mut plain = unprotect(raw.trim())?;
-        let seed: [u8; 32] = hex::decode(plain.trim())?
-            .try_into()
-            .map_err(|_| anyhow!("pq seed должен быть 32 байта"))?;
-        plain.zeroize();
-        Ok(seed)
+        let mut raw = Zeroizing::new(String::new());
+        f.read_to_string(&mut raw)
+            .map_err(|e| anyhow!("{PQ_IDENTITY_FILE}: {e}"))?;
+        let plain = Zeroizing::new(unprotect(raw.trim())?);
+        let seed_bytes = Zeroizing::new(hex::decode(plain.trim())?);
+        let seed = Zeroizing::new(
+            <[u8; 32]>::try_from(seed_bytes.as_slice())
+                .map_err(|_| anyhow!("pq seed должен быть 32 байта"))?,
+        );
+        Ok(*seed)
     }
 }
 
@@ -541,5 +583,48 @@ mod tests {
             let sig = keys.sign_digest(&digest);
             assert!(crate::proto::pq_falcon_verify(&pub_bytes, &digest, &sig));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_and_load_refuse_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!("infnode-keyring-sym-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        secure_dir(&dir).unwrap();
+
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "orig").unwrap();
+        let sym = dir.join("link.key");
+        symlink(&target, &sym).unwrap();
+        assert!(
+            write_private(&sym, "new").is_err(),
+            "write_private must refuse symlink"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "orig");
+
+        // Regular file written by write_private gets 0o600
+        let reg = dir.join("good.key");
+        write_private(&reg, "secret").unwrap();
+        let mode = std::fs::symlink_metadata(&reg)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // NodeKeys::load refuses symlinked e2e.key
+        let keys = NodeKeys::generate();
+        keys.save(&dir).unwrap();
+        let e2e = dir.join("e2e.key");
+        let real_e2e = dir.join("real_e2e.key");
+        std::fs::rename(&e2e, &real_e2e).unwrap();
+        symlink(&real_e2e, &e2e).unwrap();
+        assert!(
+            NodeKeys::load(&dir).is_err(),
+            "NodeKeys::load must refuse symlinked e2e.key"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1228,17 +1228,8 @@ impl Governance {
         // Audit G2: lock the proposer's OWN stake (self-bond + delegations
         // out — the same formula as vote weight) for the proposal's lifetime.
         // Others' delegations TO the proposer are not theirs to lock.
-        let proposer_own: u128 = ledger
-            .validators
-            .get(&proposer)
-            .map(|v| v.self_bond as u128)
-            .unwrap_or(0)
-            + ledger
-                .delegations
-                .iter()
-                .filter(|((_, d), _)| *d == proposer)
-                .map(|(_, amount)| *amount as u128)
-                .sum::<u128>();
+        // Reuses `electorate_weights` computed above instead of re-scanning `ledger.delegations`.
+        let proposer_own: u128 = electorate_weights.get(&proposer).copied().unwrap_or(0);
         let proposer_lock = u64::try_from(proposer_own).unwrap_or(u64::MAX);
         ledger.lock_governance(proposer, proposer_lock);
         self.proposals.insert(
@@ -2173,12 +2164,21 @@ impl Governance {
     /// takes no lock and bumps no commitment generation, so an ordinary block
     /// leaves the state root byte-identical.
     pub fn has_due_governance(&self, now: u64, cur_height: u64) -> bool {
-        let upgrades = upgrade_exec_active_at(cur_height);
-        self.proposals.values().any(|p| {
-            (p.status == ProposalStatus::Open && now >= p.voting_end)
-                || (p.status == ProposalStatus::Passed
-                    && self.is_mature(p.id, cur_height)
-                    && (upgrades || !matches!(p.action, GovAction::SoftwareUpgrade { .. })))
+        if self.proposals.is_empty() {
+            return false;
+        }
+        let mut upgrades: Option<bool> = None;
+        self.proposals.values().any(|p| match p.status {
+            ProposalStatus::Open => now >= p.voting_end,
+            ProposalStatus::Passed => {
+                let allowed = if matches!(p.action, GovAction::SoftwareUpgrade { .. }) {
+                    *upgrades.get_or_insert_with(|| upgrade_exec_active_at(cur_height))
+                } else {
+                    true
+                };
+                allowed && self.is_mature(p.id, cur_height)
+            }
+            ProposalStatus::Rejected | ProposalStatus::Executed => false,
         })
     }
 

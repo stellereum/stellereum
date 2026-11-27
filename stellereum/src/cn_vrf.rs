@@ -992,7 +992,7 @@ pub fn load_cnvrf_nonce_from_file(path: &Path) -> Result<[u8; 32], String> {
         }
     }
 
-    let mut raw = String::new();
+    let mut raw = Zeroizing::new(String::new());
     file.read_to_string(&mut raw)
         .map_err(|e| format!("[cnvrf] cannot read nonce file {}: {e}", path.display()))?;
     let line = raw

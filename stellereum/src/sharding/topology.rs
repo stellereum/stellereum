@@ -544,7 +544,7 @@ impl DynamicShardManager {
 
     pub fn record_tx_load(&mut self, shard_id: ShardId, tx_count: u64) {
         if let Some(s) = self.shards.get_mut(&shard_id) {
-            s.tx_load += tx_count;
+            s.tx_load = s.tx_load.saturating_add(tx_count);
         }
     }
 
@@ -602,7 +602,7 @@ impl DynamicShardManager {
             return None;
         }
 
-        if s0.tx_load + s1.tx_load > SHARD_MERGE_LOAD_THRESHOLD {
+        if s0.tx_load.saturating_add(s1.tx_load) > SHARD_MERGE_LOAD_THRESHOLD {
             return None;
         }
 
@@ -1730,7 +1730,7 @@ impl ShardTopology {
             target_balances,
         };
 
-        self.transitions += 1;
+        self.transitions = self.transitions.saturating_add(1);
         Some(SplitTransition {
             parent: parent_desc,
             children: [child0, child1],
@@ -1781,7 +1781,7 @@ impl ShardTopology {
             target_balances: vec![self.shard_balance(parent.shard_id)],
         };
 
-        self.transitions += 1;
+        self.transitions = self.transitions.saturating_add(1);
         Some(MergeTransition {
             children: [desc_a, desc_b],
             parent,

@@ -316,6 +316,313 @@ impl DisjointScheduler {
 
         waves
     }
+
+    /// Fine-grained Phase 13a/13b wave scheduler with `Read + Read` compatibility.
+    ///
+    /// Allows concurrent `Read` accesses on the same [`ResourceKeyV2`] to share a
+    /// wave while splitting `Read + Write` and `Write + Write` across waves
+    /// deterministically, preserving strict intra-wave and [`ResourceKeyV2::Global`]
+    /// barrier invariants.
+    pub fn schedule_v2(
+        txs: &[Transaction],
+        stm_contracts: bool,
+        exec_hardening: bool,
+    ) -> Vec<Vec<usize>> {
+        if txs.is_empty() {
+            return Vec::new();
+        }
+
+        let mut waves: Vec<Vec<usize>> = Vec::new();
+        let mut key_waves: HashMap<ResourceKeyV2, KeyWaveState> = HashMap::with_capacity(txs.len());
+        let mut last_contract_wave: HashMap<[u8; 32], usize> = HashMap::new();
+        let mut last_global_wave: Option<usize> = None;
+        let mut current_max_wave: usize = 0;
+        let mut keys: Vec<(ResourceKeyV2, AccessMode)> = Vec::with_capacity(6);
+
+        for (i, tx) in txs.iter().enumerate() {
+            fill_access_keys_v2(tx, stm_contracts, exec_hardening, &mut keys);
+            let has_global = keys.iter().any(|(k, _)| *k == ResourceKeyV2::Global);
+            let stm_contract_addrs: Vec<[u8; 32]> = if stm_contracts && !has_global {
+                let mut addrs = Vec::new();
+                for op in &tx.payload {
+                    if exec_hardening && matches!(op, OpCode::Halt) {
+                        break;
+                    }
+                    if let OpCode::SysCallCallContract { contract, .. }
+                    | OpCode::SysCallCallContractArgs { contract, .. } = op
+                    {
+                        if !addrs.contains(contract) {
+                            addrs.push(*contract);
+                        }
+                    }
+                }
+                addrs
+            } else {
+                Vec::new()
+            };
+
+            let target_wave = if has_global {
+                if i == 0 {
+                    0
+                } else {
+                    current_max_wave + 1
+                }
+            } else {
+                let mut wave_idx = last_global_wave.map(|w| w + 1).unwrap_or(0);
+                for (key, mode) in &keys {
+                    if let Some(state) = key_waves.get(key) {
+                        if let Some(w) = state.last_write_wave {
+                            wave_idx = wave_idx.max(w + 1);
+                        }
+                        if *mode == AccessMode::Write {
+                            if let Some(w) = state.last_read_wave {
+                                wave_idx = wave_idx.max(w + 1);
+                            }
+                        }
+                    }
+                }
+                // With STM enabled, calls to the same contract may share a
+                // wave (STM executes them in ascending `tx_idx` order), but a
+                // later call must never land in an EARLIER wave than an
+                // earlier call to that contract when another dependency (e.g.
+                // `Account(tx.from)`) pushed the earlier call forward.
+                for addr in &stm_contract_addrs {
+                    if let Some(&w) = last_contract_wave.get(addr) {
+                        wave_idx = wave_idx.max(w);
+                    }
+                }
+                wave_idx
+            };
+
+            if has_global {
+                last_global_wave = Some(target_wave);
+            }
+            for addr in stm_contract_addrs {
+                let entry = last_contract_wave.entry(addr).or_insert(target_wave);
+                *entry = (*entry).max(target_wave);
+            }
+            for (key, mode) in &keys {
+                let state = key_waves.entry(*key).or_default();
+                match mode {
+                    AccessMode::Read => {
+                        state.last_read_wave = Some(
+                            state
+                                .last_read_wave
+                                .map_or(target_wave, |w| w.max(target_wave)),
+                        );
+                    }
+                    AccessMode::Write => {
+                        state.last_write_wave = Some(
+                            state
+                                .last_write_wave
+                                .map_or(target_wave, |w| w.max(target_wave)),
+                        );
+                    }
+                }
+            }
+            current_max_wave = current_max_wave.max(target_wave);
+
+            while waves.len() <= target_wave {
+                waves.push(Vec::new());
+            }
+            waves[target_wave].push(i);
+        }
+
+        waves
+    }
+}
+
+/// Access mode for a [`ResourceKeyV2`] touched by a transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AccessMode {
+    Read,
+    Write,
+}
+
+/// Fine-grained resource key for Phase 13a/13b read/write conflict scheduling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ResourceKeyV2 {
+    Account([u8; 32]),
+    TokenBalance([u8; 32], [u8; 32]),
+    TokenAllowance([u8; 32], [u8; 32], [u8; 32]),
+    TokenMeta([u8; 32]),
+    Market(u32, u32),
+    Validator([u8; 32]),
+    Oracle,
+    Contract([u8; 32]),
+    Actor,
+    Global,
+}
+
+#[derive(Clone, Copy, Default)]
+struct KeyWaveState {
+    last_read_wave: Option<usize>,
+    last_write_wave: Option<usize>,
+}
+
+/// Maps an orderbook `pair_id` into its `(base_asset, quote_asset)` market key.
+pub fn market_of_pair(pair_id: u32) -> (u32, u32) {
+    match pair_id {
+        crate::orderbook::PAIR_STELL_USDT => (0, 1),
+        crate::orderbook::PAIR_STELL_TON => (0, 2),
+        crate::orderbook::PAIR_STELL_GRAM => (0, 3),
+        other => (0, other),
+    }
+}
+
+/// Extracts fine-grained `(ResourceKeyV2, AccessMode)` pairs for `tx` into `out`.
+pub fn fill_access_keys_v2(
+    tx: &Transaction,
+    stm_contracts: bool,
+    exec_hardening: bool,
+    out: &mut Vec<(ResourceKeyV2, AccessMode)>,
+) {
+    out.clear();
+    out.push((ResourceKeyV2::Account(tx.from), AccessMode::Write));
+    out.push((ResourceKeyV2::Account(tx.to), AccessMode::Write));
+    if let Some(sponsor) = tx.effective_sponsor() {
+        out.push((ResourceKeyV2::Account(sponsor), AccessMode::Write));
+    }
+
+    if tx.payload.is_empty() {
+        dedup_keys_v2(out);
+        return;
+    }
+
+    for op in &tx.payload {
+        if exec_hardening && matches!(op, OpCode::Halt) {
+            break;
+        }
+        match op {
+            OpCode::Nop
+            | OpCode::Push(_)
+            | OpCode::Pop
+            | OpCode::Add
+            | OpCode::Sub
+            | OpCode::Mul
+            | OpCode::Div
+            | OpCode::LoadBalance
+            | OpCode::Halt
+            | OpCode::SysCallVerifyPqSignature { .. } => {}
+
+            OpCode::Transfer { recipient, .. } => {
+                out.push((ResourceKeyV2::Account(*recipient), AccessMode::Write));
+            }
+
+            OpCode::SysCallTokenTransfer { token_id, to, .. } => {
+                out.push((ResourceKeyV2::TokenMeta(*token_id), AccessMode::Read));
+                out.push((
+                    ResourceKeyV2::TokenBalance(*token_id, tx.from),
+                    AccessMode::Write,
+                ));
+                out.push((
+                    ResourceKeyV2::TokenBalance(*token_id, *to),
+                    AccessMode::Write,
+                ));
+            }
+            OpCode::SysCallTokenTransferFrom {
+                token_id, from, to, ..
+            } => {
+                out.push((ResourceKeyV2::TokenMeta(*token_id), AccessMode::Read));
+                out.push((
+                    ResourceKeyV2::TokenAllowance(*token_id, *from, tx.from),
+                    AccessMode::Write,
+                ));
+                out.push((
+                    ResourceKeyV2::TokenBalance(*token_id, *from),
+                    AccessMode::Write,
+                ));
+                out.push((
+                    ResourceKeyV2::TokenBalance(*token_id, *to),
+                    AccessMode::Write,
+                ));
+            }
+            OpCode::SysCallTokenApprove {
+                token_id, spender, ..
+            } => {
+                out.push((
+                    ResourceKeyV2::TokenAllowance(*token_id, tx.from, *spender),
+                    AccessMode::Write,
+                ));
+            }
+            OpCode::SysCallTokenBalanceOf { token_id, account } => {
+                out.push((
+                    ResourceKeyV2::TokenBalance(*token_id, *account),
+                    AccessMode::Read,
+                ));
+            }
+            OpCode::SysCallTokenMint { token_id, to, .. } => {
+                out.push((ResourceKeyV2::TokenMeta(*token_id), AccessMode::Write));
+                out.push((
+                    ResourceKeyV2::TokenBalance(*token_id, *to),
+                    AccessMode::Write,
+                ));
+            }
+            OpCode::SysCallTokenBurn { token_id, from, .. } => {
+                out.push((ResourceKeyV2::TokenMeta(*token_id), AccessMode::Write));
+                out.push((
+                    ResourceKeyV2::TokenBalance(*token_id, *from),
+                    AccessMode::Write,
+                ));
+            }
+
+            OpCode::SysCallPlaceOrder { pair_id, .. } => {
+                let (base, quote) = market_of_pair(*pair_id);
+                out.push((ResourceKeyV2::Market(base, quote), AccessMode::Write));
+                out.push((ResourceKeyV2::Oracle, AccessMode::Read));
+            }
+
+            OpCode::SysCallStake { validator, .. }
+            | OpCode::SysCallStakeWithCommission { validator, .. }
+            | OpCode::SysCallUnbond { validator, .. }
+            | OpCode::SysCallDelegate { validator, .. }
+            | OpCode::SysCallBeginUndelegate { validator, .. }
+            | OpCode::SysCallUndelegate { validator }
+            | OpCode::SysCallClaimRewards { validator }
+            | OpCode::SysCallClaimDelegatorRewards { validator }
+            | OpCode::SysCallWithdrawSelfBond { validator } => {
+                out.push((ResourceKeyV2::Validator(*validator), AccessMode::Write));
+            }
+
+            OpCode::SysCallCallContract { contract, .. }
+            | OpCode::SysCallCallContractArgs { contract, .. } => {
+                // Calls read the contract's native account balance (e.g.
+                // `synced_base_balances` / `send_ping`), so a plain transfer
+                // crediting `contract` conflicts across waves.
+                out.push((ResourceKeyV2::Account(*contract), AccessMode::Read));
+                if !stm_contracts {
+                    out.push((ResourceKeyV2::Contract(*contract), AccessMode::Write));
+                }
+            }
+
+            _ => {
+                out.push((ResourceKeyV2::Global, AccessMode::Write));
+            }
+        }
+    }
+
+    dedup_keys_v2(out);
+}
+
+fn dedup_keys_v2(keys: &mut Vec<(ResourceKeyV2, AccessMode)>) {
+    if keys.len() <= 1 {
+        return;
+    }
+    let mut i = 0;
+    while i < keys.len() {
+        let mut j = i + 1;
+        while j < keys.len() {
+            if keys[i].0 == keys[j].0 {
+                if keys[j].1 == AccessMode::Write {
+                    keys[i].1 = AccessMode::Write;
+                }
+                keys.swap_remove(j);
+            } else {
+                j += 1;
+            }
+        }
+        i += 1;
+    }
 }
 
 #[cfg(test)]

@@ -66,6 +66,17 @@ fuzz_target!(|data: &[u8]| {
                     "an epoch-seal frame must re-encode to exactly the bytes it decoded from"
                 );
             }
+            if let stellereum::mev_epoch::MevFrame::KemKey(ref ann) = frame {
+                let _ = stellereum::mev_kem_registry::validate_ek_bytes(&ann.ek);
+                let dummy_pk = [0x09u8; stellereum::post_quantum::FALCON512_PUBKEY_LEN];
+                let _ = stellereum::mev_epoch::kem_key_announcement_verify(
+                    ann,
+                    ann.chain_id,
+                    &dummy_pk,
+                );
+                let _ =
+                    stellereum::mev_epoch::kem_key_announcement_verify(ann, ann.chain_id, &[]);
+            }
         }
 
         // --- (3) the sealed-transaction payload ------------------------------

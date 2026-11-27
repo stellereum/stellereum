@@ -2036,6 +2036,10 @@ impl PqSigner for RemotePqSigner {
 
 /// Returns `true` iff `base_url` points to a loopback interface
 /// (`127.0.0.1`, `[::1]`, or `localhost`).
+///
+/// Rejects any authority containing `@` userinfo (e.g.
+/// `http://127.0.0.1:x@attacker.example:8443`) and requires an exact loopback
+/// host with an optional valid numeric TCP port.
 pub fn is_loopback_base_url(base_url: &str) -> bool {
     let lower = base_url.trim().to_ascii_lowercase();
     let rest = if let Some(r) = lower.strip_prefix("http://") {
@@ -2045,11 +2049,20 @@ pub fn is_loopback_base_url(base_url: &str) -> bool {
     } else {
         return false;
     };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.contains('@') {
+        return false;
+    }
     for host in ["127.0.0.1", "[::1]", "localhost"] {
-        if let Some(after) = rest.strip_prefix(host) {
-            if after.is_empty() || after.starts_with(':') || after.starts_with('/') {
-                return true;
-            }
+        let port_ok = authority
+            .strip_prefix(host)
+            .and_then(|after_host| after_host.strip_prefix(':'))
+            .is_some_and(|p| {
+                !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok()
+            });
+        if authority == host || port_ok {
+            return true;
         }
     }
     false
@@ -2497,7 +2510,32 @@ enum V2LineRead {
     Malformed,
 }
 
-fn read_bounded_http_line(reader: &mut BufReader<TcpStream>, max_bytes: usize) -> V2LineRead {
+struct DeadlineReader {
+    inner: TcpStream,
+    deadline: std::time::Instant,
+}
+
+impl std::io::Read for DeadlineReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let now = std::time::Instant::now();
+        let Some(remaining) = self.deadline.checked_duration_since(now) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request deadline exceeded",
+            ));
+        };
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request deadline exceeded",
+            ));
+        }
+        let _ = self.inner.set_read_timeout(Some(remaining));
+        self.inner.read(buf)
+    }
+}
+
+fn read_bounded_http_line(reader: &mut BufReader<DeadlineReader>, max_bytes: usize) -> V2LineRead {
     let mut line = String::new();
     match reader
         .by_ref()
@@ -2552,18 +2590,23 @@ pub fn serve_v2_http_connection(service: &PqSignerService, stream: TcpStream) {
 }
 
 /// Serve a single HTTP/1.1 connection against [`PqSignerService`] with an
-/// explicit socket read/write timeout.
+/// explicit overall request deadline across request line, headers, and body.
 pub fn serve_v2_http_connection_with_timeout(
     service: &PqSignerService,
     mut stream: TcpStream,
     io_timeout: Duration,
 ) {
+    let deadline = std::time::Instant::now() + io_timeout;
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(io_timeout));
     let _ = stream.set_write_timeout(Some(io_timeout));
     let Ok(cloned) = stream.try_clone() else {
         return;
     };
-    let mut reader = BufReader::new(cloned);
+    let mut reader = BufReader::new(DeadlineReader {
+        inner: cloned,
+        deadline,
+    });
     let request_line = match read_bounded_http_line(&mut reader, V2_HTTP_MAX_LINE_BYTES) {
         V2LineRead::Line(l) => l,
         V2LineRead::Eof => return,
@@ -2757,5 +2800,44 @@ mod v2_tests {
         assert!(is_loopback_base_url("http://[::1]:8080"));
         assert!(is_loopback_base_url("http://localhost:8080"));
         assert!(!is_loopback_base_url("http://localhost.evil.com:8080"));
+    }
+
+    #[test]
+    fn loopback_url_rejects_userinfo_at_bypasses_and_invalid_ports() {
+        // Valid loopback authorities (with and without ports, paths, queries, fragments)
+        assert!(is_loopback_base_url("http://127.0.0.1"));
+        assert!(is_loopback_base_url("https://127.0.0.1:8443/v2"));
+        assert!(is_loopback_base_url("http://[::1]"));
+        assert!(is_loopback_base_url("http://[::1]:8080/v2/sign"));
+        assert!(is_loopback_base_url("http://LOCALHOST:8080?x=1"));
+        assert!(is_loopback_base_url("http://localhost#frag"));
+        assert!(is_loopback_base_url("http://127.0.0.1/path@with/at"));
+
+        // `@` userinfo bypass attempts MUST NEVER match as loopback
+        assert!(!is_loopback_base_url(
+            "http://127.0.0.1:x@attacker.example:8443"
+        ));
+        assert!(!is_loopback_base_url("http://localhost:pass@evil.com"));
+        assert!(!is_loopback_base_url("http://user@127.0.0.1:8080"));
+        assert!(!is_loopback_base_url("https://127.0.0.1@evil.com:8443"));
+        assert!(!is_loopback_base_url("http://[::1]@evil.com"));
+        assert!(!is_loopback_base_url(
+            "http://127.0.0.1:8080@evil.com/v2/sign"
+        ));
+
+        // Invalid ports / host suffixes / non-http(s) schemes
+        assert!(!is_loopback_base_url("http://127.0.0.1.evil.com:8080"));
+        assert!(!is_loopback_base_url("http://127.0.0.1:notaport"));
+        assert!(!is_loopback_base_url("http://127.0.0.1:99999"));
+        assert!(!is_loopback_base_url("http://127.0.0.1:"));
+        assert!(!is_loopback_base_url("ftp://127.0.0.1:8080"));
+
+        // Transport constructed with userinfo bypass enforces HTTPS and refuses plain HTTP
+        let bypass = HttpPqSignerTransport::new("http://127.0.0.1:x@attacker.example:8443");
+        assert!(bypass.is_https_only());
+        assert_eq!(
+            bypass.public_key_v2().err(),
+            Some(SignerError::PlainHttpForbiddenOnNonLoopback)
+        );
     }
 }

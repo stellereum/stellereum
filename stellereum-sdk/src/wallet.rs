@@ -159,6 +159,21 @@ impl Wallet {
         self.build(TxBuilder::transfer(to, amount))
     }
 
+    /// Deploy a WASM smart contract (`OpCode::SysCallDeployContract`).
+    pub fn contract_deploy(&mut self, code: Vec<u8>) -> Result<SignedTx> {
+        self.build(TxBuilder::contract_deploy(code))
+    }
+
+    /// Deploy a WASM smart contract with an inline JSON ABI manifest
+    /// (`OpCode::SysCallDeployContractWithAbi`).
+    pub fn contract_deploy_with_abi(
+        &mut self,
+        code: Vec<u8>,
+        abi_json: Vec<u8>,
+    ) -> Result<SignedTx> {
+        self.build(TxBuilder::contract_deploy_with_abi(code, abi_json))
+    }
+
     /// Call a contract with typed arguments and an optional native value.
     pub fn contract_call(
         &mut self,
@@ -168,6 +183,19 @@ impl Wallet {
         value: u64,
     ) -> Result<SignedTx> {
         let b = TxBuilder::contract_call(contract, method, args, value)?;
+        self.build(b)
+    }
+
+    /// Call a contract with raw `calldata` bytes (e.g. `*_pq` entrypoints).
+    pub fn contract_call_raw(
+        &mut self,
+        contract: [u8; 32],
+        method: &str,
+        args: &[i64],
+        calldata: Vec<u8>,
+        value: u64,
+    ) -> Result<SignedTx> {
+        let b = TxBuilder::contract_call_raw(contract, method, args, calldata, value)?;
         self.build(b)
     }
 

@@ -92,15 +92,23 @@ pub const MARKER_PATH_ENV: &str = "STELL_UPGRADE_HALT_MARKER";
 /// STRICTER.
 pub const RUNNING_VERSION_ENV: &str = "STELL_UPGRADE_VERSION";
 
-/// The data directory the node runs against, as seen from the process cwd.
-const DATA_DIR: &str = "./data";
+/// Resolve the base node data directory from `STELL_DATA_DIR`, defaulting to `./data`
+/// (kept self-contained so `upgrade_halt.rs` compiles both inside `node/bootstrap.rs`
+/// and when included by path from `tests/upgrade_halt_tests.rs`).
+fn data_dir_from_env() -> PathBuf {
+    match std::env::var("STELL_DATA_DIR") {
+        Ok(v) if !v.trim().is_empty() => PathBuf::from(v.trim()),
+        _ => PathBuf::from("./data"),
+    }
+}
 
 /// Path of the halt marker: `$STELL_UPGRADE_HALT_MARKER`, else
-/// `./data/upgrade-halt.marker`.
+/// `<data_dir>/upgrade-halt.marker` where `<data_dir>` comes from
+/// `STELL_DATA_DIR` (default `./data`).
 pub fn marker_path() -> PathBuf {
     match std::env::var(MARKER_PATH_ENV) {
         Ok(v) if !v.trim().is_empty() => PathBuf::from(v.trim()),
-        _ => Path::new(DATA_DIR).join(MARKER_FILE_NAME),
+        _ => data_dir_from_env().join(MARKER_FILE_NAME),
     }
 }
 

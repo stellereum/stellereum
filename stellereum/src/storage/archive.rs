@@ -1,4 +1,4 @@
-use super::state::{decode_domain_snapshot, decode_pq_registry};
+use super::state::{decode_domain_snapshot, decode_pq_registry, DomainSnapshot};
 use super::Storage;
 use crate::state_engine::InMemoryStateEngine;
 use anyhow::{anyhow, Result};
@@ -43,18 +43,20 @@ pub fn archive_slot_key(slot: &ArchiveSlot) -> [u8; 32] {
 /// An authenticated historical root: the post-`height` state root together
 /// with the quorum certificate that commits to it.
 ///
-/// The root is the `state_root` of the finalized block at `height + 1` (a
-/// header commits to the state BEFORE its own block), and `cert` is that
-/// block's precommit QC. A client verifies `cert` against its own validator
-/// set before trusting `state_root` — without the QC the root is just a
-/// number the server asserts.
+/// The root is the `state_root` of the finalized block at
+/// [`crate::chain_spec::anchor_height_for_post_state_at`]`(height)` (`height + 1`
+/// below `EXECUTION_PIPELINE_V1`, `height + 2` at/above it; a header commits to
+/// the state BEFORE its own block), and `cert` is that block's precommit QC. A
+/// client verifies `cert` against its own validator set before trusting
+/// `state_root` — without the QC the root is just a number the server asserts.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HistoricalRoot {
     /// Height whose post-state `state_root` is.
     pub height: u64,
     /// The historical state root.
     pub state_root: [u8; 32],
-    /// The anchoring finalized block: `height + 1`.
+    /// The anchoring finalized block (`height + 1` below the execution-pipeline
+    /// gate, `height + 2` at/above it).
     pub anchor_height: u64,
     /// Hash of the anchoring block (`cert` is bound to it).
     pub anchor_hash: [u8; 32],
@@ -86,6 +88,19 @@ pub struct HistoricalRoot {
     /// Anchoring block's proposer (v4 header commitment).
     #[serde(default)]
     pub anchor_proposer: [u8; 32],
+}
+
+struct LoadedArchiveSnapshot {
+    state_bytes: Vec<u8>,
+    domains: DomainSnapshot,
+    session_keys: Option<Vec<u8>>,
+    bridge: Option<Vec<u8>>,
+    zkml_models: Option<Vec<u8>>,
+    cross_shard: Option<crate::sharding::CrossShardReplaySnapshot>,
+    cnvrf_v3: Option<crate::state_engine::CnVrfV3EngineSnapshot>,
+    evm_bindings_state: Option<Vec<u8>>,
+    pq_registry: Option<Vec<u8>>,
+    evm_settled_state: Option<Vec<u8>>,
 }
 
 impl Storage {
@@ -174,58 +189,39 @@ impl Storage {
     /// Every height holding BOTH a state and a domains snapshot (the heights
     /// an archive proof can be served for), oldest first.
     pub fn retained_archive_heights(&self) -> Result<Vec<u64>> {
-        let state_heights: std::collections::BTreeSet<u64> = self
-            .state
-            .iter()
-            .keys()
-            .filter_map(|k| k.ok())
-            .filter(|k| k.len() == 8)
-            .map(|k| u64::from_be_bytes(k.as_ref().try_into().unwrap()))
-            .collect();
-        let domain_heights: std::collections::BTreeSet<u64> = self
-            .domains
-            .iter()
-            .keys()
-            .filter_map(|k| k.ok())
-            .filter(|k| k.len() == 8)
-            .map(|k| u64::from_be_bytes(k.as_ref().try_into().unwrap()))
-            .collect();
-        Ok(state_heights
-            .intersection(&domain_heights)
-            .copied()
-            .collect())
+        let mut out = Vec::new();
+        for item in self.state.iter().keys() {
+            let Ok(k) = item else { continue };
+            if k.len() != 8 {
+                continue;
+            }
+            if self.domains.contains_key(&k)? {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&k);
+                out.push(u64::from_be_bytes(arr));
+            }
+        }
+        Ok(out)
     }
 
-    /// Bounded one-line summary of the archive coverage, for fail-closed
-    /// error messages (never dumps the full height list: an archive node
-    /// holds thousands).
-    fn archive_coverage_summary(&self) -> String {
+    /// Nearest retained snapshot heights `(below, above)` around `height` and a
+    /// bounded one-line coverage summary, computed in a single scan of
+    /// `retained_archive_heights`.
+    fn retained_archive_heights_summary(&self, height: u64) -> (Option<u64>, Option<u64>, String) {
         match self.retained_archive_heights() {
-            Ok(h) if h.is_empty() => "no snapshots retained".to_string(),
+            Ok(h) if h.is_empty() => (None, None, "no snapshots retained".to_string()),
             Ok(h) => {
+                let below_idx = h.partition_point(|&v| v < height);
+                let below = below_idx.checked_sub(1).map(|i| h[i]);
+                let above_idx = h.partition_point(|&v| v <= height);
+                let above = h.get(above_idx).copied();
                 let lo = h[0];
                 let hi = h[h.len() - 1];
-                format!("{} paired snapshot(s), heights {lo}..={hi}", h.len())
+                let coverage = format!("{} paired snapshot(s), heights {lo}..={hi}", h.len());
+                (below, above, coverage)
             }
-            Err(_) => "snapshot index unreadable".to_string(),
+            Err(_) => (None, None, "snapshot index unreadable".to_string()),
         }
-    }
-
-    /// Nearest retained snapshot heights around `height` (below, above), for
-    /// fail-closed error messages.
-    fn nearest_retained_heights(&self, height: u64) -> (Option<u64>, Option<u64>) {
-        let mut below = None;
-        let mut above = None;
-        if let Ok(h) = self.retained_archive_heights() {
-            for v in h {
-                if v < height {
-                    below = Some(v);
-                } else if v > height && above.is_none() {
-                    above = Some(v);
-                }
-            }
-        }
-        (below, above)
     }
 
     /// Rebuild the historical state trie at `height` from the persisted
@@ -234,7 +230,9 @@ impl Storage {
     /// The rebuild runs in a throwaway engine (the live trie is never
     /// touched) and the recomputed root is checked against the finalized
     /// header anchoring it (`expected_restore_root`, i.e. the `state_root`
-    /// of the block at `height + 1`). Fail closed at every step: a height
+    /// of the block at [`crate::chain_spec::anchor_height_for_post_state_at`]:
+    /// `height + 1` below the execution-pipeline gate, `height + 2` above it).
+    /// Fail closed at every step: a height
     /// above the tip, an unknown height, a pruned height, an unpaired
     /// snapshot or a root mismatch is an error, never an empty proof.
     ///
@@ -250,119 +248,160 @@ impl Storage {
                 "height {height} is above the tip ({tip}): refusing to prove the future"
             ));
         }
-        let state_bytes = self.get_state(height)?.ok_or_else(|| {
-            let (below, above) = self.nearest_retained_heights(height);
-            let coverage = self.archive_coverage_summary();
-            // Below the oldest retained snapshot the data is gone for good;
-            // inside the retained span a missing snapshot means this height
-            // was never snapshotted (snapshots are taken every
-            // `STELL_SNAPSHOT_INTERVAL` heights, not every height).
-            let reason = match below {
-                None => format!("pruned or never snapshotted ({coverage})"),
-                Some(lo) if height < lo => {
-                    format!("pruned on this node (oldest retained snapshot is at {lo}; {coverage})")
-                }
-                _ => format!(
-                    "no snapshot at this height (snapshots are taken every `STELL_SNAPSHOT_INTERVAL` heights; nearest retained: below={below:?}, above={above:?}; {coverage})"
+
+        let storage = self.clone();
+        let loaded = tokio::task::spawn_blocking(move || -> Result<LoadedArchiveSnapshot> {
+            let state_bytes = storage.get_state(height)?.ok_or_else(|| {
+                let (below, above, coverage) = storage.retained_archive_heights_summary(height);
+                // Below the oldest retained snapshot the data is gone for good;
+                // inside the retained span a missing snapshot means this height
+                // was never snapshotted (snapshots are taken every
+                // `STELL_SNAPSHOT_INTERVAL` heights, not every height).
+                let reason = match below {
+                    None => format!("pruned or never snapshotted ({coverage})"),
+                    Some(lo) if height < lo => {
+                        format!("pruned on this node (oldest retained snapshot is at {lo}; {coverage})")
+                    }
+                    _ => format!(
+                        "no snapshot at this height (snapshots are taken every `STELL_SNAPSHOT_INTERVAL` heights; nearest retained: below={below:?}, above={above:?}; {coverage})"
+                    ),
+                };
+                anyhow!("no state snapshot at height {height}: {reason}")
+            })?;
+            let domains_bytes = storage.domain_at(height)?.ok_or_else(|| {
+                anyhow!(
+                    "state snapshot at height {height} has no paired domains snapshot (unpaired snapshot, possible crash between the snapshot jobs): refusing rather than proving from half a state"
+                )
+            })?;
+            let domains = decode_domain_snapshot(&domains_bytes)?;
+            let session_keys = storage.session_keys_at(height)?;
+            let bridge = storage.bridge_at(height)?;
+            let zkml_models = storage.zkml_models_at(height)?;
+            let cross_shard = storage
+                .cross_shard_at(height)?
+                .map(|bytes| {
+                    crate::sharding::with_legacy_block_tolerance(|| bincode::deserialize(&bytes))
+                        .map_err(|e| anyhow!("restore cross-shard replay at height {height}: {e:?}"))
+                })
+                .transpose()?;
+            let cnvrf_v3 = match storage.cnvrf_v3_at(height)? {
+                Some(bytes) if !bytes.is_empty() => Some(
+                    bincode::deserialize(&bytes)
+                        .map_err(|e| anyhow!("restore cnvrf_v3 at height {height}: {e}"))?,
                 ),
+                _ => None,
             };
-            anyhow!("no state snapshot at height {height}: {reason}")
-        })?;
-        let domains_bytes = self.domain_at(height)?.ok_or_else(|| {
-            anyhow!(
-                "state snapshot at height {height} has no paired domains snapshot (unpaired snapshot, possible crash between the snapshot jobs): refusing rather than proving from half a state"
-            )
-        })?;
+            let evm_bindings_state = storage.evm_bindings_state_at(height)?;
+            let pq_registry = match storage.pq_registry_at(height)? {
+                Some(bytes) => {
+                    let _pq_reg = decode_pq_registry(&bytes)
+                        .map_err(|e| anyhow!("restore pq_registry at height {height}: {e}"))?;
+                    Some(bytes)
+                }
+                None => None,
+            };
+            let evm_settled_state = storage.evm_settled_state_at(height)?;
+            Ok(LoadedArchiveSnapshot {
+                state_bytes,
+                domains,
+                session_keys,
+                bridge,
+                zkml_models,
+                cross_shard,
+                cnvrf_v3,
+                evm_bindings_state,
+                pq_registry,
+                evm_settled_state,
+            })
+        })
+        .await
+        .map_err(|e| anyhow!("archive snapshot load task panicked: {e}"))??;
 
         // Phase 1 (throwaway): restore + verify before proving anything, the
         // same shape as `load_full_state_into`.
         let tmp = InMemoryStateEngine::new();
         tmp.attach_pq_tree(self.pq_keys.clone());
-        tmp.restore_snapshot_preserve_replay_sets(&state_bytes)
+        tmp.restore_snapshot_preserve_replay_sets(&loaded.state_bytes)
             .await
             .map_err(|e| anyhow!("restore state snapshot at height {height}: {e}"))?;
-        let snap = decode_domain_snapshot(&domains_bytes)?;
-        snap.apply(&tmp).await;
-        if let Some(bytes) = self.session_keys_at(height)? {
+        loaded.domains.apply(&tmp).await;
+        if let Some(bytes) = loaded.session_keys {
             tmp.restore_session_keys(&bytes)
                 .await
                 .map_err(|e| anyhow!("restore session keys at height {height}: {e}"))?;
         }
-        if let Some(bytes) = self.bridge_at(height)? {
+        if let Some(bytes) = loaded.bridge {
             tmp.restore_bridge(&bytes)
                 .await
                 .map_err(|e| anyhow!("restore bridge domain at height {height}: {e}"))?;
         }
         // Ristretto deletion wave: confidential/shielded ledger removed with
         // crypto_privacy; no restore (transparent paths unchanged).
-        if let Some(bytes) = self.zkml_models_at(height)? {
+        if let Some(bytes) = loaded.zkml_models {
             tmp.restore_zkml_models(&bytes)
                 .await
                 .map_err(|e| anyhow!("restore zkML models at height {height}: {e}"))?;
         }
-        if let Some(bytes) = self.cross_shard_at(height)? {
-            let replay: crate::sharding::CrossShardReplaySnapshot =
-                crate::sharding::with_legacy_block_tolerance(|| bincode::deserialize(&bytes))
-                    .map_err(|e| anyhow!("restore cross-shard replay at height {height}: {e:?}"))?;
+        if let Some(replay) = loaded.cross_shard {
             tmp.restore_cross_shard_replay(&replay).await;
         }
-        if let Some(bytes) = self.cnvrf_v3_at(height)? {
-            if !bytes.is_empty() {
-                let snap: crate::state_engine::CnVrfV3EngineSnapshot = bincode::deserialize(&bytes)
-                    .map_err(|e| anyhow!("restore cnvrf_v3 at height {height}: {e}"))?;
-                tmp.restore_cnvrf_v3_snapshot(&snap).await;
-            }
+        if let Some(snap) = loaded.cnvrf_v3 {
+            tmp.restore_cnvrf_v3_snapshot(&snap).await;
         }
-        if let Some(bytes) = self.evm_bindings_state_at(height)? {
+        if let Some(bytes) = loaded.evm_bindings_state {
             tmp.restore_evm_bindings(&bytes)
                 .await
                 .map_err(|e| anyhow!("restore evm_bindings_state at height {height}: {e}"))?;
         }
-        if let Some(bytes) = self.pq_registry_at(height)? {
-            let _pq_reg = decode_pq_registry(&bytes)
-                .map_err(|e| anyhow!("restore pq_registry at height {height}: {e}"))?;
+        if let Some(bytes) = loaded.pq_registry {
             tmp.restore_pq_registry(&bytes)
                 .await
                 .map_err(|e| anyhow!("restore pq_registry at height {height}: {e}"))?;
         }
-        if let Some(bytes) = self.evm_settled_state_at(height)? {
+        if let Some(bytes) = loaded.evm_settled_state {
             tmp.restore_evm_settled(&bytes)
                 .await
                 .map_err(|e| anyhow!("restore evm_settled_state at height {height}: {e}"))?;
         }
 
-        // Anchor the recomputed root: the header at height+1 commits to the
-        // post-`height` state. At the tip (no successor yet) check
+        // Anchor the recomputed root: the header at
+        // `anchor_height_for_post_state_at(height)` commits to the
+        // post-`height` state (`height + 1` below the execution-pipeline gate,
+        // `height + 2` at/above it). At the tip (no successor yet) check
         // `finalized_post_root_at(height)` if present, else skip for compat.
         let computed = tmp.get_state_root().await;
-        match self.expected_restore_root(height)? {
-            Some(expected) if computed != expected => {
-                return Err(anyhow!(
+        let storage = self.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            match storage.expected_restore_root(height)? {
+                Some(expected) if computed != expected => Err(anyhow!(
                     "snapshot at height {height} hashes to {} but the finalized block at {} commits to {} (truncated, corrupt or wrong-height snapshot): refusing to prove from it",
                     hex::encode(computed),
-                    height + 1,
+                    crate::chain_spec::anchor_height_for_post_state_at(height),
                     hex::encode(expected),
-                ));
-            }
-            Some(_) => {}
-            None => {
-                let finalized_tip = self.finalized()?.map(|(h, _)| h).unwrap_or(tip);
-                if height < finalized_tip {
-                    return Err(anyhow!(
-                        "no anchor to verify snapshot at height {height} (finalized head is {finalized_tip}): refusing to prove from unanchored state"
-                    ));
-                }
-                if let Some(expected) = self.finalized_post_root_at(height)? {
-                    if computed != expected {
+                )),
+                Some(_) => Ok(()),
+                None => {
+                    let finalized_tip = storage.finalized()?.map(|(h, _)| h).unwrap_or(tip);
+                    if height < finalized_tip {
                         return Err(anyhow!(
-                            "snapshot at tip height {height} hashes to {} but finalized_post_root_v1 commits to {}: refusing to prove from it",
-                            hex::encode(computed),
-                            hex::encode(expected),
+                            "no anchor to verify snapshot at height {height} (finalized head is {finalized_tip}): refusing to prove from unanchored state"
                         ));
                     }
+                    if let Some(expected) = storage.finalized_post_root_at(height)? {
+                        if computed != expected {
+                            return Err(anyhow!(
+                                "snapshot at tip height {height} hashes to {} but finalized_post_root_v1 commits to {}: refusing to prove from it",
+                                hex::encode(computed),
+                                hex::encode(expected),
+                            ));
+                        }
+                    }
+                    Ok(())
                 }
             }
-        }
+        })
+        .await
+        .map_err(|e| anyhow!("archive root check task panicked: {e}"))??;
         let trie = tmp.state_trie.read().await.compressed().clone();
         Ok((trie, computed))
     }
@@ -380,33 +419,43 @@ impl Storage {
         tip: u64,
     ) -> Result<crate::cpat2::ArchiveProof> {
         let (trie, root) = self.rebuild_historical_trie(height, tip).await?;
-        if let Some(p) = trie.generate_proof(key) {
-            crate::cpat2::ArchiveProof::inclusion(height, root, *key, &p).ok_or_else(|| {
-                anyhow!("internal error: generated inclusion proof is not for the queried key")
-            })
-        } else if let Some(p) = trie.generate_exclusion_proof(key) {
-            crate::cpat2::ArchiveProof::exclusion(height, root, *key, &p).ok_or_else(|| {
-                anyhow!("internal error: generated exclusion proof is not for the queried key")
-            })
-        } else {
-            // An empty historical trie has nothing to prove against. The
-            // snapshot exists but holds no keys (genesis): absence is still
-            // answered as an error rather than an unprovable empty proof,
-            // because an empty proof is not evidence of absence.
-            Err(anyhow!(
-                "historical trie at height {height} is empty: no proof can be served for it"
-            ))
-        }
+        let key = *key;
+        tokio::task::spawn_blocking(move || {
+            if let Some(p) = trie.generate_proof(&key) {
+                crate::cpat2::ArchiveProof::inclusion(height, root, key, &p).ok_or_else(|| {
+                    anyhow!("internal error: generated inclusion proof is not for the queried key")
+                })
+            } else if let Some(p) = trie.generate_exclusion_proof(&key) {
+                crate::cpat2::ArchiveProof::exclusion(height, root, key, &p).ok_or_else(|| {
+                    anyhow!("internal error: generated exclusion proof is not for the queried key")
+                })
+            } else {
+                // An empty historical trie has nothing to prove against. The
+                // snapshot exists but holds no keys (genesis): absence is still
+                // answered as an error rather than an unprovable empty proof,
+                // because an empty proof is not evidence of absence.
+                Err(anyhow!(
+                    "historical trie at height {height} is empty: no proof can be served for it"
+                ))
+            }
+        })
+        .await
+        .map_err(|e| anyhow!("archive proof task panicked: {e}"))?
     }
 
     /// The authenticated historical root for `height`: the post-`height`
     /// state root together with the quorum certificate that commits to it.
     ///
-    /// The root is the `state_root` of the finalized block at `height + 1`
-    /// (a header commits to the state BEFORE its own block), and the proof
-    /// is that block's precommit QC. Without the QC the root is just a
-    /// number the server asserts — the client verifies the QC against its
-    /// own validator set before trusting the root.
+    /// The root is the `state_root` of the finalized block at
+    /// [`crate::chain_spec::anchor_height_for_post_state_at`]`(height)` —
+    /// `height + 1` on the legacy lag-1 chain, `height + 2` once
+    /// `EXECUTION_PIPELINE_V1` is active (a header commits to the state BEFORE
+    /// its own block) — and the proof is that block's precommit QC. Without the
+    /// QC the root is just a number the server asserts — the client verifies
+    /// the QC against its own validator set before trusting the root.
+    ///
+    /// Identity below the gate: the helper returns `height + 1`, so this method
+    /// serves exactly the same anchor and root as before.
     ///
     /// Fail closed: a height above the tip, an unknown height, or a height
     /// whose anchoring body (and hence its QC) was pruned is an error.
@@ -417,9 +466,14 @@ impl Storage {
                 "height {height} is above the tip ({tip}): refusing to authenticate the future"
             ));
         }
-        let anchor_height = height
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("height {height} overflows: no successor can anchor it"))?;
+        let anchor_height = crate::chain_spec::anchor_height_for_post_state_at(height);
+        // The helper saturates at `u64::MAX`; an anchor that is not strictly
+        // above the state height means no successor can anchor it.
+        if anchor_height <= height {
+            return Err(anyhow!(
+                "height {height} overflows: no successor can anchor it"
+            ));
+        }
         // The anchor: header record first (survives body pruning), falling
         // back to the block body. But only the BODY carries the quorum
         // certificate, so a header without its body authenticates nothing.

@@ -1,19 +1,17 @@
-# Stellereum Testnet — Explorer + Faucet
+# Stellereum Testnet — Explorer + Faucet Backend
 
-Два **отдельных** сайта в монорепо (`/Users/immtes/Documents/exp_site`):
+Монорепо эксплорера тестнета и backend-прокси крана:
 
 - `explorer/` — тестнет-эксплорер (Vite + React + TS). Данные: `https://rpc.stellereum.org` (нативный Stellereum `stell_*` JSON-RPC, chainId 5757) + индексер `https://explorer.stellereum.org/api/v2` (проксируется через `/api/v2`, см. `docs/INDEXER_PROXY.md`).
-- `faucet/` — кран тестнета (Vite + React + TS). Выплаты через `backend/`.
 - `backend/` — минимальный backend крана (Node + TS + express): локальный rate-limit + прокси к `UPSTREAM_FAUCET_URL`.
 - `docs/` — разбор референсов, RPC-заметки, DNS-разделение testnet/mainnet.
 
 ## Быстрый старт
 
 ```bash
-cd /Users/immtes/Documents/exp_site
+cd explorer-site
 npm install
 npm run dev:explorer  # :5173
-npm run dev:faucet    # :5174 (см. vite.config)
 npm run dev:backend   # :8787
 ```
 

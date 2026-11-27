@@ -60,6 +60,37 @@ fn block_store_roundtrip_and_height_index() {
 }
 
 #[test]
+fn put_block_without_qc_never_clobbers_existing_qc() {
+    let dir = tmp();
+    let st = Storage::open(&dir).unwrap();
+    let sk = SigningKey::generate(&mut OsRng);
+
+    let b_no_qc = block(7, [0x11u8; 32], &sk, None);
+    let bh = b_no_qc.compute_hash();
+    let mut b_with_qc = b_no_qc.clone();
+    b_with_qc.precommit_qc = Some(crate::consensus::QuorumCertificate {
+        height: 7,
+        round: 0,
+        kind: crate::consensus::VoteKind::Precommit,
+        block_hash: Some(bh),
+        signatures: vec![],
+        shard_id: MASTERCHAIN_SHARD,
+    });
+
+    assert_eq!(st.put_block(&b_with_qc).unwrap(), bh);
+    // Simulate a late async PersistJob::Block from the lock path (`precommit_qc == None`).
+    assert_eq!(st.put_block(&b_no_qc).unwrap(), bh);
+
+    let got = st.get_block(&bh).unwrap().expect("block persisted");
+    assert!(
+        got.precommit_qc.is_some(),
+        "stale put_block without QC must preserve existing precommit_qc"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn finalized_meta_roundtrip() {
     let dir = tmp();
     let st = Storage::open(&dir).unwrap();

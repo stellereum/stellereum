@@ -111,9 +111,37 @@ keygen_node() {
     fi
     local id ed pq_pub falcon
     id="$(echo "$ident" | grep -oE 'id=[^ ]+' | cut -d= -f2)"
-    ed="$(echo "$ident" | grep -oE 'ed=[^ ]+' | cut -d= -f2)"
+    ed="$(echo "$ident" | grep -oE 'ed=[^ ]+' | cut -d= -f2 || true)"
     pq_pub="$(echo "$ident" | grep -oE 'pq_pub=[^ ]+' | cut -d= -f2)"
     falcon="$(echo "$ident" | grep -oE 'falcon=[^ ]+' | cut -d= -f2)"
+    if [[ -z "$ed" && -f "$dir/keys/validator.key" ]]; then
+        read -r id ed <<< "$(python3 - "$dir/keys/validator.key" <<'PY'
+import sys, struct
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+seed = bytes.fromhex(open(sys.argv[1]).read().strip())
+ed = Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+IV = [0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19]
+PERM = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8]
+def rotr(x, n): return ((x >> n) | (x << (32 - n))) & 0xFFFFFFFF
+def g(s, a, b, c, d, mx, my):
+    s[a] = (s[a] + s[b] + mx) & 0xFFFFFFFF; s[d] = rotr(s[d] ^ s[a], 16)
+    s[c] = (s[c] + s[d]) & 0xFFFFFFFF;      s[b] = rotr(s[b] ^ s[c], 12)
+    s[a] = (s[a] + s[b] + my) & 0xFFFFFFFF; s[d] = rotr(s[d] ^ s[a], 8)
+    s[c] = (s[c] + s[d]) & 0xFFFFFFFF;      s[b] = rotr(s[b] ^ s[c], 7)
+m = list(struct.unpack("<16I", ed + b"\x00" * 32))
+s = [IV[0], IV[1], IV[2], IV[3], IV[4], IV[5], IV[6], IV[7], IV[0], IV[1], IV[2], IV[3], 0, 0, 32, 11]
+for _ in range(7):
+    g(s, 0, 4, 8, 12, m[0], m[1]);  g(s, 1, 5, 9, 13, m[2], m[3])
+    g(s, 2, 6, 10, 14, m[4], m[5]); g(s, 3, 7, 11, 15, m[6], m[7])
+    g(s, 0, 5, 10, 15, m[8], m[9]); g(s, 1, 6, 11, 12, m[10], m[11])
+    g(s, 2, 7, 8, 13, m[12], m[13]); g(s, 3, 4, 9, 14, m[14], m[15])
+    m = [m[p] for p in PERM]
+cid = "inf1:" + struct.pack("<8I", *[(s[i] ^ s[i + 8]) for i in range(8)])[:20].hex()
+print(cid, ed.hex())
+PY
+        )"
+    fi
     if [[ -z "$id" || -z "$ed" || -z "$pq_pub" || -z "$falcon" ]]; then
         echo "[local-cluster] FATAL: could not parse NODE IDENTITY for node$i: $ident" >&2
         return 1

@@ -231,7 +231,7 @@ pub(super) async fn heal_engine_to_head(
                     hex::encode(local.compute_hash())
                 ));
             }
-            if block_cache.len() < HEAL_CACHE_CAP {
+            if local.precommit_qc.is_some() && block_cache.len() < HEAL_CACHE_CAP {
                 block_cache.insert(cur, local.clone());
             }
             local
@@ -308,7 +308,7 @@ pub(super) async fn heal_engine_to_head(
     let replay_prefetch_span = stellereum::sync::FETCH_MAX_CONCURRENCY.max(1) * 4;
     for (i, hash) in hashes.iter().enumerate().skip(1) {
         let expected_height = start_height + i as u64;
-        let blk = if let Some(cached) = block_cache.remove(hash) {
+        let mut blk = if let Some(cached) = block_cache.remove(hash) {
             cached
         } else if let Ok(Some(local)) = store.get_block(hash) {
             local
@@ -369,6 +369,20 @@ pub(super) async fn heal_engine_to_head(
                 hex::encode(hashes[i - 1]),
                 hex::encode(blk.prev_hash)
             ));
+        }
+        if blk.precommit_qc.is_none() {
+            let repaired = repair_missing_precommit_qc_with(
+                &mut blk,
+                expected_height,
+                *hash,
+                deadline,
+                || adapter.fetch_block(hash),
+                || adapter.fetch_block_qc(shard, expected_height),
+            )
+            .await;
+            if repaired {
+                let _ = store.put_block(&blk);
+            }
         }
         if Instant::now() >= deadline {
             return Err(format!(
@@ -870,5 +884,130 @@ pub(super) fn update_catchup_latch(st: &mut DriverState) {
     st.peer_named_height = clamp_peer_evidence_height(tip, st.peer_named_height);
     if st.rt.peer_hint.is_some_and(|(ph, _)| ph > tip) || st.peer_named_height > tip {
         st.catchup_pending = true;
+    }
+}
+
+async fn repair_missing_precommit_qc_with<FB, FBFut, FQ, FQFut>(
+    blk: &mut stellereum::sharding::Block,
+    expected_height: u64,
+    expected_hash: [u8; 32],
+    deadline: Instant,
+    fetch_body: FB,
+    fetch_qc: FQ,
+) -> bool
+where
+    FB: FnOnce() -> FBFut,
+    FBFut: std::future::Future<Output = Option<stellereum::sharding::Block>>,
+    FQ: FnOnce() -> FQFut,
+    FQFut: std::future::Future<Output = Option<stellereum::consensus::QuorumCertificate>>,
+{
+    if blk.precommit_qc.is_some() {
+        return false;
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if !remaining.is_zero() {
+        if let Ok(Some(fetched)) = tokio::time::timeout(remaining, fetch_body()).await {
+            if fetched.compute_hash() == expected_hash && fetched.precommit_qc.is_some() {
+                *blk = fetched;
+                return true;
+            }
+        }
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if !remaining.is_zero() {
+        if let Ok(Some(qc)) = tokio::time::timeout(remaining, fetch_qc()).await {
+            if qc.kind == stellereum::consensus::VoteKind::Precommit
+                && qc.height == expected_height
+                && qc.block_hash == Some(expected_hash)
+            {
+                blk.precommit_qc = Some(qc);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use stellereum::consensus::{QuorumCertificate, VoteKind};
+    use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
+
+    fn dummy_block(height: u64, prev_hash: [u8; 32]) -> Block {
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let mut b = Block {
+            shard_id: MASTERCHAIN_SHARD,
+            height,
+            prev_hash,
+            state_root: [0x11u8; 32],
+            transactions: vec![],
+            cross_shard_out: vec![],
+            timestamp: 1_000 + height,
+            proposer: sk.verifying_key().to_bytes(),
+            validator_signatures: vec![],
+            shard_headers: vec![],
+            precommit_qc: None,
+            last_qc: None,
+            mmr_epoch_root: [0u8; 32],
+            cnvrf_v3: None,
+            order_merkle_root: [0u8; 32],
+            epoch_key_commitment: [0u8; 32],
+            round: 0,
+        };
+        b.sign_block(&sk);
+        b
+    }
+
+    #[tokio::test]
+    async fn heal_repair_missing_precommit_qc_accepts_sidecar_and_rejects_mismatch() {
+        let mut blk = dummy_block(766516, [0x22u8; 32]);
+        let bh = blk.compute_hash();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+
+        // Mismatched sidecar QC (wrong block_hash) must be refused.
+        let bad_qc = QuorumCertificate {
+            height: 766516,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: Some([0x99u8; 32]),
+            signatures: vec![],
+            shard_id: MASTERCHAIN_SHARD,
+        };
+        assert!(
+            !repair_missing_precommit_qc_with(
+                &mut blk,
+                766516,
+                bh,
+                deadline,
+                || async { None },
+                || async { Some(bad_qc) },
+            )
+            .await
+        );
+        assert!(blk.precommit_qc.is_none());
+
+        // Matching sidecar QC repairs the missing local QC.
+        let good_qc = QuorumCertificate {
+            height: 766516,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: Some(bh),
+            signatures: vec![],
+            shard_id: MASTERCHAIN_SHARD,
+        };
+        assert!(
+            repair_missing_precommit_qc_with(
+                &mut blk,
+                766516,
+                bh,
+                deadline,
+                || async { None },
+                || async { Some(good_qc.clone()) },
+            )
+            .await
+        );
+        assert_eq!(blk.precommit_qc, Some(good_qc));
     }
 }

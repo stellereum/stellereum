@@ -259,14 +259,14 @@ fn record_persist_drop(policy: PersistPushPolicy, label: &'static str, consequen
 /// a reservation is abandoned (drop or closed writer), so `pending()` never
 /// leaks a phantom job — or hides a real one.
 fn decrement_queue_depth(depth: &std::sync::atomic::AtomicU64) -> u64 {
-    let mut prev = depth.load(std::sync::atomic::Ordering::Relaxed);
+    let mut prev = depth.load(std::sync::atomic::Ordering::Acquire);
     loop {
         let next = prev.saturating_sub(1);
         match depth.compare_exchange_weak(
             prev,
             next,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
         ) {
             Ok(_) => break,
             Err(actual) => prev = actual,
@@ -454,11 +454,15 @@ impl AsyncPersistence {
         let policy = persist_push_policy(&job);
         let label = persist_job_label(&job);
         let consequence = persist_drop_consequence(&job);
+        // Reserve the gauge slot BEFORE `try_send` so the `"stell-persist"` worker
+        // can never dequeue the job and saturate-decrement `0 -> 0` before we
+        // bump `0 -> 1` (which previously leaked a permanent +1 phantom job in
+        // `pending()`, stalling snapshot persistence drain and shutdown drain).
+        self.bump_queue_depth();
         match self.tx.try_send(job) {
-            Ok(()) => {
-                self.bump_queue_depth();
-            }
+            Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => {
+                decrement_queue_depth(&self.queue_depth);
                 if policy == PersistPushPolicy::DropFirst {
                     record_persist_drop(policy, label, consequence);
                     return;
@@ -565,7 +569,9 @@ impl AsyncPersistence {
                     }
                 }
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                decrement_queue_depth(&self.queue_depth);
+            }
         }
     }
 
@@ -573,7 +579,7 @@ impl AsyncPersistence {
     fn bump_queue_depth(&self) -> u64 {
         let d = self
             .queue_depth
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
             .saturating_add(1);
         crate::metrics::global().set_persist_queue_depth(d);
         d
@@ -587,15 +593,19 @@ impl AsyncPersistence {
             std::time::Instant::now() + std::time::Duration::from_millis(PERSIST_BLOCKING_WAIT_MS);
         while std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(PERSIST_RETRY_PACE_MS));
+            self.bump_queue_depth();
             match self.tx.try_send(job) {
                 Ok(()) => {
-                    self.bump_queue_depth();
                     return true;
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(j)) => {
+                    decrement_queue_depth(&self.queue_depth);
                     job = j;
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return true,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    decrement_queue_depth(&self.queue_depth);
+                    return true;
+                }
             }
         }
         false
@@ -913,7 +923,7 @@ impl AsyncPersistence {
     /// drain wait adds a bounded settle grace after observing zero rather
     /// than exiting immediately.
     pub fn pending(&self) -> u64 {
-        self.queue_depth.load(std::sync::atomic::Ordering::Relaxed)
+        self.queue_depth.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Snapshot the current state of an engine and enqueue it (convenience).
@@ -1259,6 +1269,52 @@ mod tests {
             rx.try_recv().is_err(),
             "no separate aux jobs may be enqueued by snapshot_domains"
         );
+
+        drop(ap);
+        drop(st);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn queue_depth_never_drifts_under_immediate_worker_dequeue() {
+        let dir = tmpdir("queue_depth_race");
+        let st = Arc::new(Storage::open(&dir).expect("open storage"));
+        let ap = AsyncPersistence::start(Arc::clone(&st));
+
+        // Repeatedly push single jobs from an empty queue so the worker
+        // immediately races to wake up and dequeue while the producer is active.
+        for h in 1u64..=300 {
+            ap.enqueue_finalized(h, [h as u8; 32]);
+            if h % 10 == 0 {
+                let outcome = wait_for_persist_drain_with(
+                    || ap.pending(),
+                    ShutdownDrainConfig {
+                        cap: std::time::Duration::from_secs(2),
+                        poll: std::time::Duration::from_millis(1),
+                        log_every: std::time::Duration::from_secs(60),
+                        settle_grace: std::time::Duration::from_millis(1),
+                    },
+                )
+                .await;
+                assert!(
+                    outcome.drained && outcome.last_pending == 0,
+                    "queue_depth leaked at h={h}: {outcome:?}"
+                );
+            }
+            tokio::task::yield_now().await;
+        }
+        let final_outcome = wait_for_persist_drain_with(
+            || ap.pending(),
+            ShutdownDrainConfig {
+                cap: std::time::Duration::from_secs(2),
+                poll: std::time::Duration::from_millis(1),
+                log_every: std::time::Duration::from_secs(60),
+                settle_grace: std::time::Duration::from_millis(2),
+            },
+        )
+        .await;
+        assert!(final_outcome.drained);
+        assert_eq!(ap.pending(), 0);
 
         drop(ap);
         drop(st);

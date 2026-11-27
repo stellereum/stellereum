@@ -115,32 +115,144 @@ pub(crate) async fn try_snapshot_sync(
     try_snapshot_sync_with_persistence(adapter, rt, shard, peer_height, None).await
 }
 
-async fn wait_snapshot_persistence_drain(
+async fn wait_snapshot_persistence_drain_with_timeout(
     ap: &stellereum::storage::AsyncPersistence,
     boundary: u64,
-) -> Result<(), &'static str> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
     loop {
-        let drained = ap.pending() == 0
-            && ap.storage().get_state(boundary).ok().flatten().is_some()
-            && ap.storage().domain_at(boundary).ok().flatten().is_some()
-            && ap
-                .storage()
-                .finalized()
-                .ok()
-                .flatten()
-                .is_some_and(|(h, _)| h >= boundary);
+        let pending = ap.pending();
+        let has_state = ap.storage().get_state(boundary).ok().flatten().is_some();
+        let has_domain = ap.storage().domain_at(boundary).ok().flatten().is_some();
+        let finalized_h = ap.storage().finalized().ok().flatten().map(|(h, _)| h);
+        let drained =
+            pending == 0 && has_state && has_domain && finalized_h.is_some_and(|h| h >= boundary);
         if drained {
             let _ = ap.storage().flush();
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            return Err(
-                "snapshot persistence drain timed out; refusing to advance safety ahead of disk",
-            );
+            return Err(format!(
+                "snapshot persistence drain timed out (pending={pending}, has_state={has_state}, has_domain={has_domain}, finalized_h={finalized_h:?}); refusing to advance safety ahead of disk"
+            ));
         }
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
+}
+
+async fn wait_snapshot_persistence_drain(
+    ap: &stellereum::storage::AsyncPersistence,
+    boundary: u64,
+) -> Result<(), String> {
+    let timeout_ms: u64 = std::env::var("STELL_SNAPSHOT_DRAIN_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|&ms| ms >= 1_000)
+        .unwrap_or(60_000);
+    wait_snapshot_persistence_drain_with_timeout(
+        ap,
+        boundary,
+        std::time::Duration::from_millis(timeout_ms),
+    )
+    .await
+}
+
+enum StagedSnapshotPayload {
+    SnapV4 {
+        state: Box<stellereum::snapshot_v4::SnapStateV4>,
+        staged_engine: stellereum::state_engine::InMemoryStateEngine,
+    },
+    Legacy(stellereum::sync::VerifiedSnapshotStage),
+}
+
+impl StagedSnapshotPayload {
+    fn staged_engine(&self) -> &stellereum::state_engine::InMemoryStateEngine {
+        match self {
+            Self::SnapV4 { staged_engine, .. } => staged_engine,
+            Self::Legacy(stage) => &stage.staged_engine,
+        }
+    }
+
+    async fn commit_to(
+        self,
+        target: &stellereum::state_engine::InMemoryStateEngine,
+    ) -> Result<(), String> {
+        match self {
+            Self::SnapV4 { state, .. } => state
+                .apply_to_engine(target)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("snap_v4 apply to target engine failed: {e}")),
+            Self::Legacy(stage) => stage.commit_to(target).await,
+        }
+    }
+}
+
+struct StagedSnapshotMeta<'a> {
+    shard: u32,
+    boundary: u64,
+    boundary_hash: stellereum::storage::BlockHash,
+    trusted_root: [u8; 32],
+    fetched_boundary_block: Option<&'a stellereum::sharding::Block>,
+    drain_timeout: Option<std::time::Duration>,
+}
+
+async fn persist_and_commit_staged_snapshot(
+    rt: &mut ValidatorRuntime,
+    meta: StagedSnapshotMeta<'_>,
+    persistence: Option<&std::sync::Arc<stellereum::storage::AsyncPersistence>>,
+    staged: StagedSnapshotPayload,
+) -> bool {
+    let StagedSnapshotMeta {
+        shard,
+        boundary,
+        boundary_hash,
+        trusted_root,
+        fetched_boundary_block,
+        drain_timeout,
+    } = meta;
+    // Persist the verified staged snapshot state, domains, boundary block (if
+    // fetched), and finalized pointer BEFORE mutating `rt.state` or advancing
+    // `rt.safety` / `rt.finalized`, so a persistence failure/timeout never
+    // leaves `rt.state` at `boundary` while consensus/safety stay behind.
+    if let Some(ap) = persistence {
+        let engine = staged.staged_engine();
+        if let Some(blk) = fetched_boundary_block {
+            ap.enqueue_block(blk.clone());
+        }
+        ap.snapshot_state(engine, boundary).await;
+        let (staking, governance) = {
+            let s = engine.staking_read().await.clone();
+            let g = engine.governance_read().await.clone();
+            (s, g)
+        };
+        ap.snapshot_domains(engine, &staking, &governance, boundary)
+            .await;
+        let _ = ap.storage().put_finalized_post_root(boundary, trusted_root);
+        ap.enqueue_finalized(boundary, boundary_hash);
+        ap.request_flush();
+        let drain_res = match drain_timeout {
+            Some(t) => wait_snapshot_persistence_drain_with_timeout(ap, boundary, t).await,
+            None => wait_snapshot_persistence_drain(ap, boundary).await,
+        };
+        if let Err(e) = drain_res {
+            eprintln!("[sync] REFUSING snapshot at {boundary}: {e}");
+            tracing::error!(shard, boundary, "[sync] {e}");
+            return false;
+        }
+    }
+    if let Err(e) = staged.commit_to(&rt.state).await {
+        eprintln!("[sync] REFUSING snapshot at {boundary}: {e}");
+        tracing::error!(shard, boundary, "[sync] {e}");
+        return false;
+    }
+    let pq_reg = rt.state.pq_registry_read().await;
+    let active = stellereum::pq_registry::pq_lifecycle_active_at(boundary);
+    if !pq_reg.is_empty() {
+        stellereum::consensus::sync_committed_pq_registry(&pq_reg, active);
+    }
+    true
 }
 
 pub(crate) async fn try_snapshot_sync_with_persistence(
@@ -423,7 +535,7 @@ pub(crate) async fn try_snapshot_sync_with_persistence(
             .fetch_snapv4_manifest(shard, boundary, &next_hdr.state_root, None)
             .await
             .filter(|m| matches!(m.kind, stellereum::snapshot_v4::SnapshotKind::Base));
-        let mut installed_via_snapv4 = false;
+        let mut staged_payload: Option<StagedSnapshotPayload> = None;
         if let Some(manifest) = snapv4_manifest {
             let snap_anchor = stellereum::snapshot_v4::TrustedSnapshotAnchor {
                 chain_id: stellereum::consensus::consensus_chain_id(),
@@ -445,16 +557,20 @@ pub(crate) async fn try_snapshot_sync_with_persistence(
                     .await
                     {
                         Ok(chunks) => {
-                            match stellereum::sync::fast_sync_snapv4_base(
+                            match stellereum::sync::prepare_fast_sync_snapv4_base(
                                 &rt.state,
                                 &snap_anchor,
                                 &manifest,
                                 &chunks,
-                                None,
                             )
                             .await
                             {
-                                Ok(_) => installed_via_snapv4 = true,
+                                Ok((state, staged_engine, _)) => {
+                                    staged_payload = Some(StagedSnapshotPayload::SnapV4 {
+                                        state: Box::new(state),
+                                        staged_engine,
+                                    });
+                                }
                                 Err(e) => {
                                     eprintln!("[sync] snap_v4 at {boundary} rejected: {e}");
                                 }
@@ -470,55 +586,51 @@ pub(crate) async fn try_snapshot_sync_with_persistence(
                 }
             }
         }
-        if !installed_via_snapv4 {
-            let Some(snapshot) = adapter.fetch_state_snapshot(shard, boundary).await else {
-                miss_snapshot += 1;
-                consecutive_misses = consecutive_misses.saturating_add(1);
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
-                ))
-                .await;
-                boundary = boundary.saturating_sub(probe_step);
-                continue;
-            };
-            let fetch_domain = {
-                let a = adapter.clone();
-                move |kind: &'static str| {
-                    let a = a.clone();
-                    async move { a.fetch_domain_snapshot(shard, boundary, kind).await }
+        let staged_payload = match staged_payload {
+            Some(p) => p,
+            None => {
+                let Some(snapshot) = adapter.fetch_state_snapshot(shard, boundary).await else {
+                    miss_snapshot += 1;
+                    consecutive_misses = consecutive_misses.saturating_add(1);
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
+                    ))
+                    .await;
+                    boundary = boundary.saturating_sub(probe_step);
+                    continue;
+                };
+                let fetch_domain = {
+                    let a = adapter.clone();
+                    move |kind: &'static str| {
+                        let a = a.clone();
+                        async move { a.fetch_domain_snapshot(shard, boundary, kind).await }
+                    }
+                };
+                match stellereum::sync::prepare_fast_sync_state_with_set_binding_prefetched(
+                    &rt.state,
+                    trusted_root,
+                    snapshot,
+                    fetch_domain,
+                    boundary,
+                    &anchor_set,
+                )
+                .await
+                {
+                    Ok(stage) => StagedSnapshotPayload::Legacy(stage),
+                    Err(e) => {
+                        eprintln!("[sync] snapshot at {boundary} rejected: {e}");
+                        consecutive_misses = consecutive_misses.saturating_add(1);
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
+                        ))
+                        .await;
+                        boundary = boundary.saturating_sub(probe_step);
+                        continue;
+                    }
                 }
-            };
-            if let Err(e) = stellereum::sync::fast_sync_state_with_set_binding_prefetched(
-                &rt.state,
-                trusted_root,
-                snapshot,
-                fetch_domain,
-                boundary,
-                &anchor_set,
-            )
-            .await
-            .map(|_| ())
-            {
-                eprintln!("[sync] snapshot at {boundary} rejected: {e}");
-                consecutive_misses = consecutive_misses.saturating_add(1);
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    stellereum::sync::snapshot_probe_pace_ms(consecutive_misses),
-                ))
-                .await;
-                boundary = boundary.saturating_sub(probe_step);
-                continue;
             }
-        }
+        };
 
-        // The snapshot's root is verified. Record the boundary so the normal
-        // machinery continues from here.
-        {
-            let pq_reg = rt.state.pq_registry_read().await;
-            let active = stellereum::pq_registry::pq_lifecycle_active_at(boundary);
-            if !pq_reg.is_empty() {
-                stellereum::consensus::sync_committed_pq_registry(&pq_reg, active);
-            }
-        }
         // Fetch the boundary block before persisting/advancing so it can be
         // made durable alongside the snapshot and also reused for light-client
         // re-anchoring below without a duplicate network fetch.
@@ -526,30 +638,22 @@ pub(crate) async fn try_snapshot_sync_with_persistence(
             .fetch_block(&boundary_hash)
             .await
             .filter(|blk| blk.height == boundary && blk.compute_hash() == boundary_hash);
-        // Persist the verified snapshot state, domains, boundary block (if
-        // fetched), and finalized pointer BEFORE advancing `rt.safety` /
-        // `rt.finalized` (`advance_to_verified_snapshot`), so a crash right
-        // after snapshot sync never leaves `safety_record_v1` ahead of disk.
-        if let Some(ap) = persistence {
-            if let Some(ref blk) = fetched_boundary_block {
-                ap.enqueue_block(blk.clone());
-            }
-            ap.snapshot_state(&rt.state, boundary).await;
-            let (staking, governance) = {
-                let s = rt.state.staking_read().await.clone();
-                let g = rt.state.governance_read().await.clone();
-                (s, g)
-            };
-            ap.snapshot_domains(&rt.state, &staking, &governance, boundary)
-                .await;
-            let _ = ap.storage().put_finalized_post_root(boundary, trusted_root);
-            ap.enqueue_finalized(boundary, boundary_hash);
-            ap.request_flush();
-            if let Err(e) = wait_snapshot_persistence_drain(ap, boundary).await {
-                eprintln!("[sync] REFUSING snapshot at {boundary}: {e}");
-                tracing::error!(shard, boundary, "[sync] {e}");
-                return None;
-            }
+        if !persist_and_commit_staged_snapshot(
+            rt,
+            StagedSnapshotMeta {
+                shard,
+                boundary,
+                boundary_hash,
+                trusted_root,
+                fetched_boundary_block: fetched_boundary_block.as_ref(),
+                drain_timeout: None,
+            },
+            persistence,
+            staged_payload,
+        )
+        .await
+        {
+            return None;
         }
         //
         // Safety invariant (W1 §2.6): snapshot sync NEVER clears, overwrites, or
@@ -2839,6 +2943,122 @@ mod recovery_walk_tests {
         );
 
         drop(persist);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_persistence_drain_leaves_live_state_untouched() {
+        let dir = std::env::temp_dir().join(format!(
+            "stell_sync_stage_guard_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let vid = sk.verifying_key().to_bytes();
+        let vs = ValidatorSet::from_list(vec![(vid, 1_000_000_000_000)]);
+        let live_state = Arc::new(InMemoryStateEngine::new());
+        live_state
+            .credit_native_transfer(&[0x11u8; 32], 50_000)
+            .await
+            .expect("credit live");
+        let root_before = live_state.get_state_root().await;
+
+        let mut rt = ValidatorRuntime::new(sk, vs.clone(), live_state, 1);
+
+        // Build a different verified state snapshot at height 100.
+        let src_engine = InMemoryStateEngine::new();
+        src_engine
+            .credit_native_transfer(&[0x22u8; 32], 99_000)
+            .await
+            .expect("credit src");
+        {
+            let mut st = src_engine.staking_write().await;
+            st.validators.insert(
+                vid,
+                stellereum::staking::ValidatorStake {
+                    self_bond: 1_000_000_000_000,
+                    delegated: 0,
+                    commission_bps: 0,
+                    pending_rewards: 0,
+                    total_slashed: 0,
+                    missed: 0,
+                    last_downtime_penalty: 0,
+                    withdrawal_address: Some(vid),
+                },
+            );
+        }
+        let boundary_root = src_engine.get_state_root().await;
+        assert_ne!(boundary_root, root_before);
+
+        let snap_bytes = src_engine.create_snapshot().await;
+        let staking_snap = src_engine.staking_read().await.clone();
+        let gov_snap = src_engine.governance_read().await.clone();
+        let dom_snap =
+            stellereum::storage::DomainSnapshot::capture(&src_engine, &staking_snap, &gov_snap)
+                .await;
+        let dom_bytes = bincode::serialize(&dom_snap).expect("dom bytes");
+        let xshard_bytes =
+            bincode::serialize(&stellereum::sharding::CrossShardReplaySnapshot::default())
+                .expect("xshard");
+        let cnvrf_bytes = bincode::serialize(&src_engine.cnvrf_v3_snapshot().await).expect("cnvrf");
+
+        let mut bundle_map = std::collections::HashMap::<&'static str, Vec<u8>>::new();
+        bundle_map.insert("domains", dom_bytes);
+        bundle_map.insert("session", src_engine.session_keys_snapshot().await);
+        bundle_map.insert("bridge", src_engine.bridge_snapshot().await);
+        bundle_map.insert("zkml", src_engine.zkml_models_snapshot().await);
+        bundle_map.insert("cross_shard", xshard_bytes);
+        bundle_map.insert("cnvrf_v3", cnvrf_bytes);
+        bundle_map.insert("evm_bindings", src_engine.evm_bindings_snapshot().await);
+        bundle_map.insert("pq_registry", src_engine.pq_registry_snapshot().await);
+
+        let stage = stellereum::sync::prepare_fast_sync_state_with_set_binding_prefetched(
+            &rt.state,
+            boundary_root,
+            snap_bytes,
+            |kind| {
+                let v = bundle_map.get(kind).cloned();
+                async move { v }
+            },
+            100,
+            &vs,
+        )
+        .await
+        .expect("stage snapshot");
+
+        // Gate the persistence worker so wait_snapshot_persistence_drain times out.
+        let store_dir = dir.join("gated-store");
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        let storage = Arc::new(stellereum::storage::Storage::open(&store_dir).expect("open store"));
+        let (ap, _gate_tx) = stellereum::storage::AsyncPersistence::start_gated_for_test(storage);
+        let ap = Arc::new(ap);
+
+        let ok = persist_and_commit_staged_snapshot(
+            &mut rt,
+            StagedSnapshotMeta {
+                shard: 0,
+                boundary: 100,
+                boundary_hash: [0xAAu8; 32],
+                trusted_root: boundary_root,
+                fetched_boundary_block: None,
+                drain_timeout: Some(std::time::Duration::from_millis(30)),
+            },
+            Some(&ap),
+            StagedSnapshotPayload::Legacy(stage),
+        )
+        .await;
+        assert!(!ok, "gated persistence drain must fail closed");
+        assert_eq!(
+            rt.state.get_state_root().await,
+            root_before,
+            "failed snapshot persistence drain must leave live rt.state untouched"
+        );
+
+        drop(ap);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

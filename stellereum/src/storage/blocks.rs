@@ -509,7 +509,25 @@ impl Storage {
     pub fn put_block(&self, block: &Block) -> Result<BlockHash> {
         let hash = block.compute_hash();
         let bytes = bincode::serialize(block)?;
-        self.blocks.insert(hash, bytes)?;
+        if block.precommit_qc.is_some() {
+            self.blocks.insert(hash, bytes)?;
+        } else {
+            // Never let a stale queued lock-persist (`precommit_qc == None`)
+            // overwrite a finalized QC-carrying block written synchronously
+            // by write-ahead finality (`write_ahead_finalized_block`).
+            self.blocks.fetch_and_update(hash, |existing| {
+                if let Some(raw) = existing {
+                    let has_qc = crate::sharding::with_legacy_block_tolerance(|| {
+                        decode_bounded::<Block>(raw, MAX_BLOCK_BYTES)
+                    })
+                    .is_ok_and(|b| b.precommit_qc.is_some());
+                    if has_qc {
+                        return Some(raw.to_vec());
+                    }
+                }
+                Some(bytes.clone())
+            })?;
+        }
         // The header record is written for every block regardless of retention
         // mode, so switching a node from archive to pruning never loses the chain.
         self.put_header(&BlockHeaderRecord::of(block))?;

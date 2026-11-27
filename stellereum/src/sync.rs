@@ -1543,20 +1543,68 @@ where
     G: FnMut(&'static str) -> GFut,
     GFut: std::future::Future<Output = Option<Vec<u8>>>,
 {
-    // Same yield as the fetching entry: the restore is heavy and must not hold
-    // a loaded 1-vCPU executor across it.
+    let stage = prepare_fast_sync_state_with_set_binding_prefetched(
+        target_engine,
+        expected_root,
+        snapshot_bytes,
+        fetch_domain,
+        snapshot_height,
+        anchor_set,
+    )
+    .await?;
+    stage.commit_to(target_engine).await?;
+    stage.bound_set.ok_or_else(|| {
+        "fast sync: set binding requested but no bound set returned (internal error)".to_string()
+    })
+}
+
+/// Verified snapshot bundle staged into an ephemeral `InMemoryStateEngine`
+/// without mutating `target_engine`. Callers that must durably persist the
+/// snapshot to disk before advancing live state can persist `staged_engine`,
+/// await durability, and only then invoke [`Self::commit_to`].
+pub struct VerifiedSnapshotStage {
+    bytes: Vec<u8>,
+    bundle: Vec<(&'static str, Vec<u8>)>,
+    pub staged_engine: crate::state_engine::InMemoryStateEngine,
+    pub bound_set: Option<crate::consensus::ValidatorSet>,
+}
+
+impl VerifiedSnapshotStage {
+    pub async fn commit_to(
+        &self,
+        target_engine: &crate::state_engine::InMemoryStateEngine,
+    ) -> Result<(), String> {
+        target_engine
+            .restore_snapshot_preserve_replay_sets(&self.bytes)
+            .await
+            .map_err(|e| format!("fast sync: commit snapshot error: {e}"))?;
+        install_bundle(target_engine, &self.bundle).await
+    }
+}
+
+/// Verify root, set binding, and replay coverage against `target_engine`,
+/// returning a [`VerifiedSnapshotStage`] without mutating `target_engine`.
+pub async fn prepare_fast_sync_state_with_set_binding_prefetched<G, GFut>(
+    target_engine: &crate::state_engine::InMemoryStateEngine,
+    expected_root: crate::cell::CellHash,
+    snapshot_bytes: Vec<u8>,
+    fetch_domain: G,
+    snapshot_height: u64,
+    anchor_set: &crate::consensus::ValidatorSet,
+) -> Result<VerifiedSnapshotStage, String>
+where
+    G: FnMut(&'static str) -> GFut,
+    GFut: std::future::Future<Output = Option<Vec<u8>>>,
+{
     tokio::task::yield_now().await;
-    let bound = fast_sync_verify_commit(
+    fast_sync_verify_stage(
         target_engine,
         expected_root,
         snapshot_bytes,
         fetch_domain,
         Some((snapshot_height, anchor_set)),
     )
-    .await?;
-    bound.ok_or_else(|| {
-        "fast sync: set binding requested but no bound set returned (internal error)".to_string()
-    })
+    .await
 }
 
 /// F5 set-at-height binding check over an already-fetched domain bundle.
@@ -1660,9 +1708,32 @@ async fn fast_sync_verify_commit<G, GFut>(
     target_engine: &crate::state_engine::InMemoryStateEngine,
     expected_root: crate::cell::CellHash,
     bytes: Vec<u8>,
-    mut fetch_domain: G,
+    fetch_domain: G,
     set_binding: Option<(u64, &crate::consensus::ValidatorSet)>,
 ) -> Result<Option<crate::consensus::ValidatorSet>, String>
+where
+    G: FnMut(&'static str) -> GFut,
+    GFut: std::future::Future<Output = Option<Vec<u8>>>,
+{
+    let stage = fast_sync_verify_stage(
+        target_engine,
+        expected_root,
+        bytes,
+        fetch_domain,
+        set_binding,
+    )
+    .await?;
+    stage.commit_to(target_engine).await?;
+    Ok(stage.bound_set)
+}
+
+async fn fast_sync_verify_stage<G, GFut>(
+    target_engine: &crate::state_engine::InMemoryStateEngine,
+    expected_root: crate::cell::CellHash,
+    bytes: Vec<u8>,
+    mut fetch_domain: G,
+    set_binding: Option<(u64, &crate::consensus::ValidatorSet)>,
+) -> Result<VerifiedSnapshotStage, String>
 where
     G: FnMut(&'static str) -> GFut,
     GFut: std::future::Future<Output = Option<Vec<u8>>>,
@@ -1771,14 +1842,14 @@ where
         }
     }
 
-    // Cryptographic root matches and the replay gate passed: install the SAME
-    // bytes into the target.
-    target_engine
-        .restore_snapshot_preserve_replay_sets(&bytes)
-        .await
-        .map_err(|e| format!("fast sync: commit snapshot error: {e}"))?;
-    install_bundle(target_engine, &bundle).await?;
-    Ok(bound_set)
+    // Cryptographic root matches and the replay gate passed: return the staged
+    // snapshot without mutating `target_engine` yet.
+    Ok(VerifiedSnapshotStage {
+        bytes,
+        bundle,
+        staged_engine: temp_engine,
+        bound_set,
+    })
 }
 
 /// Extract the cross-shard replay snapshot from a fetched domain bundle, if
@@ -2064,6 +2135,36 @@ fn commit_snapv4_to_storage(
 /// Verify and install a `Base` `SnapV4` checkpoint into `target_engine` (and
 /// optionally persist atomically to `storage` without touching
 /// `safety_record_v1`, `ConsensusCheckpoint`, or `VoteWatermark`).
+pub async fn prepare_fast_sync_snapv4_base(
+    target_engine: &crate::state_engine::InMemoryStateEngine,
+    anchor: &crate::snapshot_v4::TrustedSnapshotAnchor<'_>,
+    manifest: &crate::snapshot_v4::SnapshotManifestV1,
+    chunks: &std::collections::BTreeMap<(u16, u16), Vec<u8>>,
+) -> Result<
+    (
+        crate::snapshot_v4::SnapStateV4,
+        crate::state_engine::InMemoryStateEngine,
+        crate::consensus::ValidatorSet,
+    ),
+    String,
+> {
+    let state = crate::snapshot_v4::verify_and_apply_base_with_key_resolver(
+        manifest,
+        chunks,
+        anchor,
+        crate::consensus::pq_key_at_height,
+    )
+    .await
+    .map_err(|e| format!("snap_v4 base verify failed: {e}"))?;
+    let bound_set = check_snapv4_commit_gates(target_engine, &state, anchor).await?;
+    let staged = crate::state_engine::InMemoryStateEngine::new();
+    state
+        .apply_to_engine(&staged)
+        .await
+        .map_err(|e| format!("snap_v4 apply to staged engine failed: {e}"))?;
+    Ok((state, staged, bound_set))
+}
+
 pub async fn fast_sync_snapv4_base(
     target_engine: &crate::state_engine::InMemoryStateEngine,
     anchor: &crate::snapshot_v4::TrustedSnapshotAnchor<'_>,
